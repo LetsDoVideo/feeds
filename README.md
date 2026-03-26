@@ -1,59 +1,115 @@
-# OBS Plugin Template
+# ISO for OBS (Zoom)
 
-## Introduction
+**Pull individual Zoom participant video feeds (ISO) directly into OBS Studio as dedicated sources.**
 
-The plugin template is meant to be used as a starting point for OBS Studio plugin development. It includes:
+ISO for OBS is a native Windows plugin for OBS Studio that uses the Zoom Meeting SDK to give broadcasters clean, isolated video feeds from each Zoom participant — no screen capturing, no grid layouts, just raw high-quality video piped directly into your OBS scene.
 
-* Boilerplate plugin source code
-* A CMake project file
-* GitHub Actions workflows and repository actions 
+---
 
-## Supported Build Environments
+## Requirements
 
-| Platform  | Tool   |
-|-----------|--------|
-| Windows   | Visual Studio 17 2022 |
-| macOS     | XCode 16.0 |
-| Windows, macOS  | CMake 3.30.5 |
-| Ubuntu 24.04 | CMake 3.28.3 |
-| Ubuntu 24.04 | `ninja-build` |
-| Ubuntu 24.04 | `pkg-config`
-| Ubuntu 24.04 | `build-essential` |
+- Windows 10 or later (64-bit)
+- OBS Studio 29 or later
+- A Zoom account (Pro or higher recommended)
+- The Zoom meeting host must approve the livestream request when prompted
+
+---
+
+## Installation
+
+1. Download the latest **ISO-for-OBS-Windows.zip** from the [Releases](https://github.com/LetsDoVideo/iso-for-obs/releases) page
+2. Extract the ZIP file
+3. Copy the extracted contents into your OBS Studio root folder
+   - For standard OBS installs: `C:\Program Files\obs-studio\`
+   - For portable OBS installs: your portable OBS root folder
+4. Restart OBS Studio
+5. The plugin is ready — no Zoom Marketplace activation required for the Free tier
+
+---
 
 ## Quick Start
 
-An absolute bare-bones [Quick Start Guide](https://github.com/obsproject/obs-plugintemplate/wiki/Quick-Start-Guide) is available in the wiki.
+1. In OBS, click **+** in the Sources panel and add a **Zoom Participant** source
+2. In the source Properties window, click **Not connected to Zoom. Click to Connect...**
+3. Enter your Zoom meeting number or link when prompted
+4. Enter the meeting password if required
+5. The host will see a **"Request to livestream"** popup in Zoom — click **Allow**
+6. Once connected, select a participant from the dropdown to display their feed
+7. Add additional **Zoom Participant** sources for more feeds
+8. Add a **Zoom Screenshare** source to capture active screenshares
 
-## Documentation
+> **Note:** When the plugin connects, the Zoom client will open on your desktop — this is expected and useful. Place it on a secondary monitor to keep an eye on all meeting participants, including those not currently in your OBS scene. Audio from the Zoom meeting will automatically appear in OBS as Desktop Audio, ready to use in your stream or recording.
 
-All documentation can be found in the [Plugin Template Wiki](https://github.com/obsproject/obs-plugintemplate/wiki).
+---
 
-Suggested reading to get up and running:
+## Source Types
 
-* [Getting started](https://github.com/obsproject/obs-plugintemplate/wiki/Getting-Started)
-* [Build system requirements](https://github.com/obsproject/obs-plugintemplate/wiki/Build-System-Requirements)
-* [Build system options](https://github.com/obsproject/obs-plugintemplate/wiki/CMake-Build-System-Options)
+| Source | Description |
+|--------|-------------|
+| **Zoom Participant** | Captures an individual participant's camera feed |
+| **Zoom Screenshare** | Captures whatever is being shared on screen |
 
-## GitHub Actions & CI
+### Special Options
+- **[Active Speaker]** — automatically follows whoever is currently talking
 
-Default GitHub Actions workflows are available for the following repository actions:
+---
 
-* `push`: Run for commits or tags pushed to `master` or `main` branches.
-* `pr-pull`: Run when a Pull Request has been pushed or synchronized.
-* `dispatch`: Run when triggered by the workflow dispatch in GitHub's user interface.
-* `build-project`: Builds the actual project and is triggered by other workflows.
-* `check-format`: Checks CMake and plugin source code formatting and is triggered by other workflows.
+## Tier Limits
 
-The workflows make use of GitHub repository actions (contained in `.github/actions`) and build scripts (contained in `.github/scripts`) which are not needed for local development, but might need to be adjusted if additional/different steps are required to build the plugin.
+| Tier | Feeds | Resolution |
+|------|-------|------------|
+| Free | 1 | 720p |
+| Basic | 3 | 1080p |
+| Streamer | 5 | 1080p |
+| Broadcaster | 10 | 1080p |
 
-### Retrieving build artifacts
+Upgrade your tier at the [Zoom App Marketplace](https://marketplace.zoom.us).
 
-Successful builds on GitHub Actions will produce build artifacts that can be downloaded for testing. These artifacts are commonly simple archives and will not contain package installers or installation programs.
+---
 
-### Building a Release
+## Known Limitations
 
-To create a release, an appropriately named tag needs to be pushed to the `main`/`master` branch using semantic versioning (e.g., `12.3.4`, `23.4.5-beta2`). A draft release will be created on the associated repository with generated installer packages or installation programs attached as release artifacts.
+- **Windows only** in this release (macOS coming in a future version)
+- The meeting host must click **Allow** when prompted with the livestream request — without host approval the plugin cannot access video feeds
 
-## Signing and Notarizing on macOS
+---
 
-Basic concepts of codesigning and notarization on macOS are explained in the correspodning [Wiki article](https://github.com/obsproject/obs-plugintemplate/wiki/Codesigning-On-macOS) which has a specific section for the [GitHub Actions setup](https://github.com/obsproject/obs-plugintemplate/wiki/Codesigning-On-macOS#setting-up-code-signing-for-github-actions).
+## Known Issues
+
+**Occasional 1-second video latency on new sources**
+Sometimes a newly created Zoom Participant source will have approximately 1 second of video latency. If this occurs, delete the source and re-add it — the latency will not return. This is a known issue being addressed in the next release.
+
+---
+
+## Troubleshooting
+
+**Participant list is empty after connecting**
+Click the **Refresh Participant List** button in the source Properties window.
+
+**Black screen / 0x0 pixels on a source**
+Delete the source and re-add it after connecting to the meeting.
+
+**The host saw a "Request to livestream" popup — is that normal?**
+Yes. Click Allow. This is how the plugin accesses raw video feeds via the Zoom SDK.
+
+**How do I update the plugin?**
+Download the latest release ZIP from the [Releases](https://github.com/LetsDoVideo/iso-for-obs/releases) page and replace the existing files in your OBS folder.
+
+For full documentation visit [letsdovideo.com/iso-for-obs-documentation](https://letsdovideo.com/iso-for-obs-documentation/)
+
+---
+
+## Support
+
+- 📖 [Documentation](https://letsdovideo.com/iso-for-obs-documentation/)
+- 🛠️ [Support Page](https://letsdovideo.com/iso-for-obs-support/)
+- 💬 [Let's Do Video Discord](https://discord.com/invite/CXGwwKt)
+
+---
+
+## Legal
+
+ISO for OBS is an independent integration and is not officially endorsed by the OBS Project or Zoom Video Communications, Inc.
+OBS Studio is a trademark of the OBS Project. Zoom is a trademark of Zoom Video Communications, Inc.
+
+© 2026 Let's Do Video. Licensed under GPL-2.0.
