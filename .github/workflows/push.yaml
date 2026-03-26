@@ -1,0 +1,51 @@
+name: Push
+
+permissions:
+  actions: read
+  contents: write
+  security-events: write
+
+on:
+  push:
+    branches: [ master, main ]
+
+jobs:
+  build:
+    name: Build Project
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v3
+        with:
+          version: '6.5.3'
+          host: 'windows'
+          target: 'desktop'
+          arch: 'win64_msvc2019_64'
+          install-deps: 'true'
+
+      - name: Configure and Build
+        shell: cmd
+        run: |
+          cmake -B build -G "Visual Studio 17 2022" -A x64
+          cmake --build build --config Release
+
+      - name: Prepare Plugin Folder
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "dist/obs-plugins/64bit"
+          Copy-Item "build/Release/obs-zoom-connector.dll" -Destination "dist/obs-plugins/64bit/"
+          Copy-Item "build/Release/obs-zoom-connector.pdb" -Destination "dist/obs-plugins/64bit/"
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ISO-for-OBS-Windows-DropIn
+          path: dist/

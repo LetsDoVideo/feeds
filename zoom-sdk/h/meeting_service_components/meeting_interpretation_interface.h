@@ -1,0 +1,281 @@
+/**
+ * @file meeting_interpretation_interface.h
+ * @brief Meeting Service Interpretation Interface
+ * @note Valid for both ZOOM style and user custom interface mode.
+ */
+#ifndef _MEETING_INTERPRETATION_INTERFACE_H_
+#define _MEETING_INTERPRETATION_INTERFACE_H_
+#include "zoom_sdk_def.h"
+
+BEGIN_ZOOM_SDK_NAMESPACE
+/**
+ * @class IInterpretationLanguage
+ * @brief interpretation language interface.
+ */
+class IInterpretationLanguage
+{
+public:
+	virtual ~IInterpretationLanguage() {}
+	virtual int GetLanguageID() = 0;
+	virtual const zchar_t* GetLanguageAbbreviations() = 0;
+	virtual const zchar_t* GetLanguageName() = 0;
+};
+
+/**
+ * @class IInterpreter
+ * @brief interpreter interface.
+ */
+class IInterpreter
+{
+public:
+	virtual ~IInterpreter() {}
+	virtual unsigned int GetUserID() = 0;
+	virtual int GetLanguageID1() = 0;  
+	virtual int GetLanguageID2() = 0;
+	virtual bool IsAvailable() = 0;
+};
+
+/**
+ * @class IMeetingInterpretationControllerEvent
+ * @brief Meeting interpretation callback event.
+ */
+class IMeetingInterpretationControllerEvent
+{
+public:
+	virtual ~IMeetingInterpretationControllerEvent() {}
+
+	/**
+	 * @brief interpretation start callback. This function is used to inform the user interpretation has been started, and all users in meeting can get the event.
+	 */
+	virtual void OnInterpretationStart() = 0;
+	
+	/**
+ 	 * @brief interpretation stop callback. This function is used to inform the user interpretation has been stopped, and all users in meeting can get the event.
+	 */
+	virtual void OnInterpretationStop() = 0;
+	
+	/**
+ 	 * @brief interpreter list changed callback. when some interpreter leave meeting or preset interpreter join meeting, and only host can get the event.
+	 */
+	virtual void OnInterpreterListChanged() = 0;
+	
+	/**
+	 * @brief interpreter role changed callback. when a user's role changed(participant <-> interpreter), and all users in meeting can get the event.
+	 * @param userID Specify the user ID whose status changed.
+	 * @param isInterpreter Specify the user's role is interpreter or not.
+	 */
+	virtual void OnInterpreterRoleChanged(unsigned int userID, bool isInterpreter) = 0;
+	
+	/**
+ 	 * @brief interpreter active language changed callback. when a interpreter's active language changed, and all users in meeting can get the event.
+	 * @param userID Specify the user ID whose active language changed.
+	 * @param activeLanID Specify the interpreter current active language id.
+	 */
+	virtual void OnInterpreterActiveLanguageChanged(unsigned int userID, int activeLanID) = 0;
+	
+	/**
+ 	 * @brief interpreter languages changed callback. when a interpreter's languages changed, and only the interpreter can get the event.
+	 * @param lanID1 Specify the new language ID1.
+	 * @param lanID2 Specify the new language ID2.
+	 */
+	virtual void OnInterpreterLanguageChanged(int lanID1, int lanID2) = 0;
+	
+	/**
+ 	 * @brief available languages changed callback. when available languages in meeting are changed, all non interpreter users in meeting can get the event.
+	 * @param pAvailableLanguageList Specify the available languages list.
+	 */
+	virtual void OnAvailableLanguageListUpdated(IList<IInterpretationLanguage*>* pAvailableLanguageList) = 0;
+	
+	/**
+ 	 * @brief Callback to indicate that the list of available languages that interpreters can hear has changed.
+	 * @note When the list of available languages that interpreters can hear in a meeting is changed, all interpreters in the meeting can get this event.
+	 * @param availableLanguages The list of available languages that interpreters can hear.
+	 */
+	virtual void OnInterpreterLanguagesUpdated(IList<IInterpretationLanguage*>* availableLanguages) = 0;
+};
+
+/**
+ * @class IMeetingInterpretationController
+ * @brief Meeting interpretation controller interface
+ */
+class IMeetingInterpretationController
+{
+public:
+	virtual ~IMeetingInterpretationController() {}
+
+	/** 
+	 * @note Common (for all) 
+	 */
+	 
+	/**
+ 	 * @brief Sets the interpretation controller callback event handler.
+	 * @param event A pointer to the IMeetingInterpretationControllerEvent that receives the interpretation event.
+	 */
+	virtual void SetEvent(IMeetingInterpretationControllerEvent * event) = 0;  
+	
+	/**
+ 	 * @brief Determines if interpretation feature is enabled in the meeting.
+	 */
+	virtual bool IsInterpretationEnabled() = 0;
+	
+	/**
+ 	 * @brief Determines if interpretation has been started by host.
+	 */
+	virtual bool IsInterpretationStarted() = 0;
+	
+	/**
+ 	 * @brief Determines if myself is interpreter.
+	 */
+	virtual bool IsInterpreter() = 0;
+	
+	/**
+ 	 * @brief Gets the interpretation language object of specified language ID.
+	 * @param lanID Specify the language ID for which you want to get the information. 
+	 * @return If the function succeeds, it returns a pointer to the IInterpretationLanguage. Otherwise, this function fails and returns nullptr.
+	 */
+	virtual IInterpretationLanguage* GetInterpretationLanguageByID(int lanID) = 0;
+
+	/** 
+	 * @note Admin (only for host) 
+	 */
+	 
+	/**
+ 	 * @brief Gets the all interpretation language list.
+	 * @return If the function succeeds, it returns a pointer to the IList<IInterpretationLanguage*>. Otherwise, this function fails and returns nullptr.
+	 */
+    virtual IList<IInterpretationLanguage*>* GetAllLanguageList() = 0;
+	
+	/**
+ 	 * @brief Gets the interpreters list.
+	 * @return If the function succeeds, it returns a pointer to the IList<IInterpreter*>. Otherwise, this function fails and returns nullptr.
+	 */
+	virtual IList<IInterpreter*>* GetInterpreterList() = 0;
+	
+	/**
+ 	 * @brief Add someone as a interpreter.
+	 * @param userID Specify the user.
+	 * @param lanID1 Specify the language1.
+	 * @param lanID2 Specify the language2.
+	 * @return If the function succeeds, the return value is SDKERR_SUCCESS. Otherwise, this function returns an error.
+	 */
+	virtual SDKError AddInterpreter(unsigned int userID, int lanID1, int lanID2) = 0;
+	
+	/**
+ 	 * @brief Remove some interpreter.
+	 * @param userID Specify the interpreter.
+	 * @return If the function succeeds, the return value is SDKERR_SUCCESS. Otherwise, this function returns an error.
+	 */
+	virtual SDKError RemoveInterpreter(unsigned int userID) = 0;
+	
+	/**
+ 	 * @brief modify the language of some interpreter.
+	 * @param userID Specify the interpreter.
+	 * @param lanID1 Specify the new language1.
+	 * @param lanID2 Specify the new language2.
+	 * @return If the function succeeds, the return value is SDKERR_SUCCESS. Otherwise, this function returns an error.
+	 */
+	virtual SDKError ModifyInterpreter(unsigned int userID, int lanID1, int lanID2) = 0;
+	
+	/**
+ 	 * @brief Starts interpretation.
+	 * @return If the function succeeds, the return value is SDKERR_SUCCESS. Otherwise, this function returns an error.
+	 */
+	virtual SDKError StartInterpretation() = 0;
+	
+	/**
+ 	 * @brief Stops interpretation.
+	 * @return If the function succeeds, the return value is SDKERR_SUCCESS. Otherwise, this function returns an error.
+	 */
+	virtual SDKError StopInterpretation() = 0;
+
+	/** 
+	 * @note Listener (for non interpreter) 
+	 */
+	 
+	/**
+ 	 * @brief Gets the available interpretation language list.
+	 * @return If the function succeeds, it returns a pointer to the IList<IInterpretationLanguage*>. Otherwise, this function fails and returns nullptr.
+	 */
+	virtual IList<IInterpretationLanguage*>* GetAvailableLanguageList() = 0;
+	
+	/**
+ 	 * @brief Joins some language channel.
+	 * @param lanID Specify the language channel. If lanID is -1 means join major meeting.
+	 * @return If the function succeeds, the return value is SDKERR_SUCCESS. Otherwise, this function returns an error.
+	 */
+	virtual SDKError JoinLanguageChannel(int lanID) = 0;
+	
+	/**
+ 	 * @brief Gets the language ID which myself is in.
+	 * @param [out] lanID indicates the language ID which myself is in.
+	 * @return If the function succeeds, the return value is SDKERR_SUCCESS. Otherwise, this function returns an error.
+	 */
+	virtual SDKError GetJoinedLanguageID(int& lanID) = 0;
+	
+	/**
+ 	 * @brief Turn off the major audio, if you are in some interpreter language channel.
+	 * @return If the function succeeds, the return value is SDKERR_SUCCESS. Otherwise, this function returns an error.
+	 */
+	virtual SDKError TurnOffMajorAudio() = 0;
+	
+	/**
+ 	 * @brief Turn on the major audio, if you are in some interpreter language channel.
+	 * @return If the function succeeds, the return value is SDKERR_SUCCESS. Otherwise, this function returns an error.
+	 */
+	virtual SDKError TurnOnMajorAudio() = 0;
+	
+	/**
+ 	 * @brief Determines if the major audio is off.
+	 * @param [out] bOff indicates the major audio off status.
+	 * @return If the function succeeds, the return value is SDKERR_SUCCESS. Otherwise, this function returns an error.
+	 */
+	virtual SDKError IsMajorAudioTurnOff(bool& bOff) = 0;
+
+	/** 
+	 * @note Interpreter (only for interpreter) 
+	 */
+	 
+	/**
+ 	 * @brief Gets languages if myself is a interpreter.
+	 * @param [out] lanID1 Specify the language1.
+	 * @param [out] lanID2 Specify the language2.
+	 * @return If the function succeeds, the return value is SDKERR_SUCCESS. Otherwise, this function returns an error.
+	 */
+	virtual SDKError GetInterpreterLans(int& lanID1, int& lanID2) = 0;
+	
+	/**
+ 	 * @brief Sets a language channel which myself will be in, if myself is a interpreter.
+	 * @param activeLanID Specify the active language.
+	 * @return If the function succeeds, the return value is SDKERR_SUCCESS. Otherwise, this function returns an error.
+	 */
+	virtual SDKError SetInterpreterActiveLan(int activeLanID) = 0;
+	
+	/**
+ 	 * @brief Gets the active language ID, if myself is a interpreter.
+	 * @param [out] lanID Specify the active language.
+	 * @return If the function succeeds, the return value is SDKERR_SUCCESS. Otherwise, this function returns an error.
+	 */
+	virtual SDKError GetInterpreterActiveLan(int& lanID) = 0;
+	
+	/**
+ 	 * @brief Gets the list of available languages that interpreters can hear
+	 * @return If the function succeeds, it returns a pointer to the IList<IInterpretationLanguage*>. Otherwise, this function fails and returns nullptr.
+	 */
+	virtual IList<IInterpretationLanguage*>* GetInterpreterAvailableLanguages() = 0;
+	
+	/**
+ 	 * @brief Sets a language that I can hear as an interpreter.
+	 * @param lanID Specify the selected language that I can hear as an interpreter.
+	 * @return If the function succeeds, the return value is SDKERR_SUCCESS. Otherwise, this function returns an error.
+	 */
+	virtual SDKError SetInterpreterListenLan(int languageID) = 0;
+	
+	/**
+ 	 * @brief Gets a language that I can hear as an interpreter.
+	 * @param lanID Specify the selected language that I can hear as an interpreter.
+	 * @return If the function succeeds, the return value is SDKERR_SUCCESS. Otherwise, this function returns an error.
+	 */
+	virtual SDKError GetInterpreterListenLan(int& languageID) = 0;
+};
+END_ZOOM_SDK_NAMESPACE
+#endif
