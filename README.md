@@ -2,6 +2,8 @@
 
 **Pull individual Zoom participant video feeds (ISO) directly into OBS Studio as dedicated sources.**
 
+[![ISO for OBS Demo Video](assets/hero.png)](https://youtu.be/ApPm0OoGWWI)
+
 ISO for OBS is a native Windows plugin for OBS Studio that uses the Zoom Meeting SDK to give broadcasters clean, isolated video feeds from each Zoom participant. No screen capturing, no grid layouts, just raw high-quality video piped directly into your OBS scene.
 
 ---
@@ -39,6 +41,14 @@ ISO for OBS is a native Windows plugin for OBS Studio that uses the Zoom Meeting
 8. Add a **Zoom Screenshare** source to capture active screenshares
 
 > **Note:** When the plugin connects, the Zoom client will open on your desktop. This is expected and useful. Place it on a secondary monitor to keep an eye on all meeting participants, including those not currently in your OBS scene. Audio from the Zoom meeting will automatically appear in OBS as Desktop Audio, ready to use in your stream or recording.
+
+---
+
+## Screenshots
+
+![OBS Source List](assets/source-list.png)
+
+![Participant Properties](assets/properties.png)
 
 ---
 
