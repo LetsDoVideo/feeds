@@ -18,6 +18,8 @@
 !/zoom-sdk/
 !/zoom-sdk/**/*.lib
 !/zoom-sdk/**/*.h
+!/zoom-sdk/bin/
+!/zoom-sdk/bin/**
 
 # Exclude lock files
 *.lock.json
