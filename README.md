@@ -114,8 +114,8 @@ Sometimes a newly created Zoom Participant source will have approximately 1 seco
 
 ## Support
 
-- 📖 [Documentation](https://letsdovideo.com/iso-for-obs-documentation/)
-- 🛠️ [Support Page](https://letsdovideo.com/iso-for-obs-support/)
+- 📖 [Documentation](https://letsdovideo.com/isolated-feeds-for-obs-documentation/)
+- 🛠️ [Support Page](https://letsdovideo.com/isolated-feeds-for-obs-support/)
 - 💬 [Let's Do Video Discord](https://discord.com/invite/CXGwwKt)
 
 ---
