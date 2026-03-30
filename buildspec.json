@@ -36,8 +36,8 @@
             "bundleId": "com.letsdovideo.iso-for-obs"
         }
     },
-    "name": "iso-for-obs",
-    "displayName": "ISO for OBS",
+    "name": "feeds",
+    "displayName": "Feeds",
     "version": "0.1.0",
     "author": "David Maldow / Let's Do Video",
     "website": "https://letsdovideo.com/iso-for-obs-documentation/",
