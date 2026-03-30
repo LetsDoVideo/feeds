@@ -346,8 +346,8 @@ public:
         if (!lsc) return;
 
         lsc->StartRawLiveStreaming(
-            L"https://letsdovideo.com/iso-for-obs-support/",
-            L"ISO for OBS");
+            L"https://letsdovideo.com/feeds-support/",
+            L"Feeds");
 
         ZOOM_SDK_NAMESPACE::IMeetingShareController* sc =
             ms->GetMeetingShareController();
@@ -425,8 +425,8 @@ public:
                 g_liveStreamListener.onRawLiveStreamPrivilegeChanged(true);
             } else {
                 lsc->RequestRawLiveStreaming(
-                    L"https://letsdovideo.com/iso-for-obs-support/",
-                    L"ISO for OBS");
+                    L"https://letsdovideo.com/feeds-support/",
+                    L"Feeds");
             }
         }
 
@@ -505,7 +505,7 @@ public:
         ZOOM_SDK_NAMESPACE::JoinParam4WithoutLogin& param = joinParam.param.withoutloginuserJoin;
         param.isAudioOff = true;
         param.isVideoOff = true;
-        param.userName = L"ISO for OBS";
+        param.userName = L"Feeds";
 
         static std::wstring s_password;
         if (!password.trimmed().isEmpty()) {
@@ -595,13 +595,13 @@ void OnConnectClick() {
 void SetupPluginMenu(void) {
     QMainWindow* mainWindow = (QMainWindow*)obs_frontend_get_main_window();
     QMenuBar* menuBar = mainWindow->menuBar();
-    QMenu* isoMenu = new QMenu("ISO for OBS", menuBar);
+    QMenu* isoMenu = new QMenu("Feeds", menuBar);
     menuBar->addMenu(isoMenu);
     g_connectAction = isoMenu->addAction("Connect to Zoom...");
     QAction* aboutAction = isoMenu->addAction("About / Tier Status");
     QObject::connect(g_connectAction, &QAction::triggered, []() { OnConnectClick(); });
     QObject::connect(aboutAction, &QAction::triggered, []() {
-        MessageBoxA(NULL, "ISO for OBS v0.1\nTier: Free\nStatus: Active",
+        MessageBoxA(NULL, "Feeds v0.1\nTier: Free\nStatus: Active",
                     "About", MB_OK);
     });
 }
@@ -628,7 +628,7 @@ public:
 // ---------------------------------------------------------------------------
 static obs_properties_t* zp_properties(void* data) {
     obs_properties_t* props = obs_properties_create();
-    obs_properties_add_text(props, "ver_label", "ISO for OBS (v0.1 Alpha)",
+    obs_properties_add_text(props, "ver_label", "Feeds (v0.1 Alpha)",
                             OBS_TEXT_INFO);
 
     ZOOM_SDK_NAMESPACE::IMeetingService* ms = nullptr;
@@ -680,7 +680,7 @@ static obs_properties_t* zp_properties(void* data) {
                     ZOOM_SDK_NAMESPACE::IUserInfo* info = pc->GetUserByUserID(uid);
                     if (info) {
                         std::wstring wname = info->GetUserName();
-                        if (wname == L"ISO for OBS") continue;
+                        if (wname == L"Feeds") continue;
                         int size_needed = WideCharToMultiByte(
                             CP_UTF8, 0, &wname[0], (int)wname.size(),
                             NULL, 0, NULL, NULL);
@@ -703,7 +703,7 @@ static obs_properties_t* zs_properties(void* data) {
     (void)data;
     obs_properties_t* props = obs_properties_create();
     obs_properties_add_text(props, "ver_label",
-                            "ISO for OBS - Screenshare (v0.1 Alpha)", OBS_TEXT_INFO);
+                            "Feeds - Screenshare (v0.1 Alpha)", OBS_TEXT_INFO);
 
     ZOOM_SDK_NAMESPACE::IMeetingService* ms = nullptr;
     ZOOM_SDK_NAMESPACE::CreateMeetingService(&ms);
@@ -737,7 +737,7 @@ void* zp_create(obs_data_t* settings, obs_source_t* source) {
                           std::to_string(GetMaxFeedsForTier()) +
                           " participant feed(s).\n\nUpgrade your plan at:\n"
                           "https://marketplace.zoom.us";
-        MessageBoxA(NULL, msg.c_str(), "ISO for OBS - Upgrade Required",
+        MessageBoxA(NULL, msg.c_str(), "Feeds - Upgrade Required",
                     MB_OK | MB_ICONINFORMATION);
         return nullptr;
     }
