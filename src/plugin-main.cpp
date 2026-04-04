@@ -7,7 +7,14 @@
 #include <vector>
 #include <windows.h>
 #include <shellapi.h>
+#include <thread>
+#include <sstream>
+#include <iomanip>
+#include <random>
 
+// Crypto for SHA-256 (Windows native, no OpenSSL needed)
+#include <wincrypt.h>
+#pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "ws2_32.lib")
 
 // Qt Headers
@@ -63,16 +70,199 @@ static ZOOM_SDK_NAMESPACE::ZoomSDKResolution GetResolutionForTier() {
 // ---------------------------------------------------------------------------
 // GLOBALS
 // ---------------------------------------------------------------------------
-static bool g_rawLiveStreamGranted = false;
-static QAction* g_connectAction    = nullptr;
-static QAction* g_loginAction      = nullptr;
-static QAction* g_logoutAction     = nullptr;
-static bool g_isLoggedIn           = false;
-static bool g_pendingMeetingJoin   = false;
+static bool     g_rawLiveStreamGranted = false;
+static QAction* g_connectAction        = nullptr;
+static QAction* g_loginAction          = nullptr;
+static QAction* g_logoutAction         = nullptr;
+static bool     g_isLoggedIn           = false;
+static bool     g_pendingMeetingJoin   = false;
 
 static unsigned int g_activeSharerUserId  = 0;
 static unsigned int g_activeShareSourceId = 0;
 static unsigned int g_activeSpeakerUserId = 0;
+
+// PKCE state
+static std::string g_pkceVerifier;
+static std::string g_accessToken;
+static std::string g_refreshToken;
+
+// ---------------------------------------------------------------------------
+// PKCE HELPERS
+// ---------------------------------------------------------------------------
+
+// URL-safe base64 (no padding, + -> -, / -> _)
+static std::string Base64UrlEncode(const unsigned char* data, size_t len) {
+    DWORD encoded_len = 0;
+    CryptBinaryToStringA(data, (DWORD)len,
+                         CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF,
+                         nullptr, &encoded_len);
+    std::string encoded(encoded_len, '\0');
+    CryptBinaryToStringA(data, (DWORD)len,
+                         CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF,
+                         &encoded[0], &encoded_len);
+    while (!encoded.empty() && encoded.back() == '\0')
+        encoded.pop_back();
+    for (char& c : encoded) {
+        if (c == '+') c = '-';
+        else if (c == '/') c = '_';
+    }
+    while (!encoded.empty() && encoded.back() == '=')
+        encoded.pop_back();
+    return encoded;
+}
+
+// Generate a cryptographically random code_verifier
+static std::string GenerateCodeVerifier() {
+    unsigned char buf[32];
+    HCRYPTPROV hProv = 0;
+    CryptAcquireContext(&hProv, nullptr, nullptr, PROV_RSA_FULL,
+                        CRYPT_VERIFYCONTEXT);
+    CryptGenRandom(hProv, sizeof(buf), buf);
+    CryptReleaseContext(hProv, 0);
+    return Base64UrlEncode(buf, sizeof(buf));
+}
+
+// SHA-256 hash using Windows native crypto
+static std::vector<unsigned char> SHA256Hash(const std::string& input) {
+    HCRYPTPROV hProv = 0;
+    HCRYPTHASH hHash = 0;
+    std::vector<unsigned char> result(32);
+    CryptAcquireContext(&hProv, nullptr, nullptr, PROV_RSA_AES,
+                        CRYPT_VERIFYCONTEXT);
+    CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash);
+    CryptHashData(hHash, (const BYTE*)input.data(), (DWORD)input.size(), 0);
+    DWORD hashLen = 32;
+    CryptGetHashParam(hHash, HP_HASHVAL, result.data(), &hashLen, 0);
+    CryptDestroyHash(hHash);
+    CryptReleaseContext(hProv, 0);
+    return result;
+}
+
+// Derive code_challenge = BASE64URL(SHA256(verifier))
+static std::string DeriveCodeChallenge(const std::string& verifier) {
+    auto hash = SHA256Hash(verifier);
+    return Base64UrlEncode(hash.data(), hash.size());
+}
+
+// URL-encode a string for use in POST bodies
+static std::string UrlEncode(const std::string& s) {
+    std::ostringstream out;
+    for (unsigned char c : s) {
+        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            out << c;
+        } else {
+            out << '%' << std::uppercase << std::hex
+                << std::setw(2) << std::setfill('0') << (int)c;
+        }
+    }
+    return out.str();
+}
+
+// Extract a query parameter value from a URL/request string
+static std::string ExtractQueryParam(const std::string& text,
+                                     const std::string& param) {
+    std::string key = param + "=";
+    size_t pos = text.find(key);
+    if (pos == std::string::npos) return "";
+    pos += key.size();
+    size_t end = text.find_first_of("& \r\n", pos);
+    return text.substr(pos, end == std::string::npos ? std::string::npos
+                                                      : end - pos);
+}
+
+// Token exchange via WinHTTP (handles TLS to zoom.us natively)
+static std::string ExchangeCodeForToken(const std::string& code,
+                                        const std::string& verifier) {
+    std::string body =
+        "grant_type=authorization_code"
+        "&code="          + UrlEncode(code) +
+        "&client_id=JlP6KfRqTt6r0t67FcDuqQ"
+        "&redirect_uri="  + UrlEncode("http://localhost:9847/callback") +
+        "&code_verifier=" + UrlEncode(verifier);
+
+    HMODULE hWinHttp = LoadLibraryA("winhttp.dll");
+    if (!hWinHttp) return "";
+
+    typedef HINTERNET (WINAPI* PFN_Open)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD);
+    typedef HINTERNET (WINAPI* PFN_Connect)(HINTERNET, LPCWSTR, INTERNET_PORT, DWORD);
+    typedef HINTERNET (WINAPI* PFN_OpenRequest)(HINTERNET, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR*, DWORD);
+    typedef BOOL (WINAPI* PFN_AddHeaders)(HINTERNET, LPCWSTR, DWORD, DWORD);
+    typedef BOOL (WINAPI* PFN_SendRequest)(HINTERNET, LPCWSTR, DWORD, LPVOID, DWORD, DWORD, DWORD_PTR);
+    typedef BOOL (WINAPI* PFN_ReceiveResponse)(HINTERNET, LPVOID);
+    typedef BOOL (WINAPI* PFN_ReadData)(HINTERNET, LPVOID, DWORD, LPDWORD);
+    typedef BOOL (WINAPI* PFN_CloseHandle)(HINTERNET);
+
+    auto pfnOpen            = (PFN_Open)           GetProcAddress(hWinHttp, "WinHttpOpen");
+    auto pfnConnect         = (PFN_Connect)         GetProcAddress(hWinHttp, "WinHttpConnect");
+    auto pfnOpenRequest     = (PFN_OpenRequest)     GetProcAddress(hWinHttp, "WinHttpOpenRequest");
+    auto pfnAddHeaders      = (PFN_AddHeaders)      GetProcAddress(hWinHttp, "WinHttpAddRequestHeaders");
+    auto pfnSendRequest     = (PFN_SendRequest)     GetProcAddress(hWinHttp, "WinHttpSendRequest");
+    auto pfnReceiveResponse = (PFN_ReceiveResponse) GetProcAddress(hWinHttp, "WinHttpReceiveResponse");
+    auto pfnReadData        = (PFN_ReadData)        GetProcAddress(hWinHttp, "WinHttpReadData");
+    auto pfnClose           = (PFN_CloseHandle)     GetProcAddress(hWinHttp, "WinHttpCloseHandle");
+
+    if (!pfnOpen || !pfnConnect || !pfnOpenRequest || !pfnSendRequest ||
+        !pfnReceiveResponse || !pfnReadData || !pfnClose) {
+        FreeLibrary(hWinHttp);
+        return "";
+    }
+
+    HINTERNET hSession = pfnOpen(L"Feeds/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                  WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    HINTERNET hConnect = pfnConnect(hSession, L"zoom.us",
+                                     INTERNET_DEFAULT_HTTPS_PORT, 0);
+    HINTERNET hRequest = pfnOpenRequest(hConnect, L"POST", L"/oauth/token",
+                                         nullptr, WINHTTP_NO_REFERER,
+                                         WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                         WINHTTP_FLAG_SECURE);
+
+    if (pfnAddHeaders)
+        pfnAddHeaders(hRequest,
+                      L"Content-Type: application/x-www-form-urlencoded",
+                      (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
+
+    pfnSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                   (LPVOID)body.c_str(), (DWORD)body.size(),
+                   (DWORD)body.size(), 0);
+    pfnReceiveResponse(hRequest, nullptr);
+
+    std::string response;
+    char buf[4096];
+    DWORD bytesRead = 0;
+    while (pfnReadData(hRequest, buf, sizeof(buf) - 1, &bytesRead) &&
+           bytesRead > 0) {
+        buf[bytesRead] = '\0';
+        response += buf;
+    }
+
+    pfnClose(hRequest);
+    pfnClose(hConnect);
+    pfnClose(hSession);
+    FreeLibrary(hWinHttp);
+    return response;
+}
+
+// Minimal JSON string field extractor
+static std::string JsonExtractString(const std::string& json,
+                                     const std::string& key) {
+    std::string search = "\"" + key + "\"";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return "";
+    pos = json.find('"', pos + search.size() + 1);
+    if (pos == std::string::npos) return "";
+    pos++;
+    size_t end = json.find('"', pos);
+    if (end == std::string::npos) return "";
+    return json.substr(pos, end - pos);
+}
+
+// ---------------------------------------------------------------------------
+// FORWARD DECLARATIONS
+// ---------------------------------------------------------------------------
+void OnLoginClick();
+void OnLogoutClick();
+void OnConnectClick();
+void DoSDKAuth();
 
 // ---------------------------------------------------------------------------
 // PER-SOURCE VIDEO CATCHER
@@ -88,12 +278,12 @@ public:
         unsigned int height = data->GetStreamHeight();
 
         struct obs_source_frame obs_frame = {};
-        obs_frame.format    = VIDEO_FORMAT_I420;
-        obs_frame.width     = width;
-        obs_frame.height    = height;
-        obs_frame.data[0]   = (uint8_t*)data->GetYBuffer();
-        obs_frame.data[1]   = (uint8_t*)data->GetUBuffer();
-        obs_frame.data[2]   = (uint8_t*)data->GetVBuffer();
+        obs_frame.format      = VIDEO_FORMAT_I420;
+        obs_frame.width       = width;
+        obs_frame.height      = height;
+        obs_frame.data[0]     = (uint8_t*)data->GetYBuffer();
+        obs_frame.data[1]     = (uint8_t*)data->GetUBuffer();
+        obs_frame.data[2]     = (uint8_t*)data->GetVBuffer();
         obs_frame.linesize[0] = width;
         obs_frame.linesize[1] = width / 2;
         obs_frame.linesize[2] = width / 2;
@@ -117,7 +307,7 @@ public:
 // ---------------------------------------------------------------------------
 // SCREENSHARE GLOBALS
 // ---------------------------------------------------------------------------
-static obs_source_t* g_screenshareSource   = nullptr;
+static obs_source_t* g_screenshareSource     = nullptr;
 static uint64_t      g_screenshare_timestamp = 0;
 
 class ZoomShareCatcher : public ZOOM_SDK_NAMESPACE::IZoomSDKRendererDelegate {
@@ -128,12 +318,12 @@ public:
         unsigned int height = data->GetStreamHeight();
 
         struct obs_source_frame obs_frame = {};
-        obs_frame.format    = VIDEO_FORMAT_I420;
-        obs_frame.width     = width;
-        obs_frame.height    = height;
-        obs_frame.data[0]   = (uint8_t*)data->GetYBuffer();
-        obs_frame.data[1]   = (uint8_t*)data->GetUBuffer();
-        obs_frame.data[2]   = (uint8_t*)data->GetVBuffer();
+        obs_frame.format      = VIDEO_FORMAT_I420;
+        obs_frame.width       = width;
+        obs_frame.height      = height;
+        obs_frame.data[0]     = (uint8_t*)data->GetYBuffer();
+        obs_frame.data[1]     = (uint8_t*)data->GetUBuffer();
+        obs_frame.data[2]     = (uint8_t*)data->GetVBuffer();
         obs_frame.linesize[0] = width;
         obs_frame.linesize[1] = width / 2;
         obs_frame.linesize[2] = width / 2;
@@ -144,7 +334,8 @@ public:
                                     obs_frame.color_range_max);
 
         uint64_t now = os_gettime_ns();
-        if (g_screenshare_timestamp == 0 || g_screenshare_timestamp < now - 100000000ULL)
+        if (g_screenshare_timestamp == 0 ||
+            g_screenshare_timestamp < now - 100000000ULL)
             g_screenshare_timestamp = now;
         obs_frame.timestamp = g_screenshare_timestamp;
         g_screenshare_timestamp += 33333333ULL;
@@ -154,7 +345,7 @@ public:
     virtual void onRendererBeDestroyed() override {}
 };
 
-static ZoomShareCatcher                    g_shareCatcher;
+static ZoomShareCatcher                      g_shareCatcher;
 static ZOOM_SDK_NAMESPACE::IZoomSDKRenderer* g_shareRenderer = nullptr;
 
 // ---------------------------------------------------------------------------
@@ -188,9 +379,9 @@ static void UpdateShareSubscription() {
 // ---------------------------------------------------------------------------
 class ZoomParticipantSource {
 public:
-    obs_source_t* source = nullptr;
+    obs_source_t* source        = nullptr;
     unsigned int  current_user_id = 0;
-    ZoomVideoCatcher                     videoCatcher;
+    ZoomVideoCatcher                      videoCatcher;
     ZOOM_SDK_NAMESPACE::IZoomSDKRenderer* videoRenderer = nullptr;
 
     ZoomParticipantSource(obs_source_t* src) : source(src) {
@@ -221,7 +412,8 @@ public:
             if (videoRenderer) {
                 auto it = std::find(g_allParticipantSources.begin(),
                                     g_allParticipantSources.end(), this);
-                int index = (int)std::distance(g_allParticipantSources.begin(), it);
+                int index = (int)std::distance(
+                    g_allParticipantSources.begin(), it);
                 ZOOM_SDK_NAMESPACE::ZoomSDKResolution res = (index == 0)
                     ? GetResolutionForTier()
                     : ZOOM_SDK_NAMESPACE::ZoomSDKResolution_360P;
@@ -240,8 +432,8 @@ public:
     }
 
     void update(obs_data_t* settings) {
-        unsigned int selected_id = (unsigned int)obs_data_get_int(settings,
-                                                                   "participant_id");
+        unsigned int selected_id =
+            (unsigned int)obs_data_get_int(settings, "participant_id");
         current_user_id = selected_id;
         if (!videoRenderer && g_rawLiveStreamGranted)
             initRenderer();
@@ -252,13 +444,13 @@ public:
             if (effectiveId != 0) {
                 videoRenderer->subscribe(effectiveId,
                                          ZOOM_SDK_NAMESPACE::RAW_DATA_TYPE_VIDEO);
-                // Double-init to eliminate first-frame latency
                 QTimer::singleShot(600, [this, effectiveId]() {
                     if (videoRenderer && current_user_id != 0) {
                         videoRenderer->unSubscribe();
                         videoCatcher.next_timestamp = 0;
-                        videoRenderer->subscribe(effectiveId,
-                                                 ZOOM_SDK_NAMESPACE::RAW_DATA_TYPE_VIDEO);
+                        videoRenderer->subscribe(
+                            effectiveId,
+                            ZOOM_SDK_NAMESPACE::RAW_DATA_TYPE_VIDEO);
                     }
                 });
             }
@@ -294,7 +486,8 @@ public:
         const zchar_t* strList = nullptr) override {}
     virtual void onHostRequestStartAudio(
         ZOOM_SDK_NAMESPACE::IRequestStartAudioHandler* handler_) override {}
-    virtual void onJoin3rdPartyTelephonyAudio(const zchar_t* audioInfo) override {}
+    virtual void onJoin3rdPartyTelephonyAudio(
+        const zchar_t* audioInfo) override {}
     virtual void onMuteOnEntryStatusChange(bool bEnabled) override {}
 };
 static ZoomAudioListener g_audioListener;
@@ -319,8 +512,7 @@ public:
                 g_activeShareSourceId = 0;
                 UpdateShareSubscription();
                 break;
-            default:
-                break;
+            default: break;
         }
     }
     virtual void onFailedToStartShare() override {}
@@ -328,7 +520,7 @@ public:
     virtual void onShareContentNotification(
         ZOOM_SDK_NAMESPACE::ZoomSDKSharingSourceInfo shareInfo) override {}
     virtual void onMultiShareSwitchToSingleShareNeedConfirm(
-        ZOOM_SDK_NAMESPACE::IShareSwitchMultiToSingleConfirmHandler* handler_) override {}
+        ZOOM_SDK_NAMESPACE::IShareSwitchMultiToSingleConfirmHandler* h) override {}
     virtual void onShareSettingTypeChangedNotification(
         ZOOM_SDK_NAMESPACE::ShareSettingType type) override {}
     virtual void onSharedVideoEnded() override {}
@@ -342,15 +534,14 @@ static ZoomShareListener g_shareListener;
 // ---------------------------------------------------------------------------
 // LIVE STREAM LISTENER
 // ---------------------------------------------------------------------------
-class ZoomLiveStreamListener : public ZOOM_SDK_NAMESPACE::IMeetingLiveStreamCtrlEvent {
+class ZoomLiveStreamListener
+    : public ZOOM_SDK_NAMESPACE::IMeetingLiveStreamCtrlEvent {
 public:
     virtual void onRawLiveStreamPrivilegeChanged(bool bHasPrivilege) override {
         if (!bHasPrivilege) return;
 
         g_rawLiveStreamGranted = true;
-
-        if (g_connectAction)
-            g_connectAction->setEnabled(false);
+        if (g_connectAction) g_connectAction->setEnabled(false);
 
         ZOOM_SDK_NAMESPACE::IMeetingService* ms = nullptr;
         ZOOM_SDK_NAMESPACE::CreateMeetingService(&ms);
@@ -361,8 +552,7 @@ public:
         if (!lsc) return;
 
         lsc->StartRawLiveStreaming(
-            L"https://letsdovideo.com/feeds-support/",
-            L"Feeds");
+            L"https://letsdovideo.com/feeds-support/", L"Feeds");
 
         ZOOM_SDK_NAMESPACE::IMeetingShareController* sc =
             ms->GetMeetingShareController();
@@ -373,17 +563,18 @@ public:
             if (sharingUsers && sharingUsers->GetCount() > 0) {
                 unsigned int sharingUserId = sharingUsers->GetItem(0);
                 g_activeSharerUserId = sharingUserId;
-                ZOOM_SDK_NAMESPACE::IList<ZOOM_SDK_NAMESPACE::ZoomSDKSharingSourceInfo>* sourceList =
+                ZOOM_SDK_NAMESPACE::IList<
+                    ZOOM_SDK_NAMESPACE::ZoomSDKSharingSourceInfo>* sourceList =
                     sc->GetSharingSourceInfoList(sharingUserId);
                 if (sourceList && sourceList->GetCount() > 0)
-                    g_activeShareSourceId = sourceList->GetItem(0).shareSourceID;
+                    g_activeShareSourceId =
+                        sourceList->GetItem(0).shareSourceID;
             }
         }
 
         ZOOM_SDK_NAMESPACE::IMeetingAudioController* ac =
             ms->GetMeetingAudioController();
-        if (ac)
-            ac->SetEvent(&g_audioListener);
+        if (ac) ac->SetEvent(&g_audioListener);
 
         Sleep(500);
 
@@ -406,12 +597,13 @@ public:
     virtual void onLiveStreamStatusChange(
         ZOOM_SDK_NAMESPACE::LiveStreamStatus status) override {}
     virtual void onRawLiveStreamPrivilegeRequestTimeout() override {}
-    virtual void onUserRawLiveStreamPrivilegeChanged(unsigned int userid,
-                                                      bool bHasPrivilege) override {}
+    virtual void onUserRawLiveStreamPrivilegeChanged(
+        unsigned int userid, bool bHasPrivilege) override {}
     virtual void onRawLiveStreamPrivilegeRequested(
-        ZOOM_SDK_NAMESPACE::IRequestRawLiveStreamPrivilegeHandler* handler) override {}
+        ZOOM_SDK_NAMESPACE::IRequestRawLiveStreamPrivilegeHandler* h) override {}
     virtual void onUserRawLiveStreamingStatusChanged(
-        ZOOM_SDK_NAMESPACE::IList<ZOOM_SDK_NAMESPACE::RawLiveStreamInfo>* liveStreamList) override {}
+        ZOOM_SDK_NAMESPACE::IList<
+            ZOOM_SDK_NAMESPACE::RawLiveStreamInfo>* list) override {}
     virtual void onLiveStreamReminderStatusChanged(bool enable) override {}
     virtual void onLiveStreamReminderStatusChangeFailed() override {}
     virtual void onUserThresholdReachedForLiveStream(int percent) override {}
@@ -423,8 +615,8 @@ static ZoomLiveStreamListener g_liveStreamListener;
 // ---------------------------------------------------------------------------
 class ZoomMeetingListener : public ZOOM_SDK_NAMESPACE::IMeetingServiceEvent {
 public:
-    virtual void onMeetingStatusChanged(ZOOM_SDK_NAMESPACE::MeetingStatus status,
-                                         int iResult = 0) override {
+    virtual void onMeetingStatusChanged(
+        ZOOM_SDK_NAMESPACE::MeetingStatus status, int iResult = 0) override {
         if (status == ZOOM_SDK_NAMESPACE::MEETING_STATUS_INMEETING) {
             ZOOM_SDK_NAMESPACE::IMeetingService* ms = nullptr;
             ZOOM_SDK_NAMESPACE::CreateMeetingService(&ms);
@@ -433,25 +625,23 @@ public:
             ZOOM_SDK_NAMESPACE::IMeetingLiveStreamController* lsc =
                 ms->GetMeetingLiveStreamController();
             if (!lsc) return;
-
             lsc->SetEvent(&g_liveStreamListener);
 
-            if (lsc->CanStartRawLiveStream() == ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
+            if (lsc->CanStartRawLiveStream() ==
+                ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
                 g_liveStreamListener.onRawLiveStreamPrivilegeChanged(true);
             } else {
                 lsc->RequestRawLiveStreaming(
-                    L"https://letsdovideo.com/feeds-support/",
-                    L"Feeds");
+                    L"https://letsdovideo.com/feeds-support/", L"Feeds");
             }
         }
 
         if (status == ZOOM_SDK_NAMESPACE::MEETING_STATUS_ENDED ||
             status == ZOOM_SDK_NAMESPACE::MEETING_STATUS_DISCONNECTING) {
-            g_rawLiveStreamGranted  = false;
-            g_activeSharerUserId    = 0;
-            g_activeShareSourceId   = 0;
-            g_activeSpeakerUserId   = 0;
-            // Re-enable Connect to Zoom Meeting (user is still logged in)
+            g_rawLiveStreamGranted = false;
+            g_activeSharerUserId   = 0;
+            g_activeShareSourceId  = 0;
+            g_activeSpeakerUserId  = 0;
             if (g_connectAction && g_isLoggedIn)
                 g_connectAction->setEnabled(true);
             if (g_shareRenderer) {
@@ -468,10 +658,12 @@ public:
     virtual void onSuspendParticipantsActivities() override {}
     virtual void onAICompanionActiveChangeNotice(bool bActive) override {}
     virtual void onMeetingTopicChanged(const zchar_t* sTopic) override {}
-    virtual void onMeetingFullToWatchLiveStream(const zchar_t* sLiveStreamUrl) override {}
-    virtual void onUserNetworkStatusChanged(ZOOM_SDK_NAMESPACE::MeetingComponentType type,
-                                             ZOOM_SDK_NAMESPACE::ConnectionQuality level,
-                                             unsigned int userId, bool uplink) override {}
+    virtual void onMeetingFullToWatchLiveStream(
+        const zchar_t* sLiveStreamUrl) override {}
+    virtual void onUserNetworkStatusChanged(
+        ZOOM_SDK_NAMESPACE::MeetingComponentType type,
+        ZOOM_SDK_NAMESPACE::ConnectionQuality level,
+        unsigned int userId, bool uplink) override {}
 #if defined(WIN32)
     virtual void onAppSignalPanelUpdated(
         ZOOM_SDK_NAMESPACE::IMeetingAppSignalHandler* pHandler) override {}
@@ -480,50 +672,43 @@ public:
 static ZoomMeetingListener g_meetingListener;
 
 // ---------------------------------------------------------------------------
-// FORWARD DECLARATIONS for login/connect (defined below SetupPluginMenu)
-// ---------------------------------------------------------------------------
-void OnLoginClick();
-void OnLogoutClick();
-void OnConnectClick();
-
-// ---------------------------------------------------------------------------
 // AUTH LISTENER
 // ---------------------------------------------------------------------------
 class ZoomAuthListener : public ZOOM_SDK_NAMESPACE::IAuthServiceEvent {
 public:
-virtual void onAuthenticationReturn(ZOOM_SDK_NAMESPACE::AuthResult ret) override {
-    if (ret != ZOOM_SDK_NAMESPACE::AUTHRET_SUCCESS) {
-        MessageBoxA(NULL,
-            "Zoom authentication failed. Please try logging in again.",
-            "Feeds - Auth Failed", MB_OK | MB_ICONERROR);
-        return;
+    virtual void onAuthenticationReturn(
+        ZOOM_SDK_NAMESPACE::AuthResult ret) override {
+        if (ret != ZOOM_SDK_NAMESPACE::AUTHRET_SUCCESS) {
+            MessageBoxA(NULL,
+                "Zoom authentication failed. Please try logging in again.",
+                "Feeds - Auth Failed", MB_OK | MB_ICONERROR);
+            if (g_loginAction) g_loginAction->setEnabled(true);
+            return;
+        }
+
+        g_isLoggedIn = true;
+        if (g_loginAction)   g_loginAction->setEnabled(false);
+        if (g_logoutAction)  g_logoutAction->setEnabled(true);
+        if (g_connectAction) g_connectAction->setEnabled(true);
+
+        // Refresh all open source properties panels
+        for (ZoomParticipantSource* src : g_allParticipantSources) {
+            if (src && src->source)
+                obs_source_update_properties(src->source);
+        }
+        if (g_screenshareSource)
+            obs_source_update_properties(g_screenshareSource);
+
+        if (g_pendingMeetingJoin) {
+            g_pendingMeetingJoin = false;
+            QTimer::singleShot(200, []() { OnConnectClick(); });
+        }
     }
 
-    // Mark as logged in, update menu state
-    g_isLoggedIn = true;
-    if (g_loginAction)   g_loginAction->setEnabled(false);
-    if (g_logoutAction)  g_logoutAction->setEnabled(true);
-    if (g_connectAction) g_connectAction->setEnabled(true);
-
-    // Refresh all open source properties panels so Login btn -> Connect btn
-    for (ZoomParticipantSource* src : g_allParticipantSources) {
-        if (src && src->source)
-            obs_source_update_properties(src->source);
-    }
-    // Also refresh screenshare source if one exists
-    if (g_screenshareSource)
-        obs_source_update_properties(g_screenshareSource);
-
-    // If they clicked "Connect to Zoom Meeting" before logging in, proceed now
-    if (g_pendingMeetingJoin) {
-        g_pendingMeetingJoin = false;
-        QTimer::singleShot(200, []() { OnConnectClick(); });
-    }
-}
-
-    virtual void onLoginReturnWithReason(ZOOM_SDK_NAMESPACE::LOGINSTATUS ret,
-                                          ZOOM_SDK_NAMESPACE::IAccountInfo* pAccountInfo,
-                                          ZOOM_SDK_NAMESPACE::LoginFailReason reason) override {}
+    virtual void onLoginReturnWithReason(
+        ZOOM_SDK_NAMESPACE::LOGINSTATUS ret,
+        ZOOM_SDK_NAMESPACE::IAccountInfo* pAccountInfo,
+        ZOOM_SDK_NAMESPACE::LoginFailReason reason) override {}
     virtual void onLogout() override {}
     virtual void onZoomIdentityExpired() override {}
     virtual void onZoomAuthIdentityExpired() override {}
@@ -558,7 +743,136 @@ static void StartPostConnectRefreshTimer() {
 }
 
 // ---------------------------------------------------------------------------
-// LOGIN HELPER (PKCE stub — real browser flow comes in Step 2)
+// SDK AUTH — called on Qt main thread after token exchange succeeds
+// ---------------------------------------------------------------------------
+void DoSDKAuth() {
+    ZOOM_SDK_NAMESPACE::IAuthService* auth_service = nullptr;
+    if (ZOOM_SDK_NAMESPACE::CreateAuthService(&auth_service) !=
+            ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS || !auth_service)
+        return;
+    auth_service->SetEvent(&g_authListener);
+
+    ZOOM_SDK_NAMESPACE::AuthContext authContext;
+    static std::wstring s_clientId = L"JlP6KfRqTt6r0t67FcDuqQ";
+    authContext.publicAppKey = s_clientId.c_str();
+    auth_service->SDKAuth(authContext);
+}
+
+// ---------------------------------------------------------------------------
+// PKCE LOCALHOST LISTENER
+// Runs on a background thread. Waits for Zoom to redirect to
+// http://localhost:9847/callback?code=... then extracts the code,
+// exchanges it for a token, and fires DoSDKAuth() on the Qt main thread.
+// ---------------------------------------------------------------------------
+static void RunPKCEListener(std::string verifier) {
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+
+    SOCKET listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listenSock == INVALID_SOCKET) { WSACleanup(); return; }
+
+    int opt = 1;
+    setsockopt(listenSock, SOL_SOCKET, SO_REUSEADDR,
+               (const char*)&opt, sizeof(opt));
+
+    sockaddr_in addr = {};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port        = htons(9847);
+
+    if (bind(listenSock, (sockaddr*)&addr, sizeof(addr)) != 0 ||
+        listen(listenSock, 1) != 0) {
+        closesocket(listenSock);
+        WSACleanup();
+        // Re-enable login button so user can retry
+        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
+            MessageBoxA(NULL,
+                "Could not open local port 9847 for Zoom login.\n"
+                "Another application may be using it. Please try again.",
+                "Feeds - Login Error", MB_OK | MB_ICONERROR);
+            if (g_loginAction) g_loginAction->setEnabled(true);
+        });
+        return;
+    }
+
+    // 5-minute timeout — if user abandons the browser, thread exits cleanly
+    DWORD timeout = 300000;
+    setsockopt(listenSock, SOL_SOCKET, SO_RCVTIMEO,
+               (const char*)&timeout, sizeof(timeout));
+
+    SOCKET clientSock = accept(listenSock, nullptr, nullptr);
+    closesocket(listenSock);
+
+    if (clientSock == INVALID_SOCKET) {
+        WSACleanup();
+        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
+            if (g_loginAction) g_loginAction->setEnabled(true);
+        });
+        return;
+    }
+
+    // Read the HTTP request line
+    char buf[4096] = {};
+    recv(clientSock, buf, sizeof(buf) - 1, 0);
+
+    // Send a friendly success page so the browser tab doesn't show an error
+    const char* httpResponse =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/html\r\n"
+        "Connection: close\r\n\r\n"
+        "<html><body style='font-family:sans-serif;text-align:center;"
+        "margin-top:80px'>"
+        "<h2>&#10003; Logged in to Feeds successfully!</h2>"
+        "<p>You can close this tab and return to OBS.</p>"
+        "</body></html>";
+    send(clientSock, httpResponse, (int)strlen(httpResponse), 0);
+    closesocket(clientSock);
+    WSACleanup();
+
+    // Parse the auth code out of the GET request line:
+    // "GET /callback?code=XXXX HTTP/1.1"
+    std::string request(buf);
+    std::string code = ExtractQueryParam(request, "code");
+
+    if (code.empty()) {
+        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
+            MessageBoxA(NULL,
+                "Login was cancelled or the authorization code was missing.\n"
+                "Please try again.",
+                "Feeds - Login", MB_OK | MB_ICONWARNING);
+            if (g_loginAction) g_loginAction->setEnabled(true);
+        });
+        return;
+    }
+
+    // Exchange code + verifier for access token (blocking HTTPS call)
+    std::string tokenResponse = ExchangeCodeForToken(code, verifier);
+    std::string accessToken   = JsonExtractString(tokenResponse, "access_token");
+    std::string refreshToken  = JsonExtractString(tokenResponse, "refresh_token");
+
+    if (accessToken.empty()) {
+        // Log the raw response to help debug if something goes wrong
+        std::string errMsg = "Token exchange failed.\n\nServer response:\n" +
+                             tokenResponse.substr(0, 300);
+        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
+                           [errMsg]() {
+            MessageBoxA(NULL, errMsg.c_str(),
+                        "Feeds - Login Error", MB_OK | MB_ICONERROR);
+            if (g_loginAction) g_loginAction->setEnabled(true);
+        });
+        return;
+    }
+
+    g_accessToken  = accessToken;
+    g_refreshToken = refreshToken;
+
+    // Fire SDK auth on the Qt main thread
+    QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
+                       []() { DoSDKAuth(); });
+}
+
+// ---------------------------------------------------------------------------
+// LOGIN HELPER — full PKCE flow
 // ---------------------------------------------------------------------------
 void OnLoginClick() {
     if (g_isLoggedIn) {
@@ -567,18 +881,30 @@ void OnLoginClick() {
         return;
     }
 
-    // STUB: authenticates SDK with publicAppKey directly.
-    // Step 2 will replace this with the full PKCE browser + token exchange flow.
-    ZOOM_SDK_NAMESPACE::IAuthService* auth_service = nullptr;
-    if (ZOOM_SDK_NAMESPACE::CreateAuthService(&auth_service) != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS
-        || !auth_service)
-        return;
-    auth_service->SetEvent(&g_authListener);
+    // Disable login button while flow is in progress to prevent double-clicks
+    if (g_loginAction) g_loginAction->setEnabled(false);
 
-    ZOOM_SDK_NAMESPACE::AuthContext authContext;
-    static std::wstring s_clientId = L"JlP6KfRqTt6r0t67FcDuqQ";
-    authContext.publicAppKey = s_clientId.c_str();
-    auth_service->SDKAuth(authContext);
+    // Generate PKCE values
+    g_pkceVerifier        = GenerateCodeVerifier();
+    std::string challenge = DeriveCodeChallenge(g_pkceVerifier);
+
+    // Build the Zoom authorization URL
+    std::string authUrl =
+        "https://zoom.us/oauth/authorize"
+        "?response_type=code"
+        "&client_id=JlP6KfRqTt6r0t67FcDuqQ"
+        "&redirect_uri="          + UrlEncode("http://localhost:9847/callback") +
+        "&code_challenge="        + challenge +
+        "&code_challenge_method=S256";
+
+    // Open the system browser to the Zoom login page
+    ShellExecuteA(NULL, "open", authUrl.c_str(), NULL, NULL, SW_SHOWNORMAL);
+
+    // Start background thread to listen for the redirect
+    std::string verifier = g_pkceVerifier;
+    std::thread([verifier]() {
+        RunPKCEListener(verifier);
+    }).detach();
 }
 
 // ---------------------------------------------------------------------------
@@ -592,13 +918,16 @@ void OnLogoutClick() {
     }
 
     ZOOM_SDK_NAMESPACE::IAuthService* auth_service = nullptr;
-    if (ZOOM_SDK_NAMESPACE::CreateAuthService(&auth_service) != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS
-        || !auth_service)
-        return;
-    auth_service->LogOut();
+    if (ZOOM_SDK_NAMESPACE::CreateAuthService(&auth_service) ==
+            ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS && auth_service)
+        auth_service->LogOut();
 
     g_isLoggedIn         = false;
     g_pendingMeetingJoin = false;
+    g_accessToken.clear();
+    g_refreshToken.clear();
+    g_pkceVerifier.clear();
+
     if (g_loginAction)   g_loginAction->setEnabled(true);
     if (g_logoutAction)  g_logoutAction->setEnabled(false);
     if (g_connectAction) g_connectAction->setEnabled(false);
@@ -612,7 +941,6 @@ void OnLogoutClick() {
 // ---------------------------------------------------------------------------
 void OnConnectClick() {
     if (!g_isLoggedIn) {
-        // Remember they wanted to join a meeting, then trigger login first
         g_pendingMeetingJoin = true;
         MessageBoxA(NULL,
             "You need to log in to Zoom first.\n\n"
@@ -631,16 +959,14 @@ void OnConnectClick() {
 
     bool ok = false;
     QString input = QInputDialog::getText(
-        mainWindow,
-        "Join Zoom Meeting",
+        mainWindow, "Join Zoom Meeting",
         "Enter your Zoom Meeting number or link:",
         QLineEdit::Normal, "", &ok);
     if (!ok || input.trimmed().isEmpty()) return;
 
     bool okPwd = false;
     QString password = QInputDialog::getText(
-        mainWindow,
-        "Meeting Password",
+        mainWindow, "Meeting Password",
         "Enter meeting password (leave blank if none):",
         QLineEdit::Normal, "", &okPwd);
     if (!okPwd) return;
@@ -649,7 +975,8 @@ void OnConnectClick() {
 
     ZOOM_SDK_NAMESPACE::JoinParam joinParam;
     joinParam.userType = ZOOM_SDK_NAMESPACE::SDK_UT_WITHOUT_LOGIN;
-    ZOOM_SDK_NAMESPACE::JoinParam4WithoutLogin& param = joinParam.param.withoutloginuserJoin;
+    ZOOM_SDK_NAMESPACE::JoinParam4WithoutLogin& param =
+        joinParam.param.withoutloginuserJoin;
     param.isAudioOff = true;
     param.isVideoOff = true;
     param.userName   = L"Feeds";
@@ -663,13 +990,13 @@ void OnConnectClick() {
     static std::wstring s_vanityId;
 
     if (input.contains("zoom.us/my/")) {
-        int start = input.indexOf("zoom.us/my/") + 11;
+        int start    = input.indexOf("zoom.us/my/") + 11;
         QString vanityId = input.mid(start).split(
             QRegularExpression("[?\\s]")).first();
-        s_vanityId       = vanityId.toStdWString();
-        param.vanityID   = s_vanityId.c_str();
+        s_vanityId     = vanityId.toStdWString();
+        param.vanityID = s_vanityId.c_str();
     } else if (input.contains("zoom.us/j/")) {
-        int start = input.indexOf("zoom.us/j/") + 10;
+        int start  = input.indexOf("zoom.us/j/") + 10;
         QString numStr = input.mid(start).split(
             QRegularExpression("[?\\s]")).first();
         numStr = numStr.replace(QRegularExpression("[^0-9]"), "");
@@ -706,9 +1033,12 @@ void SetupPluginMenu(void) {
     g_logoutAction->setEnabled(false);
     g_connectAction->setEnabled(false);
 
-    QObject::connect(g_loginAction,   &QAction::triggered, []() { OnLoginClick(); });
-    QObject::connect(g_logoutAction,  &QAction::triggered, []() { OnLogoutClick(); });
-    QObject::connect(g_connectAction, &QAction::triggered, []() { OnConnectClick(); });
+    QObject::connect(g_loginAction,   &QAction::triggered,
+                     []() { OnLoginClick(); });
+    QObject::connect(g_logoutAction,  &QAction::triggered,
+                     []() { OnLogoutClick(); });
+    QObject::connect(g_connectAction, &QAction::triggered,
+                     []() { OnConnectClick(); });
     QObject::connect(aboutAction,     &QAction::triggered, []() {
         MessageBoxA(NULL, "Feeds v0.1\nTier: Basic\nStatus: Active",
                     "About", MB_OK);
@@ -792,10 +1122,9 @@ static obs_properties_t* zp_properties(void* data) {
     if (src && g_rawLiveStreamGranted && !src->videoRenderer)
         src->initRenderer();
 
-    obs_property_t* list = obs_properties_add_list(props, "participant_id",
-                                                    "Select Participant",
-                                                    OBS_COMBO_TYPE_LIST,
-                                                    OBS_COMBO_FORMAT_INT);
+    obs_property_t* list = obs_properties_add_list(
+        props, "participant_id", "Select Participant",
+        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
     obs_property_list_add_int(list, "--- Select Participant ---", 0);
     obs_property_list_add_int(list, "[Active Speaker]", 1);
 
@@ -807,7 +1136,7 @@ static obs_properties_t* zp_properties(void* data) {
                 pc->GetParticipantsList();
             if (userList) {
                 for (int i = 0; i < userList->GetCount(); i++) {
-                    unsigned int uid  = userList->GetItem(i);
+                    unsigned int uid = userList->GetItem(i);
                     ZOOM_SDK_NAMESPACE::IUserInfo* info =
                         pc->GetUserByUserID(uid);
                     if (info) {
@@ -818,9 +1147,8 @@ static obs_properties_t* zp_properties(void* data) {
                             NULL, 0, NULL, NULL);
                         std::string name(size_needed, 0);
                         WideCharToMultiByte(CP_UTF8, 0, &wname[0],
-                                            (int)wname.size(),
-                                            &name[0], size_needed,
-                                            NULL, NULL);
+                                            (int)wname.size(), &name[0],
+                                            size_needed, NULL, NULL);
                         obs_property_list_add_int(list, name.c_str(),
                                                   (long long)uid);
                     }
@@ -907,8 +1235,8 @@ void zs_destroy(void* data) {
 // ---------------------------------------------------------------------------
 // SOURCE INFO STRUCTS
 // ---------------------------------------------------------------------------
-struct obs_source_info zoom_participant_info  = {};
-struct obs_source_info zoom_screenshare_info  = {};
+struct obs_source_info zoom_participant_info = {};
+struct obs_source_info zoom_screenshare_info = {};
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("feeds", "en-US")
