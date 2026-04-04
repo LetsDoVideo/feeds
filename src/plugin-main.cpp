@@ -867,12 +867,13 @@ void OnLoginClick() {
 
     // Build the Zoom authorization URL
     std::string authUrl =
-        "https://zoom.us/oauth/authorize"
-        "?response_type=code"
-        "&client_id=JlP6KfRqTt6r0t67FcDuqQ"
-        "&redirect_uri="          + UrlEncode("http://localhost:9847/callback") +
-        "&code_challenge="        + challenge +
-        "&code_challenge_method=S256";
+    "https://zoom.us/oauth/authorize"
+    "?response_type=code"
+    "&client_id=JlP6KfRqTt6r0t67FcDuqQ"
+    "&redirect_uri="          + UrlEncode("http://localhost:9847/callback") +
+    "&code_challenge="        + challenge +
+    "&code_challenge_method=S256"
+    "&prompt=login";
 
     // Open the system browser to the Zoom login page
     ShellExecuteA(NULL, "open", authUrl.c_str(), NULL, NULL, SW_SHOWNORMAL);
@@ -958,15 +959,22 @@ static bool FetchUserInfo(std::string& zak, std::string& displayName) {
     displayName = JsonExtractString(userResponse, "display_name");
     if (displayName.empty())
         displayName = JsonExtractString(userResponse, "first_name");
-    if (displayName.empty()) return false;
 
     // Get ZAK from /v2/users/me/zak
     std::string zakResponse = doGet(L"/v2/users/me/zak");
     zak = JsonExtractString(zakResponse, "token");
-    if (zak.empty()) return false;
+
+    if (zak.empty() || displayName.empty()) {
+        // Show raw responses to diagnose the problem
+        std::string errMsg =
+            "API call failed.\n\n"
+            "/users/me response:\n" + userResponse.substr(0, 200) + "\n\n"
+            "/users/me/zak response:\n" + zakResponse.substr(0, 200);
+        MessageBoxA(NULL, errMsg.c_str(), "Feeds - API Debug", MB_OK | MB_ICONERROR);
+        return false;
+    }
 
     return true;
-}
 // ---------------------------------------------------------------------------
 // CONNECT TO MEETING HELPER
 // ---------------------------------------------------------------------------
