@@ -343,9 +343,9 @@ public:
 	/**
 	 * @brief Set BO option.
 	 * @param option, the option that you want to set.
-	 * @return true if the function succeeds. Otherwise, false.
+	 * @return SDKERR_SUCCESS if the function succeeds. Otherwise, returns the specific error code.
 	 */
-	virtual bool SetBOOption(const BOOption& option) = 0;
+	virtual SDKError SetBOOption(const BOOption& option) = 0;
 	
 	/**
 	 * @brief Gets BO option.

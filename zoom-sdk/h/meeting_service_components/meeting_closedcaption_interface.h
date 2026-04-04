@@ -177,6 +177,7 @@ public:
 	/**
 	 * @brief live transcription status changed callback.
 	 * @param status: the live transcription status.
+	 * @note This callback is triggered when the live transcription status changes. It can be triggered by calling StartLiveTranscription() or by calling SetTranslationLanguage() for the first time before calling StartLiveTranscription().
 	 */
 	virtual void onLiveTranscriptionStatus(SDKLiveTranscriptionStatus status) = 0;
 
@@ -452,8 +453,8 @@ public:
 	/**
 	 * @brief Sets the translation language of the current user.	
 	 * @param languageID: The translation language id.
-	 * @note If the language id is set to -1, live translation will be disabled.You can receive closed captions if the host sets manual captions to true for the meeting.
 	 * @return If the function succeeds, the return value is SDKERR_SUCCESS. Otherwise, this function returns an error.
+	 * @note If the language id is set to -1, live translation will be disabled.You can receive closed captions if the host sets manual captions to true for the meeting. If you call this method before calling StartLiveTranscription(), it will trigger the onLiveTranscriptionStatus callback when the translation status changes. If translation is already enabled, calling this method again will not trigger the onLiveTranscriptionStatus callback.
 	 */
 	virtual SDKError SetTranslationLanguage(int languageID) = 0;
 

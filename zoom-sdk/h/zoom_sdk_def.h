@@ -115,6 +115,8 @@ enum SDKError
 	SDKERR_MEETING_REMOTE_CONTROL_IS_OFF,
 	/** File transfer fail. */
 	SDKERR_FILETRANSFER_ERROR,
+	/** No breakout room created yet. */
+	SDKERR_BREAKOUT_ROOM_NOT_CREATED,
 
 };
 

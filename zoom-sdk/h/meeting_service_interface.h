@@ -943,6 +943,7 @@ class ICustomImmersiveController;
 class IMeetingPollingController;
 class IMeetingIndicatorController;
 class IMeetingProductionStudioController;
+class IMeetingTalkbackController;
 #endif
 class IMeetingConfiguration;
 class IMeetingBOController;
@@ -1309,6 +1310,11 @@ public:
 	 * @return If the function succeeds, the return value is a pointer to IMeetingProductionStudioController. Otherwise returns nullptr.
 	 */
 	virtual IMeetingProductionStudioController* GetMeetingProductionStudioController() = 0;
+	/**
+	 * @brief Get the talkback controller.
+	 * @return If the function succeeds, the return value is a pointer to IMeetingTalkbackController. Otherwise returns nullptr.
+	 */
+	virtual IMeetingTalkbackController* GetMeetingTalkbackController() = 0;
 #endif
 	/**
 	 * @brief Gets data center information.

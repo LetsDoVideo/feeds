@@ -220,15 +220,46 @@ public:
 	 */
 	virtual SDKError SetEvent(IMeetingShareCtrlEvent* pEvent) = 0;
 	
-#if defined(WIN32)
 	/**
 	 * @brief Shares the specified application.
 	 * @param hwndSharedApp The window handle of the application to be shared. If the hwndSharedApp can't be shared, the return value is the SDKERR_INVALID_PARAMETER error code. If the hwndSharedApp is nullptr, the primary monitor will be shared. 
+	*   \if WINDOWS
+     *   The window handle to share.
+     *   \endif
+     *   \if LINUX
+     *   The device name. Format:
+     *   `hostname:display_number-screen_number(x, y, width, height)-app_id`
+     *   e.g. `:0-0(0,0,1920,1080)-34563456`
+     *   - display_name: `hostname:display_number`
+     *   - screen_number: virtual X11 device (default 0)
+     *   - device_frame: `(x, y, width, height)`
+     *   - app_id: `app_id`
+     *   \endif
 	 * @return If the function succeeds, the return value is SDKERR_SUCCESS. Otherwise, this function returns an error.
 	 * @note Valid for both ZOOM style and user custom interface mode.
 	 */
 	virtual SDKError StartAppShare(HWND hwndSharedApp) = 0;
 	
+	/**
+	 * @brief Shares the specified monitor.
+	 * @param monitorID The monitor ID to be shared. You may get the value via EnumDisplayMonitors System API. If the monitorID is nullptr, the primary monitor will be shared. For more details, see szDevice in MONITORINFOEX structure.
+	 *   \if WINDOWS
+     *   The screen name to share.
+     *   \endif
+     *   \if LINUX
+     *   The device name. Format:
+     *   `hostname:display_number-screen_number(x, y, width, height)-winid`
+     *   e.g. `:0-0(0,0,1920,1080)-34563456`
+     *   - display_name: `hostname:display_number`
+     *   - screen_number: virtual X11 device (default 0)
+     *   - device_frame: `(x, y, width, height)`
+     *   - window_id: `winid`
+     *   \endif
+	 * @return If the function succeeds, the return value is SDKERR_SUCCESS. Otherwise, this function returns an error.
+	 * @note Valid for both ZOOM style and user custom interface mode.
+	 */
+	virtual SDKError StartMonitorShare(const zchar_t* monitorID) = 0;
+#if defined(WIN32)
 	/**
 	 * @brief Determines whether the window handle can be shared. If the hwndSharedApp is nullptr, the return value is false.
 	 * @param hwndSharedApp The window handle to validate.
@@ -236,15 +267,6 @@ public:
 	 * @note Valid for both ZOOM style and user custom interface mode.
 	 */
 	virtual bool IsShareAppValid(HWND hwndSharedApp) = 0;
-	
-	/**
-	 * @brief Shares the specified monitor.
-	 * @param monitorID The monitor ID to be shared. You may get the value via EnumDisplayMonitors System API. If the monitorID is nullptr, the primary monitor will be shared. For more details, see szDevice in MONITORINFOEX structure.
-	 * @return If the function succeeds, the return value is SDKERR_SUCCESS. Otherwise, this function returns an error.
-	 * @note Valid for both ZOOM style and user custom interface mode.
-	 */
-	virtual SDKError StartMonitorShare(const zchar_t* monitorID) = 0;
-	
 	/**
 	 * @brief A dialog box pops up that enable the user to choose the application or window to share.
 	 * @return If the function succeeds, the return value is SDKERR_SUCCESS. Otherwise, this function returns an error.

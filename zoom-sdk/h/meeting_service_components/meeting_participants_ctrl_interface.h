@@ -173,6 +173,12 @@ public:
 	 * @return If the function succeeds, it returns the mic level of the user.
 	 */
 	virtual int GetAudioVoiceLevel() = 0;
+
+	/**
+	 * @brief Determine whether the user specified by the current information supports talkback.
+	 * @return TRUE indicates that the user supports talkback.
+	 */
+	virtual bool IsSupportTalkback() = 0;
 	
 	/**
 	 * @brief Determines whether the user corresponding to the current information is the sender of Closed Caption or not.

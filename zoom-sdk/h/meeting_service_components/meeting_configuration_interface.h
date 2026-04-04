@@ -36,6 +36,8 @@ public:
 		REQUIRED_INFO_TYPE_ScreenName,
 		/** The user needs to enter the screen name and the meeting id,via the InputMeetingMeetingIDAndScreenName() to specify the necessary information. */
 		REQUIRED_INFO_TYPE_MeetingIDAndScreenName,
+		/** The user needs to confirm audio and video status before joining the meeting. */
+		REQUIRED_INFO_TYPE_AVPreview,
 	};
 
 	/**
@@ -75,6 +77,17 @@ public:
 	 * @note The SDK will destroy this object instance after calling this function. 
 	 */
 	virtual void Cancel() = 0;
+
+	/**
+	 * @brief Confirms the user's display name and audio and video settings before joining the meeting.
+	 * @param screenName The user's display name. Can be null or empty if the display name has already been set.
+	 * @param videoOn true if video is on in meeting. false otherwise.
+	 * @param audioOn true if audio is on in meeting. false otherwise.
+	 * @return If the function succeeds, it returns SDKERR_SUCCESS. Otherwise, this function returns an error.
+	 * @note Only for custom UI.
+	 */
+	virtual SDKError ConfirmPreview(const zchar_t* screenName, bool videoOn, bool audioOn) = 0;
+
 	virtual ~IMeetingPasswordAndScreenNameHandler() {};
 };
 

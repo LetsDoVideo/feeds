@@ -15,7 +15,7 @@ enum AuthResult
 { 
 	/** Authentication is successful. */
 	AUTHRET_SUCCESS,
-	/** The key or secret to authenticate is empty. */
+	/**  The key or secret to authenticate is empty. */
 	AUTHRET_KEYORSECRETEMPTY,
 	/** he key or secret to authenticate is wrong */
 	AUTHRET_KEYORSECRETWRONG,
@@ -150,6 +150,26 @@ typedef struct tagAuthContext
 	/**
 	 * @brief JWT token. You may generate your JWT token using the online tool https://jwt.io/. 
 	 * @note It is highly recommended to generate your JWT token in your backend server.
+	 * JWT is generated with three core parts: Header, Payload, and Signature. When combined, these parts are separated by a period to form a token: `aaaaa.bbbbb.cccc`.
+     * Please follow this template to compose your payload for SDK initialization:
+	 *		Header
+	 *		{
+	 *		"alg": "HS256",
+	 *		"typ": "JWT"
+	 *		}
+	 *		Payload
+	 *		{
+	 *		"appKey": "string", // Your SDK key
+	 *		"iat": long, // access token issue timestamp
+	 *		"exp": long, // access token expire time
+	 *		"tokenExp": long // token expire time
+	 *		}
+	 *		Signature
+	 *		HMACSHA256(
+	 *			base64UrlEncode(header) + "." +
+	 *			base64UrlEncode(payload),
+	 *			"Your SDK secret here"
+		)
 	 */
 	const zchar_t* jwt_token; 
 
@@ -185,7 +205,7 @@ class IAccountInfo
 public:
     /**
 	 * @brief Gets the screen name of user.
-	 * @return If the function succeeds, it returns the displayed username.
+	 * @return If the function succeeds, it returns the displayed username. If there is no screen name of user, this function returns a string of length ZERO(0).
 	 */
 	virtual const zchar_t* GetDisplayName() = 0;
     /**
@@ -215,7 +235,7 @@ public:
 	 * @brief Notification of login result with fail reason.
 	 * @param ret Login status.
 	 * @param pAccountInfo Valid when the ret is LOGINRET_SUCCESS. Otherwise nullptr.
-	 * @param reason Login fail reason.
+	 * @param reason Login fail reason. Valid when the ret is LOGIN_FAILED. Otherwise LoginFail_None.
 	 */
 	virtual void onLoginReturnWithReason(LOGINSTATUS ret, IAccountInfo* pAccountInfo, LoginFailReason reason) = 0;
 	
@@ -225,28 +245,28 @@ public:
 	virtual void onLogout() = 0;
 
     /**
-	 * @brief Notification of Zoom identity has expired.
+	 * @brief Notification of Zoom identity has expired, please re-login or generate a new zoom access token via REST Api.
 	 */
 	virtual void onZoomIdentityExpired() = 0;
 
     /**
-	 * @brief Notification of Zoom authentication identity will be expired in 10 minutes.
+	 * @brief Notification of Zoom authentication identity will be expired in 10 minutes, please re-auth.
 	 */
 	virtual void onZoomAuthIdentityExpired() = 0;
 #if defined(WIN32)
     /**
 	 * @brief Notification of service status changed.
+	 * @param status The value of transfer meeting service.
+	 * @param error Connection Notification service fail error code.
 	 */
 	virtual void onNotificationServiceStatus(SDKNotificationServiceStatus status, SDKNotificationServiceError error) = 0;
 #endif
 };
-
 #if defined(WIN32)
 class IDirectShareServiceHelper;
 class IOutlookPluginIntegrationHelper;
 class INotificationServiceHelper;
 #endif
-
 /**
  * @class IAuthService
  * @brief Authentication Service Interface.
@@ -256,71 +276,91 @@ class IAuthService
 public:
     /**
 	 * @brief Sets the authentication service callback event handler.
+	 * @param pEvent A pointer to receive authentication event. 
+	 * @return If the function succeeds, the return value is SDKERR_SUCCESS. Otherwise, this function returns an error.
 	 */
 	virtual SDKError SetEvent(IAuthServiceEvent* pEvent) = 0;
 
     /**
 	 * @brief Authenticates SDK.
+	 * @param authContext The parameter to be used for authentication SDK.
+	 * @return If the function succeeds, the return value is SDKERR_SUCCESS. Otherwise, this function returns an error.
 	 */
 	virtual SDKError SDKAuth(AuthContext& authContext) = 0;
 
      /**
 	 * @brief Gets authentication status.
+	 * @return If the function succeeds, it returns the authentication status.
 	 */
 	virtual AuthResult GetAuthResult() = 0;
 
     /**
 	 * @brief Gets SDK identity.
+	 * @return If the function succeeds, it returns the SDK identity. Otherwise, this function fails and returns nullptr.
 	 */
 	virtual const zchar_t* GetSDKIdentity() = 0;
 
     /**
 	 * @brief Gets SSO login web URL.
+	 * @param prefix_of_vanity_url The prefix of vanity URL. 
+	 * @return If the function succeeds, it returns the SSO login web URL. Otherwise, this function fails and returns nullptr.
 	 */
 	virtual const zchar_t* GenerateSSOLoginWebURL(const zchar_t* prefix_of_vanity_url) = 0;
 
     /**
 	 * @brief Performs account login.
+	 * @param uri_protocol The parameter to be used for SSO account login.
+	 * @return If the function succeeds, the return value is SDKERR_SUCCESS. Otherwise, this function returns an error.
+	 * @note You need to call this API after IAuthServiceEvent::onAuthenticationReturn(AUTHRET_SUCCESS).
 	 */
 	virtual SDKError SSOLoginWithWebUriProtocol(const zchar_t* uri_protocol) = 0;
 	
     /**
 	 * @brief Performs account logout.
+	 * @return If the function succeeds, the return value is SDKERR_SUCCESS. Otherwise, this function returns an error.
 	 */
 	virtual SDKError LogOut() = 0;
 
     /**
 	 * @brief Gets login account information.
+	 * @return If you have logged in your account successfully, the return value is a pointer to IAccountInfo. Otherwise, this function returns nullptr.
 	 */
 	virtual IAccountInfo* GetAccountInfo() = 0;
 
     /**
 	 * @brief Gets login status.
+	 * @return If the function succeeds, it returns the login status. Otherwise, this function returns an error.
 	 */
 	virtual LOGINSTATUS GetLoginStatus() = 0;
 #if defined(WIN32)
     /**
 	 * @brief Gets direct share service helper interface. 
+	 * @return If you have logged in your account successfully, the return value is a pointer to IDirectShareServiceHelper. Otherwise, this function returns nullptr.
 	 */
 	virtual IDirectShareServiceHelper* GetDirectShareServiceHelper() = 0;
 
     /**
-	 * @brief Enables or disables auto register notification service.
+	 * @brief Enables or disables auto register notification service. This is enabled by default.
+	 * @param bEnable true to enable, false to disable. 
 	 */
 	virtual void EnableAutoRegisterNotificationServiceForLogin(bool bEnable) = 0;
 
     /**
 	 * @brief Registers notification service.
+	 * @param accessToken The initialization parameter of notification service.
+	 * @return If the function succeeds, the return value is SDKERR_SUCCESS. Otherwise, this function returns an error.
 	 */
 	virtual SDKError RegisterNotificationService(const zchar_t* accessToken) = 0;
 
     /**
 	 * @brief Unregisters notification service.
+	 * @return If the function succeeds, the return value is SDKERR_SUCCESS. Otherwise, this function returns an error.
 	 */
 	virtual SDKError UnregisterNotificationService() = 0;
 
     /**
 	 * @brief Gets notification service helper interface. 
+	 * @return If the function succeeds, the return value is a pointer to INotificationServiceHelper. Otherwise, this function fails and returns nullptr.
 	 */
 	virtual INotificationServiceHelper* GetNotificationServiceHelper() = 0;
 #endif
