@@ -491,26 +491,35 @@ void OnConnectClick();
 // ---------------------------------------------------------------------------
 class ZoomAuthListener : public ZOOM_SDK_NAMESPACE::IAuthServiceEvent {
 public:
-    virtual void onAuthenticationReturn(ZOOM_SDK_NAMESPACE::AuthResult ret) override {
-        if (ret != ZOOM_SDK_NAMESPACE::AUTHRET_SUCCESS) {
-            MessageBoxA(NULL,
-                "Zoom authentication failed. Please try logging in again.",
-                "Feeds - Auth Failed", MB_OK | MB_ICONERROR);
-            return;
-        }
-
-        // Mark as logged in, update menu state
-        g_isLoggedIn = true;
-        if (g_loginAction)   g_loginAction->setEnabled(false);
-        if (g_logoutAction)  g_logoutAction->setEnabled(true);
-        if (g_connectAction) g_connectAction->setEnabled(true);
-
-        // If they clicked "Connect to Zoom Meeting" before logging in, proceed now
-        if (g_pendingMeetingJoin) {
-            g_pendingMeetingJoin = false;
-            QTimer::singleShot(200, []() { OnConnectClick(); });
-        }
+virtual void onAuthenticationReturn(ZOOM_SDK_NAMESPACE::AuthResult ret) override {
+    if (ret != ZOOM_SDK_NAMESPACE::AUTHRET_SUCCESS) {
+        MessageBoxA(NULL,
+            "Zoom authentication failed. Please try logging in again.",
+            "Feeds - Auth Failed", MB_OK | MB_ICONERROR);
+        return;
     }
+
+    // Mark as logged in, update menu state
+    g_isLoggedIn = true;
+    if (g_loginAction)   g_loginAction->setEnabled(false);
+    if (g_logoutAction)  g_logoutAction->setEnabled(true);
+    if (g_connectAction) g_connectAction->setEnabled(true);
+
+    // Refresh all open source properties panels so Login btn -> Connect btn
+    for (ZoomParticipantSource* src : g_allParticipantSources) {
+        if (src && src->source)
+            obs_source_update_properties(src->source);
+    }
+    // Also refresh screenshare source if one exists
+    if (g_screenshareSource)
+        obs_source_update_properties(g_screenshareSource);
+
+    // If they clicked "Connect to Zoom Meeting" before logging in, proceed now
+    if (g_pendingMeetingJoin) {
+        g_pendingMeetingJoin = false;
+        QTimer::singleShot(200, []() { OnConnectClick(); });
+    }
+}
 
     virtual void onLoginReturnWithReason(ZOOM_SDK_NAMESPACE::LOGINSTATUS ret,
                                           ZOOM_SDK_NAMESPACE::IAccountInfo* pAccountInfo,
