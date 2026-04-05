@@ -176,9 +176,9 @@ static std::string ExtractQueryParam(const std::string& text,
 static std::string ExchangeCodeForToken(const std::string& code,
                                         const std::string& verifier) {
     std::string body =
-        "grant_type=authorization_code"
+        std::string("grant_type=authorization_code") +
         "&code="          + UrlEncode(code) +
-        "&client_id=Y73jzQRmQxihh4Z72qR2tg"
+        "&client_id=Y73jzQRmQxihh4Z72qR2tg" +
         "&redirect_uri="  + UrlEncode("http://localhost:9847/callback") +
         "&code_verifier=" + UrlEncode(verifier);
 
@@ -799,8 +799,7 @@ static void RunPKCEListener(std::string verifier) {
         "Connection: close\r\n\r\n"
         "<html><body style='font-family:sans-serif;text-align:center;"
         "margin-top:80px'>"
-        "<h2>&#10003; Successfully logged in to Zoom!</h2>"
-        "<p>Your Zoom account is now connected to Feeds.</p>"
+        "<h2>&#10003; Logged in to Feeds successfully!</h2>"
         "<p>You can close this tab and return to OBS.</p>"
         "</body></html>";
     send(clientSock, httpResponse, (int)strlen(httpResponse), 0);
@@ -867,7 +866,7 @@ void OnLoginClick() {
     std::string challenge = DeriveCodeChallenge(g_pkceVerifier);
 
     // Build the Zoom authorization URL
-    // prompt=consent forces Zoom to show the account chooser even if
+    // prompt=login forces Zoom to show the account chooser even if
     // the user is already logged in — important for multi-account users
     std::string authUrl =
         "https://zoom.us/oauth/authorize"
@@ -876,7 +875,7 @@ void OnLoginClick() {
         "&redirect_uri="          + UrlEncode("http://localhost:9847/callback") +
         "&code_challenge="        + challenge +
         "&code_challenge_method=S256"
-        "&prompt=consent";
+        "&prompt=login";
 
     // Open the system browser to the Zoom login page
     ShellExecuteA(NULL, "open", authUrl.c_str(), NULL, NULL, SW_SHOWNORMAL);
