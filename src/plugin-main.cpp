@@ -178,7 +178,7 @@ static std::string ExchangeCodeForToken(const std::string& code,
     std::string body =
         std::string("grant_type=authorization_code") +
         "&code="          + UrlEncode(code) +
-        "&client_id=Y73jzQRmQxihh4Z72qR2tg" +
+        "&client_id=JlP6KfRqTt6r0t67FcDuqQ" +
         "&redirect_uri="  + UrlEncode("http://localhost:9847/callback") +
         "&code_verifier=" + UrlEncode(verifier);
 
@@ -730,7 +730,7 @@ void DoSDKAuth() {
     auth_service->SetEvent(&g_authListener);
 
     ZOOM_SDK_NAMESPACE::AuthContext authContext;
-    static std::wstring s_clientId = L"Y73jzQRmQxihh4Z72qR2tg";
+    static std::wstring s_clientId = L"JlP6KfRqTt6r0t67FcDuqQ";
     authContext.publicAppKey = s_clientId.c_str();
     auth_service->SDKAuth(authContext);
 }
@@ -871,7 +871,7 @@ void OnLoginClick() {
     std::string authUrl =
         "https://zoom.us/oauth/authorize"
         "?response_type=code"
-        "&client_id=Y73jzQRmQxihh4Z72qR2tg"
+        "&client_id=JlP6KfRqTt6r0t67FcDuqQ"
         "&redirect_uri="          + UrlEncode("http://localhost:9847/callback") +
         "&code_challenge="        + challenge +
         "&code_challenge_method=S256"
