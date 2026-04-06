@@ -73,7 +73,7 @@ jobs:
         shell: cmd
         run: |
           copy LICENSE installer\LICENSE
-          "C:\Program Files (x86)\NSIS\makensis.exe" installer\feeds-installer.nsi
+          "C:\Program Files (x86)\NSIS\makensis.exe" /DROOT_DIR="%CD%" installer\feeds-installer.nsi
           move installer\Feeds-Setup.exe Feeds-${{ github.ref_name }}-Setup.exe
 
       - name: Create GitHub Release
