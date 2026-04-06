@@ -644,6 +644,44 @@ public:
                 g_shareRenderer = nullptr;
             }
         }
+        if (status == ZOOM_SDK_NAMESPACE::MEETING_STATUS_FAILED) {
+            std::string msg;
+            switch (iResult) {
+                case ZOOM_SDK_NAMESPACE::MEETING_FAIL_PASSWORD_ERR:
+                    msg = "Incorrect meeting password. Please try again.";
+                    break;
+                case ZOOM_SDK_NAMESPACE::MEETING_FAIL_MEETING_NOT_EXIST:
+                    msg = "Meeting not found. Please check the meeting number or link.";
+                    break;
+                case ZOOM_SDK_NAMESPACE::MEETING_FAIL_CONNECTION_ERR:
+                    msg = "Connection error. Please check your internet connection and try again.";
+                    break;
+                case ZOOM_SDK_NAMESPACE::MEETING_FAIL_HOST_DISALLOW_OUTSIDE_USER_JOIN:
+                    msg = "The host has disabled external participants from joining this meeting.";
+                    break;
+                case ZOOM_SDK_NAMESPACE::MEETING_FAIL_UNABLE_TO_JOIN_EXTERNAL_MEETING:
+                    msg = "This app must be published on the Zoom Marketplace before joining external meetings.";
+                    break;
+                case ZOOM_SDK_NAMESPACE::MEETING_FAIL_APP_CAN_NOT_ANONYMOUS_JOIN_MEETING:
+                    msg = "This meeting requires you to be logged in to Zoom. Please log in and try again.";
+                    break;
+                case ZOOM_SDK_NAMESPACE::MEETING_FAIL_BLOCKED_BY_ACCOUNT_ADMIN:
+                    msg = "Your Zoom account administrator has blocked this application.";
+                    break;
+                case ZOOM_SDK_NAMESPACE::MEETING_FAIL_NEED_SIGN_IN_FOR_PRIVATE_MEETING:
+                    msg = "This is a private meeting. Please log in to Zoom and try again.";
+                    break;
+                default:
+                    msg = "Failed to join meeting. Error code: " + std::to_string(iResult);
+                    break;
+            }
+            // Re-enable connect button and show error
+            if (g_connectAction && g_isLoggedIn)
+                g_connectAction->setEnabled(true);
+            std::string fullMsg = "Feeds - Could not join meeting\n\n" + msg;
+            MessageBoxA(NULL, fullMsg.c_str(),
+                        "Feeds - Join Failed", MB_OK | MB_ICONERROR);
+        }
     }
     virtual void onMeetingStatisticsWarningNotification(
         ZOOM_SDK_NAMESPACE::StatisticsWarningType type) override {}
