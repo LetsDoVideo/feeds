@@ -30,7 +30,7 @@ SetCompressor /SOLID lzma
 
 ; Pages
 !insertmacro MUI_PAGE_WELCOME
-!insertmacro MUI_PAGE_LICENSE "LICENSE"
+!insertmacro MUI_PAGE_LICENSE "${ROOT_DIR}\LICENSE"
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
@@ -50,24 +50,24 @@ Section "Feeds Plugin" SecMain
 
     ; Plugin DLL -> obs-plugins/64bit/
     SetOutPath "$INSTDIR\obs-plugins\64bit"
-    File "dist\obs-plugins\64bit\feeds.dll"
+    File "${ROOT_DIR}\dist\obs-plugins\64bit\feeds.dll"
 
     ; Locale -> data/obs-plugins/feeds/locale/
     SetOutPath "$INSTDIR\data\obs-plugins\feeds\locale"
-    File "dist\data\obs-plugins\feeds\locale\en-US.ini"
+    File "File "${ROOT_DIR}\dist\data\obs-plugins\feeds\locale\en-US.ini""
 
     ; Zoom SDK runtime DLLs -> bin/64bit/
     SetOutPath "$INSTDIR\bin\64bit"
-    File "dist\bin\64bit\*.dll"
-    File "dist\bin\64bit\*.exe"
+    File "${ROOT_DIR}\dist\bin\64bit\*.dll"
+    File "${ROOT_DIR}\dist\bin\64bit\*.exe"
 
     ; Zoom SDK language files -> bin/64bit/language/
     SetOutPath "$INSTDIR\bin\64bit\language"
-    File "dist\bin\64bit\language\*.*"
+    File "${ROOT_DIR}\dist\bin\64bit\language\*.*"
 
     ; Zoom SDK ringtone files -> bin/64bit/ringtone/
     SetOutPath "$INSTDIR\bin\64bit\ringtone"
-    File "dist\bin\64bit\ringtone\*.*"
+    File "${ROOT_DIR}\dist\bin\64bit\ringtone\*.*"
 
     ; Write uninstaller
     WriteUninstaller "$INSTDIR\Feeds-Uninstall.exe"
