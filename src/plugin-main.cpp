@@ -901,8 +901,9 @@ static void RunPKCEListener(std::string verifier) {
         "Connection: close\r\n\r\n"
         "<html><body style='font-family:sans-serif;text-align:center;"
         "margin-top:80px'>"
-        "<h2>&#10003; Logged in to Feeds successfully!</h2>"
-        "<p>You can close this tab and return to OBS.</p>"
+        "<h2>&#10003; Successfully connected to Zoom!</h2>"
+        "<p>Your Zoom account is now linked to Feeds. "
+        "You can close this tab and return to OBS.</p>"
         "</body></html>";
     send(clientSock, httpResponse, (int)strlen(httpResponse), 0);
     closesocket(clientSock);
