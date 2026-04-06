@@ -66,6 +66,9 @@ jobs:
         run: |
           Compress-Archive -Path "dist/*" -DestinationPath "Feeds-${{ github.ref_name }}-windows-x64.zip"
 
+      - name: Install NSIS
+        run: choco install nsis -y
+        
       - name: Build Installer
         shell: cmd
         run: |
