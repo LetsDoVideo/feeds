@@ -34,7 +34,7 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DI
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE sdk)
 
 # Core libraries
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs ws2_32 crypt32)
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs ws2_32 crypt32 winhttp)
 
 if(ENABLE_FRONTEND_API)
     find_package(obs-frontend-api REQUIRED)
