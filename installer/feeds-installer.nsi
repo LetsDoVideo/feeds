@@ -54,7 +54,7 @@ Section "Feeds Plugin" SecMain
 
     ; Locale -> data/obs-plugins/feeds/locale/
     SetOutPath "$INSTDIR\data\obs-plugins\feeds\locale"
-    File "File "${ROOT_DIR}\dist\data\obs-plugins\feeds\locale\en-US.ini""
+    File "${ROOT_DIR}\dist\data\obs-plugins\feeds\locale\en-US.ini""
 
     ; Zoom SDK runtime DLLs -> bin/64bit/
     SetOutPath "$INSTDIR\bin\64bit"
