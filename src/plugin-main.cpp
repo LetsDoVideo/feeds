@@ -1020,28 +1020,35 @@ void OnLogoutClick() {
     MessageBoxA(NULL, "You have been logged out of Zoom.",
                 "Feeds - Logout", MB_OK | MB_ICONINFORMATION);
 }
+// ---------------------------------------------------------------------------
+// REFRESH ACCESS TOKEN using stored refresh token
+// Returns true if successful, updates g_accessToken and g_refreshToken
+// ---------------------------------------------------------------------------
+static bool RefreshAccessToken() {
+    if (g_refreshToken.empty()) return false;
 
-// ---------------------------------------------------------------------------
-// INTERNAL HELPER: single authenticated GET to api.zoom.us
-// ---------------------------------------------------------------------------
-static std::string ZoomApiGet(const std::wstring& path) {
+    std::string body =
+        std::string("grant_type=refresh_token") +
+        "&refresh_token=" + UrlEncode(g_refreshToken) +
+        "&client_id=JlP6KfRqTt6r0t67FcDuqQ";
+
     HINTERNET hSession = WinHttpOpen(L"Feeds/1.0",
                                       WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                       WINHTTP_NO_PROXY_NAME,
                                       WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!hSession) return "";
-    HINTERNET hConnect = WinHttpConnect(hSession, L"api.zoom.us",
+    if (!hSession) return false;
+    HINTERNET hConnect = WinHttpConnect(hSession, L"zoom.us",
                                          INTERNET_DEFAULT_HTTPS_PORT, 0);
-    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", path.c_str(),
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", L"/oauth/token",
                                              nullptr, WINHTTP_NO_REFERER,
                                              WINHTTP_DEFAULT_ACCEPT_TYPES,
                                              WINHTTP_FLAG_SECURE);
-    std::wstring authHeader = L"Authorization: Bearer " +
-        std::wstring(g_accessToken.begin(), g_accessToken.end());
-    WinHttpAddRequestHeaders(hRequest, authHeader.c_str(),
-                             (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
+    WinHttpAddRequestHeaders(hRequest,
+        L"Content-Type: application/x-www-form-urlencoded",
+        (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
     WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                       nullptr, 0, 0, 0);
+                       (LPVOID)body.c_str(), (DWORD)body.size(),
+                       (DWORD)body.size(), 0);
     WinHttpReceiveResponse(hRequest, nullptr);
 
     std::string response;
@@ -1055,7 +1062,95 @@ static std::string ZoomApiGet(const std::wstring& path) {
     WinHttpCloseHandle(hRequest);
     WinHttpCloseHandle(hConnect);
     WinHttpCloseHandle(hSession);
-    return response;
+
+    std::string newAccess  = JsonExtractString(response, "access_token");
+    std::string newRefresh = JsonExtractString(response, "refresh_token");
+
+    if (newAccess.empty()) return false;
+
+    g_accessToken  = newAccess;
+    // Zoom issues a new refresh token each time — old one becomes invalid
+    if (!newRefresh.empty())
+        g_refreshToken = newRefresh;
+    SaveTokensToRegistry();
+    return true;
+}
+// ---------------------------------------------------------------------------
+// INTERNAL HELPER: single authenticated GET to api.zoom.us
+// ---------------------------------------------------------------------------
+static std::string ZoomApiGet(const std::wstring& path) {
+    auto doRequest = [&]() -> std::string {
+        HINTERNET hSession = WinHttpOpen(L"Feeds/1.0",
+                                          WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                          WINHTTP_NO_PROXY_NAME,
+                                          WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!hSession) return "";
+        HINTERNET hConnect = WinHttpConnect(hSession, L"api.zoom.us",
+                                             INTERNET_DEFAULT_HTTPS_PORT, 0);
+        HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", path.c_str(),
+                                                 nullptr, WINHTTP_NO_REFERER,
+                                                 WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                                 WINHTTP_FLAG_SECURE);
+        std::wstring authHeader = L"Authorization: Bearer " +
+            std::wstring(g_accessToken.begin(), g_accessToken.end());
+        WinHttpAddRequestHeaders(hRequest, authHeader.c_str(),
+                                 (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
+        WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                           nullptr, 0, 0, 0);
+        WinHttpReceiveResponse(hRequest, nullptr);
+
+        // Check HTTP status code
+        DWORD statusCode = 0;
+        DWORD statusSize = sizeof(statusCode);
+        WinHttpQueryHeaders(hRequest,
+                            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            WINHTTP_HEADER_NAME_BY_INDEX,
+                            &statusCode, &statusSize,
+                            WINHTTP_NO_HEADER_INDEX);
+
+        std::string response;
+        char buf[4096];
+        DWORD bytesRead = 0;
+        while (WinHttpReadData(hRequest, buf, sizeof(buf) - 1, &bytesRead)
+               && bytesRead > 0) {
+            buf[bytesRead] = '\0';
+            response += buf;
+        }
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+
+        // Return status code prepended so caller can detect 401
+        return std::to_string(statusCode) + "|" + response;
+    };
+
+    std::string result = doRequest();
+    std::string status = result.substr(0, result.find('|'));
+    std::string body   = result.substr(result.find('|') + 1);
+
+    if (status == "401") {
+        // Token expired — try to refresh and retry once
+        if (RefreshAccessToken()) {
+            result = doRequest();
+            body   = result.substr(result.find('|') + 1);
+        } else {
+            // Refresh failed — user needs to log in again
+            QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
+                g_isLoggedIn = false;
+                ClearTokensFromRegistry();
+                if (g_loginAction)   g_loginAction->setEnabled(true);
+                if (g_logoutAction)  g_logoutAction->setEnabled(false);
+                if (g_connectAction) g_connectAction->setEnabled(false);
+                MessageBoxA(NULL,
+                    "Your Zoom login has expired and could not be renewed.\n\n"
+                    "Please log in again.",
+                    "Feeds - Session Expired", MB_OK | MB_ICONWARNING);
+            });
+            return "";
+        }
+    }
+
+    return body;
 }
 
 // ---------------------------------------------------------------------------
