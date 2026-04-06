@@ -69,7 +69,7 @@ jobs:
       - name: Build Installer
         shell: cmd
         run: |
-          copy LICENSE.txt installer\LICENSE.txt
+          copy LICENSE installer\LICENSE
           "C:\Program Files (x86)\NSIS\makensis.exe" installer\feeds-installer.nsi
           move installer\Feeds-Setup.exe Feeds-${{ github.ref_name }}-Setup.exe
 
