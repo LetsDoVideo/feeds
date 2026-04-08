@@ -222,7 +222,7 @@ static std::string ExchangeCodeForToken(const std::string& code,
 }
 
 // Minimal JSON string field extractor
-static std::string JsonExtractString(const std::string& json,
+static std::string (const std::string& json,
                                      const std::string& key) {
     std::string search = "\"" + key + "\"";
     size_t pos = json.find(search);
@@ -233,6 +233,19 @@ static std::string JsonExtractString(const std::string& json,
     size_t end = json.find('"', pos);
     if (end == std::string::npos) return "";
     return json.substr(pos, end - pos);
+}
+
+// Extract a numeric field from JSON (returned without quotes)
+static std::string JsonExtractNumber(const std::string& json,
+                                     const std::string& key) {
+    std::string search = "\"" + key + "\"";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return "";
+    pos = json.find_first_of("0123456789", pos + search.size());
+    if (pos == std::string::npos) return "";
+    size_t end = json.find_first_not_of("0123456789", pos);
+    return json.substr(pos, end == std::string::npos ? std::string::npos
+                                                      : end - pos);
 }
 
 // ---------------------------------------------------------------------------
@@ -906,8 +919,8 @@ static void RunPKCEListener(std::string verifier) {
     }
 
     std::string tokenResponse = ExchangeCodeForToken(code, verifier);
-    std::string accessToken   = JsonExtractString(tokenResponse, "access_token");
-    std::string refreshToken  = JsonExtractString(tokenResponse, "refresh_token");
+    std::string accessToken   = (tokenResponse, "access_token");
+    std::string refreshToken  = (tokenResponse, "refresh_token");
 
     if (accessToken.empty()) {
         std::string errMsg = "Token exchange failed.\n\nServer response:\n" +
@@ -1035,8 +1048,8 @@ static bool RefreshAccessToken() {
     WinHttpCloseHandle(hConnect);
     WinHttpCloseHandle(hSession);
 
-    std::string newAccess  = JsonExtractString(response, "access_token");
-    std::string newRefresh = JsonExtractString(response, "refresh_token");
+    std::string newAccess  = (response, "access_token");
+    std::string newRefresh = (response, "refresh_token");
 
     if (newAccess.empty()) return false;
 
@@ -1157,7 +1170,7 @@ static bool FetchUserInfo(std::string& zak, std::string& displayName) {
     if (displayName.empty())
         displayName = JsonExtractString(userResponse, "first_name");
     g_userDisplayName = displayName;
-    g_userPMI         = JsonExtractString(userResponse, "pmi");
+    g_userPMI         = JsonExtractNumber(userResponse, "pmi");
 
     std::string zakResponse = ZoomApiGet(L"/v2/users/me/zak");
     zak = JsonExtractString(zakResponse, "token");
