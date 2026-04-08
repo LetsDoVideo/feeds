@@ -1048,8 +1048,8 @@ static bool RefreshAccessToken() {
     WinHttpCloseHandle(hConnect);
     WinHttpCloseHandle(hSession);
 
-    std::string newAccess  = (response, "access_token");
-    std::string newRefresh = (response, "refresh_token");
+    std::string newAccess  = JsonExtractString(response, "access_token");
+    std::string newRefresh = JsonExtractString(response, "refresh_token");
 
     if (newAccess.empty()) return false;
 
