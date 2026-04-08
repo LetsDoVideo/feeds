@@ -52,6 +52,7 @@
 // TIER GATING
 // 0 = Free (1 feed), 1 = Basic (3 feeds), 2 = Streamer (5 feeds), 3 = Broadcaster (8 feeds)
 // ---------------------------------------------------------------------------
+static int g_currentTier = 0;
 static int g_activeParticipantSources = 0;
 
 static int GetMaxFeedsForTier() {
@@ -87,7 +88,6 @@ static std::string g_pkceVerifier;
 static std::string g_accessToken;
 static std::string g_refreshToken;
 static std::string g_userDisplayName;
-static int         g_currentTier = 0; // 0=Free, 1=Basic, 2=Streamer, 3=Broadcaster
 
 // ---------------------------------------------------------------------------
 // PKCE HELPERS
@@ -1156,6 +1156,7 @@ static std::string ZoomApiGet(const std::wstring& path) {
 // ---------------------------------------------------------------------------
 // FETCH USER INFO (ZAK + display name) via Zoom REST API
 // ---------------------------------------------------------------------------
+static void FetchAndApplyEntitlement(); // forward declaration
 static bool FetchUserInfo(std::string& zak, std::string& displayName) {
 
     // Get display name from /v2/users/me  (requires user:read:user scope)
@@ -1175,7 +1176,6 @@ static bool FetchUserInfo(std::string& zak, std::string& displayName) {
             "Please log out and log in again.",
             "Feeds - Error", MB_OK | MB_ICONERROR);
         return false;
-    }
     }
 
     FetchAndApplyEntitlement();
