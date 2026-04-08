@@ -83,11 +83,12 @@ static unsigned int g_activeSharerUserId  = 0;
 static unsigned int g_activeShareSourceId = 0;
 static unsigned int g_activeSpeakerUserId = 0;
 
-// PKCE state
+// PKCE / user state
 static std::string g_pkceVerifier;
 static std::string g_accessToken;
 static std::string g_refreshToken;
 static std::string g_userDisplayName;
+static std::string g_userPMI;
 
 // ---------------------------------------------------------------------------
 // PKCE HELPERS
@@ -199,23 +200,6 @@ static std::string ExchangeCodeForToken(const std::string& code,
     WinHttpAddRequestHeaders(hRequest,
         L"Content-Type: application/x-www-form-urlencoded",
         (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
-
-    // Basic auth with client_id and empty secret for public client
-    std::string credStr = "JlP6KfRqTt6r0t67FcDuqQ:";
-    DWORD b64Len = 0;
-    CryptBinaryToStringA((const BYTE*)credStr.data(), (DWORD)credStr.size(),
-                          CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF,
-                          nullptr, &b64Len);
-    std::string b64(b64Len, '\0');
-    CryptBinaryToStringA((const BYTE*)credStr.data(), (DWORD)credStr.size(),
-                          CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF,
-                          &b64[0], &b64Len);
-    while (!b64.empty() && (b64.back() == '\0' || b64.back() == '\n'))
-        b64.pop_back();
-    std::wstring basicAuth = L"Authorization: Basic " +
-                              std::wstring(b64.begin(), b64.end());
-    WinHttpAddRequestHeaders(hRequest, basicAuth.c_str(),
-                             (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
 
     WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                        (LPVOID)body.c_str(), (DWORD)body.size(),
@@ -374,7 +358,7 @@ static void UpdateShareSubscription() {
 // ---------------------------------------------------------------------------
 class ZoomParticipantSource {
 public:
-    obs_source_t* source        = nullptr;
+    obs_source_t* source          = nullptr;
     unsigned int  current_user_id = 0;
     ZoomVideoCatcher                      videoCatcher;
     ZOOM_SDK_NAMESPACE::IZoomSDKRenderer* videoRenderer = nullptr;
@@ -645,6 +629,7 @@ public:
                 g_shareRenderer = nullptr;
             }
         }
+
         if (status == ZOOM_SDK_NAMESPACE::MEETING_STATUS_FAILED) {
             std::string msg;
             switch (iResult) {
@@ -676,12 +661,10 @@ public:
                     msg = "Failed to join meeting. Error code: " + std::to_string(iResult);
                     break;
             }
-            // Re-enable connect button and show error
             if (g_connectAction && g_isLoggedIn)
                 g_connectAction->setEnabled(true);
-            std::string fullMsg = "Feeds - Could not join meeting\n\n" + msg;
-            MessageBoxA(NULL, fullMsg.c_str(),
-                        "Feeds - Join Failed", MB_OK | MB_ICONERROR);
+            MessageBoxA(NULL, msg.c_str(), "Feeds - Join Failed",
+                        MB_OK | MB_ICONERROR);
         }
     }
     virtual void onMeetingStatisticsWarningNotification(
@@ -774,6 +757,7 @@ static void StartPostConnectRefreshTimer() {
     });
     timer->start();
 }
+
 // ---------------------------------------------------------------------------
 // TOKEN PERSISTENCE via Windows Registry
 // ---------------------------------------------------------------------------
@@ -863,7 +847,6 @@ static void RunPKCEListener(std::string verifier) {
         listen(listenSock, 1) != 0) {
         closesocket(listenSock);
         WSACleanup();
-        // Re-enable login button so user can retry
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
             MessageBoxA(NULL,
                 "Could not open local port 9847 for Zoom login.\n"
@@ -894,7 +877,6 @@ static void RunPKCEListener(std::string verifier) {
     char buf[4096] = {};
     recv(clientSock, buf, sizeof(buf) - 1, 0);
 
-    // Send a friendly success page so the browser tab doesn't show an error
     const char* httpResponse =
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/html\r\n"
@@ -909,8 +891,6 @@ static void RunPKCEListener(std::string verifier) {
     closesocket(clientSock);
     WSACleanup();
 
-    // Parse the auth code out of the GET request line:
-    // "GET /callback?code=XXXX HTTP/1.1"
     std::string request(buf);
     std::string code = ExtractQueryParam(request, "code");
 
@@ -925,13 +905,11 @@ static void RunPKCEListener(std::string verifier) {
         return;
     }
 
-    // Exchange code + verifier for access token (blocking HTTPS call)
     std::string tokenResponse = ExchangeCodeForToken(code, verifier);
     std::string accessToken   = JsonExtractString(tokenResponse, "access_token");
     std::string refreshToken  = JsonExtractString(tokenResponse, "refresh_token");
 
     if (accessToken.empty()) {
-        // Log the raw response to help debug if something goes wrong
         std::string errMsg = "Token exchange failed.\n\nServer response:\n" +
                              tokenResponse.substr(0, 300);
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
@@ -947,7 +925,6 @@ static void RunPKCEListener(std::string verifier) {
     g_refreshToken = refreshToken;
     SaveTokensToRegistry();
 
-    // Fire SDK auth on the Qt main thread
     QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
                        []() { DoSDKAuth(); });
 }
@@ -962,29 +939,22 @@ void OnLoginClick() {
         return;
     }
 
-    // Disable login button while flow is in progress to prevent double-clicks
     if (g_loginAction) g_loginAction->setEnabled(false);
 
-    // Generate PKCE values
     g_pkceVerifier        = GenerateCodeVerifier();
     std::string challenge = DeriveCodeChallenge(g_pkceVerifier);
 
-    // Build the Zoom authorization URL
-    // prompt=login forces Zoom to show the account chooser even if
-    // the user is already logged in — important for multi-account users
     std::string authUrl =
-        "https://zoom.us/oauth/authorize"
-        "?response_type=code"
-        "&client_id=JlP6KfRqTt6r0t67FcDuqQ"
+        std::string("https://zoom.us/oauth/authorize") +
+        "?response_type=code" +
+        "&client_id=JlP6KfRqTt6r0t67FcDuqQ" +
         "&redirect_uri="          + UrlEncode("http://localhost:9847/callback") +
         "&code_challenge="        + challenge +
-        "&code_challenge_method=S256"
-        "&prompt=login";
+        "&code_challenge_method=S256" +
+        "&prompt=consent";
 
-    // Open the system browser to the Zoom login page
     ShellExecuteA(NULL, "open", authUrl.c_str(), NULL, NULL, SW_SHOWNORMAL);
 
-    // Start background thread to listen for the redirect
     std::string verifier = g_pkceVerifier;
     std::thread([verifier]() {
         RunPKCEListener(verifier);
@@ -1011,6 +981,8 @@ void OnLogoutClick() {
     g_accessToken.clear();
     g_refreshToken.clear();
     g_pkceVerifier.clear();
+    g_userDisplayName.clear();
+    g_userPMI.clear();
     ClearTokensFromRegistry();
 
     if (g_loginAction)   g_loginAction->setEnabled(true);
@@ -1020,9 +992,9 @@ void OnLogoutClick() {
     MessageBoxA(NULL, "You have been logged out of Zoom.",
                 "Feeds - Logout", MB_OK | MB_ICONINFORMATION);
 }
+
 // ---------------------------------------------------------------------------
 // REFRESH ACCESS TOKEN using stored refresh token
-// Returns true if successful, updates g_accessToken and g_refreshToken
 // ---------------------------------------------------------------------------
 static bool RefreshAccessToken() {
     if (g_refreshToken.empty()) return false;
@@ -1068,13 +1040,13 @@ static bool RefreshAccessToken() {
 
     if (newAccess.empty()) return false;
 
-    g_accessToken  = newAccess;
-    // Zoom issues a new refresh token each time — old one becomes invalid
+    g_accessToken = newAccess;
     if (!newRefresh.empty())
         g_refreshToken = newRefresh;
     SaveTokensToRegistry();
     return true;
 }
+
 // ---------------------------------------------------------------------------
 // INTERNAL HELPER: single authenticated GET to api.zoom.us
 // ---------------------------------------------------------------------------
@@ -1099,7 +1071,6 @@ static std::string ZoomApiGet(const std::wstring& path) {
                            nullptr, 0, 0, 0);
         WinHttpReceiveResponse(hRequest, nullptr);
 
-        // Check HTTP status code
         DWORD statusCode = 0;
         DWORD statusSize = sizeof(statusCode);
         WinHttpQueryHeaders(hRequest,
@@ -1120,7 +1091,6 @@ static std::string ZoomApiGet(const std::wstring& path) {
         WinHttpCloseHandle(hConnect);
         WinHttpCloseHandle(hSession);
 
-        // Return status code prepended so caller can detect 401
         return std::to_string(statusCode) + "|" + response;
     };
 
@@ -1129,12 +1099,10 @@ static std::string ZoomApiGet(const std::wstring& path) {
     std::string body   = result.substr(result.find('|') + 1);
 
     if (status == "401") {
-        // Token expired — try to refresh and retry once
         if (RefreshAccessToken()) {
             result = doRequest();
             body   = result.substr(result.find('|') + 1);
         } else {
-            // Refresh failed — user needs to log in again
             QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
                 g_isLoggedIn = false;
                 ClearTokensFromRegistry();
@@ -1154,19 +1122,43 @@ static std::string ZoomApiGet(const std::wstring& path) {
 }
 
 // ---------------------------------------------------------------------------
-// FETCH USER INFO (ZAK + display name) via Zoom REST API
+// FETCH AND APPLY MARKETPLACE ENTITLEMENT
+// Sets g_currentTier based on what the user has purchased.
+// DEBUG box shows raw response — remove once tier names confirmed.
 // ---------------------------------------------------------------------------
-static void FetchAndApplyEntitlement(); // forward declaration
-static bool FetchUserInfo(std::string& zak, std::string& displayName) {
+static void FetchAndApplyEntitlement() {
+    std::string response = ZoomApiGet(
+        L"/v2/marketplace/users/me/entitlements"
+        L"?app_id=JlP6KfRqTt6r0t67FcDuqQ");
 
-    // Get display name from /v2/users/me  (requires user:read:user scope)
+    // DEBUG: show raw response so we can verify field names
+    // Remove this MessageBoxA block once tier names are confirmed
+    MessageBoxA(NULL,
+        ("Entitlement response:\n" + response.substr(0, 400)).c_str(),
+        "Feeds - Entitlement Debug", MB_OK | MB_ICONINFORMATION);
+
+    // Default to Free tier
+    g_currentTier = 0;
+
+    if (response.find("Broadcaster") != std::string::npos)
+        g_currentTier = 3;
+    else if (response.find("Streamer") != std::string::npos)
+        g_currentTier = 2;
+    else if (response.find("Basic") != std::string::npos)
+        g_currentTier = 1;
+}
+
+// ---------------------------------------------------------------------------
+// FETCH USER INFO (ZAK + display name + PMI) via Zoom REST API
+// ---------------------------------------------------------------------------
+static bool FetchUserInfo(std::string& zak, std::string& displayName) {
     std::string userResponse = ZoomApiGet(L"/v2/users/me");
     displayName = JsonExtractString(userResponse, "display_name");
     if (displayName.empty())
         displayName = JsonExtractString(userResponse, "first_name");
-    g_userDisplayName = displayName; 
+    g_userDisplayName = displayName;
+    g_userPMI         = JsonExtractString(userResponse, "pmi");
 
-    // Get ZAK from /v2/users/me/zak  (requires user:read:zak scope)
     std::string zakResponse = ZoomApiGet(L"/v2/users/me/zak");
     zak = JsonExtractString(zakResponse, "token");
 
@@ -1180,35 +1172,6 @@ static bool FetchUserInfo(std::string& zak, std::string& displayName) {
 
     FetchAndApplyEntitlement();
     return true;
-}
-
-// ---------------------------------------------------------------------------
-// FETCH AND APPLY MARKETPLACE ENTITLEMENT
-// Sets g_currentTier based on what the user has purchased.
-// Shows raw response in debug box so we can verify field names on first run.
-// ---------------------------------------------------------------------------
-static void FetchAndApplyEntitlement() {
-    std::string response = ZoomApiGet(
-        L"/v2/marketplace/users/me/entitlements");
-
-    // DEBUG: show raw response so we can verify field names
-    // Remove this block once tier names are confirmed
-    MessageBoxA(NULL,
-        ("Entitlement response:\n" + response.substr(0, 400)).c_str(),
-        "Feeds - Entitlement Debug", MB_OK | MB_ICONINFORMATION);
-
-    // Default to Free tier
-    g_currentTier = 0;
-
-    // Map tier names to tier levels
-    // These strings must match your Marketplace plan names exactly
-    if (response.find("Broadcaster") != std::string::npos)
-        g_currentTier = 3;
-    else if (response.find("Streamer") != std::string::npos)
-        g_currentTier = 2;
-    else if (response.find("Basic") != std::string::npos)
-        g_currentTier = 1;
-    // else: Free tier, g_currentTier stays 0
 }
 
 // ---------------------------------------------------------------------------
@@ -1232,31 +1195,60 @@ void OnConnectClick() {
 
     QMainWindow* mainWindow = (QMainWindow*)obs_frontend_get_main_window();
 
+    // Show join options dialog
+    QStringList options;
+    QString pmiOption = "My Personal Meeting Room (PMI)";
+    if (!g_userPMI.empty())
+        pmiOption += " - " + QString::fromStdString(g_userPMI);
+    options << pmiOption
+            << "Join by Meeting Number or Link";
+
     bool ok = false;
-    QString input = QInputDialog::getText(
+    QString choice = QInputDialog::getItem(
         mainWindow, "Join Zoom Meeting",
-        "Enter your Zoom Meeting number or link:",
-        QLineEdit::Normal, "", &ok);
-    if (!ok || input.trimmed().isEmpty()) return;
+        "How would you like to join?",
+        options, 0, false, &ok);
+    if (!ok) return;
 
-    bool okPwd = false;
-    QString password = QInputDialog::getText(
-        mainWindow, "Meeting Password",
-        "Enter meeting password (leave blank if none):",
-        QLineEdit::Normal, "", &okPwd);
-    if (!okPwd) return;
+    QString input;
+    QString password;
 
-    input = input.trimmed();
+    if (choice.startsWith("My Personal")) {
+        if (g_userPMI.empty()) {
+            MessageBoxA(NULL,
+                "Could not retrieve your Personal Meeting Room ID.\n"
+                "Please use Join by Meeting Number instead.",
+                "Feeds", MB_OK | MB_ICONWARNING);
+            return;
+        }
+        input = QString::fromStdString(g_userPMI);
+        bool okPwd = false;
+        password = QInputDialog::getText(
+            mainWindow, "Meeting Password",
+            "Enter your PMI password (leave blank if none):",
+            QLineEdit::Normal, "", &okPwd);
+        if (!okPwd) return;
+    } else {
+        bool okInput = false;
+        input = QInputDialog::getText(
+            mainWindow, "Join Zoom Meeting",
+            "Enter your Zoom Meeting number or link:",
+            QLineEdit::Normal, "", &okInput);
+        if (!okInput || input.trimmed().isEmpty()) return;
+        input = input.trimmed();
 
-    // Fetch ZAK and display name using our OAuth access token.
-    // ZAK identifies the user to Zoom: grants host privileges,
-    // bypasses waiting room for own meetings, and satisfies the
-    // March 2026 external-meeting authorization requirement.
-    std::string zak, displayName;
-    if (!FetchUserInfo(zak, displayName)) {
-        // FetchUserInfo already showed a diagnostic message box
-        return;
+        bool okPwd = false;
+        password = QInputDialog::getText(
+            mainWindow, "Meeting Password",
+            "Enter meeting password (leave blank if none):",
+            QLineEdit::Normal, "", &okPwd);
+        if (!okPwd) return;
     }
+
+    // Fetch ZAK and display name
+    std::string zak, displayName;
+    if (!FetchUserInfo(zak, displayName))
+        return;
 
     ZOOM_SDK_NAMESPACE::JoinParam joinParam;
     joinParam.userType = ZOOM_SDK_NAMESPACE::SDK_UT_WITHOUT_LOGIN;
@@ -1265,14 +1257,12 @@ void OnConnectClick() {
     param.isAudioOff = true;
     param.isVideoOff = true;
 
-    // Join as the authenticated user, not as anonymous "Feeds"
     static std::wstring s_userName;
     s_userName     = std::wstring(displayName.begin(), displayName.end());
     param.userName = s_userName.c_str();
 
-    // Pass ZAK so Zoom recognises the user
     static std::wstring s_zak;
-    s_zak        = std::wstring(zak.begin(), zak.end());
+    s_zak         = std::wstring(zak.begin(), zak.end());
     param.userZAK = s_zak.c_str();
 
     static std::wstring s_password;
@@ -1284,19 +1274,20 @@ void OnConnectClick() {
     static std::wstring s_vanityId;
 
     if (input.contains("zoom.us/my/")) {
-        int start    = input.indexOf("zoom.us/my/") + 11;
+        int start = input.indexOf("zoom.us/my/") + 11;
         QString vanityId = input.mid(start).split(
             QRegularExpression("[?\\s]")).first();
         s_vanityId     = vanityId.toStdWString();
         param.vanityID = s_vanityId.c_str();
     } else if (input.contains("zoom.us/j/")) {
-        int start  = input.indexOf("zoom.us/j/") + 10;
+        int start = input.indexOf("zoom.us/j/") + 10;
         QString numStr = input.mid(start).split(
             QRegularExpression("[?\\s]")).first();
         numStr = numStr.replace(QRegularExpression("[^0-9]"), "");
         if (numStr.isEmpty()) return;
         param.meetingNumber = numStr.toULongLong();
     } else {
+        // Treat as raw meeting number or PMI number
         QString numStr = input.replace(QRegularExpression("[\\s\\-]"), "");
         numStr = numStr.replace(QRegularExpression("[^0-9]"), "");
         if (numStr.isEmpty()) return;
@@ -1323,7 +1314,6 @@ void SetupPluginMenu(void) {
     feedsMenu->addSeparator();
     QAction* aboutAction = feedsMenu->addAction("About / Tier Status");
 
-    // Initial state: not logged in
     g_logoutAction->setEnabled(false);
     g_connectAction->setEnabled(false);
 
@@ -1436,16 +1426,22 @@ static obs_properties_t* zp_properties(void* data) {
         ZOOM_SDK_NAMESPACE::IMeetingParticipantsController* pc =
             ms->GetMeetingParticipantsController();
         if (pc) {
+            // Get our own user ID to exclude from the participant list
+            unsigned int myUserId = 0;
+            ZOOM_SDK_NAMESPACE::IUserInfo* mySelf = pc->GetMySelfUser();
+            if (mySelf) myUserId = mySelf->GetUserID();
+
             ZOOM_SDK_NAMESPACE::IList<unsigned int>* userList =
                 pc->GetParticipantsList();
             if (userList) {
                 for (int i = 0; i < userList->GetCount(); i++) {
                     unsigned int uid = userList->GetItem(i);
+                    // Skip ourselves — filter by ID, not name
+                    if (myUserId != 0 && uid == myUserId) continue;
                     ZOOM_SDK_NAMESPACE::IUserInfo* info =
                         pc->GetUserByUserID(uid);
                     if (info) {
                         std::wstring wname = info->GetUserName();
-                        if (wname == L"Feeds") continue;
                         int size_needed = WideCharToMultiByte(
                             CP_UTF8, 0, &wname[0], (int)wname.size(),
                             NULL, 0, NULL, NULL);
@@ -1574,7 +1570,6 @@ bool obs_module_load(void) {
     obs_frontend_add_event_callback([](enum obs_frontend_event event, void*) {
         if (event == OBS_FRONTEND_EVENT_FINISHED_LOADING) {
             SetupPluginMenu();
-            // Auto-login if we have stored tokens
             if (LoadTokensFromRegistry()) {
                 DoSDKAuth();
             }
