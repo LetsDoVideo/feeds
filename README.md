@@ -1,10 +1,10 @@
-# Isolated Feeds for OBS (Zoom)
+# Feeds (Isolated Zoom Feeds for OBS)
 
 **Pull individual Zoom participant video feeds directly into OBS Studio as dedicated sources.**
 
 https://github.com/user-attachments/assets/3b861b97-1134-487a-94b7-51a2d7d1844c
 
-Isolated Feeds for OBS is a native Windows plugin for OBS Studio that uses the Zoom Meeting SDK to give broadcasters clean, isolated video feeds from each Zoom participant. No screen capturing, no grid layouts, just raw high-quality video piped directly into your OBS scene.
+Feeds is a native Windows plugin for OBS Studio that uses the Zoom Meeting SDK to give broadcasters clean, isolated video feeds from each Zoom participant. No screen capturing, no grid layouts, just raw high-quality video piped directly into your OBS scene.
 
 ---
 
@@ -19,13 +19,16 @@ Isolated Feeds for OBS is a native Windows plugin for OBS Studio that uses the Z
 
 ## Installation
 
-1. Download the latest **Isolated-Feeds-for-OBS-Windows.zip** from the [Releases](https://github.com/LetsDoVideo/iso-for-obs/releases) page
-2. Extract the ZIP file
-3. Copy the extracted contents into your OBS Studio root folder
+1. Download the latest **Feeds.exe** from the [Releases](https://github.com/LetsDoVideo/feeds/releases) page
+2. Run the installation file.
+3. or
+4. Download the latest **Feeds.zip** from the [Releases](https://github.com/LetsDoVideo/feeds/releases) page
+5.Extract the ZIP file
+6. Copy the extracted contents into your OBS Studio root folder
    - For standard OBS installs: `C:\Program Files\obs-studio\`
    - For portable OBS installs: your portable OBS root folder
-4. Restart OBS Studio
-5. The plugin is ready. No Zoom Marketplace activation required for the Free tier
+7. Restart OBS Studio
+8. The plugin is ready. No Zoom Marketplace activation required for the Free tier
 
 ---
 
@@ -86,9 +89,7 @@ Upgrade your tier at the [Zoom App Marketplace](https://marketplace.zoom.us).
 
 ## Known Issues
 
-**Occasional 1-second video latency on new sources**
-
-Sometimes a newly created Zoom Participant source will have approximately 1 second of video latency. If this occurs, delete the source and re-add it. The latency will not return. This is a known issue being addressed in the next release.
+**No current known issues. Please let us know if you experience any.**
 
 ---
 
@@ -108,21 +109,21 @@ Sometimes a newly created Zoom Participant source will have approximately 1 seco
 
 **How do I update the plugin?**
 
-- Download the latest release ZIP from the [Releases](https://github.com/LetsDoVideo/iso-for-obs/releases) page and replace the existing files in your OBS folder.
+- Download the latest release from the [Releases](https://github.com/LetsDoVideo/feeds/releases) page and run the install exe or use the zip to replace the existing files in your OBS folder.
 
 ---
 
 ## Support
 
-- 📖 [Documentation](https://letsdovideo.com/isolated-feeds-for-obs-documentation/)
-- 🛠️ [Support Page](https://letsdovideo.com/isolated-feeds-for-obs-support/)
+- 📖 [Documentation](https://letsdovideo.com/feeds-documentation/)
+- 🛠️ [Support Page](https://letsdovideo.com/feeds-support/)
 - 💬 [Let's Do Video Discord](https://discord.com/invite/CXGwwKt)
 
 ---
 
 ## Legal
 
-Isolated Feeds for OBS is an independent integration and is not officially endorsed by the OBS Project or Zoom Communications, Inc.
+Feeds is an independent integration and is not officially endorsed by the OBS Project or Zoom Communications, Inc.
 OBS Studio is a trademark of the OBS Project. Zoom is a trademark of Zoom Communications, Inc.
 
 © 2026 Let's Do Video. Licensed under GPL-2.0.
