@@ -52,7 +52,6 @@
 // TIER GATING
 // 0 = Free (1 feed), 1 = Basic (3 feeds), 2 = Streamer (5 feeds), 3 = Broadcaster (8 feeds)
 // ---------------------------------------------------------------------------
-static int g_currentTier = 1;
 static int g_activeParticipantSources = 0;
 
 static int GetMaxFeedsForTier() {
@@ -88,6 +87,7 @@ static std::string g_pkceVerifier;
 static std::string g_accessToken;
 static std::string g_refreshToken;
 static std::string g_userDisplayName;
+static int         g_currentTier = 0; // 0=Free, 1=Basic, 2=Streamer, 3=Broadcaster
 
 // ---------------------------------------------------------------------------
 // PKCE HELPERS
@@ -1170,19 +1170,45 @@ static bool FetchUserInfo(std::string& zak, std::string& displayName) {
     zak = JsonExtractString(zakResponse, "token");
 
     if (zak.empty() || displayName.empty()) {
-        // Show raw API responses to help diagnose scope or token problems
-        std::string errMsg =
+        MessageBoxA(NULL,
             "Could not retrieve your Zoom account details.\n\n"
-            "/users/me response:\n" +
-            userResponse.substr(0, 300) + "\n\n"
-            "/users/me/zak response:\n" +
-            zakResponse.substr(0, 300);
-        MessageBoxA(NULL, errMsg.c_str(),
-                    "Feeds - API Debug", MB_OK | MB_ICONERROR);
+            "Please log out and log in again.",
+            "Feeds - Error", MB_OK | MB_ICONERROR);
         return false;
     }
+    }
 
+    FetchAndApplyEntitlement();
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// FETCH AND APPLY MARKETPLACE ENTITLEMENT
+// Sets g_currentTier based on what the user has purchased.
+// Shows raw response in debug box so we can verify field names on first run.
+// ---------------------------------------------------------------------------
+static void FetchAndApplyEntitlement() {
+    std::string response = ZoomApiGet(
+        L"/v2/marketplace/users/me/entitlements");
+
+    // DEBUG: show raw response so we can verify field names
+    // Remove this block once tier names are confirmed
+    MessageBoxA(NULL,
+        ("Entitlement response:\n" + response.substr(0, 400)).c_str(),
+        "Feeds - Entitlement Debug", MB_OK | MB_ICONINFORMATION);
+
+    // Default to Free tier
+    g_currentTier = 0;
+
+    // Map tier names to tier levels
+    // These strings must match your Marketplace plan names exactly
+    if (response.find("Broadcaster") != std::string::npos)
+        g_currentTier = 3;
+    else if (response.find("Streamer") != std::string::npos)
+        g_currentTier = 2;
+    else if (response.find("Basic") != std::string::npos)
+        g_currentTier = 1;
+    // else: Free tier, g_currentTier stays 0
 }
 
 // ---------------------------------------------------------------------------
@@ -1340,7 +1366,7 @@ public:
 // ---------------------------------------------------------------------------
 static obs_properties_t* zp_properties(void* data) {
     obs_properties_t* props = obs_properties_create();
-    obs_properties_add_text(props, "ver_label", "Feeds (v0.1 Alpha)",
+    obs_properties_add_text(props, "ver_label", "Feeds (v1.0)",
                             OBS_TEXT_INFO);
 
     ZOOM_SDK_NAMESPACE::IMeetingService* ms = nullptr;
@@ -1439,7 +1465,7 @@ static obs_properties_t* zs_properties(void* data) {
     (void)data;
     obs_properties_t* props = obs_properties_create();
     obs_properties_add_text(props, "ver_label",
-                            "Feeds - Screenshare (v0.1 Alpha)", OBS_TEXT_INFO);
+                            "Feeds - Screenshare (v1.0)", OBS_TEXT_INFO);
 
     ZOOM_SDK_NAMESPACE::IMeetingService* ms = nullptr;
     ZOOM_SDK_NAMESPACE::CreateMeetingService(&ms);
