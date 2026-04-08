@@ -278,7 +278,6 @@ static void FetchAndApplyEntitlement();
 class ZoomVideoCatcher : public ZOOM_SDK_NAMESPACE::IZoomSDKRendererDelegate {
 public:
     obs_source_t* target = nullptr;
-    uint64_t next_timestamp = 0;
 
     virtual void onRawDataFrameReceived(YUVRawDataI420* data) override {
         if (!target) return;
@@ -301,11 +300,10 @@ public:
                                     obs_frame.color_range_min,
                                     obs_frame.color_range_max);
 
-        uint64_t now = os_gettime_ns();
-        if (next_timestamp == 0 || next_timestamp < now - 100000000ULL)
-            next_timestamp = now;
-        obs_frame.timestamp = next_timestamp;
-        next_timestamp += 33333333ULL;
+        // Use wall clock directly for each frame. Accumulating a fixed
+        // 33ms increment causes forward drift vs. actual delivery rate,
+        // which OBS buffers away as latency (~1s after ~30s of streaming).
+        obs_frame.timestamp = os_gettime_ns();
         obs_source_output_video(target, &obs_frame);
     }
     virtual void onRawDataStatusChanged(RawDataStatus status) override {}
@@ -315,8 +313,7 @@ public:
 // ---------------------------------------------------------------------------
 // SCREENSHARE GLOBALS
 // ---------------------------------------------------------------------------
-static obs_source_t* g_screenshareSource     = nullptr;
-static uint64_t      g_screenshare_timestamp = 0;
+static obs_source_t* g_screenshareSource = nullptr;
 
 class ZoomShareCatcher : public ZOOM_SDK_NAMESPACE::IZoomSDKRendererDelegate {
 public:
@@ -341,12 +338,8 @@ public:
                                     obs_frame.color_range_min,
                                     obs_frame.color_range_max);
 
-        uint64_t now = os_gettime_ns();
-        if (g_screenshare_timestamp == 0 ||
-            g_screenshare_timestamp < now - 100000000ULL)
-            g_screenshare_timestamp = now;
-        obs_frame.timestamp = g_screenshare_timestamp;
-        g_screenshare_timestamp += 33333333ULL;
+        // Use wall clock directly — same drift fix as ZoomVideoCatcher.
+        obs_frame.timestamp = os_gettime_ns();
         obs_source_output_video(g_screenshareSource, &obs_frame);
     }
     virtual void onRawDataStatusChanged(RawDataStatus status) override {}
@@ -428,7 +421,6 @@ public:
                 videoRenderer->setRawDataResolution(res);
             }
         }
-        videoCatcher.next_timestamp = 0;
         if (videoRenderer) {
             videoRenderer->unSubscribe();
             unsigned int effectiveId = (current_user_id == 1)
@@ -455,7 +447,6 @@ public:
                 QTimer::singleShot(600, [this, effectiveId]() {
                     if (videoRenderer && current_user_id != 0) {
                         videoRenderer->unSubscribe();
-                        videoCatcher.next_timestamp = 0;
                         videoRenderer->subscribe(
                             effectiveId,
                             ZOOM_SDK_NAMESPACE::RAW_DATA_TYPE_VIDEO);
