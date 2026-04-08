@@ -1566,7 +1566,6 @@ void* zs_create(obs_data_t* settings, obs_source_t* source) {
     obs_source_set_async_unbuffered(source, true);
     return new ZoomScreenshareSource(source);
 }
-}
 
 void zs_destroy(void* data) {
     if (data) delete static_cast<ZoomScreenshareSource*>(data);
