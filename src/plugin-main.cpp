@@ -89,6 +89,7 @@ static std::string g_accessToken;
 static std::string g_refreshToken;
 static std::string g_userDisplayName;
 static std::string g_userPMI;
+static bool        g_sessionExpiredShown = false;
 
 // ---------------------------------------------------------------------------
 // PKCE HELPERS
@@ -936,6 +937,7 @@ static void RunPKCEListener(std::string verifier) {
 
     g_accessToken  = accessToken;
     g_refreshToken = refreshToken;
+    g_sessionExpiredShown = false;
     SaveTokensToRegistry();
 
     QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
@@ -1117,6 +1119,8 @@ static std::string ZoomApiGet(const std::wstring& path) {
             body   = result.substr(result.find('|') + 1);
         } else {
             QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
+                if (g_sessionExpiredShown) return;
+                g_sessionExpiredShown = true;
                 g_isLoggedIn = false;
                 ClearTokensFromRegistry();
                 if (g_loginAction)   g_loginAction->setEnabled(true);
@@ -1126,6 +1130,7 @@ static std::string ZoomApiGet(const std::wstring& path) {
                     "Your Zoom login has expired and could not be renewed.\n\n"
                     "Please log in again.",
                     "Feeds - Session Expired", MB_OK | MB_ICONWARNING);
+                g_sessionExpiredShown = false;
             });
             return "";
         }
