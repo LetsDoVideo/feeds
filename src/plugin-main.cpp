@@ -269,6 +269,8 @@ void OnLoginClick();
 void OnLogoutClick();
 void OnConnectClick();
 void DoSDKAuth();
+static std::string ZoomApiGet(const std::wstring& path);
+static void FetchAndApplyEntitlement();
 
 // ---------------------------------------------------------------------------
 // PER-SOURCE VIDEO CATCHER
