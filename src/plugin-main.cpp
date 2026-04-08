@@ -222,7 +222,7 @@ static std::string ExchangeCodeForToken(const std::string& code,
 }
 
 // Minimal JSON string field extractor
-static std::string (const std::string& json,
+static std::string JsonExtractString(const std::string& json,
                                      const std::string& key) {
     std::string search = "\"" + key + "\"";
     size_t pos = json.find(search);
