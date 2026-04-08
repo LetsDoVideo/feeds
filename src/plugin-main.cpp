@@ -234,7 +234,18 @@ static std::string JsonExtractString(const std::string& json,
     if (end == std::string::npos) return "";
     return json.substr(pos, end - pos);
 }
-
+// Extract a numeric field from JSON (returned without quotes)
+static std::string JsonExtractNumber(const std::string& json,
+                                     const std::string& key) {
+    std::string search = "\"" + key + "\"";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return "";
+    pos = json.find_first_of("0123456789", pos + search.size());
+    if (pos == std::string::npos) return "";
+    size_t end = json.find_first_not_of("0123456789", pos);
+    return json.substr(pos, end == std::string::npos ? std::string::npos
+                                                      : end - pos);
+}
 // ---------------------------------------------------------------------------
 // FORWARD DECLARATIONS
 // ---------------------------------------------------------------------------
@@ -1157,7 +1168,7 @@ static bool FetchUserInfo(std::string& zak, std::string& displayName) {
     if (displayName.empty())
         displayName = JsonExtractString(userResponse, "first_name");
     g_userDisplayName = displayName;
-    g_userPMI         = JsonExtractString(userResponse, "pmi");
+    g_userPMI         = JsonExtractNumber(userResponse, "pmi");
 
     std::string zakResponse = ZoomApiGet(L"/v2/users/me/zak");
     zak = JsonExtractString(zakResponse, "token");
