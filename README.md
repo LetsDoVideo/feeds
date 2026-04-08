@@ -2,7 +2,7 @@
 
 **Pull individual Zoom participant video feeds directly into OBS Studio as dedicated sources.**
 
-https://github.com/user-attachments/assets/3b861b97-1134-487a-94b7-51a2d7d1844c
+https://github.com/user-attachments/assets/afe838b2-f571-47ee-a9d1-389b3247d3ed
 
 Feeds is a native Windows plugin for OBS Studio that uses the Zoom Meeting SDK to give broadcasters clean, isolated video feeds from each Zoom participant. No screen capturing, no grid layouts, just raw high-quality video piped directly into your OBS scene.
 
