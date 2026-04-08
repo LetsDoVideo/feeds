@@ -1550,6 +1550,7 @@ void* zp_create(obs_data_t* settings, obs_source_t* source) {
                     MB_OK | MB_ICONINFORMATION);
         return nullptr;
     }
+    obs_source_set_async_unbuffered(source, true);
     return new ZoomParticipantSource(source);
 }
 
@@ -1562,7 +1563,9 @@ void zp_update(void* data, obs_data_t* settings) {
 }
 
 void* zs_create(obs_data_t* settings, obs_source_t* source) {
+    obs_source_set_async_unbuffered(source, true);
     return new ZoomScreenshareSource(source);
+}
 }
 
 void zs_destroy(void* data) {
@@ -1581,7 +1584,7 @@ OBS_MODULE_USE_DEFAULT_LOCALE("feeds", "en-US")
 bool obs_module_load(void) {
     zoom_participant_info.id             = "zoom_participant_source";
     zoom_participant_info.type           = OBS_SOURCE_TYPE_INPUT;
-    zoom_participant_info.output_flags   = OBS_SOURCE_ASYNC_VIDEO | OBS_SOURCE_FLAG_UNBUFFERED;
+    zoom_participant_info.output_flags   = OBS_SOURCE_ASYNC_VIDEO;
     zoom_participant_info.get_name       = [](void*) { return "Zoom Participant"; };
     zoom_participant_info.create         = zp_create;
     zoom_participant_info.destroy        = zp_destroy;
@@ -1592,7 +1595,7 @@ bool obs_module_load(void) {
 
     zoom_screenshare_info.id             = "zoom_screenshare_source";
     zoom_screenshare_info.type           = OBS_SOURCE_TYPE_INPUT;
-    zoom_screenshare_info.output_flags   = OBS_SOURCE_ASYNC_VIDEO | OBS_SOURCE_FLAG_UNBUFFERED;
+    zoom_screenshare_info.output_flags   = OBS_SOURCE_ASYNC_VIDEO;
     zoom_screenshare_info.get_name       = [](void*) { return "Zoom Screenshare"; };
     zoom_screenshare_info.create         = zs_create;
     zoom_screenshare_info.destroy        = zs_destroy;
