@@ -1334,13 +1334,18 @@ void SetupPluginMenu(void) {
     QObject::connect(g_connectAction, &QAction::triggered,
                      []() { OnConnectClick(); });
     QObject::connect(aboutAction, &QAction::triggered, []() {
-        std::string info = "Feeds v0.1\n";
-        if (g_isLoggedIn && !g_userDisplayName.empty())
-            info += "Logged in as: " + g_userDisplayName + "\n";
-        else
-            info += "Not logged in\n";
-        info += "Tier: Basic\nStatus: Active";
-        MessageBoxA(NULL, info.c_str(), "About Feeds", MB_OK);
+        std::string tierName;
+        switch (g_currentTier) {
+            case 1:  tierName = "Basic";       break;
+            case 2:  tierName = "Streamer";    break;
+            case 3:  tierName = "Broadcaster"; break;
+            default: tierName = "Free";        break;
+        }
+        std::string aboutText = "Feeds v1.0\n";
+        if (!g_userDisplayName.empty())
+            aboutText += "Logged in as: " + g_userDisplayName + "\n";
+        aboutText += "Tier: " + tierName;
+        MessageBoxA(NULL, aboutText.c_str(), "About Feeds", MB_OK);
     });
 }
 
