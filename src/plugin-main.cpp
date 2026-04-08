@@ -234,6 +234,7 @@ static std::string JsonExtractString(const std::string& json,
     if (end == std::string::npos) return "";
     return json.substr(pos, end - pos);
 }
+
 // Extract a numeric field from JSON (returned without quotes)
 static std::string JsonExtractNumber(const std::string& json,
                                      const std::string& key) {
@@ -246,6 +247,21 @@ static std::string JsonExtractNumber(const std::string& json,
     return json.substr(pos, end == std::string::npos ? std::string::npos
                                                       : end - pos);
 }
+
+// Safe UTF-8 to wstring conversion (handles non-ASCII display names)
+static std::wstring Utf8ToWide(const std::string& utf8) {
+    if (utf8.empty()) return L"";
+    int needed = MultiByteToWideChar(CP_UTF8, 0,
+                                     utf8.c_str(), (int)utf8.size(),
+                                     nullptr, 0);
+    if (needed <= 0) return L"";
+    std::wstring result(needed, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0,
+                        utf8.c_str(), (int)utf8.size(),
+                        &result[0], needed);
+    return result;
+}
+
 // ---------------------------------------------------------------------------
 // FORWARD DECLARATIONS
 // ---------------------------------------------------------------------------
@@ -718,6 +734,21 @@ public:
         if (g_logoutAction)  g_logoutAction->setEnabled(true);
         if (g_connectAction) g_connectAction->setEnabled(true);
 
+        // Pre-fetch user info (display name + PMI) so it is ready before
+        // the user clicks Connect for the first time. ZAK is fetched fresh
+        // at connect time since ZAK tokens are short-lived.
+        std::thread([]() {
+            std::string userResponse = ZoomApiGet(L"/v2/users/me");
+            std::string displayName = JsonExtractString(userResponse, "display_name");
+            if (displayName.empty())
+                displayName = JsonExtractString(userResponse, "first_name");
+            g_userDisplayName = displayName;
+            g_userPMI         = JsonExtractNumber(userResponse, "pmi");
+
+            // Also apply entitlement tier at login time
+            FetchAndApplyEntitlement();
+        }).detach();
+
         // Refresh all open source properties panels
         for (ZoomParticipantSource* src : g_allParticipantSources) {
             if (src && src->source)
@@ -728,7 +759,7 @@ public:
 
         if (g_pendingMeetingJoin) {
             g_pendingMeetingJoin = false;
-            QTimer::singleShot(200, []() { OnConnectClick(); });
+            QTimer::singleShot(500, []() { OnConnectClick(); });
         }
     }
 
@@ -1135,18 +1166,13 @@ static std::string ZoomApiGet(const std::wstring& path) {
 // ---------------------------------------------------------------------------
 // FETCH AND APPLY MARKETPLACE ENTITLEMENT
 // Sets g_currentTier based on what the user has purchased.
-// DEBUG box shows raw response — remove once tier names confirmed.
+// Defaults to Free (0) if the app is not yet on the Marketplace or the
+// user has no paid entitlement.
 // ---------------------------------------------------------------------------
 static void FetchAndApplyEntitlement() {
     std::string response = ZoomApiGet(
         L"/v2/marketplace/users/me/entitlements"
         L"?app_id=JlP6KfRqTt6r0t67FcDuqQ");
-
-    // DEBUG: show raw response so we can verify field names
-    // Remove this MessageBoxA block once tier names are confirmed
-    MessageBoxA(NULL,
-        ("Entitlement response:\n" + response.substr(0, 400)).c_str(),
-        "Feeds - Entitlement Debug", MB_OK | MB_ICONINFORMATION);
 
     // Default to Free tier
     g_currentTier = 0;
@@ -1161,15 +1187,23 @@ static void FetchAndApplyEntitlement() {
 
 // ---------------------------------------------------------------------------
 // FETCH USER INFO (ZAK + display name + PMI) via Zoom REST API
+// Always fetches a fresh ZAK (short-lived token).
+// Skips the /v2/users/me call if display name and PMI are already cached
+// from the post-login pre-fetch, saving an API round-trip.
 // ---------------------------------------------------------------------------
 static bool FetchUserInfo(std::string& zak, std::string& displayName) {
-    std::string userResponse = ZoomApiGet(L"/v2/users/me");
-    displayName = JsonExtractString(userResponse, "display_name");
-    if (displayName.empty())
-        displayName = JsonExtractString(userResponse, "first_name");
-    g_userDisplayName = displayName;
-    g_userPMI         = JsonExtractNumber(userResponse, "pmi");
+    // Only call /v2/users/me if we don't already have the cached values
+    if (g_userDisplayName.empty() || g_userPMI.empty()) {
+        std::string userResponse = ZoomApiGet(L"/v2/users/me");
+        std::string fetchedName = JsonExtractString(userResponse, "display_name");
+        if (fetchedName.empty())
+            fetchedName = JsonExtractString(userResponse, "first_name");
+        g_userDisplayName = fetchedName;
+        g_userPMI         = JsonExtractNumber(userResponse, "pmi");
+    }
+    displayName = g_userDisplayName;
 
+    // Always fetch a fresh ZAK — these are short-lived
     std::string zakResponse = ZoomApiGet(L"/v2/users/me/zak");
     zak = JsonExtractString(zakResponse, "token");
 
@@ -1181,7 +1215,6 @@ static bool FetchUserInfo(std::string& zak, std::string& displayName) {
         return false;
     }
 
-    FetchAndApplyEntitlement();
     return true;
 }
 
@@ -1256,7 +1289,7 @@ void OnConnectClick() {
         if (!okPwd) return;
     }
 
-    // Fetch ZAK and display name
+    // Fetch a fresh ZAK token (and display name / PMI if not yet cached)
     std::string zak, displayName;
     if (!FetchUserInfo(zak, displayName))
         return;
@@ -1269,7 +1302,7 @@ void OnConnectClick() {
     param.isVideoOff = true;
 
     static std::wstring s_userName;
-    s_userName     = std::wstring(displayName.begin(), displayName.end());
+    s_userName     = Utf8ToWide(displayName);
     param.userName = s_userName.c_str();
 
     static std::wstring s_zak;
