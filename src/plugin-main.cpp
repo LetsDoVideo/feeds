@@ -1435,18 +1435,19 @@ static obs_properties_t* zp_properties(void* data) {
         obs_properties_add_button2(props, "refresh_btn",
             "Refresh Participant List",
             [](obs_properties_t*, obs_property_t*, void* data) -> bool {
-                ZoomParticipantSource* src =
-                    static_cast<ZoomParticipantSource*>(data);
-                if (src) {
-                    obs_data_t* settings =
-                        obs_source_get_settings(src->source);
-                    if (settings) {
-                        src->update(settings);
-                        obs_data_release(settings);
-                    }
-                }
-                return true;
-            }, src);
+    ZoomParticipantSource* src =
+        static_cast<ZoomParticipantSource*>(data);
+    if (src) {
+        obs_data_t* settings =
+            obs_source_get_settings(src->source);
+        if (settings) {
+            src->update(settings);
+            obs_data_release(settings);
+        }
+        obs_source_update_properties(src->source);
+    }
+    return true;
+}, src);
     }
 
     ZoomParticipantSource* src = static_cast<ZoomParticipantSource*>(data);
