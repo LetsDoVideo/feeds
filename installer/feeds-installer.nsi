@@ -41,6 +41,29 @@ SetCompressor /SOLID lzma
 !insertmacro MUI_LANGUAGE "English"
 
 ; ---------------------------------------------------------------------------
+; VC++ 2015-2022 REDISTRIBUTABLE CHECK
+; Silently installs the MSVC runtime if not already present.
+; The redist installer is bundled in the installer package.
+; ---------------------------------------------------------------------------
+Section "-VCRedist" SecVCRedist
+    ; Check if VC++ 2015-2022 x64 redist is already installed by looking
+    ; for the registry key it writes on install
+    ReadRegDWORD $0 HKLM "SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64" "Installed"
+    ${If} $0 == 1
+        ; Already installed — skip
+        Goto VCRedistDone
+    ${EndIf}
+
+    ; Not found — install silently
+    SetOutPath "$TEMP"
+    File "${ROOT_DIR}\redist\vc_redist.x64.exe"
+    ExecWait '"$TEMP\vc_redist.x64.exe" /install /quiet /norestart'
+    Delete "$TEMP\vc_redist.x64.exe"
+
+    VCRedistDone:
+SectionEnd
+
+; ---------------------------------------------------------------------------
 ; INSTALLER SECTIONS
 ; ---------------------------------------------------------------------------
 Section "Feeds Plugin" SecMain
