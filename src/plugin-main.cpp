@@ -72,6 +72,7 @@ static ZOOM_SDK_NAMESPACE::ZoomSDKResolution GetResolutionForTier() {
 // ---------------------------------------------------------------------------
 // GLOBALS
 // ---------------------------------------------------------------------------
+static bool     g_sdkInitialized       = false; // Set true after InitSDK succeeds
 static bool     g_rawLiveStreamGranted = false;
 static QAction* g_connectAction        = nullptr;
 static QAction* g_loginAction          = nullptr;
@@ -399,8 +400,14 @@ public:
         if (it != g_allParticipantSources.end())
             g_allParticipantSources.erase(it);
         if (videoRenderer) {
-            videoRenderer->unSubscribe();
-            ZOOM_SDK_NAMESPACE::destroyRenderer(videoRenderer);
+            // Guard against SDK being partially shut down during OBS exit.
+            // The SDK may have already freed internal state by the time
+            // zp_destroy is called, causing an access violation if we call
+            // through to it unguarded.
+            try {
+                videoRenderer->unSubscribe();
+                ZOOM_SDK_NAMESPACE::destroyRenderer(videoRenderer);
+            } catch (...) {}
             videoRenderer = nullptr;
         }
         videoCatcher.target = nullptr;
@@ -1435,19 +1442,19 @@ static obs_properties_t* zp_properties(void* data) {
         obs_properties_add_button2(props, "refresh_btn",
             "Refresh Participant List",
             [](obs_properties_t*, obs_property_t*, void* data) -> bool {
-    ZoomParticipantSource* src =
-        static_cast<ZoomParticipantSource*>(data);
-    if (src) {
-        obs_data_t* settings =
-            obs_source_get_settings(src->source);
-        if (settings) {
-            src->update(settings);
-            obs_data_release(settings);
-        }
-        obs_source_update_properties(src->source);
-    }
-    return true;
-}, src);
+                ZoomParticipantSource* src =
+                    static_cast<ZoomParticipantSource*>(data);
+                if (src) {
+                    obs_data_t* settings =
+                        obs_source_get_settings(src->source);
+                    if (settings) {
+                        src->update(settings);
+                        obs_data_release(settings);
+                    }
+                    obs_source_update_properties(src->source);
+                }
+                return true;
+            }, src);
     }
 
     ZoomParticipantSource* src = static_cast<ZoomParticipantSource*>(data);
@@ -1542,6 +1549,17 @@ static obs_properties_t* zs_properties(void* data) {
 // SOURCE CALLBACKS
 // ---------------------------------------------------------------------------
 void* zp_create(obs_data_t* settings, obs_source_t* source) {
+    // Guard against source creation before the Zoom SDK has finished
+    // initializing. On slower machines the SDK can take 2+ seconds to init,
+    // and if the user adds a source during that window the SDK call inside
+    // ZoomParticipantSource's constructor can crash.
+    if (!g_sdkInitialized) {
+        MessageBoxA(NULL,
+            "The Zoom SDK is still initializing. Please wait a moment and try again.",
+            "Feeds - Not Ready", MB_OK | MB_ICONINFORMATION);
+        return nullptr;
+    }
+
     if (g_activeParticipantSources >= GetMaxFeedsForTier()) {
         std::string msg = "Your current tier allows a maximum of " +
                           std::to_string(GetMaxFeedsForTier()) +
@@ -1564,6 +1582,8 @@ void zp_update(void* data, obs_data_t* settings) {
 }
 
 void* zs_create(obs_data_t* settings, obs_source_t* source) {
+    if (!g_sdkInitialized)
+        return nullptr;
     obs_source_set_async_unbuffered(source, true);
     return new ZoomScreenshareSource(source);
 }
@@ -1605,7 +1625,10 @@ bool obs_module_load(void) {
 
     ZOOM_SDK_NAMESPACE::InitParam initParam;
     initParam.strWebDomain = L"https://zoom.us";
-    ZOOM_SDK_NAMESPACE::InitSDK(initParam);
+    if (ZOOM_SDK_NAMESPACE::InitSDK(initParam) ==
+            ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
+        g_sdkInitialized = true;
+    }
 
     obs_frontend_add_event_callback([](enum obs_frontend_event event, void*) {
         if (event == OBS_FRONTEND_EVENT_FINISHED_LOADING) {
@@ -1620,9 +1643,12 @@ bool obs_module_load(void) {
 }
 
 void obs_module_unload(void) {
+    g_sdkInitialized = false;
     if (g_shareRenderer) {
-        g_shareRenderer->unSubscribe();
-        ZOOM_SDK_NAMESPACE::destroyRenderer(g_shareRenderer);
+        try {
+            g_shareRenderer->unSubscribe();
+            ZOOM_SDK_NAMESPACE::destroyRenderer(g_shareRenderer);
+        } catch (...) {}
         g_shareRenderer = nullptr;
     }
 }
