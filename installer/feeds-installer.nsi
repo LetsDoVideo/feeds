@@ -56,9 +56,9 @@ Section "-VCRedist" SecVCRedist
 
     ; Not found — install silently
     SetOutPath "$TEMP"
-    File "${ROOT_DIR}\redist\vc_redist.x64.exe"
-    ExecWait '"$TEMP\vc_redist.x64.exe" /install /quiet /norestart'
-    Delete "$TEMP\vc_redist.x64.exe"
+    File "${ROOT_DIR}\installer\VC_redist.x64.exe"
+    ExecWait '"$TEMP\VC_redist.x64.exe" /install /quiet /norestart'
+    Delete "$TEMP\VC_redist.x64.exe"
 
     VCRedistDone:
 SectionEnd
