@@ -13,6 +13,7 @@ jobs:
   build:
     name: Build Feeds
     runs-on: windows-latest
+    environment: release
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -67,7 +68,7 @@ jobs:
           Copy-Item "zoom-sdk/bin/language/*" -Destination "dist/bin/64bit/language/"
           New-Item -ItemType Directory -Force -Path "dist/bin/64bit/ringtone"
           Copy-Item "zoom-sdk/bin/ringtone/*" -Destination "dist/bin/64bit/ringtone/"
-      - name: Create ZIP Release
+      - name: Create ZIP
         shell: pwsh
         run: |
           Compress-Archive -Path "dist/*" -DestinationPath "Feeds-${{ github.ref_name }}-windows-x64.zip"
@@ -79,20 +80,29 @@ jobs:
           copy LICENSE installer\LICENSE
           "C:\Program Files (x86)\NSIS\makensis.exe" /DROOT_DIR="%CD%" installer\feeds-installer.nsi
           move installer\Feeds-Setup.exe Feeds-${{ github.ref_name }}-Setup.exe
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Feeds-${{ github.ref_name }}
+          path: |
+            Feeds-*-windows-x64.zip
+            Feeds-*-Setup.exe
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: Feeds-${{ github.ref_name }}
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            Feeds-${{ github.ref_name }}-windows-x64.zip
-            Feeds-${{ github.ref_name }}-Setup.exe
+            Feeds-*-windows-x64.zip
+            Feeds-*-Setup.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: Feeds
-          path: |
-            dist/
-            Feeds-*.zip
-            Feeds-*-Setup.exe
