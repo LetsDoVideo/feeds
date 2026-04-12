@@ -1,16 +1,13 @@
 name: Build and Release
-
 permissions:
   actions: read
   contents: write
   security-events: write
-
 on:
   push:
     branches: [ master, main ]
     tags:
       - 'v*'
-
 jobs:
   build:
     name: Build Feeds
@@ -20,10 +17,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
-
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@v2
-
       - name: Install Qt
         uses: jurplel/install-qt-action@v3
         with:
@@ -32,13 +27,25 @@ jobs:
           target: 'desktop'
           arch: 'win64_msvc2019_64'
           install-deps: 'true'
-
       - name: Configure and Build
         shell: cmd
         run: |
           cmake -B build -G "Visual Studio 17 2022" -A x64
           cmake --build build --config Release
-
+      - name: Sign Plugin
+        uses: azure/trusted-signing-action@v0.4.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: https://eus.codesigning.azure.net/
+          trusted-signing-account-name: feeds-signing
+          certificate-profile-name: feeds-signing
+          files-folder: ${{ github.workspace }}\build\Release
+          files-folder-filter: feeds.dll
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
       - name: Assemble Drop-in ZIP
         shell: pwsh
         run: |
@@ -46,38 +53,30 @@ jobs:
           New-Item -ItemType Directory -Force -Path "dist/obs-plugins/64bit"
           Copy-Item "build/Release/feeds.dll" -Destination "dist/obs-plugins/64bit/"
           Copy-Item "build/Release/feeds.pdb" -Destination "dist/obs-plugins/64bit/"
-
           # Locale file -> data/obs-plugins/iso-for-obs/locale/
           New-Item -ItemType Directory -Force -Path "dist/data/obs-plugins/feeds/locale"
           Copy-Item "data/locale/en-US.ini" -Destination "dist/data/obs-plugins/feeds/locale/"
-
           # Zoom SDK runtime files -> bin/64bit/ (flat)
           New-Item -ItemType Directory -Force -Path "dist/bin/64bit"
           Get-ChildItem "zoom-sdk/bin" -File | Copy-Item -Destination "dist/bin/64bit/"
-
           # Zoom SDK language subfolder -> bin/64bit/language/
           New-Item -ItemType Directory -Force -Path "dist/bin/64bit/language"
           Copy-Item "zoom-sdk/bin/language/*" -Destination "dist/bin/64bit/language/"
-
           # Zoom SDK ringtone subfolder -> bin/64bit/ringtone/
           New-Item -ItemType Directory -Force -Path "dist/bin/64bit/ringtone"
           Copy-Item "zoom-sdk/bin/ringtone/*" -Destination "dist/bin/64bit/ringtone/"
-          
       - name: Create ZIP Release
         shell: pwsh
         run: |
           Compress-Archive -Path "dist/*" -DestinationPath "Feeds-${{ github.ref_name }}-windows-x64.zip"
-
       - name: Install NSIS
         run: choco install nsis -y
-        
       - name: Build Installer
         shell: cmd
         run: |
           copy LICENSE installer\LICENSE
           "C:\Program Files (x86)\NSIS\makensis.exe" /DROOT_DIR="%CD%" installer\feeds-installer.nsi
           move installer\Feeds-Setup.exe Feeds-${{ github.ref_name }}-Setup.exe
-
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v1
@@ -86,8 +85,7 @@ jobs:
             Feeds-${{ github.ref_name }}-windows-x64.zip
             Feeds-${{ github.ref_name }}-Setup.exe
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 
-
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
