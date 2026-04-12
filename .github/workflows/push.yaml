@@ -80,6 +80,20 @@ jobs:
           copy LICENSE installer\LICENSE
           "C:\Program Files (x86)\NSIS\makensis.exe" /DROOT_DIR="%CD%" installer\feeds-installer.nsi
           move installer\Feeds-Setup.exe Feeds-${{ github.ref_name }}-Setup.exe
+      - name: Sign Installer
+        uses: azure/trusted-signing-action@v0.4.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          endpoint: https://eus.codesigning.azure.net/
+          trusted-signing-account-name: feeds-signing
+          certificate-profile-name: feeds-signing
+          files-folder: ${{ github.workspace }}
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
