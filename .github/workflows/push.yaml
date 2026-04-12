@@ -3,6 +3,7 @@ permissions:
   actions: read
   contents: write
   security-events: write
+  id-token: write
 on:
   push:
     branches: [ master, main ]
@@ -32,12 +33,18 @@ jobs:
         run: |
           cmake -B build -G "Visual Studio 17 2022" -A x64
           cmake --build build --config Release
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
       - name: Sign Plugin
         uses: azure/trusted-signing-action@v0.4.0
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          azure-subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           endpoint: https://eus.codesigning.azure.net/
           trusted-signing-account-name: feeds-signing
           certificate-profile-name: feeds-signing
@@ -49,20 +56,15 @@ jobs:
       - name: Assemble Drop-in ZIP
         shell: pwsh
         run: |
-          # Plugin files -> obs-plugins/64bit/
           New-Item -ItemType Directory -Force -Path "dist/obs-plugins/64bit"
           Copy-Item "build/Release/feeds.dll" -Destination "dist/obs-plugins/64bit/"
           Copy-Item "build/Release/feeds.pdb" -Destination "dist/obs-plugins/64bit/"
-          # Locale file -> data/obs-plugins/iso-for-obs/locale/
           New-Item -ItemType Directory -Force -Path "dist/data/obs-plugins/feeds/locale"
           Copy-Item "data/locale/en-US.ini" -Destination "dist/data/obs-plugins/feeds/locale/"
-          # Zoom SDK runtime files -> bin/64bit/ (flat)
           New-Item -ItemType Directory -Force -Path "dist/bin/64bit"
           Get-ChildItem "zoom-sdk/bin" -File | Copy-Item -Destination "dist/bin/64bit/"
-          # Zoom SDK language subfolder -> bin/64bit/language/
           New-Item -ItemType Directory -Force -Path "dist/bin/64bit/language"
           Copy-Item "zoom-sdk/bin/language/*" -Destination "dist/bin/64bit/language/"
-          # Zoom SDK ringtone subfolder -> bin/64bit/ringtone/
           New-Item -ItemType Directory -Force -Path "dist/bin/64bit/ringtone"
           Copy-Item "zoom-sdk/bin/ringtone/*" -Destination "dist/bin/64bit/ringtone/"
       - name: Create ZIP Release
