@@ -18,6 +18,7 @@
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "Advapi32.lib")
 
 // Qt Headers
 #include <QMainWindow>
@@ -801,52 +802,68 @@ static void StartPostConnectRefreshTimer() {
 }
 
 // ---------------------------------------------------------------------------
-// TOKEN PERSISTENCE via Windows Registry
+// TOKEN PERSISTENCE via Windows Credential Manager (DPAPI-protected)
+// Tokens are stored as generic credentials under the target name "Feeds".
+// Only the same Windows user account can read them back — DPAPI ensures
+// the data is encrypted at rest and tied to the user's login credentials.
 // ---------------------------------------------------------------------------
 static void SaveTokensToRegistry() {
-    HKEY hKey;
-    if (RegCreateKeyExA(HKEY_CURRENT_USER, "Software\\Feeds", 0, nullptr,
-                        REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr,
-                        &hKey, nullptr) != ERROR_SUCCESS)
-        return;
-    RegSetValueExA(hKey, "access_token", 0, REG_SZ,
-                   (const BYTE*)g_accessToken.c_str(),
-                   (DWORD)g_accessToken.size() + 1);
-    RegSetValueExA(hKey, "refresh_token", 0, REG_SZ,
-                   (const BYTE*)g_refreshToken.c_str(),
-                   (DWORD)g_refreshToken.size() + 1);
-    RegCloseKey(hKey);
+    // Store access token
+    {
+        std::string targetAccess = "Feeds_AccessToken";
+        CREDENTIALA cred = {};
+        cred.Type                 = CRED_TYPE_GENERIC;
+        cred.TargetName           = (LPSTR)targetAccess.c_str();
+        cred.CredentialBlobSize   = (DWORD)g_accessToken.size();
+        cred.CredentialBlob       = (LPBYTE)g_accessToken.data();
+        cred.Persist              = CRED_PERSIST_LOCAL_MACHINE;
+        CredWriteA(&cred, 0);
+    }
+    // Store refresh token
+    {
+        std::string targetRefresh = "Feeds_RefreshToken";
+        CREDENTIALA cred = {};
+        cred.Type                 = CRED_TYPE_GENERIC;
+        cred.TargetName           = (LPSTR)targetRefresh.c_str();
+        cred.CredentialBlobSize   = (DWORD)g_refreshToken.size();
+        cred.CredentialBlob       = (LPBYTE)g_refreshToken.data();
+        cred.Persist              = CRED_PERSIST_LOCAL_MACHINE;
+        CredWriteA(&cred, 0);
+    }
 }
 
 static bool LoadTokensFromRegistry() {
-    HKEY hKey;
-    if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Feeds", 0,
-                      KEY_READ, &hKey) != ERROR_SUCCESS)
-        return false;
-    char buf[4096];
-    DWORD size = sizeof(buf);
-    DWORD type = REG_SZ;
-    if (RegQueryValueExA(hKey, "access_token", nullptr, &type,
-                         (BYTE*)buf, &size) == ERROR_SUCCESS)
-        g_accessToken = std::string(buf, size - 1);
-    size = sizeof(buf);
-    if (RegQueryValueExA(hKey, "refresh_token", nullptr, &type,
-                         (BYTE*)buf, &size) == ERROR_SUCCESS)
-        g_refreshToken = std::string(buf, size - 1);
-    RegCloseKey(hKey);
-    return !g_accessToken.empty();
+    bool loaded = false;
+
+    // Load access token
+    {
+        PCREDENTIALA pCred = nullptr;
+        if (CredReadA("Feeds_AccessToken", CRED_TYPE_GENERIC, 0, &pCred)) {
+            g_accessToken = std::string(
+                (char*)pCred->CredentialBlob,
+                pCred->CredentialBlobSize);
+            CredFree(pCred);
+            loaded = true;
+        }
+    }
+    // Load refresh token
+    {
+        PCREDENTIALA pCred = nullptr;
+        if (CredReadA("Feeds_RefreshToken", CRED_TYPE_GENERIC, 0, &pCred)) {
+            g_refreshToken = std::string(
+                (char*)pCred->CredentialBlob,
+                pCred->CredentialBlobSize);
+            CredFree(pCred);
+        }
+    }
+
+    return loaded && !g_accessToken.empty();
 }
 
 static void ClearTokensFromRegistry() {
-    HKEY hKey;
-    if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Feeds", 0,
-                      KEY_WRITE, &hKey) != ERROR_SUCCESS)
-        return;
-    RegDeleteValueA(hKey, "access_token");
-    RegDeleteValueA(hKey, "refresh_token");
-    RegCloseKey(hKey);
+    CredDeleteA("Feeds_AccessToken",  CRED_TYPE_GENERIC, 0);
+    CredDeleteA("Feeds_RefreshToken", CRED_TYPE_GENERIC, 0);
 }
-
 // ---------------------------------------------------------------------------
 // SDK AUTH — called on Qt main thread after token exchange succeeds
 // ---------------------------------------------------------------------------
