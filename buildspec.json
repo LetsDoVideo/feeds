@@ -33,13 +33,13 @@
     },
     "platformConfig": {
         "macos": {
-            "bundleId": "com.letsdovideo.iso-for-obs"
+            "bundleId": "com.letsdovideo.feeds"
         }
     },
     "name": "feeds",
-    "displayName": "Feeds",
-    "version": "0.1.0",
+    "displayName": "Feeds - Isolated Feeds for OBS",
+    "version": "1.0.0",
     "author": "David Maldow / Let's Do Video",
-    "website": "https://letsdovideo.com/iso-for-obs-documentation/",
+    "website": "https://letsdovideo.com/feeds",
     "email": "david@letsdovideo.com"
 }
