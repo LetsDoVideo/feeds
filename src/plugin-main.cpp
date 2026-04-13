@@ -1610,7 +1610,7 @@ bool obs_module_load(void) {
     zoom_participant_info.destroy        = zp_destroy;
     zoom_participant_info.get_properties = zp_properties;
     zoom_participant_info.update         = zp_update;
-    zoom_participant_info.icon_type      = OBS_ICON_TYPE_CUSTOM;
+    zoom_participant_info.icon_type      = OBS_ICON_TYPE_CAMERA;
     obs_register_source(&zoom_participant_info);
 
     zoom_screenshare_info.id             = "zoom_screenshare_source";
@@ -1620,7 +1620,7 @@ bool obs_module_load(void) {
     zoom_screenshare_info.create         = zs_create;
     zoom_screenshare_info.destroy        = zs_destroy;
     zoom_screenshare_info.get_properties = zs_properties;
-    zoom_screenshare_info.icon_type      = OBS_ICON_TYPE_CUSTOM;
+    zoom_screenshare_info.icon_type      = OBS_ICON_TYPE_DESKTOP_CAPTURE;
     obs_register_source(&zoom_screenshare_info);
 
     ZOOM_SDK_NAMESPACE::InitParam initParam;
