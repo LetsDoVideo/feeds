@@ -14,6 +14,7 @@
 
 // Crypto for SHA-256 (Windows native, no OpenSSL needed)
 #include <wincrypt.h>
+#include <wincred.h>
 #include <winhttp.h>
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "winhttp.lib")
