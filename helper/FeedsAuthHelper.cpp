@@ -19,6 +19,10 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     code = full.substr(pos + 5);
     pos = code.find('&');
     if (pos != std::string::npos) code = code.substr(0, pos);
+    // Strip any trailing whitespace, CR, LF, or null characters
+while (!code.empty() && (code.back() == '\r' || code.back() == '\n' 
+       || code.back() == ' ' || code.back() == '\0' || code.back() == '#'))
+    code.pop_back();
 
     // Send code to named pipe
     HANDLE pipe = INVALID_HANDLE_VALUE;
