@@ -11,7 +11,7 @@ Feeds is a native Windows plugin for OBS Studio that uses the Zoom Meeting SDK t
 ## Requirements
 
 - Windows 10 or later (64-bit)
-- OBS Studio 29 or later
+- OBS Studio 32 or later
 - A Zoom account (Pro or higher recommended)
 - The Zoom meeting host must approve the livestream request when prompted
 
