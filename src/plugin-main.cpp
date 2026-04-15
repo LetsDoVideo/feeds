@@ -1603,7 +1603,7 @@ static void HandleFeedsAuthIfPresent() {
         std::wstring arg(argv[i]);
         // Look for --feeds-auth=CODE or feeds://CODE
         std::wstring prefix1 = L"--feeds-auth=";
-        std::wstring prefix2 = L"feeds://";
+        std::wstring prefix2 = L"ldvfeeds://";
         if (arg.substr(0, prefix1.size()) == prefix1) {
             std::wstring wcode = arg.substr(prefix1.size());
             code = std::string(wcode.begin(), wcode.end());
@@ -1695,7 +1695,7 @@ bool obs_module_load(void) {
     std::string command = "\"" + obsExe + "\" \"--feeds-auth=%1\"";
 
     HKEY hKey;
-    RegCreateKeyExA(HKEY_CURRENT_USER, "Software\\Classes\\feeds",
+    RegCreateKeyExA(HKEY_CURRENT_USER, "Software\\Classes\\ldvfeeds",
         0, nullptr, 0, KEY_WRITE, nullptr, &hKey, nullptr);
     RegSetValueExA(hKey, "", 0, REG_SZ,
         (BYTE*)"URL:Feeds Protocol", 19);
@@ -1704,7 +1704,7 @@ bool obs_module_load(void) {
     RegCloseKey(hKey);
 
     RegCreateKeyExA(HKEY_CURRENT_USER,
-        "Software\\Classes\\feeds\\shell\\open\\command",
+        "Software\\Classes\\ldvfeeds\\shell\\open\\command",
         0, nullptr, 0, KEY_WRITE, nullptr, &hKey, nullptr);
     RegSetValueExA(hKey, "", 0, REG_SZ,
         (BYTE*)command.c_str(), (DWORD)command.size() + 1);
