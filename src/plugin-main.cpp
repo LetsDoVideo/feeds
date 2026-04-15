@@ -884,17 +884,32 @@ void DoSDKAuth() {
 // to deliver the auth code via a named pipe, then completes token exchange.
 // ---------------------------------------------------------------------------
 static void RunNamedPipeListener(std::string verifier) {
+SECURITY_ATTRIBUTES sa = {};
+    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+    sa.bInheritHandle = FALSE;
+    sa.lpSecurityDescriptor = nullptr;
+
     HANDLE pipe = CreateNamedPipeA(
         "\\\\.\\pipe\\FeedsAuth",
         PIPE_ACCESS_INBOUND,
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-        1,       // max instances
-        256,     // out buffer
-        256,     // in buffer
-        300000,  // 5 minute timeout
-        nullptr
+        1,
+        256,
+        256,
+        300000,
+        &sa
     );
-
+if (pipe == INVALID_HANDLE_VALUE) {
+        DWORD err = GetLastError();
+        std::string errMsg = "Could not create auth pipe for Zoom login.\nError code: " + 
+                             std::to_string(err) + "\nPlease try again.";
+        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), [errMsg]() {
+            MessageBoxA(NULL, errMsg.c_str(),
+                "Feeds - Login Error", MB_OK | MB_ICONERROR);
+            if (g_loginAction) g_loginAction->setEnabled(true);
+        });
+        return;
+    }
     if (pipe == INVALID_HANDLE_VALUE) {
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
             MessageBoxA(NULL, "Could not create auth pipe for Zoom login.\nPlease try again.",
