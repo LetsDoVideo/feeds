@@ -66,3 +66,5 @@ if(MSVC)
         OPTIONAL
     )
 endif()
+
+add_executable(FeedsAuthHelper WIN32 helper/FeedsAuthHelper.cpp)
