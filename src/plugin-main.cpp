@@ -935,6 +935,7 @@ if (pipe == INVALID_HANDLE_VALUE) {
     CloseHandle(pipe);
 
     std::string code(buf, bytesRead);
+    MessageBoxA(NULL, ("Code received: [" + code + "]\nLength: " + std::to_string(code.size())).c_str(), "Feeds - Debug", MB_OK);
 
     if (code.empty()) {
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
