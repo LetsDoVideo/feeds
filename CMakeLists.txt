@@ -69,8 +69,42 @@ endif()
 
 add_executable(FeedsLogin WIN32 helper/FeedsAuthHelper.cpp)
 
-add_library(libcurl_proxy SHARED proxy/libcurl_proxy.cpp)
-set_target_properties(libcurl_proxy PROPERTIES
-    OUTPUT_NAME "libcurl"
-    LINK_FLAGS "/DEF:\"${CMAKE_CURRENT_SOURCE_DIR}/proxy/libcurl_proxy.def\""
+# Generate import libs from the bundled curl DLLs so the proxy can link
+add_custom_command(
+    OUTPUT ${CMAKE_BINARY_DIR}/libcurl_obs.lib ${CMAKE_BINARY_DIR}/libcurl_zoom.lib
+    COMMAND lib /def:"${CMAKE_CURRENT_SOURCE_DIR}/proxy/libcurl_obs.def" /out:"${CMAKE_BINARY_DIR}/libcurl_obs.lib" /machine:x64
+    COMMAND lib /def:"${CMAKE_CURRENT_SOURCE_DIR}/proxy/libcurl_zoom.def" /out:"${CMAKE_BINARY_DIR}/libcurl_zoom.lib" /machine:x64
+    DEPENDS
+        ${CMAKE_CURRENT_SOURCE_DIR}/proxy/libcurl_obs.def
+        ${CMAKE_CURRENT_SOURCE_DIR}/proxy/libcurl_zoom.def
 )
+add_custom_target(curl_import_libs DEPENDS
+    ${CMAKE_BINARY_DIR}/libcurl_obs.lib
+    ${CMAKE_BINARY_DIR}/libcurl_zoom.lib
+)
+
+add_library(libcurl_proxy SHARED proxy/libcurl_proxy.cpp proxy/libcurl_proxy.def)
+add_dependencies(libcurl_proxy curl_import_libs)
+add_executable(FeedsLogin WIN32 helper/FeedsAuthHelper.cpp)
+
+# Generate import libs from the bundled curl DLLs so the proxy can link
+add_custom_command(
+    OUTPUT ${CMAKE_BINARY_DIR}/libcurl_obs.lib ${CMAKE_BINARY_DIR}/libcurl_zoom.lib
+    COMMAND lib /def:"${CMAKE_CURRENT_SOURCE_DIR}/proxy/libcurl_obs.def" /out:"${CMAKE_BINARY_DIR}/libcurl_obs.lib" /machine:x64
+    COMMAND lib /def:"${CMAKE_CURRENT_SOURCE_DIR}/proxy/libcurl_zoom.def" /out:"${CMAKE_BINARY_DIR}/libcurl_zoom.lib" /machine:x64
+    DEPENDS
+        ${CMAKE_CURRENT_SOURCE_DIR}/proxy/libcurl_obs.def
+        ${CMAKE_CURRENT_SOURCE_DIR}/proxy/libcurl_zoom.def
+)
+add_custom_target(curl_import_libs DEPENDS
+    ${CMAKE_BINARY_DIR}/libcurl_obs.lib
+    ${CMAKE_BINARY_DIR}/libcurl_zoom.lib
+)
+
+add_library(libcurl_proxy SHARED proxy/libcurl_proxy.cpp proxy/libcurl_proxy.def)
+add_dependencies(libcurl_proxy curl_import_libs)
+target_link_libraries(libcurl_proxy PRIVATE
+    ${CMAKE_BINARY_DIR}/libcurl_obs.lib
+    ${CMAKE_BINARY_DIR}/libcurl_zoom.lib
+)
+set_target_properties(libcurl_proxy PROPERTIES OUTPUT_NAME "libcurl")
