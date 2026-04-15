@@ -200,9 +200,7 @@ static std::string ExchangeCodeForToken(const std::string& code,
     WinHttpAddRequestHeaders(hRequest,
         L"Content-Type: application/x-www-form-urlencoded",
         (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
-    
-    MessageBoxA(NULL, ("POST body:\n" + body).c_str(), "Feeds - Token Debug", MB_OK);
-    
+          
     WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                        (LPVOID)body.c_str(), (DWORD)body.size(),
                        (DWORD)body.size(), 0);
@@ -937,8 +935,7 @@ if (pipe == INVALID_HANDLE_VALUE) {
     CloseHandle(pipe);
 
     std::string code(buf, bytesRead);
-    MessageBoxA(NULL, ("Code received: [" + code + "]\nLength: " + std::to_string(code.size())).c_str(), "Feeds - Debug", MB_OK);
-
+   
     if (code.empty()) {
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
             MessageBoxA(NULL, "Login was cancelled or the authorization code was missing.\nPlease try again.",
