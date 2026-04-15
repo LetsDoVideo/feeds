@@ -1,4 +1,4 @@
-LIBRARY libcurl_obs
+LIBRARY libcurl
 EXPORTS
     curl_easy_cleanup
     curl_easy_duphandle
@@ -96,3 +96,12 @@ EXPORTS
     curl_ws_meta
     curl_ws_recv
     curl_ws_send
+    Curl_hostcheck
+    Curl_ssl_init_certinfo
+    Curl_ssl_push_certinfo_len
+    curl_global_init_for_zoom
+    curl_multi_get_offt
+    curl_multi_notify_disable
+    curl_multi_notify_enable
+    curl_websocket_conn_cleanup
+    curl_ws_start_frame
