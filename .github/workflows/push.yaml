@@ -50,7 +50,7 @@ jobs:
           trusted-signing-account-name: feeds-signing
           certificate-profile-name: feeds-signing
           files-folder: ${{ github.workspace }}\build\Release
-          files-folder-filter: feeds.dll
+          files-folder-filter: dll,exe
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
@@ -68,6 +68,7 @@ jobs:
           Copy-Item "zoom-sdk/bin/language/*" -Destination "dist/bin/64bit/language/"
           New-Item -ItemType Directory -Force -Path "dist/bin/64bit/ringtone"
           Copy-Item "zoom-sdk/bin/ringtone/*" -Destination "dist/bin/64bit/ringtone/"
+          Copy-Item "build/Release/FeedsAuthHelper.exe" -Destination "dist/bin/64bit/"
       - name: Create ZIP
         shell: pwsh
         run: |
