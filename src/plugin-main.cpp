@@ -1587,65 +1587,7 @@ void* zs_create(obs_data_t* settings, obs_source_t* source) {
 void zs_destroy(void* data) {
     if (data) delete static_cast<ZoomScreenshareSource*>(data);
 }
-// ---------------------------------------------------------------------------
-// FEEDS AUTH HANDLER
-// Called at plugin load time. If OBS was launched with --feeds-auth=CODE
-// (by the feeds:// protocol handler), extract the code and send it to the
-// existing OBS instance via named pipe, then signal OBS to exit.
-// ---------------------------------------------------------------------------
-static void HandleFeedsAuthIfPresent() {
-    int argc = 0;
-    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    if (!argv) return;
 
-    std::string code;
-    for (int i = 1; i < argc; i++) {
-        std::wstring arg(argv[i]);
-        // Look for --feeds-auth=CODE or feeds://CODE
-        std::wstring prefix1 = L"--feeds-auth=";
-        std::wstring prefix2 = L"ldvfeeds://";
-        if (arg.substr(0, prefix1.size()) == prefix1) {
-            std::wstring wcode = arg.substr(prefix1.size());
-            code = std::string(wcode.begin(), wcode.end());
-            break;
-        }
-        if (arg.substr(0, prefix2.size()) == prefix2) {
-            // feeds://callback?code=XXX  or  feeds://XXX
-            std::string full(arg.begin(), arg.end());
-            size_t pos = full.find("code=");
-            if (pos != std::string::npos)
-                code = full.substr(pos + 5);
-            // strip any trailing & params
-            pos = code.find('&');
-            if (pos != std::string::npos)
-                code = code.substr(0, pos);
-            break;
-        }
-    }
-    LocalFree(argv);
-
-    if (code.empty()) return;
-
-    // We are the second instance — send code to existing instance via pipe
-    HANDLE pipe = INVALID_HANDLE_VALUE;
-    for (int attempt = 0; attempt < 10; attempt++) {
-        pipe = CreateFileA(
-            "\\\\.\\pipe\\FeedsAuth",
-            GENERIC_WRITE, 0, nullptr,
-            OPEN_EXISTING, 0, nullptr);
-        if (pipe != INVALID_HANDLE_VALUE) break;
-        Sleep(500);
-    }
-
-    if (pipe != INVALID_HANDLE_VALUE) {
-        DWORD written = 0;
-        WriteFile(pipe, code.c_str(), (DWORD)code.size(), &written, nullptr);
-        CloseHandle(pipe);
-    }
-
-    // Exit this second OBS instance
-    ExitProcess(0);
-}
 // ---------------------------------------------------------------------------
 // SOURCE INFO STRUCTS
 // ---------------------------------------------------------------------------
@@ -1656,7 +1598,6 @@ OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("feeds", "en-US")
 
 bool obs_module_load(void) {
-    HandleFeedsAuthIfPresent();
     zoom_participant_info.id             = "zoom_participant_source";
     zoom_participant_info.type           = OBS_SOURCE_TYPE_INPUT;
     zoom_participant_info.output_flags   = OBS_SOURCE_ASYNC_VIDEO;
@@ -1689,10 +1630,10 @@ bool obs_module_load(void) {
     char pluginPath[MAX_PATH] = {};
     GetModuleFileNameA(nullptr, pluginPath, MAX_PATH);
     std::string obsPath(pluginPath);
-    // pluginPath is obs64.exe itself since we're loaded inside it
-    std::string obsExe = obsPath;
-
-    std::string command = "\"" + obsExe + "\" \"--feeds-auth=%1\"";
+    // obs64.exe is at bin/64bit/, FeedsAuthHelper.exe is also at bin/64bit/
+    size_t binPos = obsPath.rfind("obs64.exe");
+    std::string helperExe = obsPath.substr(0, binPos) + "FeedsAuthHelper.exe";
+    std::string command = "\"" + helperExe + "\" \"%1\"";
 
     HKEY hKey;
     RegCreateKeyExA(HKEY_CURRENT_USER, "Software\\Classes\\ldvfeeds",
