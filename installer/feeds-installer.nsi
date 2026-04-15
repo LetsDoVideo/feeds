@@ -6,7 +6,6 @@
 !define PRODUCT_PUBLISHER "LetsDoVideo"
 !define PRODUCT_WEB_SITE "https://letsdovideo.com/feeds"
 !define PRODUCT_UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\Feeds-OBS"
-!define FEEDS_REG_KEY "Software\LetsDoVideo\Feeds"
 
 ; Modern UI
 !include "MUI2.nsh"
@@ -123,11 +122,10 @@ Section "Uninstall"
 
     ; Remove registry entries
     DeleteRegKey HKLM "${PRODUCT_UNINST_KEY}"
+    DeleteRegKey HKCU "Software\Classes\feeds"
 
-    ; Remove stored tokens (user data) - optional, ask user
-    MessageBox MB_YESNO "Remove saved Zoom login credentials?" IDNO SkipTokens
-        DeleteRegKey HKCU "${FEEDS_REG_KEY}"
-    SkipTokens:
+    ; Remove stored tokens from Windows Credential Manager
+        ; (credentials are stored as Feeds_AccessToken and Feeds_RefreshToken)
 
     ; Note: We do NOT remove Zoom SDK DLLs from bin/64bit as other
     ; apps may depend on them
