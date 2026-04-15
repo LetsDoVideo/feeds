@@ -1,5 +1,3 @@
-#include <winsock2.h>
-#include <ws2tcpip.h>
 #include <obs-module.h>
 #include <obs-frontend-api.h>
 #include <util/platform.h>
@@ -18,7 +16,6 @@
 #include <winhttp.h>
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "winhttp.lib")
-#pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "Advapi32.lib")
 
 // Qt Headers
@@ -184,7 +181,7 @@ static std::string ExchangeCodeForToken(const std::string& code,
         std::string("grant_type=authorization_code") +
         "&code="          + UrlEncode(code) +
         "&client_id=JlP6KfRqTt6r0t67FcDuqQ" +
-        "&redirect_uri="  + UrlEncode("http://localhost:9847/callback") +
+        "&redirect_uri="  + UrlEncode("https://letsdovideo.com/loginsuccess") +
         "&code_verifier=" + UrlEncode(verifier);
 
     HINTERNET hSession = WinHttpOpen(L"Feeds/1.0",
@@ -882,83 +879,51 @@ void DoSDKAuth() {
 }
 
 // ---------------------------------------------------------------------------
-// PKCE LOCALHOST LISTENER
-// Runs on a background thread. Waits for Zoom to redirect to
-// http://localhost:9847/callback?code=... then extracts the code,
-// exchanges it for a token, and fires DoSDKAuth() on the Qt main thread.
+// NAMED PIPE LISTENER
+// Runs on a background thread. Waits for the feeds:// protocol handler
+// to deliver the auth code via a named pipe, then completes token exchange.
 // ---------------------------------------------------------------------------
-static void RunPKCEListener(std::string verifier) {
-    WSADATA wsa;
-    WSAStartup(MAKEWORD(2, 2), &wsa);
+static void RunNamedPipeListener(std::string verifier) {
+    HANDLE pipe = CreateNamedPipeA(
+        "\\\\.\\pipe\\FeedsAuth",
+        PIPE_ACCESS_INBOUND,
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+        1,       // max instances
+        256,     // out buffer
+        256,     // in buffer
+        300000,  // 5 minute timeout
+        nullptr
+    );
 
-    SOCKET listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (listenSock == INVALID_SOCKET) { WSACleanup(); return; }
-
-    int opt = 1;
-    setsockopt(listenSock, SOL_SOCKET, SO_REUSEADDR,
-               (const char*)&opt, sizeof(opt));
-
-    sockaddr_in addr = {};
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port        = htons(9847);
-
-    if (bind(listenSock, (sockaddr*)&addr, sizeof(addr)) != 0 ||
-        listen(listenSock, 1) != 0) {
-        closesocket(listenSock);
-        WSACleanup();
+    if (pipe == INVALID_HANDLE_VALUE) {
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
-            MessageBoxA(NULL,
-                "Could not open local port 9847 for Zoom login.\n"
-                "Another application may be using it. Please try again.",
+            MessageBoxA(NULL, "Could not create auth pipe for Zoom login.\nPlease try again.",
                 "Feeds - Login Error", MB_OK | MB_ICONERROR);
             if (g_loginAction) g_loginAction->setEnabled(true);
         });
         return;
     }
 
-    // 5-minute timeout — if user abandons the browser, thread exits cleanly
-    DWORD timeout = 300000;
-    setsockopt(listenSock, SOL_SOCKET, SO_RCVTIMEO,
-               (const char*)&timeout, sizeof(timeout));
-
-    SOCKET clientSock = accept(listenSock, nullptr, nullptr);
-    closesocket(listenSock);
-
-    if (clientSock == INVALID_SOCKET) {
-        WSACleanup();
+    // Wait for protocol handler to connect (5 min timeout via pipe settings)
+    BOOL connected = ConnectNamedPipe(pipe, nullptr);
+    if (!connected && GetLastError() != ERROR_PIPE_CONNECTED) {
+        CloseHandle(pipe);
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
             if (g_loginAction) g_loginAction->setEnabled(true);
         });
         return;
     }
 
-    // Read the HTTP request line
-    char buf[4096] = {};
-    recv(clientSock, buf, sizeof(buf) - 1, 0);
+    char buf[512] = {};
+    DWORD bytesRead = 0;
+    ReadFile(pipe, buf, sizeof(buf) - 1, &bytesRead, nullptr);
+    CloseHandle(pipe);
 
-    const char* httpResponse =
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: text/html\r\n"
-        "Connection: close\r\n\r\n"
-        "<html><body style='font-family:sans-serif;text-align:center;"
-        "margin-top:80px'>"
-        "<h2>&#10003; Successfully connected to Zoom!</h2>"
-        "<p>Your Zoom account is now linked to Feeds. "
-        "You can close this tab and return to OBS.</p>"
-        "</body></html>";
-    send(clientSock, httpResponse, (int)strlen(httpResponse), 0);
-    closesocket(clientSock);
-    WSACleanup();
-
-    std::string request(buf);
-    std::string code = ExtractQueryParam(request, "code");
+    std::string code(buf, bytesRead);
 
     if (code.empty()) {
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
-            MessageBoxA(NULL,
-                "Login was cancelled or the authorization code was missing.\n"
-                "Please try again.",
+            MessageBoxA(NULL, "Login was cancelled or the authorization code was missing.\nPlease try again.",
                 "Feeds - Login", MB_OK | MB_ICONWARNING);
             if (g_loginAction) g_loginAction->setEnabled(true);
         });
@@ -972,10 +937,8 @@ static void RunPKCEListener(std::string verifier) {
     if (accessToken.empty()) {
         std::string errMsg = "Token exchange failed.\n\nServer response:\n" +
                              tokenResponse.substr(0, 300);
-        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
-                           [errMsg]() {
-            MessageBoxA(NULL, errMsg.c_str(),
-                        "Feeds - Login Error", MB_OK | MB_ICONERROR);
+        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), [errMsg]() {
+            MessageBoxA(NULL, errMsg.c_str(), "Feeds - Login Error", MB_OK | MB_ICONERROR);
             if (g_loginAction) g_loginAction->setEnabled(true);
         });
         return;
@@ -1008,7 +971,7 @@ void OnLoginClick() {
         std::string("https://zoom.us/oauth/authorize") +
         "?response_type=code" +
         "&client_id=JlP6KfRqTt6r0t67FcDuqQ" +
-        "&redirect_uri="          + UrlEncode("http://localhost:9847/callback") +
+        "&redirect_uri="          + UrlEncode("https://letsdovideo.com/loginsuccess") +
         "&code_challenge="        + challenge +
         "&code_challenge_method=S256" +
         "&prompt=consent";
@@ -1017,8 +980,8 @@ void OnLoginClick() {
 
     std::string verifier = g_pkceVerifier;
     std::thread([verifier]() {
-        RunPKCEListener(verifier);
-    }).detach();
+    RunNamedPipeListener(verifier);
+}).detach();
 }
 
 // ---------------------------------------------------------------------------
@@ -1609,7 +1572,65 @@ void* zs_create(obs_data_t* settings, obs_source_t* source) {
 void zs_destroy(void* data) {
     if (data) delete static_cast<ZoomScreenshareSource*>(data);
 }
+// ---------------------------------------------------------------------------
+// FEEDS AUTH HANDLER
+// Called at plugin load time. If OBS was launched with --feeds-auth=CODE
+// (by the feeds:// protocol handler), extract the code and send it to the
+// existing OBS instance via named pipe, then signal OBS to exit.
+// ---------------------------------------------------------------------------
+static void HandleFeedsAuthIfPresent() {
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv) return;
 
+    std::string code;
+    for (int i = 1; i < argc; i++) {
+        std::wstring arg(argv[i]);
+        // Look for --feeds-auth=CODE or feeds://CODE
+        std::wstring prefix1 = L"--feeds-auth=";
+        std::wstring prefix2 = L"feeds://";
+        if (arg.substr(0, prefix1.size()) == prefix1) {
+            std::wstring wcode = arg.substr(prefix1.size());
+            code = std::string(wcode.begin(), wcode.end());
+            break;
+        }
+        if (arg.substr(0, prefix2.size()) == prefix2) {
+            // feeds://callback?code=XXX  or  feeds://XXX
+            std::string full(arg.begin(), arg.end());
+            size_t pos = full.find("code=");
+            if (pos != std::string::npos)
+                code = full.substr(pos + 5);
+            // strip any trailing & params
+            pos = code.find('&');
+            if (pos != std::string::npos)
+                code = code.substr(0, pos);
+            break;
+        }
+    }
+    LocalFree(argv);
+
+    if (code.empty()) return;
+
+    // We are the second instance — send code to existing instance via pipe
+    HANDLE pipe = INVALID_HANDLE_VALUE;
+    for (int attempt = 0; attempt < 10; attempt++) {
+        pipe = CreateFileA(
+            "\\\\.\\pipe\\FeedsAuth",
+            GENERIC_WRITE, 0, nullptr,
+            OPEN_EXISTING, 0, nullptr);
+        if (pipe != INVALID_HANDLE_VALUE) break;
+        Sleep(500);
+    }
+
+    if (pipe != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        WriteFile(pipe, code.c_str(), (DWORD)code.size(), &written, nullptr);
+        CloseHandle(pipe);
+    }
+
+    // Exit this second OBS instance
+    ExitProcess(0);
+}
 // ---------------------------------------------------------------------------
 // SOURCE INFO STRUCTS
 // ---------------------------------------------------------------------------
@@ -1620,6 +1641,7 @@ OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("feeds", "en-US")
 
 bool obs_module_load(void) {
+    HandleFeedsAuthIfPresent();
     zoom_participant_info.id             = "zoom_participant_source";
     zoom_participant_info.type           = OBS_SOURCE_TYPE_INPUT;
     zoom_participant_info.output_flags   = OBS_SOURCE_ASYNC_VIDEO;
@@ -1646,6 +1668,32 @@ bool obs_module_load(void) {
     if (ZOOM_SDK_NAMESPACE::InitSDK(initParam) ==
             ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
         g_sdkInitialized = true;
+    // Register feeds:// protocol handler pointing at obs64.exe
+    // Plugin knows its own path, obs64.exe is always at ../../bin/64bit/obs64.exe
+    // relative to the plugin at obs-plugins/64bit/feeds.dll
+    char pluginPath[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, pluginPath, MAX_PATH);
+    std::string obsPath(pluginPath);
+    // pluginPath is obs64.exe itself since we're loaded inside it
+    std::string obsExe = obsPath;
+
+    std::string command = "\"" + obsExe + "\" \"--feeds-auth=%1\"";
+
+    HKEY hKey;
+    RegCreateKeyExA(HKEY_CURRENT_USER, "Software\\Classes\\feeds",
+        0, nullptr, 0, KEY_WRITE, nullptr, &hKey, nullptr);
+    RegSetValueExA(hKey, "", 0, REG_SZ,
+        (BYTE*)"URL:Feeds Protocol", 19);
+    RegSetValueExA(hKey, "URL Protocol", 0, REG_SZ,
+        (BYTE*)"", 1);
+    RegCloseKey(hKey);
+
+    RegCreateKeyExA(HKEY_CURRENT_USER,
+        "Software\\Classes\\feeds\\shell\\open\\command",
+        0, nullptr, 0, KEY_WRITE, nullptr, &hKey, nullptr);
+    RegSetValueExA(hKey, "", 0, REG_SZ,
+        (BYTE*)command.c_str(), (DWORD)command.size() + 1);
+    RegCloseKey(hKey);
     }
 
     obs_frontend_add_event_callback([](enum obs_frontend_event event, void*) {
