@@ -200,7 +200,9 @@ static std::string ExchangeCodeForToken(const std::string& code,
     WinHttpAddRequestHeaders(hRequest,
         L"Content-Type: application/x-www-form-urlencoded",
         (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
-
+    
+    MessageBoxA(NULL, ("POST body:\n" + body).c_str(), "Feeds - Token Debug", MB_OK);
+    
     WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                        (LPVOID)body.c_str(), (DWORD)body.size(),
                        (DWORD)body.size(), 0);
