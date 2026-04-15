@@ -78,12 +78,6 @@ Section "Feeds Plugin" SecMain
     SetOutPath "$INSTDIR\data\obs-plugins\feeds\locale"
     File "${ROOT_DIR}\dist\data\obs-plugins\feeds\locale\en-US.ini"
 
-    ; Rename OBS's libcurl.dll to libcurl_obs.dll before dropping our files.
-    ; Our proxy libcurl.dll will forward standard curl calls to libcurl_obs.dll
-    ; and Zoom-specific calls to libcurl_zoom.dll, allowing both OBS (YouTube
-    ; etc.) and the Zoom SDK to use their own libcurl builds without conflict.
-    Rename "$INSTDIR\bin\64bit\libcurl.dll" "$INSTDIR\bin\64bit\libcurl_obs.dll"
-
     ; Zoom SDK runtime DLLs and proxy -> bin/64bit/
     SetOutPath "$INSTDIR\bin\64bit"
     File "${ROOT_DIR}\dist\bin\64bit\*.dll"
@@ -127,7 +121,7 @@ Section "Uninstall"
     Delete "$INSTDIR\bin\64bit\libcurl.dll"
     Delete "$INSTDIR\bin\64bit\libcurl_zoom.dll"
     Rename "$INSTDIR\bin\64bit\libcurl_obs.dll" "$INSTDIR\bin\64bit\libcurl.dll"
-
+    
     ; Remove uninstaller
     Delete "$INSTDIR\Feeds-Uninstall.exe"
 
