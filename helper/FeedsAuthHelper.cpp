@@ -10,7 +10,9 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     LocalFree(argv);
 
     // Extract code from ldvfeeds://callback?code=XXX
-    std::string full(arg.begin(), arg.end());
+    int len = WideCharToMultiByte(CP_UTF8, 0, arg.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    std::string full(len, 0);
+    WideCharToMultiByte(CP_UTF8, 0, arg.c_str(), -1, &full[0], len, nullptr, nullptr);
     std::string code;
     size_t pos = full.find("code=");
     if (pos == std::string::npos) return 1;
