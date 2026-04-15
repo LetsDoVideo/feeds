@@ -68,3 +68,9 @@ if(MSVC)
 endif()
 
 add_executable(FeedsLogin WIN32 helper/FeedsAuthHelper.cpp)
+
+add_library(libcurl_proxy SHARED proxy/libcurl_proxy.cpp)
+set_target_properties(libcurl_proxy PROPERTIES
+    OUTPUT_NAME "libcurl"
+    LINK_FLAGS "/DEF:\"${CMAKE_CURRENT_SOURCE_DIR}/proxy/libcurl_proxy.def\""
+)
