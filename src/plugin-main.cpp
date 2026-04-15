@@ -1630,9 +1630,9 @@ bool obs_module_load(void) {
     char pluginPath[MAX_PATH] = {};
     GetModuleFileNameA(nullptr, pluginPath, MAX_PATH);
     std::string obsPath(pluginPath);
-    // obs64.exe is at bin/64bit/, FeedsAuthHelper.exe is also at bin/64bit/
+    // obs64.exe is at bin/64bit/, FeedsLogin.exe is also at bin/64bit/
     size_t binPos = obsPath.rfind("obs64.exe");
-    std::string helperExe = obsPath.substr(0, binPos) + "FeedsAuthHelper.exe";
+    std::string helperExe = obsPath.substr(0, binPos) + "FeedsLogin.exe";
     std::string command = "\"" + helperExe + "\" \"%1\"";
 
     HKEY hKey;
