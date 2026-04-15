@@ -64,7 +64,6 @@ jobs:
           Copy-Item "data/locale/en-US.ini" -Destination "dist/data/obs-plugins/feeds/locale/"
           New-Item -ItemType Directory -Force -Path "dist/bin/64bit"
           Get-ChildItem "zoom-sdk/bin" -File | Where-Object { $_.Name -ne "libcurl.dll" } | Copy-Item -Destination "dist/bin/64bit/"
-          Copy-Item "zoom-sdk/bin/libcurl.dll" -Destination "dist/bin/64bit/libcurl_zoom.dll"
           Copy-Item "build/Release/libcurl.dll" -Destination "dist/bin/64bit/"
           New-Item -ItemType Directory -Force -Path "dist/bin/64bit/language"
           Copy-Item "zoom-sdk/bin/language/*" -Destination "dist/bin/64bit/language/"
