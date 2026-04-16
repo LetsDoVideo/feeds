@@ -46,8 +46,6 @@
 // 4. Raw Data
 #include "rawdata/rawdata_renderer_interface.h"
 #include "rawdata/zoom_rawdata_api.h"
-#include <delayimp.h>
-#include <shlwapi.h>
 
 // ---------------------------------------------------------------------------
 // TIER GATING
@@ -1589,42 +1587,6 @@ void* zs_create(obs_data_t* settings, obs_source_t* source) {
 void zs_destroy(void* data) {
     if (data) delete static_cast<ZoomScreenshareSource*>(data);
 }
-
-// ---------------------------------------------------------------------------
-// ZOOM SDK DELAY-LOAD HOOK
-// Intercepts sdk.dll resolution and loads it from zoom-sdk/ subfolder.
-// LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR ensures sdk.dll's own directory is
-// searched for its dependencies (zcurl.dll, etc.)
-// ---------------------------------------------------------------------------
-static HMODULE g_hZoomSDK = nullptr;
-
-static FARPROC WINAPI ZoomDelayLoadHook(unsigned dliNotify, PDelayLoadInfo pdli) {
-    if (dliNotify == dliNotePreLoadLibrary) {
-        if (_stricmp(pdli->szDll, "sdk.dll") == 0) {
-            if (!g_hZoomSDK) {
-                HMODULE hSelf = nullptr;
-                GetModuleHandleExW(
-                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                    (LPCWSTR)&ZoomDelayLoadHook,
-                    &hSelf);
-
-                wchar_t path[MAX_PATH];
-                GetModuleFileNameW(hSelf, path, MAX_PATH);
-                PathRemoveFileSpecW(path);
-                wcscat_s(path, MAX_PATH, L"\\..\\..\\bin\\64bit\\zoom-sdk\\sdk.dll");
-
-                g_hZoomSDK = LoadLibraryExW(path, NULL,
-                    LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
-                    LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-            }
-            return (FARPROC)g_hZoomSDK;
-        }
-    }
-    return NULL;
-}
-
-const PfnDliHook __pfnDliNotifyHook2 = &ZoomDelayLoadHook;
 
 // ---------------------------------------------------------------------------
 // SOURCE INFO STRUCTS
