@@ -1616,8 +1616,6 @@ bool obs_module_load(void) {
                 std::string obsRoot = pluginDllPath.substr(0, obsPlugins);
                 std::string sdkFolder = obsRoot + "bin\\64bit\\zoom-sdk";
                 std::wstring sdkFolderW(sdkFolder.begin(), sdkFolder.end());
-                SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS |
-                                         LOAD_LIBRARY_SEARCH_USER_DIRS);
                 AddDllDirectory(sdkFolderW.c_str());
             }
         }
