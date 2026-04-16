@@ -78,18 +78,21 @@ Section "Feeds Plugin" SecMain
     SetOutPath "$INSTDIR\data\obs-plugins\feeds\locale"
     File "${ROOT_DIR}\dist\data\obs-plugins\feeds\locale\en-US.ini"
 
-    ; Zoom SDK runtime DLLs and proxy -> bin/64bit/
+    ; FeedsLogin.exe -> bin/64bit/
     SetOutPath "$INSTDIR\bin\64bit"
-    File "${ROOT_DIR}\dist\bin\64bit\*.dll"
-    File "${ROOT_DIR}\dist\bin\64bit\*.exe"
+    File "${ROOT_DIR}\dist\bin\64bit\FeedsLogin.exe"
 
-    ; Zoom SDK language files -> bin/64bit/language/
-    SetOutPath "$INSTDIR\bin\64bit\language"
-    File "${ROOT_DIR}\dist\bin\64bit\language\*.*"
+    ; Zoom SDK runtime DLLs -> bin/64bit/zoom-sdk/
+    SetOutPath "$INSTDIR\bin\64bit\zoom-sdk"
+    File "${ROOT_DIR}\dist\bin\64bit\zoom-sdk\*.dll"
 
-    ; Zoom SDK ringtone files -> bin/64bit/ringtone/
-    SetOutPath "$INSTDIR\bin\64bit\ringtone"
-    File "${ROOT_DIR}\dist\bin\64bit\ringtone\*.*"
+    ; Zoom SDK language files -> bin/64bit/zoom-sdk/language/
+    SetOutPath "$INSTDIR\bin\64bit\zoom-sdk\language"
+    File "${ROOT_DIR}\dist\bin\64bit\zoom-sdk\language\*.*"
+
+    ; Zoom SDK ringtone files -> bin/64bit/zoom-sdk/ringtone/
+    SetOutPath "$INSTDIR\bin\64bit\zoom-sdk\ringtone"
+    File "${ROOT_DIR}\dist\bin\64bit\zoom-sdk\ringtone\*.*"
 
     ; Write uninstaller
     WriteUninstaller "$INSTDIR\Feeds-Uninstall.exe"
@@ -117,10 +120,11 @@ Section "Uninstall"
     RMDir "$INSTDIR\data\obs-plugins\feeds\locale"
     RMDir "$INSTDIR\data\obs-plugins\feeds"
 
-    ; Remove proxy and Zoom libcurl, restore OBS's original libcurl
-    Delete "$INSTDIR\bin\64bit\libcurl.dll"
-    Delete "$INSTDIR\bin\64bit\libcurl_zoom.dll"
-    Rename "$INSTDIR\bin\64bit\libcurl_obs.dll" "$INSTDIR\bin\64bit\libcurl.dll"
+    ; Remove FeedsLogin.exe
+    Delete "$INSTDIR\bin\64bit\FeedsLogin.exe"
+
+    ; Remove Zoom SDK files
+    RMDir /r "$INSTDIR\bin\64bit\zoom-sdk"
     
     ; Remove uninstaller
     Delete "$INSTDIR\Feeds-Uninstall.exe"
@@ -132,10 +136,7 @@ Section "Uninstall"
     ; Remove stored tokens from Windows Credential Manager
         ; (credentials are stored as Feeds_AccessToken and Feeds_RefreshToken)
 
-    ; Note: We do NOT remove Zoom SDK DLLs from bin/64bit as other
-    ; apps may depend on them
-
-    MessageBox MB_OK "Feeds has been uninstalled successfully."
+      MessageBox MB_OK "Feeds has been uninstalled successfully."
 
 SectionEnd
 
