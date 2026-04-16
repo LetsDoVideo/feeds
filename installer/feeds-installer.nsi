@@ -82,6 +82,10 @@ Section "Feeds Plugin" SecMain
     SetOutPath "$INSTDIR\bin\64bit"
     File "${ROOT_DIR}\dist\bin\64bit\FeedsLogin.exe"
 
+    ; FeedsLogin.exe -> bin/64bit/
+    SetOutPath "$INSTDIR\bin\64bit"
+    File "${ROOT_DIR}\dist\bin\64bit\FeedsLogin.exe"
+
     ; Zoom SDK runtime DLLs -> bin/64bit/zoom-sdk/
     SetOutPath "$INSTDIR\bin\64bit\zoom-sdk"
     File "${ROOT_DIR}\dist\bin\64bit\zoom-sdk\*.dll"
@@ -130,8 +134,9 @@ Section "Uninstall"
     ; Remove stored tokens from Windows Credential Manager
         ; (credentials are stored as Feeds_AccessToken and Feeds_RefreshToken)
 
-    ; Note: We do NOT remove Zoom SDK DLLs from bin/64bit as other
-    ; apps may depend on them
+    ; Remove Zoom SDK subfolder
+    RMDir /r "$INSTDIR\bin\64bit\zoom-sdk"
+    Delete "$INSTDIR\bin\64bit\FeedsLogin.exe"
 
     MessageBox MB_OK "Feeds has been uninstalled successfully."
 
