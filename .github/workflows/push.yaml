@@ -63,11 +63,12 @@ jobs:
           New-Item -ItemType Directory -Force -Path "dist/data/obs-plugins/feeds/locale"
           Copy-Item "data/locale/en-US.ini" -Destination "dist/data/obs-plugins/feeds/locale/"
           New-Item -ItemType Directory -Force -Path "dist/bin/64bit"
-          Get-ChildItem "zoom-sdk/bin" -File | Copy-Item -Destination "dist/bin/64bit/"
-          New-Item -ItemType Directory -Force -Path "dist/bin/64bit/language"
-          Copy-Item "zoom-sdk/bin/language/*" -Destination "dist/bin/64bit/language/"
-          New-Item -ItemType Directory -Force -Path "dist/bin/64bit/ringtone"
-          Copy-Item "zoom-sdk/bin/ringtone/*" -Destination "dist/bin/64bit/ringtone/"
+          New-Item -ItemType Directory -Force -Path "dist/bin/64bit/zoom-sdk"
+          Get-ChildItem "zoom-sdk/bin" -File | Copy-Item -Destination "dist/bin/64bit/zoom-sdk/"
+          New-Item -ItemType Directory -Force -Path "dist/bin/64bit/zoom-sdk/language"
+          Copy-Item "zoom-sdk/bin/language/*" -Destination "dist/bin/64bit/zoom-sdk/language/"
+          New-Item -ItemType Directory -Force -Path "dist/bin/64bit/zoom-sdk/ringtone"
+          Copy-Item "zoom-sdk/bin/ringtone/*" -Destination "dist/bin/64bit/zoom-sdk/ringtone/"
           Copy-Item "build/Release/FeedsLogin.exe" -Destination "dist/bin/64bit/"
       - name: Create ZIP
         shell: pwsh
