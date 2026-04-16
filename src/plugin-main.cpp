@@ -200,7 +200,7 @@ static std::string ExchangeCodeForToken(const std::string& code,
     WinHttpAddRequestHeaders(hRequest,
         L"Content-Type: application/x-www-form-urlencoded",
         (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
-
+          
     WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                        (LPVOID)body.c_str(), (DWORD)body.size(),
                        (DWORD)body.size(), 0);
@@ -935,7 +935,7 @@ if (pipe == INVALID_HANDLE_VALUE) {
     CloseHandle(pipe);
 
     std::string code(buf, bytesRead);
-
+   
     if (code.empty()) {
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
             MessageBoxA(NULL, "Login was cancelled or the authorization code was missing.\nPlease try again.",
@@ -1598,29 +1598,6 @@ OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("feeds", "en-US")
 
 bool obs_module_load(void) {
-
-    // Establish zoom-sdk/ subfolder in DLL search path FIRST, before anything
-    // else — including source registration — in case static init touches SDK.
-    {
-        char dllPath[MAX_PATH] = {};
-        HMODULE hSelf = nullptr;
-        GetModuleHandleExA(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            (LPCSTR)&obs_module_load, &hSelf);
-        if (hSelf) {
-            GetModuleFileNameA(hSelf, dllPath, MAX_PATH);
-            std::string pluginDllPath(dllPath);
-            size_t obsPlugins = pluginDllPath.rfind("obs-plugins");
-            if (obsPlugins != std::string::npos) {
-                std::string obsRoot = pluginDllPath.substr(0, obsPlugins);
-                std::string sdkFolder = obsRoot + "bin\\64bit\\zoom-sdk";
-                std::wstring sdkFolderW(sdkFolder.begin(), sdkFolder.end());
-                AddDllDirectory(sdkFolderW.c_str());
-            }
-        }
-    }
-
     zoom_participant_info.id             = "zoom_participant_source";
     zoom_participant_info.type           = OBS_SOURCE_TYPE_INPUT;
     zoom_participant_info.output_flags   = OBS_SOURCE_ASYNC_VIDEO;
@@ -1644,15 +1621,8 @@ bool obs_module_load(void) {
 
     ZOOM_SDK_NAMESPACE::InitParam initParam;
     initParam.strWebDomain = L"https://zoom.us";
-    bool sdkInitResult = false;
-    try {
-        sdkInitResult = (ZOOM_SDK_NAMESPACE::InitSDK(initParam) ==
-                         ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS);
-    } catch (...) {
-        MessageBoxA(NULL, "InitSDK threw an exception. sdk.dll may not be loading from zoom-sdk/ subfolder.",
-                    "Feeds - SDK Init Failed", MB_OK | MB_ICONERROR);
-    }
-    if (sdkInitResult) {
+    if (ZOOM_SDK_NAMESPACE::InitSDK(initParam) ==
+            ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
         g_sdkInitialized = true;
     // Register feeds:// protocol handler pointing at obs64.exe
     // Plugin knows its own path, obs64.exe is always at ../../bin/64bit/obs64.exe
