@@ -63,7 +63,7 @@ static int GetMaxFeedsForTier() {
     }
 }
 
-static ZOOM_SDK_::ZoomSDKResolution GetResolutionForTier() {
+static ZOOM_SDK_NAMESPACE::ZoomSDKResolution GetResolutionForTier() {
     return (g_currentTier >= 1) ? ZOOM_SDK_::ZoomSDKResolution_1080P
                                 : ZOOM_SDK_::ZoomSDKResolution_720P;
 }
