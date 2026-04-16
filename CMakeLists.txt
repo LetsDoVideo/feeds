@@ -38,7 +38,7 @@ if(MSVC)
 endif()
 
 # Core libraries
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs ws2_32 crypt32 winhttp)
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs ws2_32 crypt32 winhttp shlwapi)
 
 if(ENABLE_FRONTEND_API)
     find_package(obs-frontend-api REQUIRED)
