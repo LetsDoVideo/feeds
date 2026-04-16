@@ -1658,9 +1658,35 @@ bool obs_module_load(void) {
         }
     }
 
+    // Explicitly load sdk.dll from zoom-sdk/ subfolder before InitSDK
+    {
+        char dllPath[MAX_PATH] = {};
+        HMODULE hSelf = nullptr;
+        GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            (LPCSTR)&obs_module_load, &hSelf);
+        if (hSelf) {
+            GetModuleFileNameA(hSelf, dllPath, MAX_PATH);
+            std::string p(dllPath);
+            size_t pos = p.rfind("obs-plugins");
+            if (pos != std::string::npos) {
+                std::string sdkFolder = p.substr(0, pos) + "bin\\64bit\\zoom-sdk";
+                std::wstring sdkFolderW(sdkFolder.begin(), sdkFolder.end());
+                SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS |
+                                         LOAD_LIBRARY_SEARCH_USER_DIRS);
+                AddDllDirectory(sdkFolderW.c_str());
+                std::wstring sdkPathW = sdkFolderW + L"\\sdk.dll";
+                LoadLibraryExW(sdkPathW.c_str(), nullptr,
+                               LOAD_LIBRARY_SEARCH_USER_DIRS |
+                               LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+            }
+        }
+    }
+
     ZOOM_SDK_NAMESPACE::InitParam initParam;
     initParam.strWebDomain = L"https://zoom.us";
-   if (TryInitSDK(initParam)) {
+    if (TryInitSDK(initParam)) {
         g_sdkInitialized = true;
     char pluginPath[MAX_PATH] = {};
     GetModuleFileNameA(nullptr, pluginPath, MAX_PATH);
