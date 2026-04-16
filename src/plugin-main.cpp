@@ -46,39 +46,7 @@
 // 4. Raw Data
 #include "rawdata/rawdata_renderer_interface.h"
 #include "rawdata/zoom_rawdata_api.h"
-#include <delayimp.h>
 
-// Delay-load hook: intercept sdk.dll resolution and load it from zoom-sdk/ subfolder
-static FARPROC WINAPI FeedsDelayLoadHook(unsigned dliNotify, PDelayLoadInfo pdli) {
-    if (dliNotify == dliNotePreLoadLibrary &&
-        _stricmp(pdli->szDll, "sdk.dll") == 0) {
-        // Get our own module path to find zoom-sdk/ subfolder
-        char dllPath[MAX_PATH] = {};
-        HMODULE hSelf = nullptr;
-        GetModuleHandleExA(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            (LPCSTR)&FeedsDelayLoadHook, &hSelf);
-        if (hSelf) {
-            GetModuleFileNameA(hSelf, dllPath, MAX_PATH);
-            std::string p(dllPath);
-            size_t pos = p.rfind("obs-plugins");
-            if (pos != std::string::npos) {
-                std::string sdkFolder = p.substr(0, pos) + "bin\\64bit\\zoom-sdk";
-                std::string sdkPath = sdkFolder + "\\sdk.dll";
-                // Set search dir so sdk.dll finds its own dependencies
-                std::wstring sdkFolderW(sdkFolder.begin(), sdkFolder.end());
-                AddDllDirectory(sdkFolderW.c_str());
-                HMODULE h = LoadLibraryA(sdkPath.c_str());
-                if (h) return (FARPROC)h;
-            }
-        }
-    }
-    return nullptr;
-}
-
-// Register the hook
-const PfnDliHook __pfnDliNotifyHook2 = FeedsDelayLoadHook;
 // ---------------------------------------------------------------------------
 // TIER GATING
 // 0 = Free (1 feed), 1 = Basic (3 feeds), 2 = Streamer (5 feeds), 3 = Broadcaster (8 feeds)
