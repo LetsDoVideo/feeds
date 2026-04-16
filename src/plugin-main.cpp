@@ -64,8 +64,8 @@ static int GetMaxFeedsForTier() {
 }
 
 static ZOOM_SDK_NAMESPACE::ZoomSDKResolution GetResolutionForTier() {
-    return (g_currentTier >= 1) ? ZOOM_SDK_::ZoomSDKResolution_1080P
-                                : ZOOM_SDK_::ZoomSDKResolution_720P;
+    return (g_currentTier >= 1) ? ZOOM_SDK_NAMESPACE::ZoomSDKResolution_1080P
+                                : ZOOM_SDK_NAMESPACE::ZoomSDKResolution_720P;
 }
 
 // ---------------------------------------------------------------------------
@@ -200,7 +200,7 @@ static std::string ExchangeCodeForToken(const std::string& code,
     WinHttpAddRequestHeaders(hRequest,
         L"Content-Type: application/x-www-form-urlencoded",
         (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
-          
+
     WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                        (LPVOID)body.c_str(), (DWORD)body.size(),
                        (DWORD)body.size(), 0);
@@ -275,7 +275,7 @@ static void FetchAndApplyEntitlement();
 // ---------------------------------------------------------------------------
 // PER-SOURCE VIDEO CATCHER
 // ---------------------------------------------------------------------------
-class ZoomVideoCatcher : public ZOOM_SDK_::IZoomSDKRendererDelegate {
+class ZoomVideoCatcher : public ZOOM_SDK_NAMESPACE::IZoomSDKRendererDelegate {
 public:
     obs_source_t* target = nullptr;
 
@@ -315,7 +315,7 @@ public:
 // ---------------------------------------------------------------------------
 static obs_source_t* g_screenshareSource = nullptr;
 
-class ZoomShareCatcher : public ZOOM_SDK_::IZoomSDKRendererDelegate {
+class ZoomShareCatcher : public ZOOM_SDK_NAMESPACE::IZoomSDKRendererDelegate {
 public:
     virtual void onRawDataFrameReceived(YUVRawDataI420* data) override {
         if (!g_screenshareSource) return;
@@ -935,7 +935,7 @@ if (pipe == INVALID_HANDLE_VALUE) {
     CloseHandle(pipe);
 
     std::string code(buf, bytesRead);
-   
+
     if (code.empty()) {
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
             MessageBoxA(NULL, "Login was cancelled or the authorization code was missing.\nPlease try again.",
@@ -1621,7 +1621,6 @@ bool obs_module_load(void) {
 
     ZOOM_SDK_NAMESPACE::InitParam initParam;
     initParam.strWebDomain = L"https://zoom.us";
-    initParam.obConfigOpts.sdkPathPostfix = L"zoom-sdk";
     if (ZOOM_SDK_NAMESPACE::InitSDK(initParam) ==
             ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
         g_sdkInitialized = true;
@@ -1631,9 +1630,9 @@ bool obs_module_load(void) {
     char pluginPath[MAX_PATH] = {};
     GetModuleFileNameA(nullptr, pluginPath, MAX_PATH);
     std::string obsPath(pluginPath);
-    // obs64.exe is at bin/64bit/, FeedsLogin.exe is also at bin/64bit/
+    // obs64.exe is at bin/64bit/, FeedsAuthHelper.exe is also at bin/64bit/
     size_t binPos = obsPath.rfind("obs64.exe");
-    std::string helperExe = obsPath.substr(0, binPos) + "FeedsLogin.exe";
+    std::string helperExe = obsPath.substr(0, binPos) + "FeedsAuthHelper.exe";
     std::string command = "\"" + helperExe + "\" \"%1\"";
 
     HKEY hKey;
