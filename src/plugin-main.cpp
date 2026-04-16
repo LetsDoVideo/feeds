@@ -46,7 +46,39 @@
 // 4. Raw Data
 #include "rawdata/rawdata_renderer_interface.h"
 #include "rawdata/zoom_rawdata_api.h"
+#include <delayimp.h>
 
+// Delay-load hook: intercept sdk.dll resolution and load it from zoom-sdk/ subfolder
+static FARPROC WINAPI FeedsDelayLoadHook(unsigned dliNotify, PDelayLoadInfo pdli) {
+    if (dliNotify == dliNotePreLoadLibrary &&
+        _stricmp(pdli->szDll, "sdk.dll") == 0) {
+        // Get our own module path to find zoom-sdk/ subfolder
+        char dllPath[MAX_PATH] = {};
+        HMODULE hSelf = nullptr;
+        GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            (LPCSTR)&FeedsDelayLoadHook, &hSelf);
+        if (hSelf) {
+            GetModuleFileNameA(hSelf, dllPath, MAX_PATH);
+            std::string p(dllPath);
+            size_t pos = p.rfind("obs-plugins");
+            if (pos != std::string::npos) {
+                std::string sdkFolder = p.substr(0, pos) + "bin\\64bit\\zoom-sdk";
+                std::string sdkPath = sdkFolder + "\\sdk.dll";
+                // Set search dir so sdk.dll finds its own dependencies
+                SetDllDirectoryA(sdkFolder.c_str());
+                HMODULE h = LoadLibraryA(sdkPath.c_str());
+                SetDllDirectoryA(nullptr);
+                if (h) return (FARPROC)h;
+            }
+        }
+    }
+    return nullptr;
+}
+
+// Register the hook
+const PfnDliHook __pfnDliNotifyHook2 = FeedsDelayLoadHook;
 // ---------------------------------------------------------------------------
 // TIER GATING
 // 0 = Free (1 feed), 1 = Basic (3 feeds), 2 = Streamer (5 feeds), 3 = Broadcaster (8 feeds)
@@ -1619,45 +1651,14 @@ bool obs_module_load(void) {
     zoom_screenshare_info.icon_type      = OBS_ICON_TYPE_DESKTOP_CAPTURE;
     obs_register_source(&zoom_screenshare_info);
 
-    // DEBUG: verify path computation
-    {
-        char dllPath[MAX_PATH] = {};
-        HMODULE hSelf = nullptr;
-        GetModuleHandleExA(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            (LPCSTR)&obs_module_load, &hSelf);
-        if (hSelf) {
-            GetModuleFileNameA(hSelf, dllPath, MAX_PATH);
-            std::string p(dllPath);
-            size_t pos = p.rfind("obs-plugins");
-            if (pos != std::string::npos) {
-                std::string sdkPath = p.substr(0, pos) +
-                                      "bin\\64bit\\zoom-sdk\\sdk.dll";
-                MessageBoxA(NULL, sdkPath.c_str(),
-                            "Feeds - SDK Path", MB_OK);
-            } else {
-                MessageBoxA(NULL, dllPath,
-                            "Feeds - obs-plugins not found in path", MB_OK);
-            }
-        } else {
-            MessageBoxA(NULL, "GetModuleHandleExA failed",
-                        "Feeds - Error", MB_OK);
-        }
-    }
-
     ZOOM_SDK_NAMESPACE::InitParam initParam;
     initParam.strWebDomain = L"https://zoom.us";
     if (ZOOM_SDK_NAMESPACE::InitSDK(initParam) ==
             ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
         g_sdkInitialized = true;
-    // Register feeds:// protocol handler pointing at obs64.exe
-    // Plugin knows its own path, obs64.exe is always at ../../bin/64bit/obs64.exe
-    // relative to the plugin at obs-plugins/64bit/feeds.dll
     char pluginPath[MAX_PATH] = {};
     GetModuleFileNameA(nullptr, pluginPath, MAX_PATH);
     std::string obsPath(pluginPath);
-    // obs64.exe is at bin/64bit/, FeedsLogin.exe is also at bin/64bit/
     size_t binPos = obsPath.rfind("obs64.exe");
     std::string helperExe = obsPath.substr(0, binPos) + "FeedsLogin.exe";
     std::string command = "\"" + helperExe + "\" \"%1\"";
