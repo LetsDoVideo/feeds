@@ -1621,20 +1621,18 @@ bool obs_module_load(void) {
 
     ZOOM_SDK_NAMESPACE::InitParam initParam;
     initParam.strWebDomain = L"https://zoom.us";
-    auto initResult = ZOOM_SDK_NAMESPACE::InitSDK(initParam);
-if (initResult == ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
-    g_sdkInitialized = true;
-} else {
-    MessageBoxA(NULL, ("InitSDK failed with error: " + std::to_string((int)initResult)).c_str(), "Feeds - Init Error", MB_OK);
+    if (ZOOM_SDK_NAMESPACE::InitSDK(initParam) ==
+            ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
+        g_sdkInitialized = true;
     // Register feeds:// protocol handler pointing at obs64.exe
     // Plugin knows its own path, obs64.exe is always at ../../bin/64bit/obs64.exe
     // relative to the plugin at obs-plugins/64bit/feeds.dll
     char pluginPath[MAX_PATH] = {};
     GetModuleFileNameA(nullptr, pluginPath, MAX_PATH);
     std::string obsPath(pluginPath);
-    // obs64.exe is at bin/64bit/, FeedsAuthHelper.exe is also at bin/64bit/
+    // obs64.exe is at bin/64bit/, FeedsLogin.exe is also at bin/64bit/
     size_t binPos = obsPath.rfind("obs64.exe");
-    std::string helperExe = obsPath.substr(0, binPos) + "FeedsAuthHelper.exe";
+    std::string helperExe = obsPath.substr(0, binPos) + "FeedsLogin.exe";
     std::string command = "\"" + helperExe + "\" \"%1\"";
 
     HKEY hKey;
