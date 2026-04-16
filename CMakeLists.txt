@@ -31,11 +31,7 @@ endif()
 # Zoom Meeting SDK
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/zoom-sdk/h")
 target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/zoom-sdk/lib")
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE sdk delayimp)
-
-if(MSVC)
-    target_link_options(${CMAKE_PROJECT_NAME} PRIVATE /DELAYLOAD:sdk.dll)
-endif()
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE sdk)
 
 # Core libraries
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs ws2_32 crypt32 winhttp)
@@ -71,6 +67,4 @@ if(MSVC)
     )
 endif()
 
-# Auth helper — receives ldvfeeds:// deeplink and passes code to named pipe
 add_executable(FeedsLogin WIN32 helper/FeedsAuthHelper.cpp)
-
