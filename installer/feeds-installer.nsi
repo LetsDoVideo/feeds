@@ -78,18 +78,21 @@ Section "Feeds Plugin" SecMain
     SetOutPath "$INSTDIR\data\obs-plugins\feeds\locale"
     File "${ROOT_DIR}\dist\data\obs-plugins\feeds\locale\en-US.ini"
 
-    ; Zoom SDK runtime DLLs -> bin/64bit/
+    ; FeedsLogin.exe -> bin/64bit/
     SetOutPath "$INSTDIR\bin\64bit"
-    File "${ROOT_DIR}\dist\bin\64bit\*.dll"
-    File "${ROOT_DIR}\dist\bin\64bit\*.exe"
+    File "${ROOT_DIR}\dist\bin\64bit\FeedsLogin.exe"
 
-    ; Zoom SDK language files -> bin/64bit/language/
-    SetOutPath "$INSTDIR\bin\64bit\language"
-    File "${ROOT_DIR}\dist\bin\64bit\language\*.*"
+    ; Zoom SDK runtime DLLs -> bin/64bit/zoom-sdk/
+    SetOutPath "$INSTDIR\bin\64bit\zoom-sdk"
+    File "${ROOT_DIR}\dist\bin\64bit\zoom-sdk\*.dll"
 
-    ; Zoom SDK ringtone files -> bin/64bit/ringtone/
-    SetOutPath "$INSTDIR\bin\64bit\ringtone"
-    File "${ROOT_DIR}\dist\bin\64bit\ringtone\*.*"
+    ; Zoom SDK language files -> bin/64bit/zoom-sdk/language/
+    SetOutPath "$INSTDIR\bin\64bit\zoom-sdk\language"
+    File "${ROOT_DIR}\dist\bin\64bit\zoom-sdk\language\*.*"
+
+    ; Zoom SDK ringtone files -> bin/64bit/zoom-sdk/ringtone/
+    SetOutPath "$INSTDIR\bin\64bit\zoom-sdk\ringtone"
+    File "${ROOT_DIR}\dist\bin\64bit\zoom-sdk\ringtone\*.*"
 
     ; Write uninstaller
     WriteUninstaller "$INSTDIR\Feeds-Uninstall.exe"
