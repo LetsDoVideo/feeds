@@ -1619,11 +1619,47 @@ bool obs_module_load(void) {
     zoom_screenshare_info.icon_type      = OBS_ICON_TYPE_DESKTOP_CAPTURE;
     obs_register_source(&zoom_screenshare_info);
 
+    // Explicitly load sdk.dll from zoom-sdk/ subfolder
+    {
+        char dllPath[MAX_PATH] = {};
+        HMODULE hSelf = nullptr;
+        GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            (LPCSTR)&obs_module_load, &hSelf);
+        if (hSelf) {
+            GetModuleFileNameA(hSelf, dllPath, MAX_PATH);
+            std::string p(dllPath);
+            size_t pos = p.rfind("obs-plugins");
+            if (pos != std::string::npos) {
+                std::string sdkFolder = p.substr(0, pos) + "bin\\64bit\\zoom-sdk";
+                std::wstring sdkFolderW(sdkFolder.begin(), sdkFolder.end());
+                SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS |
+                                         LOAD_LIBRARY_SEARCH_USER_DIRS);
+                AddDllDirectory(sdkFolderW.c_str());
+                std::string sdkPath = sdkFolder + "\\sdk.dll";
+                std::wstring sdkPathW(sdkPath.begin(), sdkPath.end());
+                LoadLibraryExW(sdkPathW.c_str(), nullptr,
+                               LOAD_LIBRARY_SEARCH_USER_DIRS |
+                               LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+            }
+        }
+    }
+
     ZOOM_SDK_NAMESPACE::InitParam initParam;
     initParam.strWebDomain = L"https://zoom.us";
-    if (ZOOM_SDK_NAMESPACE::InitSDK(initParam) ==
-            ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
-            g_sdkInitialized = true;
+    bool sdkInitResult = false;
+    __try {
+        sdkInitResult = (ZOOM_SDK_NAMESPACE::InitSDK(initParam) ==
+                         ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        DWORD code = GetExceptionCode();
+        char msg[64];
+        sprintf_s(msg, "InitSDK threw SEH exception: 0x%08X", code);
+        MessageBoxA(NULL, msg, "Feeds - SDK Init Failed", MB_OK | MB_ICONERROR);
+    }
+    if (sdkInitResult) {
+        g_sdkInitialized = true;
     char pluginPath[MAX_PATH] = {};
     GetModuleFileNameA(nullptr, pluginPath, MAX_PATH);
     std::string obsPath(pluginPath);
