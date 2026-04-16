@@ -69,7 +69,6 @@ static FARPROC WINAPI FeedsDelayLoadHook(unsigned dliNotify, PDelayLoadInfo pdli
                 // Set search dir so sdk.dll finds its own dependencies
                 SetDllDirectoryA(sdkFolder.c_str());
                 HMODULE h = LoadLibraryA(sdkPath.c_str());
-                SetDllDirectoryA(nullptr);
                 if (h) return (FARPROC)h;
             }
         }
@@ -1655,6 +1654,7 @@ bool obs_module_load(void) {
     initParam.strWebDomain = L"https://zoom.us";
     if (ZOOM_SDK_NAMESPACE::InitSDK(initParam) ==
             ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
+        SetDllDirectoryA(nullptr); // Restore after SDK and all its deps loaded
         g_sdkInitialized = true;
     char pluginPath[MAX_PATH] = {};
     GetModuleFileNameA(nullptr, pluginPath, MAX_PATH);
