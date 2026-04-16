@@ -1619,7 +1619,7 @@ bool obs_module_load(void) {
     zoom_screenshare_info.icon_type      = OBS_ICON_TYPE_DESKTOP_CAPTURE;
     obs_register_source(&zoom_screenshare_info);
 
-    Z// Explicitly pre-load sdk.dll from zoom-sdk/ subfolder before InitSDK
+    // Explicitly pre-load sdk.dll from zoom-sdk/ subfolder before InitSDK
     // triggers delay-load resolution. feeds.dll is at obs-plugins/64bit/,
     // so zoom-sdk/ is at ../../bin/64bit/zoom-sdk/ relative to OBS root.
     {
