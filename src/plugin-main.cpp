@@ -46,6 +46,8 @@
 // 4. Raw Data
 #include "rawdata/rawdata_renderer_interface.h"
 #include "rawdata/zoom_rawdata_api.h"
+#include <delayimp.h>
+#include <shlwapi.h>
 
 // ---------------------------------------------------------------------------
 // TIER GATING
@@ -1589,6 +1591,42 @@ void zs_destroy(void* data) {
 }
 
 // ---------------------------------------------------------------------------
+// ZOOM SDK DELAY-LOAD HOOK
+// Intercepts sdk.dll resolution and loads it from zoom-sdk/ subfolder.
+// LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR ensures sdk.dll's own directory is
+// searched for its dependencies (zcurl.dll, etc.)
+// ---------------------------------------------------------------------------
+static HMODULE g_hZoomSDK = nullptr;
+
+static FARPROC WINAPI ZoomDelayLoadHook(unsigned dliNotify, PDelayLoadInfo pdli) {
+    if (dliNotify == dliNotePreLoadLibrary) {
+        if (_stricmp(pdli->szDll, "sdk.dll") == 0) {
+            if (!g_hZoomSDK) {
+                HMODULE hSelf = nullptr;
+                GetModuleHandleExW(
+                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    (LPCWSTR)&ZoomDelayLoadHook,
+                    &hSelf);
+
+                wchar_t path[MAX_PATH];
+                GetModuleFileNameW(hSelf, path, MAX_PATH);
+                PathRemoveFileSpecW(path);
+                wcscat_s(path, MAX_PATH, L"\\..\\..\\bin\\64bit\\zoom-sdk\\sdk.dll");
+
+                g_hZoomSDK = LoadLibraryExW(path, NULL,
+                    LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
+                    LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+            }
+            return (FARPROC)g_hZoomSDK;
+        }
+    }
+    return NULL;
+}
+
+const PfnDliHook __pfnDliNotifyHook2 = &ZoomDelayLoadHook;
+
+// ---------------------------------------------------------------------------
 // SOURCE INFO STRUCTS
 // ---------------------------------------------------------------------------
 struct obs_source_info zoom_participant_info = {};
@@ -1596,16 +1634,6 @@ struct obs_source_info zoom_screenshare_info = {};
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("feeds", "en-US")
-static bool TryInitSDK(ZOOM_SDK_NAMESPACE::InitParam& initParam) {
-    __try {
-        return ZOOM_SDK_NAMESPACE::InitSDK(initParam) ==
-               ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS;
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        // SDK throws 0xC06D007E during init but still initializes successfully.
-        // Treat as success and continue.
-        return true;
-    }
-}
 
 bool obs_module_load(void) {
     zoom_participant_info.id             = "zoom_participant_source";
@@ -1629,62 +1657,10 @@ bool obs_module_load(void) {
     zoom_screenshare_info.icon_type      = OBS_ICON_TYPE_DESKTOP_CAPTURE;
     obs_register_source(&zoom_screenshare_info);
 
-    // Explicitly load sdk.dll from zoom-sdk/ subfolder
-    {
-        char dllPath[MAX_PATH] = {};
-        HMODULE hSelf = nullptr;
-        GetModuleHandleExA(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            (LPCSTR)&obs_module_load, &hSelf);
-        if (hSelf) {
-            GetModuleFileNameA(hSelf, dllPath, MAX_PATH);
-            std::string p(dllPath);
-            size_t pos = p.rfind("obs-plugins");
-            if (pos != std::string::npos) {
-                std::string sdkFolder = p.substr(0, pos) + "bin\\64bit\\zoom-sdk";
-                std::wstring sdkFolderW(sdkFolder.begin(), sdkFolder.end());
-                SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS |
-                                         LOAD_LIBRARY_SEARCH_USER_DIRS);
-                AddDllDirectory(sdkFolderW.c_str());
-                std::string sdkPath = sdkFolder + "\\sdk.dll";
-                std::wstring sdkPathW(sdkPath.begin(), sdkPath.end());
-                LoadLibraryExW(sdkPathW.c_str(), nullptr,
-                               LOAD_LIBRARY_SEARCH_USER_DIRS |
-                               LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-            }
-        }
-    }
-
-    // Explicitly load sdk.dll from zoom-sdk/ subfolder before InitSDK
-    {
-        char dllPath[MAX_PATH] = {};
-        HMODULE hSelf = nullptr;
-        GetModuleHandleExA(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            (LPCSTR)&obs_module_load, &hSelf);
-        if (hSelf) {
-            GetModuleFileNameA(hSelf, dllPath, MAX_PATH);
-            std::string p(dllPath);
-            size_t pos = p.rfind("obs-plugins");
-            if (pos != std::string::npos) {
-                std::string sdkFolder = p.substr(0, pos) + "bin\\64bit\\zoom-sdk";
-                std::wstring sdkFolderW(sdkFolder.begin(), sdkFolder.end());
-                SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS |
-                                         LOAD_LIBRARY_SEARCH_USER_DIRS);
-                AddDllDirectory(sdkFolderW.c_str());
-                std::wstring sdkPathW = sdkFolderW + L"\\sdk.dll";
-                LoadLibraryExW(sdkPathW.c_str(), nullptr,
-                               LOAD_LIBRARY_SEARCH_USER_DIRS |
-                               LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-            }
-        }
-    }
-
     ZOOM_SDK_NAMESPACE::InitParam initParam;
     initParam.strWebDomain = L"https://zoom.us";
-    if (TryInitSDK(initParam)) {
+    if (ZOOM_SDK_NAMESPACE::InitSDK(initParam) ==
+            ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
         g_sdkInitialized = true;
     char pluginPath[MAX_PATH] = {};
     GetModuleFileNameA(nullptr, pluginPath, MAX_PATH);
