@@ -1619,6 +1619,28 @@ bool obs_module_load(void) {
     zoom_screenshare_info.icon_type      = OBS_ICON_TYPE_DESKTOP_CAPTURE;
     obs_register_source(&zoom_screenshare_info);
 
+    // Add zoom-sdk/ subfolder to DLL search path so delay-loaded sdk.dll
+    // finds its own libcurl.dll (not OBS's). feeds.dll lives at
+    // obs-plugins/64bit/feeds.dll, so zoom-sdk/ is at ../../bin/64bit/zoom-sdk/
+    {
+        char dllPath[MAX_PATH] = {};
+        HMODULE hSelf = nullptr;
+        GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            (LPCSTR)&obs_module_load, &hSelf);
+        GetModuleFileNameA(hSelf, dllPath, MAX_PATH);
+        std::string pluginDllPath(dllPath);
+        // Strip "obs-plugins\64bit\feeds.dll" -> get OBS root
+        size_t obsPlugins = pluginDllPath.rfind("obs-plugins");
+        if (obsPlugins != std::string::npos) {
+            std::string obsRoot = pluginDllPath.substr(0, obsPlugins);
+            std::string sdkFolder = obsRoot + "bin\\64bit\\zoom-sdk";
+            std::wstring sdkFolderW(sdkFolder.begin(), sdkFolder.end());
+            AddDllDirectory(sdkFolderW.c_str());
+        }
+    }
+
     ZOOM_SDK_NAMESPACE::InitParam initParam;
     initParam.strWebDomain = L"https://zoom.us";
     if (ZOOM_SDK_NAMESPACE::InitSDK(initParam) ==
