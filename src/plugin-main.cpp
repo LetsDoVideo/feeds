@@ -1659,11 +1659,8 @@ bool obs_module_load(void) {
 
     ZOOM_SDK_NAMESPACE::InitParam initParam;
     initParam.strWebDomain = L"https://zoom.us";
-    auto sdkErr = ZOOM_SDK_NAMESPACE::InitSDK(initParam);
-    char initMsg[64];
-    sprintf_s(initMsg, "InitSDK result: %d", (int)sdkErr);
-    MessageBoxA(NULL, initMsg, "Feeds - SDK Init", MB_OK);
-    if (sdkErr == ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
+    if (ZOOM_SDK_NAMESPACE::InitSDK(initParam) ==
+            ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
         g_sdkInitialized = true;
     char pluginPath[MAX_PATH] = {};
     GetModuleFileNameA(nullptr, pluginPath, MAX_PATH);
