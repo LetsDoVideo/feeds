@@ -1619,9 +1619,7 @@ bool obs_module_load(void) {
     zoom_screenshare_info.icon_type      = OBS_ICON_TYPE_DESKTOP_CAPTURE;
     obs_register_source(&zoom_screenshare_info);
 
-    // Explicitly pre-load sdk.dll from zoom-sdk/ subfolder before InitSDK
-    // triggers delay-load resolution. feeds.dll is at obs-plugins/64bit/,
-    // so zoom-sdk/ is at ../../bin/64bit/zoom-sdk/ relative to OBS root.
+    // DEBUG: verify path computation
     {
         char dllPath[MAX_PATH] = {};
         HMODULE hSelf = nullptr;
@@ -1634,16 +1632,17 @@ bool obs_module_load(void) {
             std::string p(dllPath);
             size_t pos = p.rfind("obs-plugins");
             if (pos != std::string::npos) {
-                std::string sdkFolder = p.substr(0, pos) + "bin\\64bit\\zoom-sdk";
-                std::string sdkPath = sdkFolder + "\\sdk.dll";
-                // Temporarily add zoom-sdk/ so sdk.dll finds its dependencies
-                char prevDir[MAX_PATH] = {};
-                GetDllDirectoryA(MAX_PATH, prevDir);
-                SetDllDirectoryA(sdkFolder.c_str());
-                LoadLibraryExA(sdkPath.c_str(), nullptr,
-                               LOAD_WITH_ALTERED_SEARCH_PATH);
-                SetDllDirectoryA(prevDir[0] ? prevDir : nullptr);
+                std::string sdkPath = p.substr(0, pos) +
+                                      "bin\\64bit\\zoom-sdk\\sdk.dll";
+                MessageBoxA(NULL, sdkPath.c_str(),
+                            "Feeds - SDK Path", MB_OK);
+            } else {
+                MessageBoxA(NULL, dllPath,
+                            "Feeds - obs-plugins not found in path", MB_OK);
             }
+        } else {
+            MessageBoxA(NULL, "GetModuleHandleExA failed",
+                        "Feeds - Error", MB_OK);
         }
     }
 
