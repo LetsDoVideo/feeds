@@ -1634,10 +1634,15 @@ bool obs_module_load(void) {
             std::string p(dllPath);
             size_t pos = p.rfind("obs-plugins");
             if (pos != std::string::npos) {
-                std::string sdkPath = p.substr(0, pos) +
-                                      "bin\\64bit\\zoom-sdk\\sdk.dll";
+                std::string sdkFolder = p.substr(0, pos) + "bin\\64bit\\zoom-sdk";
+                std::string sdkPath = sdkFolder + "\\sdk.dll";
+                // Temporarily add zoom-sdk/ so sdk.dll finds its dependencies
+                char prevDir[MAX_PATH] = {};
+                GetDllDirectoryA(MAX_PATH, prevDir);
+                SetDllDirectoryA(sdkFolder.c_str());
                 LoadLibraryExA(sdkPath.c_str(), nullptr,
                                LOAD_WITH_ALTERED_SEARCH_PATH);
+                SetDllDirectoryA(prevDir[0] ? prevDir : nullptr);
             }
         }
     }
