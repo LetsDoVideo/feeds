@@ -63,9 +63,9 @@ static int GetMaxFeedsForTier() {
     }
 }
 
-static ZOOM_SDK_NAMESPACE::ZoomSDKResolution GetResolutionForTier() {
-    return (g_currentTier >= 1) ? ZOOM_SDK_NAMESPACE::ZoomSDKResolution_1080P
-                                : ZOOM_SDK_NAMESPACE::ZoomSDKResolution_720P;
+static ZOOM_SDK_::ZoomSDKResolution GetResolutionForTier() {
+    return (g_currentTier >= 1) ? ZOOM_SDK_::ZoomSDKResolution_1080P
+                                : ZOOM_SDK_::ZoomSDKResolution_720P;
 }
 
 // ---------------------------------------------------------------------------
@@ -275,7 +275,7 @@ static void FetchAndApplyEntitlement();
 // ---------------------------------------------------------------------------
 // PER-SOURCE VIDEO CATCHER
 // ---------------------------------------------------------------------------
-class ZoomVideoCatcher : public ZOOM_SDK_NAMESPACE::IZoomSDKRendererDelegate {
+class ZoomVideoCatcher : public ZOOM_SDK_::IZoomSDKRendererDelegate {
 public:
     obs_source_t* target = nullptr;
 
@@ -315,7 +315,7 @@ public:
 // ---------------------------------------------------------------------------
 static obs_source_t* g_screenshareSource = nullptr;
 
-class ZoomShareCatcher : public ZOOM_SDK_NAMESPACE::IZoomSDKRendererDelegate {
+class ZoomShareCatcher : public ZOOM_SDK_::IZoomSDKRendererDelegate {
 public:
     virtual void onRawDataFrameReceived(YUVRawDataI420* data) override {
         if (!g_screenshareSource) return;
@@ -1621,6 +1621,7 @@ bool obs_module_load(void) {
 
     ZOOM_SDK_NAMESPACE::InitParam initParam;
     initParam.strWebDomain = L"https://zoom.us";
+    initParam.obConfigOpts.sdkPathPostfix = L"zoom-sdk";
     if (ZOOM_SDK_NAMESPACE::InitSDK(initParam) ==
             ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
         g_sdkInitialized = true;
