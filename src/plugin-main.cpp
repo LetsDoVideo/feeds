@@ -1621,9 +1621,11 @@ bool obs_module_load(void) {
 
     ZOOM_SDK_NAMESPACE::InitParam initParam;
     initParam.strWebDomain = L"https://zoom.us";
-    if (ZOOM_SDK_NAMESPACE::InitSDK(initParam) ==
-            ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
-        g_sdkInitialized = true;
+    auto initResult = ZOOM_SDK_NAMESPACE::InitSDK(initParam);
+if (initResult == ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
+    g_sdkInitialized = true;
+} else {
+    MessageBoxA(NULL, ("InitSDK failed with error: " + std::to_string((int)initResult)).c_str(), "Feeds - Init Error", MB_OK);
     // Register feeds:// protocol handler pointing at obs64.exe
     // Plugin knows its own path, obs64.exe is always at ../../bin/64bit/obs64.exe
     // relative to the plugin at obs-plugins/64bit/feeds.dll
