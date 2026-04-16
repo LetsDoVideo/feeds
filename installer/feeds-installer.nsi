@@ -82,21 +82,18 @@ Section "Feeds Plugin" SecMain
     SetOutPath "$INSTDIR\bin\64bit"
     File "${ROOT_DIR}\dist\bin\64bit\FeedsLogin.exe"
 
-    ; FeedsLogin.exe -> bin/64bit/
+   ; Zoom SDK runtime DLLs + FeedsLogin.exe -> bin/64bit/
     SetOutPath "$INSTDIR\bin\64bit"
-    File "${ROOT_DIR}\dist\bin\64bit\FeedsLogin.exe"
+    File "${ROOT_DIR}\dist\bin\64bit\*.dll"
+    File "${ROOT_DIR}\dist\bin\64bit\*.exe"
 
-    ; Zoom SDK runtime DLLs -> bin/64bit/zoom-sdk/
-    SetOutPath "$INSTDIR\bin\64bit\zoom-sdk"
-    File "${ROOT_DIR}\dist\bin\64bit\zoom-sdk\*.dll"
+    ; Zoom SDK language files -> bin/64bit/language/
+    SetOutPath "$INSTDIR\bin\64bit\language"
+    File "${ROOT_DIR}\dist\bin\64bit\language\*.*"
 
-    ; Zoom SDK language files -> bin/64bit/zoom-sdk/language/
-    SetOutPath "$INSTDIR\bin\64bit\zoom-sdk\language"
-    File "${ROOT_DIR}\dist\bin\64bit\zoom-sdk\language\*.*"
-
-    ; Zoom SDK ringtone files -> bin/64bit/zoom-sdk/ringtone/
-    SetOutPath "$INSTDIR\bin\64bit\zoom-sdk\ringtone"
-    File "${ROOT_DIR}\dist\bin\64bit\zoom-sdk\ringtone\*.*"
+    ; Zoom SDK ringtone files -> bin/64bit/ringtone/
+    SetOutPath "$INSTDIR\bin\64bit\ringtone"
+    File "${ROOT_DIR}\dist\bin\64bit\ringtone\*.*"
 
     ; Write uninstaller
     WriteUninstaller "$INSTDIR\Feeds-Uninstall.exe"
@@ -134,9 +131,10 @@ Section "Uninstall"
     ; Remove stored tokens from Windows Credential Manager
         ; (credentials are stored as Feeds_AccessToken and Feeds_RefreshToken)
 
-    ; Remove Zoom SDK subfolder
-    RMDir /r "$INSTDIR\bin\64bit\zoom-sdk"
+    ; Remove FeedsLogin.exe
     Delete "$INSTDIR\bin\64bit\FeedsLogin.exe"
+    ; Note: We do NOT remove Zoom SDK DLLs from bin/64bit as other
+    ; apps may depend on them
 
     MessageBox MB_OK "Feeds has been uninstalled successfully."
 
