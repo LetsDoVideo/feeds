@@ -1596,6 +1596,17 @@ struct obs_source_info zoom_screenshare_info = {};
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("feeds", "en-US")
+bool sdkInitResult = false;
+    __try {
+        sdkInitResult = (ZOOM_SDK_NAMESPACE::InitSDK(initParam) ==
+                         ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        DWORD code = GetExceptionCode();
+        char msg[64];
+        sprintf_s(msg, "InitSDK threw SEH exception: 0x%08X", code);
+        MessageBoxA(NULL, msg, "Feeds - SDK Init Failed", MB_OK | MB_ICONERROR);
+    }
+    if (sdkInitResult) {
 
 bool obs_module_load(void) {
     zoom_participant_info.id             = "zoom_participant_source";
@@ -1648,17 +1659,7 @@ bool obs_module_load(void) {
 
     ZOOM_SDK_NAMESPACE::InitParam initParam;
     initParam.strWebDomain = L"https://zoom.us";
-    bool sdkInitResult = false;
-    __try {
-        sdkInitResult = (ZOOM_SDK_NAMESPACE::InitSDK(initParam) ==
-                         ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        DWORD code = GetExceptionCode();
-        char msg[64];
-        sprintf_s(msg, "InitSDK threw SEH exception: 0x%08X", code);
-        MessageBoxA(NULL, msg, "Feeds - SDK Init Failed", MB_OK | MB_ICONERROR);
-    }
-    if (sdkInitResult) {
+   if (TryInitSDK(initParam)) {
         g_sdkInitialized = true;
     char pluginPath[MAX_PATH] = {};
     GetModuleFileNameA(nullptr, pluginPath, MAX_PATH);
