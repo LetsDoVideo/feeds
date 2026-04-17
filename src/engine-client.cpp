@@ -8,6 +8,9 @@
 #include <string>
 #include <thread>
 #include <atomic>
+#include <map>
+#include <functional>
+#include <mutex>
 #include <obs-module.h>
 
 namespace feeds {
@@ -18,6 +21,11 @@ static HANDLE g_pipeHandle = INVALID_HANDLE_VALUE;
 static std::thread g_pipeReaderThread;
 static std::atomic<bool> g_shutdownRequested{false};
 
+static std::mutex g_handlersMutex;
+static std::map<std::string, std::function<void(const std::string&)>> g_messageHandlers;
+
+static std::mutex g_writeMutex;
+
 static const wchar_t* PIPE_NAME = L"\\\\.\\pipe\\FeedsEngine";
 
 // Forward declarations
@@ -25,6 +33,11 @@ static bool CreatePipeServer();
 static bool CreateJobObject();
 static bool LaunchEngineProcess();
 static void PipeReaderThread();
+static std::string ExtractJsonStringField(const std::string& json, const std::string& field);
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
 
 bool StartEngine()
 {
@@ -52,10 +65,8 @@ bool StartEngine()
     DWORD err = GetLastError();
 
     if (!connected && err == ERROR_PIPE_CONNECTED) {
-        // Already connected - that's fine
         connected = TRUE;
     } else if (!connected && err == ERROR_IO_PENDING) {
-        // Async connect pending - wait for it
         DWORD waitResult = WaitForSingleObject(ov.hEvent, 10000);
         connected = (waitResult == WAIT_OBJECT_0);
     }
@@ -69,7 +80,6 @@ bool StartEngine()
 
     blog(LOG_INFO, "[feeds] StartEngine: engine connected to pipe");
 
-    // Start background thread to read messages from engine
     g_shutdownRequested = false;
     g_pipeReaderThread = std::thread(PipeReaderThread);
 
@@ -91,8 +101,6 @@ void StopEngine()
         g_pipeReaderThread.join();
     }
 
-    // Closing the Job Object handle kills the engine process
-    // (because of JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
     if (g_jobObject != NULL) {
         CloseHandle(g_jobObject);
         g_jobObject = NULL;
@@ -105,6 +113,38 @@ void StopEngine()
 
     blog(LOG_INFO, "[feeds] StopEngine: shutdown complete");
 }
+
+bool SendToEngine(const std::string& jsonMessage)
+{
+    std::lock_guard<std::mutex> lock(g_writeMutex);
+
+    if (g_pipeHandle == INVALID_HANDLE_VALUE) {
+        blog(LOG_ERROR, "[feeds] SendToEngine: pipe not connected");
+        return false;
+    }
+
+    DWORD written = 0;
+    BOOL ok = WriteFile(g_pipeHandle, jsonMessage.c_str(),
+                        (DWORD)jsonMessage.size(), &written, NULL);
+    if (!ok) {
+        blog(LOG_ERROR, "[feeds] SendToEngine: WriteFile failed: %lu", GetLastError());
+        return false;
+    }
+
+    blog(LOG_INFO, "[feeds] SendToEngine: sent %s", jsonMessage.c_str());
+    return true;
+}
+
+void RegisterMessageHandler(const std::string& messageType,
+                            std::function<void(const std::string&)> handler)
+{
+    std::lock_guard<std::mutex> lock(g_handlersMutex);
+    g_messageHandlers[messageType] = handler;
+}
+
+// ---------------------------------------------------------------------------
+// Internal: Job Object, pipe server, process launch
+// ---------------------------------------------------------------------------
 
 static bool CreateJobObject()
 {
@@ -134,11 +174,7 @@ static bool CreatePipeServer()
         PIPE_NAME,
         PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
         PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-        1,          // Max instances
-        4096,       // Out buffer size
-        4096,       // In buffer size
-        0,          // Default timeout
-        NULL        // Default security
+        1, 4096, 4096, 0, NULL
     );
 
     if (g_pipeHandle == INVALID_HANDLE_VALUE) {
@@ -151,7 +187,6 @@ static bool CreatePipeServer()
 
 static bool LaunchEngineProcess()
 {
-    // Find FeedsEngine.exe relative to the plugin DLL
     HMODULE hModule = NULL;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -161,21 +196,14 @@ static bool LaunchEngineProcess()
     wchar_t pluginPath[MAX_PATH];
     GetModuleFileNameW(hModule, pluginPath, MAX_PATH);
 
-    // Plugin is at: <obs>\obs-plugins\64bit\feeds.dll
-    // Engine is at: <obs>\bin\64bit\FeedsEngine.exe
-    // So we need to go up two dirs from the plugin, then into bin\64bit
     wchar_t enginePath[MAX_PATH];
     wcscpy_s(enginePath, pluginPath);
-    // Strip feeds.dll
     wchar_t* lastSlash = wcsrchr(enginePath, L'\\');
     if (lastSlash) *lastSlash = L'\0';
-    // Strip 64bit
     lastSlash = wcsrchr(enginePath, L'\\');
     if (lastSlash) *lastSlash = L'\0';
-    // Strip obs-plugins
     lastSlash = wcsrchr(enginePath, L'\\');
     if (lastSlash) *lastSlash = L'\0';
-    // Append bin\64bit\FeedsEngine.exe
     wcscat_s(enginePath, L"\\bin\\64bit\\FeedsEngine.exe");
 
     blog(LOG_INFO, "[feeds] LaunchEngineProcess: launching %ls", enginePath);
@@ -184,7 +212,6 @@ static bool LaunchEngineProcess()
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi = {};
 
-    // Launch suspended so we can assign to Job Object before it runs
     BOOL ok = CreateProcessW(
         enginePath, NULL, NULL, NULL, FALSE,
         CREATE_SUSPENDED | CREATE_NO_WINDOW,
@@ -196,7 +223,6 @@ static bool LaunchEngineProcess()
         return false;
     }
 
-    // Assign to Job Object (so it dies if we die)
     if (!AssignProcessToJobObject(g_jobObject, pi.hProcess)) {
         blog(LOG_ERROR, "[feeds] AssignProcessToJobObject failed: %lu", GetLastError());
         TerminateProcess(pi.hProcess, 0);
@@ -205,7 +231,6 @@ static bool LaunchEngineProcess()
         return false;
     }
 
-    // Now resume the process
     ResumeThread(pi.hThread);
     CloseHandle(pi.hThread);
 
@@ -213,6 +238,57 @@ static bool LaunchEngineProcess()
     blog(LOG_INFO, "[feeds] LaunchEngineProcess: engine launched, pid=%lu", pi.dwProcessId);
 
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Internal: pipe reader and message dispatch
+// ---------------------------------------------------------------------------
+
+// Minimal JSON string field extractor. Extracts the value of a string-typed
+// field from a flat JSON object. Returns empty string on failure. This is
+// intentionally naive — full JSON parsing happens on the plugin side only
+// if/when we need it. For now, reading "type" is enough to dispatch messages.
+static std::string ExtractJsonStringField(const std::string& json, const std::string& field)
+{
+    std::string key = "\"" + field + "\"";
+    size_t keyPos = json.find(key);
+    if (keyPos == std::string::npos) return "";
+
+    size_t colonPos = json.find(':', keyPos + key.size());
+    if (colonPos == std::string::npos) return "";
+
+    size_t quoteStart = json.find('"', colonPos + 1);
+    if (quoteStart == std::string::npos) return "";
+
+    size_t quoteEnd = json.find('"', quoteStart + 1);
+    if (quoteEnd == std::string::npos) return "";
+
+    return json.substr(quoteStart + 1, quoteEnd - quoteStart - 1);
+}
+
+static void DispatchMessage(const std::string& json)
+{
+    std::string type = ExtractJsonStringField(json, "type");
+    if (type.empty()) {
+        blog(LOG_WARNING, "[feeds] DispatchMessage: could not extract type from: %s", json.c_str());
+        return;
+    }
+
+    std::function<void(const std::string&)> handler;
+    {
+        std::lock_guard<std::mutex> lock(g_handlersMutex);
+        auto it = g_messageHandlers.find(type);
+        if (it != g_messageHandlers.end()) {
+            handler = it->second;
+        }
+    }
+
+    if (handler) {
+        handler(json);
+    } else {
+        blog(LOG_INFO, "[feeds] DispatchMessage: no handler for type '%s' (message: %s)",
+             type.c_str(), json.c_str());
+    }
 }
 
 static void PipeReaderThread()
@@ -234,7 +310,9 @@ static void PipeReaderThread()
 
         if (bytesRead > 0) {
             buffer[bytesRead] = '\0';
-            blog(LOG_INFO, "[feeds] PipeReaderThread: received message: %s", buffer);
+            std::string json(buffer, bytesRead);
+            blog(LOG_INFO, "[feeds] PipeReaderThread: received: %s", json.c_str());
+            DispatchMessage(json);
         }
     }
 
