@@ -979,6 +979,11 @@ if (pipe == INVALID_HANDLE_VALUE) {
 // LOGIN HELPER — full PKCE flow
 // ---------------------------------------------------------------------------
 void OnLoginClick() {
+    // Phase 3: Forward login request to engine
+    feeds::SendToEngine("{\"type\":\"login_start\"}");
+    return;
+
+    // OLD OAuth code below — left in place for reference, unreachable due to return above
     if (g_isLoggedIn) {
         MessageBoxA(NULL, "You are already logged in to Zoom.",
                     "Feeds - Login", MB_OK | MB_ICONINFORMATION);
@@ -1629,6 +1634,27 @@ bool obs_module_load(void) {
     
     // Phase 2: Launch engine subprocess (does not yet host Zoom SDK)
     feeds::StartEngine();
+
+    // Phase 3: Register handlers for messages we expect from the engine
+    feeds::RegisterMessageHandler("login_failed", [](const std::string& json) {
+        // Extract error field for display
+        std::string error = "unknown";
+        size_t errPos = json.find("\"error\"");
+        if (errPos != std::string::npos) {
+            size_t q1 = json.find('"', errPos + 7);
+            if (q1 != std::string::npos) {
+                size_t q2 = json.find('"', json.find(':', errPos) + 1);
+                if (q2 != std::string::npos) {
+                    size_t q3 = json.find('"', q2 + 1);
+                    if (q3 != std::string::npos) {
+                        error = json.substr(q2 + 1, q3 - q2 - 1);
+                    }
+                }
+            }
+        }
+        std::string msg = "Login failed: " + error;
+        MessageBoxA(NULL, msg.c_str(), "Feeds - Login", MB_OK);
+    });
     
     ZOOM_SDK_NAMESPACE::InitParam initParam;
     initParam.strWebDomain = L"https://zoom.us";
