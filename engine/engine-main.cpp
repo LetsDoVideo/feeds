@@ -1,18 +1,23 @@
 // FeedsEngine.exe — subprocess that hosts the Zoom Meeting SDK.
 //
 // Launched by feeds.dll. Connects to the named pipe created by the plugin,
-// sends engine_ready, then waits for commands.
+// sends engine_ready, then processes incoming command messages.
 
 #include <windows.h>
 #include <string>
 #include <cstdio>
+#include <map>
+#include <functional>
 
 static const wchar_t* PIPE_NAME = L"\\\\.\\pipe\\FeedsEngine";
 
 static HANDLE g_pipeHandle = INVALID_HANDLE_VALUE;
+static std::map<std::string, std::function<void(const std::string&)>> g_messageHandlers;
 
-// Simple log to a file next to the exe, so we can see what's happening
-// even though we're a windowless subprocess.
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
+
 static void LogToFile(const char* msg)
 {
     wchar_t logPath[MAX_PATH];
@@ -32,23 +37,21 @@ static void LogToFile(const char* msg)
     }
 }
 
+// ---------------------------------------------------------------------------
+// Pipe send/receive
+// ---------------------------------------------------------------------------
+
 static bool ConnectToPipe()
 {
-    // The plugin creates the pipe then launches us, so the pipe should
-    // already exist. But add a short retry loop just in case of timing.
     for (int i = 0; i < 20; i++) {
         g_pipeHandle = CreateFileW(
             PIPE_NAME,
             GENERIC_READ | GENERIC_WRITE,
-            0, NULL,
-            OPEN_EXISTING,
-            0, NULL
+            0, NULL, OPEN_EXISTING, 0, NULL
         );
 
         if (g_pipeHandle != INVALID_HANDLE_VALUE) {
             LogToFile("Connected to pipe");
-            
-            // Set to message mode
             DWORD mode = PIPE_READMODE_MESSAGE;
             SetNamedPipeHandleState(g_pipeHandle, &mode, NULL, NULL);
             return true;
@@ -69,17 +72,69 @@ static bool ConnectToPipe()
     return false;
 }
 
-static bool SendMessage(const char* json)
+static bool SendToPlugin(const std::string& json)
 {
     DWORD written = 0;
-    BOOL ok = WriteFile(g_pipeHandle, json, (DWORD)strlen(json), &written, NULL);
+    BOOL ok = WriteFile(g_pipeHandle, json.c_str(), (DWORD)json.size(), &written, NULL);
     if (!ok) {
         char msg[256];
         sprintf_s(msg, "WriteFile failed: %lu", GetLastError());
         LogToFile(msg);
         return false;
     }
+
+    char msg[4200];
+    sprintf_s(msg, "Sent: %s", json.c_str());
+    LogToFile(msg);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// JSON helpers and message dispatch
+// ---------------------------------------------------------------------------
+
+static std::string ExtractJsonStringField(const std::string& json, const std::string& field)
+{
+    std::string key = "\"" + field + "\"";
+    size_t keyPos = json.find(key);
+    if (keyPos == std::string::npos) return "";
+
+    size_t colonPos = json.find(':', keyPos + key.size());
+    if (colonPos == std::string::npos) return "";
+
+    size_t quoteStart = json.find('"', colonPos + 1);
+    if (quoteStart == std::string::npos) return "";
+
+    size_t quoteEnd = json.find('"', quoteStart + 1);
+    if (quoteEnd == std::string::npos) return "";
+
+    return json.substr(quoteStart + 1, quoteEnd - quoteStart - 1);
+}
+
+static void RegisterHandler(const std::string& type,
+                            std::function<void(const std::string&)> handler)
+{
+    g_messageHandlers[type] = handler;
+}
+
+static void DispatchMessage(const std::string& json)
+{
+    std::string type = ExtractJsonStringField(json, "type");
+    if (type.empty()) {
+        char msg[4200];
+        sprintf_s(msg, "Could not extract type from: %s", json.c_str());
+        LogToFile(msg);
+        return;
+    }
+
+    auto it = g_messageHandlers.find(type);
+    if (it != g_messageHandlers.end()) {
+        it->second(json);
+    } else {
+        char msg[4200];
+        sprintf_s(msg, "No handler for type '%s' (message: %s)", type.c_str(), json.c_str());
+        LogToFile(msg);
+    }
 }
 
 static void PipeReaderLoop()
@@ -99,12 +154,39 @@ static void PipeReaderLoop()
 
         if (bytesRead > 0) {
             buffer[bytesRead] = '\0';
+            std::string json(buffer, bytesRead);
+
             char msg[4200];
-            sprintf_s(msg, "Received message: %s", buffer);
+            sprintf_s(msg, "Received: %s", json.c_str());
             LogToFile(msg);
+
+            DispatchMessage(json);
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Message handlers (stubs for now — will be filled in as phases progress)
+// ---------------------------------------------------------------------------
+
+static void HandleLoginStart(const std::string& json)
+{
+    LogToFile("HandleLoginStart: received login_start message (stub)");
+    // Phase 3 step 3 will do the actual OAuth here.
+    // For now, just acknowledge to prove the round-trip works.
+    SendToPlugin("{\"type\":\"login_failed\",\"error\":\"not_implemented_yet\"}");
+}
+
+static void HandleShutdown(const std::string& json)
+{
+    LogToFile("HandleShutdown: received shutdown message");
+    SendToPlugin("{\"type\":\"shutdown_complete\"}");
+    // Pipe will close when plugin closes its handle; reader loop will exit.
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 {
@@ -116,15 +198,17 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
         return 1;
     }
 
-    // Send engine_ready
-    const char* readyMsg = "{\"type\":\"engine_ready\",\"version\":\"1.0.0\"}";
-    if (!SendMessage(readyMsg)) {
+    // Register handlers for messages we expect from the plugin
+    RegisterHandler("login_start", HandleLoginStart);
+    RegisterHandler("shutdown", HandleShutdown);
+
+    // Announce we're ready
+    if (!SendToPlugin("{\"type\":\"engine_ready\",\"version\":\"1.0.0\"}")) {
         LogToFile("Failed to send engine_ready");
         return 1;
     }
-    LogToFile("Sent engine_ready");
 
-    // Now loop reading messages from plugin until pipe closes
+    // Process messages until pipe closes
     PipeReaderLoop();
 
     LogToFile("FeedsEngine.exe exiting normally");
