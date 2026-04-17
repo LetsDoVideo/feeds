@@ -50,6 +50,9 @@
 namespace feeds {
     bool StartEngine();
     void StopEngine();
+    bool SendToEngine(const std::string& jsonMessage);
+    void RegisterMessageHandler(const std::string& messageType,
+                                std::function<void(const std::string&)> handler);
 }
 
 // ---------------------------------------------------------------------------
