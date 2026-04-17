@@ -47,6 +47,11 @@
 #include "rawdata/rawdata_renderer_interface.h"
 #include "rawdata/zoom_rawdata_api.h"
 
+namespace feeds {
+    bool StartEngine();
+    void StopEngine();
+}
+
 // ---------------------------------------------------------------------------
 // TIER GATING
 // 0 = Free (1 feed), 1 = Basic (3 feeds), 2 = Streamer (5 feeds), 3 = Broadcaster (8 feeds)
@@ -1618,7 +1623,10 @@ bool obs_module_load(void) {
     zoom_screenshare_info.get_properties = zs_properties;
     zoom_screenshare_info.icon_type      = OBS_ICON_TYPE_DESKTOP_CAPTURE;
     obs_register_source(&zoom_screenshare_info);
-
+    
+    // Phase 2: Launch engine subprocess (does not yet host Zoom SDK)
+    feeds::StartEngine();
+    
     ZOOM_SDK_NAMESPACE::InitParam initParam;
     initParam.strWebDomain = L"https://zoom.us";
     if (ZOOM_SDK_NAMESPACE::InitSDK(initParam) ==
@@ -1661,6 +1669,7 @@ bool obs_module_load(void) {
 }
 
 void obs_module_unload(void) {
+    feeds::StopEngine();
     g_sdkInitialized = false;
     if (g_shareRenderer) {
         try {
