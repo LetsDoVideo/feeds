@@ -297,8 +297,11 @@ static void PipeReaderThread()
 
     char buffer[4096];
     while (!g_shutdownRequested) {
+        blog(LOG_INFO, "[feeds] PipeReaderThread: calling ReadFile (waiting for message)");
         DWORD bytesRead = 0;
         BOOL ok = ReadFile(g_pipeHandle, buffer, sizeof(buffer) - 1, &bytesRead, NULL);
+        blog(LOG_INFO, "[feeds] PipeReaderThread: ReadFile returned ok=%d, bytes=%lu, err=%lu", 
+             ok, bytesRead, ok ? 0 : GetLastError());
 
         if (!ok) {
             DWORD err = GetLastError();
