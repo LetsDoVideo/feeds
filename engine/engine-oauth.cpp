@@ -18,9 +18,9 @@
 #include <thread>
 #include <cstdio>
 
-// Forward declarations to engine-main.cpp
-extern void EngineLog(const char* msg);
-extern bool EngineSendToPlugin(const std::string& json);
+// Defined in engine-main.cpp
+extern void LogToFile(const char* msg);
+extern bool SendToPlugin(const std::string& json);
 
 namespace feeds_engine {
 
@@ -205,13 +205,13 @@ static std::string WaitForAuthCode()
         1, 256, 256, 300000, &sa);
 
     if (pipe == INVALID_HANDLE_VALUE) {
-        EngineLog("OAuth: failed to create FeedsAuth pipe");
+        LogToFile("OAuth: failed to create FeedsAuth pipe");
         return "";
     }
 
     BOOL connected = ConnectNamedPipe(pipe, nullptr);
     if (!connected && GetLastError() != ERROR_PIPE_CONNECTED) {
-        EngineLog("OAuth: ConnectNamedPipe on FeedsAuth failed");
+        LogToFile("OAuth: ConnectNamedPipe on FeedsAuth failed");
         CloseHandle(pipe);
         return "";
     }
@@ -230,7 +230,7 @@ static std::string WaitForAuthCode()
 
 static void LoginThreadFunc()
 {
-    EngineLog("OAuth: LoginThreadFunc started");
+    LogToFile("OAuth: LoginThreadFunc started");
 
     std::string verifier  = GenerateCodeVerifier();
     std::string challenge = DeriveCodeChallenge(verifier);
@@ -244,35 +244,35 @@ static void LoginThreadFunc()
         "&code_challenge_method=S256" +
         "&prompt=consent";
 
-    EngineLog("OAuth: opening browser to Zoom authorize endpoint");
+    LogToFile("OAuth: opening browser to Zoom authorize endpoint");
     ShellExecuteA(NULL, "open", authUrl.c_str(), NULL, NULL, SW_SHOWNORMAL);
 
-    EngineLog("OAuth: waiting for auth code via FeedsAuth pipe");
+    LogToFile("OAuth: waiting for auth code via FeedsAuth pipe");
     std::string code = WaitForAuthCode();
 
     if (code.empty()) {
-        EngineLog("OAuth: auth code was empty (user cancelled or pipe failed)");
-        EngineSendToPlugin("{\"type\":\"login_failed\",\"error\":\"user_cancelled\"}");
+        LogToFile("OAuth: auth code was empty (user cancelled or pipe failed)");
+        SendToPlugin("{\"type\":\"login_failed\",\"error\":\"user_cancelled\"}");
         return;
     }
 
-    EngineLog("OAuth: got auth code, exchanging for tokens");
+    LogToFile("OAuth: got auth code, exchanging for tokens");
     std::string response = ExchangeCodeForToken(code, verifier);
 
     std::string accessToken  = JsonExtractString(response, "access_token");
     std::string refreshToken = JsonExtractString(response, "refresh_token");
 
     if (accessToken.empty()) {
-        EngineLog("OAuth: token exchange failed, no access_token in response");
-        EngineSendToPlugin("{\"type\":\"login_failed\",\"error\":\"token_exchange_failed\"}");
+        LogToFile("OAuth: token exchange failed, no access_token in response");
+        SendToPlugin("{\"type\":\"login_failed\",\"error\":\"token_exchange_failed\"}");
         return;
     }
 
-    EngineLog("OAuth: got tokens, saving to Credential Manager");
+    LogToFile("OAuth: got tokens, saving to Credential Manager");
     SaveTokensToCredentialManager(accessToken, refreshToken);
 
-    EngineLog("OAuth: login complete, notifying plugin");
-    EngineSendToPlugin("{\"type\":\"login_succeeded\"}");
+    LogToFile("OAuth: login complete, notifying plugin");
+    SendToPlugin("{\"type\":\"login_succeeded\"}");
 }
 
 // ---------------------------------------------------------------------------
@@ -281,7 +281,7 @@ static void LoginThreadFunc()
 
 bool StartLoginFlow()
 {
-    EngineLog("OAuth: StartLoginFlow called");
+    LogToFile("OAuth: StartLoginFlow called");
     std::thread t(LoginThreadFunc);
     t.detach();
     return true;
