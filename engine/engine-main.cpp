@@ -9,9 +9,11 @@
 #include <map>
 #include <functional>
 
-static const wchar_t* PIPE_NAME = L"\\\\.\\pipe\\FeedsEngine";
+static const wchar_t* P2E_PIPE_NAME = L"\\\\.\\pipe\\FeedsEngine_P2E";
+static const wchar_t* E2P_PIPE_NAME = L"\\\\.\\pipe\\FeedsEngine_E2P";
 
-static HANDLE g_pipeHandle = INVALID_HANDLE_VALUE;
+static HANDLE g_readPipe  = INVALID_HANDLE_VALUE;  // engine reads from P2E
+static HANDLE g_writePipe = INVALID_HANDLE_VALUE;  // engine writes to E2P
 static std::map<std::string, std::function<void(const std::string&)>> g_messageHandlers;
 
 // ---------------------------------------------------------------------------
@@ -41,41 +43,63 @@ void LogToFile(const char* msg)
 // Pipe send/receive
 // ---------------------------------------------------------------------------
 
-static bool ConnectToPipe()
+static bool ConnectToPipes()
 {
+    // Connect to P2E (plugin-to-engine: engine reads)
     for (int i = 0; i < 20; i++) {
-        g_pipeHandle = CreateFileW(
-            PIPE_NAME,
-            GENERIC_READ | GENERIC_WRITE,
-            0, NULL, OPEN_EXISTING, 0, NULL
-        );
+        g_readPipe = CreateFileW(
+            P2E_PIPE_NAME,
+            GENERIC_READ,
+            0, NULL, OPEN_EXISTING, 0, NULL);
 
-        if (g_pipeHandle != INVALID_HANDLE_VALUE) {
-            LogToFile("Connected to pipe");
+        if (g_readPipe != INVALID_HANDLE_VALUE) {
+            LogToFile("Connected to P2E pipe");
             DWORD mode = PIPE_READMODE_MESSAGE;
-            SetNamedPipeHandleState(g_pipeHandle, &mode, NULL, NULL);
+            SetNamedPipeHandleState(g_readPipe, &mode, NULL, NULL);
+            break;
+        }
+
+        DWORD err = GetLastError();
+        if (err == ERROR_PIPE_BUSY) {
+            WaitNamedPipeW(P2E_PIPE_NAME, 500);
+        } else {
+            Sleep(250);
+        }
+    }
+
+    if (g_readPipe == INVALID_HANDLE_VALUE) {
+        LogToFile("Failed to connect to P2E pipe");
+        return false;
+    }
+
+    // Connect to E2P (engine-to-plugin: engine writes)
+    for (int i = 0; i < 20; i++) {
+        g_writePipe = CreateFileW(
+            E2P_PIPE_NAME,
+            GENERIC_WRITE,
+            0, NULL, OPEN_EXISTING, 0, NULL);
+
+        if (g_writePipe != INVALID_HANDLE_VALUE) {
+            LogToFile("Connected to E2P pipe");
             return true;
         }
 
         DWORD err = GetLastError();
         if (err == ERROR_PIPE_BUSY) {
-            WaitNamedPipeW(PIPE_NAME, 500);
+            WaitNamedPipeW(E2P_PIPE_NAME, 500);
         } else {
-            char msg[256];
-            sprintf_s(msg, "CreateFile on pipe failed: %lu", err);
-            LogToFile(msg);
             Sleep(250);
         }
     }
 
-    LogToFile("Failed to connect to pipe after 20 attempts");
+    LogToFile("Failed to connect to E2P pipe");
     return false;
 }
 
 bool SendToPlugin(const std::string& json)
 {
     DWORD written = 0;
-    BOOL ok = WriteFile(g_pipeHandle, json.c_str(), (DWORD)json.size(), &written, NULL);
+    BOOL ok = WriteFile(g_writePipe, json.c_str(), (DWORD)json.size(), &written, NULL);
     if (!ok) {
         char msg[256];
         sprintf_s(msg, "WriteFile failed: %lu", GetLastError());
@@ -142,7 +166,7 @@ static void PipeReaderLoop()
     char buffer[4096];
     while (true) {
         DWORD bytesRead = 0;
-        BOOL ok = ReadFile(g_pipeHandle, buffer, sizeof(buffer) - 1, &bytesRead, NULL);
+        BOOL ok = ReadFile(g_readPipe, buffer, sizeof(buffer) - 1, &bytesRead, NULL);
 
         if (!ok) {
             DWORD err = GetLastError();
@@ -193,8 +217,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
     LogToFile("========================================");
     LogToFile("FeedsEngine.exe starting");
 
-    if (!ConnectToPipe()) {
-        LogToFile("Could not connect to pipe, exiting");
+    if (!ConnectToPipes()) {
+        LogToFile("Could not connect to pipes, exiting");
         return 1;
     }
 
