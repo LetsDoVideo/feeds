@@ -230,7 +230,7 @@ static bool LaunchEngineProcess()
     if (lastSlash) *lastSlash = L'\0';
     lastSlash = wcsrchr(enginePath, L'\\');
     if (lastSlash) *lastSlash = L'\0';
-    wcscat_s(enginePath, L"\\bin\\64bit\\FeedsEngine.exe");
+    wcscat_s(enginePath, L"\\bin\\64bit\\zoom-sdk\\FeedsEngine.exe");
 
     blog(LOG_INFO, "[feeds] LaunchEngineProcess: launching %ls", enginePath);
 
