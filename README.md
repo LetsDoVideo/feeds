@@ -1,4 +1,4 @@
-# Feeds 
+# Feeds
 
 **Pull individual Zoom participant video feeds directly into OBS Studio as dedicated sources.**
 
