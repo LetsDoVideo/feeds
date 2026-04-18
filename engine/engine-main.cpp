@@ -221,11 +221,34 @@ static void HandleShutdown(const std::string& json)
 // ---------------------------------------------------------------------------
 
 static std::atomic<bool> g_engineShuttingDown{false};
+// Dummy window proc for the message-only window
+static LRESULT CALLBACK EngineWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    return DefWindowProc(hwnd, msg, wp, lp);
+}
 
-int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
 {
     LogToFile("========================================");
     LogToFile("FeedsEngine.exe starting");
+
+    // Create a message-only window. The Zoom SDK requires a real HWND
+    // on the main thread for its async callbacks to fire.
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc   = EngineWndProc;
+    wc.hInstance     = hInstance;
+    wc.lpszClassName = L"FeedsEngineWindow";
+    RegisterClassW(&wc);
+
+    HWND hwnd = CreateWindowExW(
+        0, L"FeedsEngineWindow", L"FeedsEngine",
+        0, 0, 0, 0, 0,
+        HWND_MESSAGE, NULL, hInstance, NULL);
+
+    if (!hwnd) {
+        LogToFile("Failed to create message-only window");
+        return 1;
+    }
+    LogToFile("Created message-only window");
 
     if (!ConnectToPipes()) {
         LogToFile("Could not connect to pipes, exiting");
@@ -242,8 +265,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
         return 1;
     }
 
-    // Initialize the Zoom SDK. If tokens exist, this also triggers auth.
-    // Must be called from the main thread (same thread that runs the message pump).
+    // Initialize the Zoom SDK. Must happen on the thread that runs the message
+    // pump and created the window.
     feeds_engine::InitializeSDK();
 
     // Pipe reading runs on a background thread so the main thread is free
@@ -251,12 +274,9 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
     std::thread pipeThread([]() {
         PipeReaderLoop();
         g_engineShuttingDown = true;
-        // Post a quit message so the main thread's message loop exits
         PostQuitMessage(0);
     });
 
-    // Windows message pump on the main thread — required for the Zoom SDK's
-    // async callbacks (onAuthenticationReturn, etc.) to fire.
     LogToFile("Entering main thread message pump");
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0) > 0) {
@@ -269,6 +289,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
         pipeThread.join();
     }
 
+    DestroyWindow(hwnd);
     LogToFile("FeedsEngine.exe exiting normally");
     return 0;
 }
