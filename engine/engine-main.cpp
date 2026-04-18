@@ -8,6 +8,9 @@
 #include <cstdio>
 #include <map>
 #include <functional>
+#include <thread>
+#include <atomic>
+
 
 static const wchar_t* P2E_PIPE_NAME = L"\\\\.\\pipe\\FeedsEngine_P2E";
 static const wchar_t* E2P_PIPE_NAME = L"\\\\.\\pipe\\FeedsEngine_E2P";
@@ -146,7 +149,7 @@ static void RegisterHandler(const std::string& type,
     g_messageHandlers[type] = handler;
 }
 
-static void DispatchMessage(const std::string& json)
+static void DispatchIpcMessage(const std::string& json)
 {
     std::string type = ExtractJsonStringField(json, "type");
     if (type.empty()) {
@@ -189,7 +192,7 @@ static void PipeReaderLoop()
             sprintf_s(msg, "Received: %s", json.c_str());
             LogToFile(msg);
 
-            DispatchMessage(json);
+            DispatchIpcMessage(json);
         }
     }
 }
@@ -217,6 +220,8 @@ static void HandleShutdown(const std::string& json)
 // Main
 // ---------------------------------------------------------------------------
 
+static std::atomic<bool> g_engineShuttingDown{false};
+
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 {
     LogToFile("========================================");
@@ -232,16 +237,37 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
     RegisterHandler("shutdown", HandleShutdown);
 
     // Announce we're ready
-   if (!SendToPlugin("{\"type\":\"engine_ready\",\"version\":\"1.0.0\"}")) {
+    if (!SendToPlugin("{\"type\":\"engine_ready\",\"version\":\"1.0.0\"}")) {
         LogToFile("Failed to send engine_ready");
         return 1;
     }
 
     // Initialize the Zoom SDK. If tokens exist, this also triggers auth.
+    // Must be called from the main thread (same thread that runs the message pump).
     feeds_engine::InitializeSDK();
 
-    // Process messages until pipe closes
-    PipeReaderLoop();
+    // Pipe reading runs on a background thread so the main thread is free
+    // to pump Windows messages (required for Zoom SDK async callbacks).
+    std::thread pipeThread([]() {
+        PipeReaderLoop();
+        g_engineShuttingDown = true;
+        // Post a quit message so the main thread's message loop exits
+        PostQuitMessage(0);
+    });
+
+    // Windows message pump on the main thread — required for the Zoom SDK's
+    // async callbacks (onAuthenticationReturn, etc.) to fire.
+    LogToFile("Entering main thread message pump");
+    MSG msg;
+    while (GetMessage(&msg, NULL, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+    LogToFile("Exited main thread message pump");
+
+    if (pipeThread.joinable()) {
+        pipeThread.join();
+    }
 
     LogToFile("FeedsEngine.exe exiting normally");
     return 0;
