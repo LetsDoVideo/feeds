@@ -653,49 +653,13 @@ static void RegisterEngineHandlers() {
     });
 
     feeds::RegisterMessageHandler("meeting_failed", [](const std::string& json) {
-        int code = (int)ExtractJsonNumber(json, "code");
-        blog(LOG_ERROR, "[feeds] meeting_failed: code=%d", code);
+        int code         = (int)ExtractJsonNumber(json, "code");
+        std::string msg  = ExtractJsonString(json, "message");
+        blog(LOG_ERROR, "[feeds] meeting_failed: code=%d, msg=%s",
+             code, msg.c_str());
 
-        // V1.0.0 error-code-to-message mapping. These are the SDK
-        // MEETING_FAIL_* constants, as integers.
-        std::string msg;
-        switch (code) {
-            case 1901: // MEETING_FAIL_PASSWORD_ERR
-                msg = "Incorrect meeting password. Please try again.";
-                break;
-            case 1903: // MEETING_FAIL_MEETING_NOT_EXIST
-                msg = "Meeting not found. Please check the meeting number or link.";
-                break;
-            case 1005: // MEETING_FAIL_CONNECTION_ERR (varies; fall-through fine)
-                msg = "Connection error. Please check your internet connection and try again.";
-                break;
-            case 1143: // MEETING_FAIL_HOST_DISALLOW_OUTSIDE_USER_JOIN
-                msg = "The host has disabled external participants from joining this meeting.";
-                break;
-            case 1144: // MEETING_FAIL_UNABLE_TO_JOIN_EXTERNAL_MEETING
-                msg = "This app must be published on the Zoom Marketplace before joining external meetings.";
-                break;
-            case 1145: // MEETING_FAIL_APP_CAN_NOT_ANONYMOUS_JOIN_MEETING
-                msg = "This meeting requires you to be logged in to Zoom. Please log in and try again.";
-                break;
-            case 1146: // MEETING_FAIL_BLOCKED_BY_ACCOUNT_ADMIN
-                msg = "Your Zoom account administrator has blocked this application.";
-                break;
-            case 1147: // MEETING_FAIL_NEED_SIGN_IN_FOR_PRIVATE_MEETING
-                msg = "This is a private meeting. Please log in to Zoom and try again.";
-                break;
-            default:
-                msg = "Failed to join meeting. Error code: " + std::to_string(code);
-                break;
-        }
-
-        // NOTE: The numeric constants above are illustrative; the SDK
-        // assigns them and v1.0.0 used the named enums. Because we don't
-        // pull the SDK header into the plugin anymore, we use the integer
-        // values the engine sends. If Zoom changes these, the mapping
-        // falls through to the default branch which is harmless — just
-        // a less-friendly message. Revisit if any user reports the wrong
-        // message for a known failure cause.
+        if (msg.empty())
+            msg = "Failed to join meeting. Error code: " + std::to_string(code);
 
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
             [msg]() {
