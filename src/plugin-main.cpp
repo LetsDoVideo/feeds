@@ -1655,6 +1655,15 @@ bool obs_module_load(void) {
         std::string msg = "Login failed: " + error;
         MessageBoxA(NULL, msg.c_str(), "Feeds - Login", MB_OK);
     });
+
+    feeds::RegisterMessageHandler("login_succeeded", [](const std::string& json) {
+        // Engine already saved tokens to Credential Manager.
+        // Load them into plugin memory and kick off SDK auth on Qt main thread.
+        if (LoadTokensFromRegistry()) {
+            QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
+                               []() { DoSDKAuth(); });
+        }
+    });
     
     ZOOM_SDK_NAMESPACE::InitParam initParam;
     initParam.strWebDomain = L"https://zoom.us";
