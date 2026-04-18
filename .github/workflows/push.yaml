@@ -70,11 +70,7 @@ jobs:
           Copy-Item "zoom-sdk/bin/ringtone/*" -Destination "dist/bin/64bit/zoom-sdk/ringtone/"
           Copy-Item "build/Release/FeedsLogin.exe" -Destination "dist/bin/64bit/"
           Copy-Item "build/Release/FeedsEngine.exe" -Destination "dist/bin/64bit/zoom-sdk/"
-      - name: Patch Zoom SDK DLLs
-        shell: cmd
-        run: |
-          pip install pefile
-          python patch_zoom_imports.py dist\bin\64bit
+      
       - name: Create ZIP
         shell: pwsh
         run: |
