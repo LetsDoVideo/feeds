@@ -7,7 +7,7 @@ This document defines the inter-process communication protocol between the Feeds
 The Feeds plugin is split into two processes:
 
 - **`feeds.dll`** — Loaded in-process by OBS. Thin wrapper that registers source types, shows menu items, and relays user actions to the engine. Does NOT load the Zoom SDK.
-- **`FeedsEngine.exe`** — Separate process launched lazily by the plugin when Feeds functionality is first used. Hosts the Zoom Meeting SDK, performs OAuth, joins meetings, captures video frames.
+- **`FeedsEngine.exe`** — Separate process launched by the plugin. Hosts the Zoom Meeting SDK, performs OAuth, joins meetings, captures video frames.
 
 This separation exists because the Zoom SDK's `libcurl.dll` conflicts with OBS's `libcurl.dll` when loaded in-process. Running the SDK in a subprocess gives it its own DLL search path and eliminates the conflict.
 
@@ -15,30 +15,28 @@ This separation exists because the Zoom SDK's `libcurl.dll` conflicts with OBS's
 
 Two separate transport mechanisms are used:
 
-- **Named pipe (`\\.\pipe\FeedsEngine`)** — Control messages. Bidirectional. JSON messages, newline-terminated.
-- **D3D11 shared NT handles** — Video frame data. The engine creates shared textures and transmits the handles via the named pipe. Pixel data never flows through the pipe; it stays in GPU memory, accessible by both processes.
+- **Two unidirectional named pipes** — Control messages. `\\.\pipe\FeedsEngine_P2E` (plugin writes, engine reads) and `\\.\pipe\FeedsEngine_E2P` (engine writes, plugin reads). JSON messages, one per pipe write.
+- **D3D11 shared NT handles** — Video frame data (Phase 6, not yet implemented). The engine will create shared textures and transmit the handles via the named pipes. Pixel data will never flow through the pipes; it will stay in GPU memory, accessible by both processes.
 
 ## Message Format
 
-Each message is a single JSON object on one line, terminated by `\n`:
+Each message is a single JSON object per pipe write:
 
 ```json
 {"type": "message_name", "field1": "value1", "field2": 123}
 ```
 
-All messages have a `type` field. Additional fields are message-specific.
+All messages have a `type` field. Additional fields are message-specific. The engine's string parsing is minimal — it extracts specific fields by key lookup rather than full JSON parsing.
 
 ## Process Lifecycle
 
-1. User takes a Feeds action (Login, join meeting, add source) for the first time in the OBS session.
-2. Plugin creates a Windows Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` flag.
-3. Plugin launches `FeedsEngine.exe` (located next to `feeds.dll`) and assigns it to the Job Object.
-4. Engine starts, opens named pipe to plugin, sends `engine_ready`.
-5. Plugin sends `initialize` with any stored auth token.
-6. Engine sends `initialized`, and normal operation begins.
+1. Plugin (in `obs_module_load`) creates a Windows Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
+2. Plugin creates both named pipe servers.
+3. Plugin launches `FeedsEngine.exe` and assigns it to the Job Object.
+4. Engine connects to both pipes, creates a message-only window (required for Zoom SDK async callbacks), starts a background pipe reader thread, and enters a Windows message pump on the main thread.
+5. Engine sends `engine_ready`.
+6. Engine calls `InitSDK`. If tokens are in Windows Credential Manager, engine automatically calls `SDKAuth` to restore the previous session.
 7. On OBS shutdown, plugin sends `shutdown`, waits briefly, then closes the Job Object handle (which guarantees engine termination even if graceful shutdown fails).
-
-If the engine dies unexpectedly, a background thread in the plugin (waiting on the engine's process handle) detects it and triggers recovery: relaunch engine, re-initialize, restore meeting state if applicable.
 
 ## Messages
 
@@ -47,206 +45,203 @@ Direction notation: **P→E** = plugin to engine, **E→P** = engine to plugin.
 ### Startup
 
 #### `engine_ready` (E→P)
-Sent once, when the engine has started and is ready to receive commands. Plugin should not send any messages before receiving this.
+Sent once, when the engine has started and is ready to receive commands.
 
 ```json
 {"type": "engine_ready", "version": "1.0.0"}
 ```
 
-#### `initialize` (P→E)
-Plugin's first real message. Includes stored refresh token if one exists, so the engine can restore the previous session without requiring re-authentication.
-
-```json
-{"type": "initialize", "refresh_token": "..." | null}
-```
-
-#### `initialized` (E→P)
-Engine confirms it has received initialization data. If a refresh token was provided and is still valid, `logged_in` will be true.
-
-```json
-{"type": "initialized", "logged_in": true, "tier": 0 | 1 | 2 | 3 | null}
-```
-
 ### Authentication
 
 #### `login_start` (P→E)
-User clicked "Login to Zoom". Engine launches `FeedsLogin.exe`, opens browser, handles OAuth callback.
+User clicked "Login to Zoom". Engine opens browser to Zoom OAuth authorize endpoint, listens on the `FeedsAuth` pipe for the auth code delivered by `FeedsLogin.exe`, exchanges the code for tokens, saves them to Windows Credential Manager, triggers `SDKAuth`, then fetches user info and entitlement.
 
 ```json
 {"type": "login_start"}
 ```
 
 #### `login_succeeded` (E→P)
-OAuth flow completed successfully.
+OAuth flow completed and user info has been fetched. Plugin should cache these fields — they are used for the PMI-or-link dialog, the "Logged in as X" about box, and tier enforcement.
 
 ```json
-{"type": "login_succeeded", "user_name": "...", "user_email": "...", "tier": 0 | 1 | 2 | 3}
+{"type": "login_succeeded",
+ "display_name": "David Maldow",
+ "pmi": "1234567890",
+ "tier": 0}
+```
+
+#### `sdk_authenticated` (E→P)
+SDK authentication succeeded. Plugin flips UI state to logged-in. Always arrives **after** `login_succeeded` so the cache is populated before the Connect menu becomes enabled.
+
+```json
+{"type": "sdk_authenticated"}
+```
+
+#### `sdk_auth_failed` (E→P)
+SDK authentication failed. Plugin shows error dialog and re-enables the Login menu item.
+
+```json
+{"type": "sdk_auth_failed", "code": 15}
 ```
 
 #### `login_failed` (E→P)
-OAuth flow failed or was cancelled.
+OAuth flow failed or was cancelled before SDK auth was attempted.
 
 ```json
-{"type": "login_failed", "error": "user_cancelled" | "network_error" | "..."}
+{"type": "login_failed", "error": "user_cancelled"}
 ```
 
 #### `logout` (P→E)
-User clicked "Logout". Engine clears tokens and any cached state.
+User clicked "Logout". Engine leaves any active meeting, calls `auth_service->LogOut()`, clears tokens from Credential Manager, clears cached user info.
 
 ```json
 {"type": "logout"}
 ```
 
 #### `logout_complete` (E→P)
-Logout finished.
+Logout finished. Plugin resets UI to logged-out state and clears its own cache.
 
 ```json
 {"type": "logout_complete"}
 ```
 
-#### `token_refreshed` (E→P)
-Engine silently refreshed the OAuth token in the background. Plugin stores the new refresh token for use on next startup.
+#### `session_expired` (E→P)
+Engine attempted to use the access token, got a 401, and the refresh token was either missing, expired, or rejected. Plugin should behave as if the user logged out.
 
 ```json
-{"type": "token_refreshed", "refresh_token": "..."}
+{"type": "session_expired"}
+```
+
+#### `token_refreshed` (E→P)
+Engine silently refreshed the OAuth token in the background. Informational only; engine has already persisted the new token to Credential Manager.
+
+```json
+{"type": "token_refreshed"}
 ```
 
 ### Meeting
 
 #### `join_meeting` (P→E)
-User requested meeting join. Engine uses Zoom SDK to join as guest.
+User completed the Connect dialog. Plugin sends the raw text from the input box (meeting number, PMI number, or URL — engine parses it), the password (may be empty), and whether the PMI option was chosen.
 
 ```json
-{"type": "join_meeting", "meeting_number": "1234567890", "password": "..." | null, "display_name": "..."}
+{"type": "join_meeting",
+ "input": "1234567890",
+ "password": "",
+ "is_pmi": true}
 ```
 
+Engine fetches a fresh ZAK token, constructs `JoinParam4WithoutLogin` with the cached display name, and calls `meetingService->Join()`.
+
 #### `meeting_joined` (E→P)
-Meeting join succeeded. Engine is now in the meeting.
+Meeting reached `MEETING_STATUS_INMEETING`. Plugin enables the Disconnect menu item. Note: participant list is not yet available at this point — it arrives via `participant_list_changed` after `raw_livestream_granted`.
 
 ```json
 {"type": "meeting_joined", "meeting_number": "1234567890"}
 ```
 
 #### `meeting_failed` (E→P)
-Meeting join failed.
+Meeting join failed. Engine maps the SDK error code to a user-readable message and sends both. Plugin displays `message` directly; `code` is for logging only.
 
 ```json
-{"type": "meeting_failed", "error": "invalid_password" | "meeting_not_found" | "..."}
+{"type": "meeting_failed",
+ "code": 4,
+ "message": "Incorrect meeting password. Please try again."}
 ```
 
 #### `leave_meeting` (P→E)
-User disconnected from meeting.
+User clicked Disconnect. Engine calls `meetingService->Leave()`.
 
 ```json
 {"type": "leave_meeting"}
 ```
 
 #### `meeting_left` (E→P)
-Engine has left the meeting.
+Engine has observed the SDK reporting `MEETING_STATUS_ENDED` or `MEETING_STATUS_DISCONNECTING`. Plugin resets meeting-related state.
 
 ```json
 {"type": "meeting_left"}
 ```
 
-#### `meeting_ended` (E→P)
-Host ended the meeting, or the engine was kicked/disconnected. Plugin should update UI and clear active source subscriptions.
+#### `raw_livestream_granted` (E→P)
+`IMeetingLiveStreamCtrlEvent::onRawLiveStreamPrivilegeChanged(true)` fired. This is the critical moment where the plugin can actually render participant video. If the user is the host (e.g. joining their own PMI), this fires almost immediately after `meeting_joined`. Otherwise it fires only after the host clicks "Allow" on the "Request to livestream" popup in the Zoom client.
 
 ```json
-{"type": "meeting_ended", "reason": "host_ended" | "disconnected" | "..."}
+{"type": "raw_livestream_granted"}
+```
+
+#### `raw_livestream_timeout` (E→P)
+The SDK timed out waiting for the host to approve the raw-livestream request. Plugin logs but does not currently show a user-visible notification (future enhancement).
+
+```json
+{"type": "raw_livestream_timeout"}
 ```
 
 ### Participants
 
-#### `participant_list_changed` (E→P)
-Sent whenever the participant list changes (join, leave, rename). Includes the full current list, not a diff.
+#### `get_participants` (P→E)
+Plugin requests the current participant list. Sent from `zp_properties` on every open (so the list stays fresh without live SDK subscriptions), and from the "Refresh Participant List" button.
 
 ```json
-{"type": "participant_list_changed", "participants": [
-    {"id": "user_id_1", "name": "Alice"},
-    {"id": "user_id_2", "name": "Bob"}
-]}
+{"type": "get_participants"}
+```
+
+#### `participant_list_changed` (E→P)
+Sent as a response to `get_participants`, and also unsolicited after `raw_livestream_granted` so the plugin gets an initial list. Includes the full current list, not a diff. `my_user_id` is the plugin's own user in the meeting, which the plugin filters out of the dropdown.
+
+```json
+{"type": "participant_list_changed",
+ "my_user_id": 12345678,
+ "participants": [
+    {"id": 12345679, "name": "Alice"},
+    {"id": 12345680, "name": "Bob"}
+ ]}
 ```
 
 #### `active_speaker_changed` (E→P)
-Optional. Sent when Zoom reports the active speaker has changed. Plugin may use this for future auto-switching features.
+Active speaker changed in the meeting. Plugin caches this for use with the [Active Speaker] dropdown option.
 
 ```json
-{"type": "active_speaker_changed", "participant_id": "user_id_1"}
+{"type": "active_speaker_changed", "participant_id": 12345679}
 ```
 
-### Video Frames
+### Screenshare
+
+#### `share_status_changed` (E→P)
+Screenshare started or ended. Plugin uses this to update the Zoom Screenshare source's properties text ("Receiving screenshare" vs "Waiting for screenshare"). `sharer_user_id` is 0 when no share is active.
+
+```json
+{"type": "share_status_changed", "sharer_user_id": 12345679}
+```
+
+### Video Frames (Phase 6 — not yet implemented)
 
 #### `participant_source_subscribe` (P→E)
 Plugin requests video from a specific participant for a specific source.
 
 ```json
-{"type": "participant_source_subscribe", "source_id": "obs_source_uuid", "participant_id": "user_id_1"}
+{"type": "participant_source_subscribe",
+ "source_id": "obs_source_uuid",
+ "participant_id": 12345679}
 ```
 
 #### `source_texture_ready` (E→P)
-Engine has created a shared texture for this source. Plugin calls `gs_texture_open_shared_nt()` with the provided handle to get an OBS texture.
+Engine has created a shared texture for this source.
 
 ```json
-{"type": "source_texture_ready", "source_id": "obs_source_uuid", "handle": 12345678, "width": 1920, "height": 1080, "format": "NV12"}
+{"type": "source_texture_ready",
+ "source_id": "obs_source_uuid",
+ "handle": 12345678,
+ "width": 1920,
+ "height": 1080,
+ "format": "NV12"}
 ```
 
 #### `participant_source_unsubscribe` (P→E)
-Plugin no longer needs video for this source (source destroyed, participant changed, etc.).
+Plugin no longer needs video for this source.
 
 ```json
 {"type": "participant_source_unsubscribe", "source_id": "obs_source_uuid"}
-```
-
-#### `source_texture_released` (E→P)
-Engine has released the shared texture. Plugin should release its OBS texture reference.
-
-```json
-{"type": "source_texture_released", "source_id": "obs_source_uuid"}
-```
-
-#### `texture_handle_changed` (E→P)
-The shared texture for a source had to be recreated (typically due to resolution change). Plugin must re-import the handle.
-
-```json
-{"type": "texture_handle_changed", "source_id": "obs_source_uuid", "handle": 87654321, "width": 1280, "height": 720, "format": "NV12"}
-```
-
-### Screenshare
-
-#### `screenshare_subscribe` (P→E)
-Plugin requests the meeting's active screenshare feed for a source.
-
-```json
-{"type": "screenshare_subscribe", "source_id": "obs_source_uuid"}
-```
-
-#### `screenshare_texture_ready` (E→P)
-Engine created a shared texture for the screenshare. Same semantics as `source_texture_ready`.
-
-```json
-{"type": "screenshare_texture_ready", "source_id": "obs_source_uuid", "handle": 11223344, "width": 1920, "height": 1080, "format": "NV12"}
-```
-
-#### `screenshare_unsubscribe` (P→E)
-Plugin no longer needs screenshare.
-
-```json
-{"type": "screenshare_unsubscribe", "source_id": "obs_source_uuid"}
-```
-
-### Tier
-
-#### `tier_info` (E→P)
-Sent after login with the user's current tier. Plugin uses this to enforce source count and resolution limits.
-
-Tier values:
-- 0 = Free (1 feed, 720p)
-- 1 = Basic (3 feeds, 1080p)
-- 2 = Streamer (5 feeds, 1080p)
-- 3 = Broadcaster (8 feeds, 1080p)
-
-```json
-{"type": "tier_info", "tier": 0, "max_feeds": 1, "max_resolution": 720}
 ```
 
 ### Shutdown
@@ -259,7 +254,7 @@ OBS is closing. Engine should leave any active meeting, tear down the Zoom SDK c
 ```
 
 #### `shutdown_complete` (E→P)
-Engine has finished cleanup and is about to exit. Plugin may close the pipe.
+Engine has finished cleanup and is about to exit.
 
 ```json
 {"type": "shutdown_complete"}
@@ -267,28 +262,30 @@ Engine has finished cleanup and is about to exit. Plugin may close the pipe.
 
 ### Diagnostics
 
-#### `engine_error` (E→P)
-Something unrecoverable happened. Plugin logs and optionally shows the user a notification.
-
-```json
-{"type": "engine_error", "code": "sdk_init_failed" | "...", "message": "..."}
-```
-
 #### `engine_log` (E→P)
 Routine log message from the engine. Plugin forwards to the OBS log so everything is visible in one place.
 
 ```json
-{"type": "engine_log", "level": "info" | "warning" | "error", "message": "..."}
+{"type": "engine_log", "level": "info", "message": "..."}
+```
+
+#### `engine_error` (E→P)
+Something unrecoverable happened.
+
+```json
+{"type": "engine_error", "code": "sdk_init_failed", "message": "..."}
 ```
 
 ## Design Principles
 
-**Authoritative state lives in the engine.** The plugin is mostly a UI and frame-rendering layer. The engine is the source of truth for authentication, meeting state, and participants. If they disagree, the engine wins.
+**Authoritative state lives in the engine.** The plugin is a UI and (eventually) frame-rendering layer. The engine is the source of truth for authentication, meeting state, and participants. The plugin maintains a cache that's populated by engine messages, and reads from the cache during OBS's synchronous property-function calls.
 
-**Small, explicit messages.** Rather than generic RPC with method names and argument arrays, each message type has a clear purpose and explicit fields. This makes the protocol easy to debug, easy to extend, and resistant to accidental misuse.
+**Error messages are engine-generated.** The engine has the Zoom SDK headers and knows what each error code means. Rather than the plugin maintaining a duplicate table of codes and strings that can drift out of sync with the SDK, the engine sends both a numeric `code` (for logs) and a human-readable `message` (for display). Plugin just shows whatever the engine says.
 
-**Video data does not flow through the pipe.** Frame pixels live in GPU memory via shared textures. The pipe only carries handles and notifications. This keeps pipe traffic tiny regardless of frame rate or resolution.
+**Small, explicit messages.** Rather than generic RPC with method names and argument arrays, each message type has a clear purpose and explicit fields.
 
-**Request/response is loose.** Most P→E messages trigger an eventual E→P response, but the plugin does not block waiting. All pipe I/O happens on a dedicated pipe-reader thread in the plugin; responses are dispatched to handlers asynchronously.
+**Video data will not flow through the pipe.** Frame pixels will live in GPU memory via shared textures. The pipe carries handles and notifications only.
 
-**Extensibility.** Adding a new message type does not require protocol versioning — both sides ignore message types they don't recognize. Adding fields to existing messages is also safe, as long as old required fields are preserved.
+**Request/response is loose.** Most P→E messages trigger an eventual E→P response, but the plugin does not block waiting. All pipe I/O happens on a dedicated pipe-reader thread in the plugin; responses are dispatched to handlers asynchronously. Handlers marshal UI work to the Qt main thread via `QTimer::singleShot`.
+
+**Extensibility.** Both sides ignore message types they don't recognize. Adding fields to existing messages is safe, as long as old required fields are preserved.
