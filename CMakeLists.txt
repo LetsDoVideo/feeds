@@ -28,11 +28,6 @@ if(MSVC)
     add_compile_options(/WX-)
 endif()
 
-# Zoom Meeting SDK
-target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/zoom-sdk/h")
-target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/zoom-sdk/lib")
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE sdk)
-
 # Core libraries
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs ws2_32 crypt32 winhttp shlwapi)
 
@@ -70,9 +65,11 @@ if(MSVC)
     )
 endif()
 
-add_executable(FeedsLogin WIN32 helper/FeedsAuthHelper.cpp)
 add_executable(FeedsEngine WIN32
     engine/engine-main.cpp
     engine/engine-oauth.cpp
+    engine/engine-sdk.cpp
 )
-target_link_libraries(FeedsEngine PRIVATE winhttp crypt32 advapi32 shell32)
+target_include_directories(FeedsEngine PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/zoom-sdk/h")
+target_link_directories(FeedsEngine PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/zoom-sdk/lib")
+target_link_libraries(FeedsEngine PRIVATE winhttp crypt32 advapi32 shell32 sdk)
