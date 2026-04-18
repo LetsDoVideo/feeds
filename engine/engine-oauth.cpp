@@ -23,6 +23,7 @@ extern void LogToFile(const char* msg);
 extern bool SendToPlugin(const std::string& json);
 
 namespace feeds_engine {
+bool AuthenticateSDK();  // defined in engine-sdk.cpp
 
 // ---------------------------------------------------------------------------
 // Crypto, encoding, and JSON helpers
@@ -270,6 +271,9 @@ static void LoginThreadFunc()
 
     LogToFile("OAuth: got tokens, saving to Credential Manager");
     SaveTokensToCredentialManager(accessToken, refreshToken);
+
+    LogToFile("OAuth: triggering SDK authentication with new token");
+    AuthenticateSDK();
 
     LogToFile("OAuth: login complete, notifying plugin");
     SendToPlugin("{\"type\":\"login_succeeded\"}");
