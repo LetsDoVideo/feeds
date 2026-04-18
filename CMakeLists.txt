@@ -71,5 +71,8 @@ if(MSVC)
 endif()
 
 add_executable(FeedsLogin WIN32 helper/FeedsAuthHelper.cpp)
-add_executable(FeedsEngine WIN32 engine/engine-main.cpp)
-
+add_executable(FeedsEngine WIN32
+    engine/engine-main.cpp
+    engine/engine-oauth.cpp
+)
+target_link_libraries(FeedsEngine PRIVATE winhttp crypt32 advapi32 shell32)
