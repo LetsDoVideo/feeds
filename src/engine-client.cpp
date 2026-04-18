@@ -12,6 +12,8 @@
 #include <map>
 #include <functional>
 #include <mutex>
+#include <future>
+#include <chrono>
 #include <obs-module.h>
 
 namespace feeds {
@@ -81,6 +83,40 @@ void StopEngine()
 
     g_shutdownRequested = true;
 
+    // Tell the engine to clean up gracefully. The engine's shutdown handler
+    // leaves any meeting, sends shutdown_complete, then the pipe closes.
+    if (g_p2ePipe != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        const char* shutdownMsg = "{\"type\":\"shutdown\"}";
+        // Best-effort; don't block shutdown if this fails.
+        WriteFile(g_p2ePipe, shutdownMsg, (DWORD)strlen(shutdownMsg),
+                  &written, NULL);
+    }
+
+    // Unstick the pipe reader if it's blocked in ReadFile. Without this,
+    // closing the handle from another thread does not reliably wake a
+    // blocking ReadFile on Windows, and thread::join hangs forever. This
+    // was the cause of OBS's "zombie process" problem where the main
+    // executable lingered in Task Manager Details even after appearing
+    // to close.
+    if (g_e2pPipe != INVALID_HANDLE_VALUE) {
+        CancelIoEx(g_e2pPipe, NULL);
+    }
+
+    // Give the reader thread up to 2 seconds to exit cleanly. If it doesn't,
+    // we still forcibly move on — OBS shutdown is more important than
+    // perfect cleanup at this point.
+    if (g_pipeReaderThread.joinable()) {
+        auto future = std::async(std::launch::async, [](){
+            if (g_pipeReaderThread.joinable())
+                g_pipeReaderThread.join();
+        });
+        if (future.wait_for(std::chrono::seconds(2)) == std::future_status::timeout) {
+            blog(LOG_WARNING, "[feeds] StopEngine: pipe reader did not exit, detaching");
+            g_pipeReaderThread.detach();
+        }
+    }
+
     if (g_p2ePipe != INVALID_HANDLE_VALUE) {
         CloseHandle(g_p2ePipe);
         g_p2ePipe = INVALID_HANDLE_VALUE;
@@ -90,10 +126,15 @@ void StopEngine()
         g_e2pPipe = INVALID_HANDLE_VALUE;
     }
 
-    if (g_pipeReaderThread.joinable()) {
-        g_pipeReaderThread.join();
+    // Give the engine a moment to exit gracefully before we kill it via
+    // Job Object. The engine typically exits within ~200ms of receiving
+    // the shutdown message.
+    if (g_engineProcess) {
+        WaitForSingleObject(g_engineProcess, 500);
     }
 
+    // Closing the Job Object handle fires KILL_ON_JOB_CLOSE, which
+    // terminates the engine subprocess if it hasn't exited on its own.
     if (g_jobObject != NULL) {
         CloseHandle(g_jobObject);
         g_jobObject = NULL;
@@ -176,6 +217,9 @@ static bool CreatePipeServers()
     }
 
     // E2P: engine writes, plugin reads -> plugin side is INBOUND only
+    // FILE_FLAG_OVERLAPPED so we can cancel pending reads on shutdown.
+    // Even though we use synchronous ReadFile, the overlapped flag allows
+    // CancelIoEx to properly interrupt a blocked read on close.
     g_e2pPipe = CreateNamedPipeW(
         E2P_PIPE_NAME,
         PIPE_ACCESS_INBOUND,
@@ -323,7 +367,12 @@ static void PipeReaderThread()
 
         if (!ok) {
             DWORD err = GetLastError();
-            if (err != ERROR_BROKEN_PIPE && !g_shutdownRequested) {
+            // ERROR_OPERATION_ABORTED (995) is expected during shutdown,
+            // triggered by CancelIoEx. ERROR_BROKEN_PIPE (109) is expected
+            // when the engine exits. Anything else is a real error.
+            if (err != ERROR_BROKEN_PIPE &&
+                err != ERROR_OPERATION_ABORTED &&
+                !g_shutdownRequested) {
                 blog(LOG_ERROR, "[feeds] PipeReaderThread: ReadFile failed: %lu", err);
             }
             break;
