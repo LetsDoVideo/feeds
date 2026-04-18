@@ -22,6 +22,10 @@ static std::map<std::string, std::function<void(const std::string&)>> g_messageH
 namespace feeds_engine { 
     bool InitializeSDK();
     bool AuthenticateSDK();
+    void HandleJoinMeeting(const std::string& json);
+    void HandleLeaveMeeting(const std::string& json);
+    void HandleGetParticipants(const std::string& json);
+    void HandleLogout(const std::string& json);
 }
 
 // ---------------------------------------------------------------------------
@@ -255,9 +259,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
         return 1;
     }
 
-    // Register handlers for messages we expect from the plugin
-    RegisterHandler("login_start", HandleLoginStart);
-    RegisterHandler("shutdown", HandleShutdown);
+  // Register handlers for messages we expect from the plugin
+    RegisterHandler("login_start",     HandleLoginStart);
+    RegisterHandler("logout",          feeds_engine::HandleLogout);
+    RegisterHandler("join_meeting",    feeds_engine::HandleJoinMeeting);
+    RegisterHandler("leave_meeting",   feeds_engine::HandleLeaveMeeting);
+    RegisterHandler("get_participants", feeds_engine::HandleGetParticipants);
+    RegisterHandler("shutdown",        HandleShutdown);
 
     // Announce we're ready
     if (!SendToPlugin("{\"type\":\"engine_ready\",\"version\":\"1.0.0\"}")) {
