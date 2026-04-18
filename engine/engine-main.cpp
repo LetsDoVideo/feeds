@@ -18,7 +18,7 @@ static std::map<std::string, std::function<void(const std::string&)>> g_messageH
 // Logging
 // ---------------------------------------------------------------------------
 
-static void LogToFile(const char* msg)
+void LogToFile(const char* msg)
 {
     wchar_t logPath[MAX_PATH];
     GetModuleFileNameW(NULL, logPath, MAX_PATH);
@@ -72,7 +72,7 @@ static bool ConnectToPipe()
     return false;
 }
 
-static bool SendToPlugin(const std::string& json)
+bool SendToPlugin(const std::string& json)
 {
     DWORD written = 0;
     BOOL ok = WriteFile(g_pipeHandle, json.c_str(), (DWORD)json.size(), &written, NULL);
@@ -169,14 +169,14 @@ static void PipeReaderLoop()
 // Message handlers (stubs for now — will be filled in as phases progress)
 // ---------------------------------------------------------------------------
 
+// Forward declaration — implemented in engine-oauth.cpp
+namespace feeds_engine { bool StartLoginFlow(); }
+
 static void HandleLoginStart(const std::string& json)
 {
-    LogToFile("HandleLoginStart: received login_start message (stub)");
-    // Phase 3 step 3 will do the actual OAuth here.
-    // For now, just acknowledge to prove the round-trip works.
-    SendToPlugin("{\"type\":\"login_failed\",\"error\":\"not_implemented_yet\"}");
+    LogToFile("HandleLoginStart: starting OAuth flow");
+    feeds_engine::StartLoginFlow();
 }
-
 static void HandleShutdown(const std::string& json)
 {
     LogToFile("HandleShutdown: received shutdown message");
