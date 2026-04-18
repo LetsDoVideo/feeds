@@ -70,6 +70,3 @@ add_executable(FeedsEngine WIN32
     engine/engine-oauth.cpp
     engine/engine-sdk.cpp
 )
-target_include_directories(FeedsEngine PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/zoom-sdk/h")
-target_link_directories(FeedsEngine PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/zoom-sdk/lib")
-target_link_libraries(FeedsEngine PRIVATE winhttp crypt32 advapi32 shell32 sdk)
