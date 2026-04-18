@@ -383,9 +383,74 @@ public:
         }
 
         if (status == ZOOM_SDK_NAMESPACE::MEETING_STATUS_FAILED) {
-            char failMsg[128];
-            sprintf_s(failMsg,
-                "{\"type\":\"meeting_failed\",\"code\":%d}", iResult);
+            // Map SDK error code to a user-visible message. We do this
+            // engine-side because the SDK headers that define these
+            // constants live here. Plugin just displays whatever we send.
+            const char* errMsg = nullptr;
+            switch (iResult) {
+                case ZOOM_SDK_NAMESPACE::MEETING_FAIL_PASSWORD_ERR:
+                    errMsg = "Incorrect meeting password. Please try again.";
+                    break;
+                case ZOOM_SDK_NAMESPACE::MEETING_FAIL_MEETING_NOT_EXIST:
+                    errMsg = "Meeting not found. Please check the meeting number or link.";
+                    break;
+                case ZOOM_SDK_NAMESPACE::MEETING_FAIL_CONNECTION_ERR:
+                case ZOOM_SDK_NAMESPACE::MEETING_FAIL_RECONNECT_ERR:
+                    errMsg = "Connection error. Please check your internet connection and try again.";
+                    break;
+                case ZOOM_SDK_NAMESPACE::MEETING_FAIL_HOST_DISALLOW_OUTSIDE_USER_JOIN:
+                    errMsg = "The host has disabled external participants from joining this meeting.";
+                    break;
+                case ZOOM_SDK_NAMESPACE::MEETING_FAIL_UNABLE_TO_JOIN_EXTERNAL_MEETING:
+                    errMsg = "This app must be published on the Zoom Marketplace before joining external meetings.";
+                    break;
+                case ZOOM_SDK_NAMESPACE::MEETING_FAIL_APP_CAN_NOT_ANONYMOUS_JOIN_MEETING:
+                    errMsg = "This meeting requires you to be logged in to Zoom. Please log in and try again.";
+                    break;
+                case ZOOM_SDK_NAMESPACE::MEETING_FAIL_BLOCKED_BY_ACCOUNT_ADMIN:
+                    errMsg = "Your Zoom account administrator has blocked this application.";
+                    break;
+                case ZOOM_SDK_NAMESPACE::MEETING_FAIL_NEED_SIGN_IN_FOR_PRIVATE_MEETING:
+                    errMsg = "This is a private meeting. Please log in to Zoom and try again.";
+                    break;
+                case ZOOM_SDK_NAMESPACE::MEETING_FAIL_MEETING_OVER:
+                    errMsg = "This meeting has already ended.";
+                    break;
+                case ZOOM_SDK_NAMESPACE::MEETING_FAIL_MEETING_NOT_START:
+                    errMsg = "This meeting has not started yet.";
+                    break;
+                case ZOOM_SDK_NAMESPACE::MEETING_FAIL_MEETING_USER_FULL:
+                    errMsg = "This meeting is at maximum capacity.";
+                    break;
+                case ZOOM_SDK_NAMESPACE::MEETING_FAIL_MEETING_RESTRICTED:
+                    errMsg = "This meeting is restricted.";
+                    break;
+                case ZOOM_SDK_NAMESPACE::MEETING_FAIL_MEETING_RESTRICTED_JBH:
+                    errMsg = "This meeting does not allow joining before the host.";
+                    break;
+                case ZOOM_SDK_NAMESPACE::MEETING_FAIL_ENFORCE_LOGIN:
+                    errMsg = "This meeting requires you to be logged in to Zoom.";
+                    break;
+                default: {
+                    static char generic[128];
+                    sprintf_s(generic, "Failed to join meeting. Error code: %d", iResult);
+                    errMsg = generic;
+                    break;
+                }
+            }
+
+            // Escape the message for JSON. All our strings are plain ASCII
+            // so we only need to escape quotes — but be defensive.
+            std::string escaped;
+            for (const char* p = errMsg; *p; ++p) {
+                if (*p == '"')  escaped += "\\\"";
+                else if (*p == '\\') escaped += "\\\\";
+                else escaped += *p;
+            }
+
+            std::string failMsg = "{\"type\":\"meeting_failed\","
+                                  "\"code\":" + std::to_string(iResult) + ","
+                                  "\"message\":\"" + escaped + "\"}";
             SendToPlugin(failMsg);
         }
     }
@@ -450,7 +515,8 @@ void HandleJoinMeeting(const std::string& json) {
 
     if (!g_meetingService) {
         LogToFile("Meeting: join requested but meeting service not initialized");
-        SendToPlugin("{\"type\":\"meeting_failed\",\"code\":-1}");
+        SendToPlugin("{\"type\":\"meeting_failed\",\"code\":-1,"
+                     "\"message\":\"Zoom SDK is not ready. Please try logging in again.\"}");
         return;
     }
 
@@ -461,7 +527,8 @@ void HandleJoinMeeting(const std::string& json) {
 
     if (input.empty()) {
         LogToFile("Meeting: join_meeting received with empty input");
-        SendToPlugin("{\"type\":\"meeting_failed\",\"code\":-2}");
+        SendToPlugin("{\"type\":\"meeting_failed\",\"code\":-2,"
+                     "\"message\":\"No meeting number or link was provided.\"}");
         return;
     }
 
@@ -472,7 +539,9 @@ void HandleJoinMeeting(const std::string& json) {
 
     if (zak.empty() || displayName.empty()) {
         LogToFile("Meeting: could not retrieve ZAK or display name");
-        SendToPlugin("{\"type\":\"meeting_failed\",\"code\":-3}");
+        SendToPlugin("{\"type\":\"meeting_failed\",\"code\":-3,"
+                     "\"message\":\"Could not retrieve your Zoom account details. "
+                     "Please log out and log in again.\"}");
         return;
     }
 
@@ -530,7 +599,8 @@ void HandleJoinMeeting(const std::string& json) {
         std::string digits;
         for (char c : rest) if (c >= '0' && c <= '9') digits += c;
         if (digits.empty()) {
-            SendToPlugin("{\"type\":\"meeting_failed\",\"code\":-2}");
+            SendToPlugin("{\"type\":\"meeting_failed\",\"code\":-2,"
+                         "\"message\":\"Could not parse meeting number from link.\"}");
             return;
         }
         param.meetingNumber = _strtoui64(digits.c_str(), nullptr, 10);
@@ -540,7 +610,8 @@ void HandleJoinMeeting(const std::string& json) {
         std::string digits;
         for (char c : input) if (c >= '0' && c <= '9') digits += c;
         if (digits.empty()) {
-            SendToPlugin("{\"type\":\"meeting_failed\",\"code\":-2}");
+            SendToPlugin("{\"type\":\"meeting_failed\",\"code\":-2,"
+                         "\"message\":\"Could not parse a valid meeting number.\"}");
             return;
         }
         param.meetingNumber = _strtoui64(digits.c_str(), nullptr, 10);
@@ -552,10 +623,10 @@ void HandleJoinMeeting(const std::string& json) {
         char buf[256];
         sprintf_s(buf, "Meeting: Join() call failed immediately: %d", (int)joinErr);
         LogToFile(buf);
-        // Map SDK call failure to a generic meeting_failed for the plugin.
-        // SDK errors in this path are rare; meeting_failed with code 0 will
-        // hit the default "Failed to join meeting. Error code: 0" branch.
-        sprintf_s(buf, "{\"type\":\"meeting_failed\",\"code\":%d}", (int)joinErr);
+        sprintf_s(buf,
+            "{\"type\":\"meeting_failed\",\"code\":%d,"
+            "\"message\":\"Could not start meeting join. SDK error: %d\"}",
+            (int)joinErr, (int)joinErr);
         SendToPlugin(buf);
         return;
     }
