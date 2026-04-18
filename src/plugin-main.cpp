@@ -1657,11 +1657,20 @@ bool obs_module_load(void) {
     });
 
     feeds::RegisterMessageHandler("login_succeeded", [](const std::string& json) {
-        // Engine already saved tokens to Credential Manager.
-        // Load them into plugin memory and kick off SDK auth on Qt main thread.
-        if (LoadTokensFromRegistry()) {
+        blog(LOG_INFO, "[feeds] login_succeeded handler: called");
+        
+        bool loaded = LoadTokensFromRegistry();
+        blog(LOG_INFO, "[feeds] login_succeeded handler: LoadTokensFromRegistry returned %d", loaded);
+        
+        if (loaded) {
+            blog(LOG_INFO, "[feeds] login_succeeded handler: scheduling DoSDKAuth on main thread");
             QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
-                               []() { DoSDKAuth(); });
+                               []() { 
+                                   blog(LOG_INFO, "[feeds] login_succeeded handler: calling DoSDKAuth now");
+                                   DoSDKAuth(); 
+                               });
+        } else {
+            blog(LOG_ERROR, "[feeds] login_succeeded handler: LoadTokensFromRegistry failed!");
         }
     });
     
