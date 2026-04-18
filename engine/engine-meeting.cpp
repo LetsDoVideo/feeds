@@ -8,6 +8,7 @@
 // messages and keeps its own cache for UI purposes.
 
 #include <windows.h>
+#include <wincred.h>
 #include <string>
 #include <sstream>
 #include <cstdio>
