@@ -1,8 +1,9 @@
 // engine-client.cpp — manages the FeedsEngine.exe subprocess and IPC with it.
 //
-// The plugin creates a named pipe server, launches FeedsEngine.exe into a
-// Job Object (so it gets killed if OBS crashes), waits for the engine to
-// connect to the pipe, then exchanges messages.
+// Uses TWO unidirectional named pipes to avoid any read/write serialization
+// issues on a single duplex pipe:
+//   \\.\pipe\FeedsEngine_P2E  — plugin writes, engine reads
+//   \\.\pipe\FeedsEngine_E2P  — engine writes, plugin reads
 
 #include <windows.h>
 #include <string>
@@ -17,7 +18,8 @@ namespace feeds {
 
 static HANDLE g_jobObject = NULL;
 static HANDLE g_engineProcess = NULL;
-static HANDLE g_pipeHandle = INVALID_HANDLE_VALUE;
+static HANDLE g_p2ePipe = INVALID_HANDLE_VALUE;  // plugin writes to this
+static HANDLE g_e2pPipe = INVALID_HANDLE_VALUE;  // plugin reads from this
 static std::thread g_pipeReaderThread;
 static std::atomic<bool> g_shutdownRequested{false};
 
@@ -26,12 +28,14 @@ static std::map<std::string, std::function<void(const std::string&)>> g_messageH
 
 static std::mutex g_writeMutex;
 
-static const wchar_t* PIPE_NAME = L"\\\\.\\pipe\\FeedsEngine";
+static const wchar_t* P2E_PIPE_NAME = L"\\\\.\\pipe\\FeedsEngine_P2E";
+static const wchar_t* E2P_PIPE_NAME = L"\\\\.\\pipe\\FeedsEngine_E2P";
 
 // Forward declarations
-static bool CreatePipeServer();
+static bool CreatePipeServers();
 static bool CreateJobObject();
 static bool LaunchEngineProcess();
+static bool WaitForEngineConnections();
 static void PipeReaderThread();
 static std::string ExtractJsonStringField(const std::string& json, const std::string& field);
 
@@ -48,8 +52,8 @@ bool StartEngine()
         return false;
     }
 
-    if (!CreatePipeServer()) {
-        blog(LOG_ERROR, "[feeds] StartEngine: failed to create pipe server");
+    if (!CreatePipeServers()) {
+        blog(LOG_ERROR, "[feeds] StartEngine: failed to create pipe servers");
         return false;
     }
 
@@ -58,14 +62,12 @@ bool StartEngine()
         return false;
     }
 
-    // Wait for engine to connect to pipe (blocks until engine connects)
-    BOOL connected = ConnectNamedPipe(g_pipeHandle, NULL);
-    if (!connected && GetLastError() != ERROR_PIPE_CONNECTED) {
-        blog(LOG_ERROR, "[feeds] StartEngine: ConnectNamedPipe failed: %lu", GetLastError());
+    if (!WaitForEngineConnections()) {
+        blog(LOG_ERROR, "[feeds] StartEngine: engine did not connect to pipes");
         return false;
     }
 
-    blog(LOG_INFO, "[feeds] StartEngine: engine connected to pipe");
+    blog(LOG_INFO, "[feeds] StartEngine: engine connected to both pipes");
 
     g_shutdownRequested = false;
     g_pipeReaderThread = std::thread(PipeReaderThread);
@@ -79,9 +81,13 @@ void StopEngine()
 
     g_shutdownRequested = true;
 
-    if (g_pipeHandle != INVALID_HANDLE_VALUE) {
-        CloseHandle(g_pipeHandle);
-        g_pipeHandle = INVALID_HANDLE_VALUE;
+    if (g_p2ePipe != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_p2ePipe);
+        g_p2ePipe = INVALID_HANDLE_VALUE;
+    }
+    if (g_e2pPipe != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_e2pPipe);
+        g_e2pPipe = INVALID_HANDLE_VALUE;
     }
 
     if (g_pipeReaderThread.joinable()) {
@@ -105,13 +111,13 @@ bool SendToEngine(const std::string& jsonMessage)
 {
     std::lock_guard<std::mutex> lock(g_writeMutex);
 
-    if (g_pipeHandle == INVALID_HANDLE_VALUE) {
-        blog(LOG_ERROR, "[feeds] SendToEngine: pipe not connected");
+    if (g_p2ePipe == INVALID_HANDLE_VALUE) {
+        blog(LOG_ERROR, "[feeds] SendToEngine: P2E pipe not connected");
         return false;
     }
 
     DWORD written = 0;
-    BOOL ok = WriteFile(g_pipeHandle, jsonMessage.c_str(),
+    BOOL ok = WriteFile(g_p2ePipe, jsonMessage.c_str(),
                         (DWORD)jsonMessage.size(), &written, NULL);
     if (!ok) {
         blog(LOG_ERROR, "[feeds] SendToEngine: WriteFile failed: %lu", GetLastError());
@@ -130,7 +136,7 @@ void RegisterMessageHandler(const std::string& messageType,
 }
 
 // ---------------------------------------------------------------------------
-// Internal: Job Object, pipe server, process launch
+// Internal: Job Object, pipe servers, process launch
 // ---------------------------------------------------------------------------
 
 static bool CreateJobObject()
@@ -155,17 +161,50 @@ static bool CreateJobObject()
     return true;
 }
 
-static bool CreatePipeServer()
+static bool CreatePipeServers()
 {
-    g_pipeHandle = CreateNamedPipeW(
-        PIPE_NAME,
-        PIPE_ACCESS_DUPLEX,
+    // P2E: plugin writes, engine reads -> plugin side is OUTBOUND only
+    g_p2ePipe = CreateNamedPipeW(
+        P2E_PIPE_NAME,
+        PIPE_ACCESS_OUTBOUND,
         PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-        1, 4096, 4096, 0, NULL
-    );
+        1, 4096, 4096, 0, NULL);
 
-    if (g_pipeHandle == INVALID_HANDLE_VALUE) {
-        blog(LOG_ERROR, "[feeds] CreateNamedPipe failed: %lu", GetLastError());
+    if (g_p2ePipe == INVALID_HANDLE_VALUE) {
+        blog(LOG_ERROR, "[feeds] CreateNamedPipe (P2E) failed: %lu", GetLastError());
+        return false;
+    }
+
+    // E2P: engine writes, plugin reads -> plugin side is INBOUND only
+    g_e2pPipe = CreateNamedPipeW(
+        E2P_PIPE_NAME,
+        PIPE_ACCESS_INBOUND,
+        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+        1, 4096, 4096, 0, NULL);
+
+    if (g_e2pPipe == INVALID_HANDLE_VALUE) {
+        blog(LOG_ERROR, "[feeds] CreateNamedPipe (E2P) failed: %lu", GetLastError());
+        CloseHandle(g_p2ePipe);
+        g_p2ePipe = INVALID_HANDLE_VALUE;
+        return false;
+    }
+
+    return true;
+}
+
+static bool WaitForEngineConnections()
+{
+    // Engine will connect to both pipes. Order matters: engine connects P2E first,
+    // then E2P. We accept them in the same order here.
+    BOOL ok = ConnectNamedPipe(g_p2ePipe, NULL);
+    if (!ok && GetLastError() != ERROR_PIPE_CONNECTED) {
+        blog(LOG_ERROR, "[feeds] ConnectNamedPipe (P2E) failed: %lu", GetLastError());
+        return false;
+    }
+
+    ok = ConnectNamedPipe(g_e2pPipe, NULL);
+    if (!ok && GetLastError() != ERROR_PIPE_CONNECTED) {
+        blog(LOG_ERROR, "[feeds] ConnectNamedPipe (E2P) failed: %lu", GetLastError());
         return false;
     }
 
@@ -202,8 +241,7 @@ static bool LaunchEngineProcess()
     BOOL ok = CreateProcessW(
         enginePath, NULL, NULL, NULL, FALSE,
         CREATE_SUSPENDED | CREATE_NO_WINDOW,
-        NULL, NULL, &si, &pi
-    );
+        NULL, NULL, &si, &pi);
 
     if (!ok) {
         blog(LOG_ERROR, "[feeds] CreateProcess failed: %lu", GetLastError());
@@ -231,10 +269,6 @@ static bool LaunchEngineProcess()
 // Internal: pipe reader and message dispatch
 // ---------------------------------------------------------------------------
 
-// Minimal JSON string field extractor. Extracts the value of a string-typed
-// field from a flat JSON object. Returns empty string on failure. This is
-// intentionally naive — full JSON parsing happens on the plugin side only
-// if/when we need it. For now, reading "type" is enough to dispatch messages.
 static std::string ExtractJsonStringField(const std::string& json, const std::string& field)
 {
     std::string key = "\"" + field + "\"";
@@ -284,11 +318,8 @@ static void PipeReaderThread()
 
     char buffer[4096];
     while (!g_shutdownRequested) {
-        blog(LOG_INFO, "[feeds] PipeReaderThread: calling ReadFile (waiting for message)");
         DWORD bytesRead = 0;
-        BOOL ok = ReadFile(g_pipeHandle, buffer, sizeof(buffer) - 1, &bytesRead, NULL);
-        blog(LOG_INFO, "[feeds] PipeReaderThread: ReadFile returned ok=%d, bytes=%lu, err=%lu", 
-             ok, bytesRead, ok ? 0 : GetLastError());
+        BOOL ok = ReadFile(g_e2pPipe, buffer, sizeof(buffer) - 1, &bytesRead, NULL);
 
         if (!ok) {
             DWORD err = GetLastError();
