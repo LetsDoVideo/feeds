@@ -6,7 +6,7 @@
 #include "auth_service_interface.h"
 #include <string>
 #include <thread>
-#include <cstdio>>
+#include <cstdio>
 
 extern void LogToFile(const char* msg);
 extern bool SendToPlugin(const std::string& json);
