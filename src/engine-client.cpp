@@ -58,23 +58,10 @@ bool StartEngine()
         return false;
     }
 
-    // Wait for engine to connect to pipe (blocking up to 10 seconds)
-    OVERLAPPED ov = {};
-    ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-    BOOL connected = ConnectNamedPipe(g_pipeHandle, &ov);
-    DWORD err = GetLastError();
-
-    if (!connected && err == ERROR_PIPE_CONNECTED) {
-        connected = TRUE;
-    } else if (!connected && err == ERROR_IO_PENDING) {
-        DWORD waitResult = WaitForSingleObject(ov.hEvent, 10000);
-        connected = (waitResult == WAIT_OBJECT_0);
-    }
-
-    CloseHandle(ov.hEvent);
-
-    if (!connected) {
-        blog(LOG_ERROR, "[feeds] StartEngine: engine did not connect to pipe within 10 seconds");
+    // Wait for engine to connect to pipe (blocks until engine connects)
+    BOOL connected = ConnectNamedPipe(g_pipeHandle, NULL);
+    if (!connected && GetLastError() != ERROR_PIPE_CONNECTED) {
+        blog(LOG_ERROR, "[feeds] StartEngine: ConnectNamedPipe failed: %lu", GetLastError());
         return false;
     }
 
@@ -172,7 +159,7 @@ static bool CreatePipeServer()
 {
     g_pipeHandle = CreateNamedPipeW(
         PIPE_NAME,
-        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+        PIPE_ACCESS_DUPLEX,
         PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
         1, 4096, 4096, 0, NULL
     );
