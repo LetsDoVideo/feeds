@@ -979,9 +979,12 @@ if (pipe == INVALID_HANDLE_VALUE) {
 // LOGIN HELPER — full PKCE flow
 // ---------------------------------------------------------------------------
 void OnLoginClick() {
+    blog(LOG_INFO, "[feeds] OnLoginClick: entered");
     // Phase 3: Forward login request to engine
     feeds::SendToEngine("{\"type\":\"login_start\"}");
+    blog(LOG_INFO, "[feeds] OnLoginClick: SendToEngine returned");
     return;
+  
 
     // OLD OAuth code below — left in place for reference, unreachable due to return above
     if (g_isLoggedIn) {
