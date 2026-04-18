@@ -16,6 +16,11 @@ static HANDLE g_readPipe  = INVALID_HANDLE_VALUE;  // engine reads from P2E
 static HANDLE g_writePipe = INVALID_HANDLE_VALUE;  // engine writes to E2P
 static std::map<std::string, std::function<void(const std::string&)>> g_messageHandlers;
 
+namespace feeds_engine { 
+    bool InitializeSDK();
+    bool AuthenticateSDK();
+}
+
 // ---------------------------------------------------------------------------
 // Logging
 // ---------------------------------------------------------------------------
@@ -227,10 +232,13 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
     RegisterHandler("shutdown", HandleShutdown);
 
     // Announce we're ready
-    if (!SendToPlugin("{\"type\":\"engine_ready\",\"version\":\"1.0.0\"}")) {
+   if (!SendToPlugin("{\"type\":\"engine_ready\",\"version\":\"1.0.0\"}")) {
         LogToFile("Failed to send engine_ready");
         return 1;
     }
+
+    // Initialize the Zoom SDK. If tokens exist, this also triggers auth.
+    feeds_engine::InitializeSDK();
 
     // Process messages until pipe closes
     PipeReaderLoop();
