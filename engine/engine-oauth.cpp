@@ -174,7 +174,12 @@ static void SaveTokensToCredentialManager(const std::string& accessToken,
         cred.TargetName         = (LPSTR)"Feeds_AccessToken";
         cred.CredentialBlobSize = (DWORD)accessToken.size();
         cred.CredentialBlob     = (LPBYTE)accessToken.data();
-        cred.Persist            = CRED_PERSIST_LOCAL_MACHINE;
+        // ENTERPRISE persists across sessions like LOCAL_MACHINE but also
+        // roams with the user's Windows profile on domain-joined systems
+        // with roaming profiles, and is allowed under stricter enterprise
+        // IT policies that disallow LOCAL_MACHINE. Functionally identical
+        // for standalone home PCs.
+        cred.Persist            = CRED_PERSIST_ENTERPRISE;
         CredWriteA(&cred, 0);
     }
     {
@@ -183,7 +188,7 @@ static void SaveTokensToCredentialManager(const std::string& accessToken,
         cred.TargetName         = (LPSTR)"Feeds_RefreshToken";
         cred.CredentialBlobSize = (DWORD)refreshToken.size();
         cred.CredentialBlob     = (LPBYTE)refreshToken.data();
-        cred.Persist            = CRED_PERSIST_LOCAL_MACHINE;
+        cred.Persist            = CRED_PERSIST_ENTERPRISE;
         CredWriteA(&cred, 0);
     }
 }
