@@ -146,4 +146,20 @@ inline std::string MakeFrameRegionName(uint32_t enginePid,
     return "Local\\FeedsFrames_" + std::to_string(enginePid) + "_" + sourceUuid;
 }
 
+// Shared memory name for the screenshare region. Unlike participant feeds
+// (which are UUID-keyed because N sources can exist, each subscribed to a
+// different user), screenshare is a singleton in the engine: one SDK
+// renderer subscribed to whoever is currently sharing. Multiple plugin-
+// side screenshare sources may exist (for filter variations, etc.); they
+// all map this same region and independently pump frames out to OBS.
+//
+// Region lifetime: created when the first screenshare source opens it in
+// an active meeting, lives until the engine process exits. When no share
+// is active the region exists but no frames are written; readers just see
+// write_index unchanged and output nothing.
+inline std::string MakeScreenShareRegionName(uint32_t enginePid)
+{
+    return "Local\\FeedsShare_" + std::to_string(enginePid);
+}
+
 } // namespace feeds_shared
