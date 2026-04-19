@@ -22,12 +22,6 @@ static std::map<std::string, std::function<void(const std::string&)>> g_messageH
 namespace feeds_engine { 
     bool InitializeSDK();
     bool AuthenticateSDK();
-    void HandleJoinMeeting(const std::string& json);
-    void HandleLeaveMeeting(const std::string& json);
-    void HandleGetParticipants(const std::string& json);
-    void HandleLogout(const std::string& json);
-    void HandleParticipantSourceSubscribe(const std::string& json);
-    void HandleParticipantSourceUnsubscribe(const std::string& json);
 }
 
 // ---------------------------------------------------------------------------
@@ -215,9 +209,32 @@ static void HandleLoginStart(const std::string& json)
     LogToFile("HandleLoginStart: starting OAuth flow");
     feeds_engine::StartLoginFlow();
 }
+// Forward decl — defined in engine-meeting.cpp
+namespace feeds_engine { void HandleLeaveMeeting(const std::string&); }
+
 static void HandleShutdown(const std::string& json)
 {
     LogToFile("HandleShutdown: received shutdown message");
+
+    // If we're currently in a Zoom meeting, leave it cleanly before the
+    // process exits. Without this, the Zoom meeting lingers after OBS
+    // closes — the SDK won't signal the server that we left, so other
+    // participants see our camera stay on as a ghost. Matches v1.0.0
+    // behavior where the SDK ran in-process and naturally cleaned up
+    // when OBS exited.
+    //
+    // HandleLeaveMeeting is a no-op if we're not in a meeting, so it's
+    // safe to call unconditionally.
+    feeds_engine::HandleLeaveMeeting(json);
+
+    // Give the SDK a brief window to deliver the "leaving" message to
+    // Zoom's servers before we exit. The SDK's Leave() call is
+    // asynchronous — it doesn't block until delivery completes. Without
+    // this wait, the process exits before the network packet goes out.
+    // 500ms is a compromise between "always works" and "not annoyingly
+    // slow to close OBS." Picked based on empirical testing.
+    Sleep(500);
+
     SendToPlugin("{\"type\":\"shutdown_complete\"}");
     // Pipe will close when plugin closes its handle; reader loop will exit.
 }
@@ -237,14 +254,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     LogToFile("========================================");
     LogToFile("FeedsEngine.exe starting");
 
-    // Create a real (but invisible) top-level window. The Zoom SDK requires
-    // a real HWND on the main thread for its async callbacks to fire, AND
-    // it looks for a top-level window in the process to anchor its own
-    // meeting UI to. A message-only window (HWND_MESSAGE parent) is not a
-    // true top-level window — the Zoom meeting window ends up in a
-    // confused initial state with a transparent top strip until the user
-    // presses Esc. A normal hidden popup window acts as the anchor the SDK
-    // wants without appearing in the taskbar or becoming visible.
+    // Create a message-only window. The Zoom SDK requires a real HWND
+    // on the main thread for its async callbacks to fire.
     WNDCLASSW wc = {};
     wc.lpfnWndProc   = EngineWndProc;
     wc.hInstance     = hInstance;
@@ -252,43 +263,27 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     RegisterClassW(&wc);
 
     HWND hwnd = CreateWindowExW(
-        WS_EX_TOOLWINDOW,           // no taskbar entry
-        L"FeedsEngineWindow", L"FeedsEngine",
-        WS_POPUP,                   // top-level, not a child
-        0, 0, 1, 1,                 // 1x1 at origin; never shown
-        NULL, NULL, hInstance, NULL);
+        0, L"FeedsEngineWindow", L"FeedsEngine",
+        0, 0, 0, 0, 0,
+        HWND_MESSAGE, NULL, hInstance, NULL);
 
     if (!hwnd) {
-        LogToFile("Failed to create anchor window");
+        LogToFile("Failed to create message-only window");
         return 1;
     }
-    // Note: intentionally do NOT call ShowWindow. The window stays hidden.
-    LogToFile("Created anchor window");
+    LogToFile("Created message-only window");
 
     if (!ConnectToPipes()) {
         LogToFile("Could not connect to pipes, exiting");
         return 1;
     }
 
-  // Register handlers for messages we expect from the plugin
-    RegisterHandler("login_start",     HandleLoginStart);
-    RegisterHandler("logout",          feeds_engine::HandleLogout);
-    RegisterHandler("join_meeting",    feeds_engine::HandleJoinMeeting);
-    RegisterHandler("leave_meeting",   feeds_engine::HandleLeaveMeeting);
-    RegisterHandler("get_participants", feeds_engine::HandleGetParticipants);
-    RegisterHandler("participant_source_subscribe",
-                    feeds_engine::HandleParticipantSourceSubscribe);
-    RegisterHandler("participant_source_unsubscribe",
-                    feeds_engine::HandleParticipantSourceUnsubscribe);
-    RegisterHandler("shutdown",        HandleShutdown);
+    // Register handlers for messages we expect from the plugin
+    RegisterHandler("login_start", HandleLoginStart);
+    RegisterHandler("shutdown", HandleShutdown);
 
-    // Announce we're ready. Include our PID so the plugin can construct
-    // the shared-memory region names used for video frames.
-    char readyMsg[128];
-    sprintf_s(readyMsg,
-        "{\"type\":\"engine_ready\",\"version\":\"1.0.0\",\"pid\":%lu}",
-        GetCurrentProcessId());
-    if (!SendToPlugin(readyMsg)) {
+    // Announce we're ready
+    if (!SendToPlugin("{\"type\":\"engine_ready\",\"version\":\"1.0.0\"}")) {
         LogToFile("Failed to send engine_ready");
         return 1;
     }
