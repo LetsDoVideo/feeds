@@ -21,6 +21,7 @@
 #include "meeting_service_components/meeting_participants_ctrl_interface.h"
 #include "meeting_service_components/meeting_live_stream_interface.h"
 #include "meeting_service_components/meeting_sharing_interface.h"
+#include "setting_service_interface.h"
 
 // Defined elsewhere in the engine
 extern void LogToFile(const char* msg);
@@ -475,9 +476,49 @@ public:
 static ZoomMeetingListener g_meetingListener;
 
 // ---------------------------------------------------------------------------
+// Configure default SDK settings. Called once right after the meeting
+// service is created. The main thing we're fixing here is the auto-full-
+// screen behavior: when our subprocess creates the meeting window in full
+// screen, the title bar paints for the wrong size and stays broken until
+// something forces a layout pass (like pressing Esc). Disabling auto-full-
+// screen sidesteps the issue — the window opens in normal windowed mode
+// and the user can go full-screen afterward if they want, which works
+// correctly because the window is already fully initialized.
+// ---------------------------------------------------------------------------
+static void ApplyDefaultSettings() {
+    ZOOM_SDK_NAMESPACE::ISettingService* settingService = nullptr;
+    ZOOM_SDK_NAMESPACE::SDKError err =
+        ZOOM_SDK_NAMESPACE::CreateSettingService(&settingService);
+    if (err != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS || !settingService) {
+        char buf[128];
+        sprintf_s(buf, "Settings: CreateSettingService failed: %d", (int)err);
+        LogToFile(buf);
+        return;
+    }
+
+    ZOOM_SDK_NAMESPACE::IGeneralSettingContext* general =
+        settingService->GetGeneralSettings();
+    if (!general) {
+        LogToFile("Settings: GetGeneralSettings returned nullptr");
+        return;
+    }
+
+    ZOOM_SDK_NAMESPACE::SDKError r =
+        general->EnableAutoFullScreenVideoWhenJoinMeeting(false);
+    if (r != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
+        char buf[128];
+        sprintf_s(buf, "Settings: EnableAutoFullScreenVideoWhenJoinMeeting(false) failed: %d", (int)r);
+        LogToFile(buf);
+    } else {
+        LogToFile("Settings: disabled auto-full-screen on meeting join");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Initialization — called from engine-sdk.cpp's onAuthenticationReturn
 // after SDK auth succeeds. Creates the meeting service (singleton in the
-// SDK, but we only need to do this once), registers the meeting listener.
+// SDK, but we only need to do this once), registers the meeting listener,
+// and applies default SDK settings.
 // ---------------------------------------------------------------------------
 bool InitializeMeetingSession() {
     if (g_meetingService) {
@@ -496,6 +537,9 @@ bool InitializeMeetingSession() {
 
     g_meetingService->SetEvent(&g_meetingListener);
     LogToFile("Meeting: service created and listener attached");
+
+    ApplyDefaultSettings();
+
     return true;
 }
 
