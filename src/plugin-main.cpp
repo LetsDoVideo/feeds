@@ -34,6 +34,18 @@
 #include <QRegularExpression>
 #include <QTimer>
 
+// Qt defines `slots` and `signals` as preprocessor macros (expanding to
+// empty or to annotations for the Meta-Object Compiler). Any non-Qt code
+// below that happens to use identifiers named `slots`, `signals`, or
+// `emit` as variables or fields will be silently mangled by the
+// preprocessor and produce cryptic syntax errors that point at the wrong
+// line. We guard our shared headers and data structures by undefining
+// these macros; we don't use Qt's signals/slots mechanism anywhere in
+// this file (connections are done via lambdas) so this is safe.
+#undef slots
+#undef signals
+#undef emit
+
 #include "shared-frame.h"
 
 // ---------------------------------------------------------------------------
@@ -112,7 +124,7 @@ struct ZpSourceData {
     HANDLE mapping = nullptr;
     void*  view    = nullptr;
     feeds_shared::SharedFrameHeader* header = nullptr;
-    feeds_shared::FrameSlot*         slots  = nullptr;
+    feeds_shared::FrameSlot*         frameSlots  = nullptr;
 
     std::thread       pumpThread;
     std::atomic<bool> pumpShouldExit{false};
@@ -190,7 +202,7 @@ static void PumpThreadFunc(ZpSourceData* data) {
         WaitForSingleObject(data->pumpWakeEvent, 8);
 
         if (data->pumpShouldExit) break;
-        if (!data->header || !data->slots) continue;
+        if (!data->header || !data->frameSlots) continue;
 
         uint32_t currentWrite = data->header->write_index;
         if (currentWrite == data->lastReadIndex) continue;
@@ -198,7 +210,7 @@ static void PumpThreadFunc(ZpSourceData* data) {
         // Read the most recent slot; skip older ones if we're behind.
         // Zero-buffering philosophy: drop frames rather than buffer them.
         uint32_t slotIdx = (currentWrite - 1) % feeds_shared::RING_SLOTS;
-        feeds_shared::FrameSlot* slot = &data->slots[slotIdx];
+        feeds_shared::FrameSlot* slot = &data->frameSlots[slotIdx];
 
         MemoryBarrier();
 
@@ -281,7 +293,7 @@ static void OpenSharedMemory(ZpSourceData* data) {
         if (data->view)    { UnmapViewOfFile(data->view); data->view = nullptr; }
         if (data->mapping) { CloseHandle(data->mapping); data->mapping = nullptr; }
         data->header = nullptr;
-        data->slots  = nullptr;
+        data->frameSlots  = nullptr;
     }
 
     std::string name = feeds_shared::MakeFrameRegionName(g_enginePid, data->uuid);
@@ -305,7 +317,7 @@ static void OpenSharedMemory(ZpSourceData* data) {
     }
 
     data->header = (feeds_shared::SharedFrameHeader*)data->view;
-    data->slots  = (feeds_shared::FrameSlot*)
+    data->frameSlots  = (feeds_shared::FrameSlot*)
         ((uint8_t*)data->view + sizeof(feeds_shared::SharedFrameHeader));
 
     if (data->header->magic != feeds_shared::REGION_MAGIC ||
@@ -317,7 +329,7 @@ static void OpenSharedMemory(ZpSourceData* data) {
         data->view = nullptr;
         data->mapping = nullptr;
         data->header = nullptr;
-        data->slots = nullptr;
+        data->frameSlots = nullptr;
         return;
     }
 
@@ -336,7 +348,7 @@ static void CloseSharedMemory(ZpSourceData* data) {
     if (data->view)    { UnmapViewOfFile(data->view); data->view = nullptr; }
     if (data->mapping) { CloseHandle(data->mapping); data->mapping = nullptr; }
     data->header = nullptr;
-    data->slots  = nullptr;
+    data->frameSlots  = nullptr;
     data->lastReadIndex = 0;
 }
 
