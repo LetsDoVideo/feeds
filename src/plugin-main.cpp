@@ -341,7 +341,12 @@ static void OpenSharedMemory(ZpSourceData* data) {
     StartPumpThread(data);
 }
 
-static void CloseSharedMemory(ZpSourceData* data) {
+// clearTexture: if true, call obs_source_output_video(nullptr) to clear
+// any lingering frame from display. Should be true when the user
+// unsubscribes mid-session (so the source goes black) but false during
+// source destruction (the source may be half-torn-down and touching it
+// can crash — same bug class as STM v1.0.1).
+static void CloseSharedMemory(ZpSourceData* data, bool clearTexture = true) {
     if (!data) return;
     StopPumpThread(data);
 
@@ -353,9 +358,9 @@ static void CloseSharedMemory(ZpSourceData* data) {
 
     // Clear the OBS source's current frame. Without this, OBS keeps
     // displaying the last frame we delivered, producing a frozen image
-    // when the user unsubscribes. Per OBS docs: "Outputs async video
-    // data. Set to NULL to deactivate the texture."
-    if (data->source) {
+    // when the user unsubscribes mid-session. Skip during destruction
+    // because the source is being torn down and touching it is unsafe.
+    if (clearTexture && data->source) {
         obs_source_output_video(data->source, nullptr);
     }
 }
@@ -564,7 +569,8 @@ static void zp_destroy(void* vdata) {
         feeds::SendToEngine(msg);
     }
 
-    CloseSharedMemory(data);
+    // clearTexture=false: source is being destroyed, don't touch it.
+    CloseSharedMemory(data, false);
 
     {
         std::lock_guard<std::mutex> lock(g_sourcesMutex);
