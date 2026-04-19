@@ -305,15 +305,34 @@ public:
     // dropdown selection.
     void Resubscribe(unsigned int newUserId) {
         if (!m_renderer) return;
+
+        // Always unsubscribe first — drops any existing subscription so
+        // the source goes black while we wait.
         m_renderer->unSubscribe();
         m_userId = newUserId;
+
+        // If this is a follow-speaker source and we don't yet know who's
+        // speaking (newUserId == ACTIVE_SPEAKER_SENTINEL), skip the SDK
+        // subscribe call entirely. Passing the sentinel would just get
+        // rejected with "invalid user" — log noise. We stay unsubscribed
+        // until NotifyActiveSpeakerChanged calls us again with a real ID.
+        if (m_followActiveSpeaker && m_userId == ACTIVE_SPEAKER_SENTINEL) {
+            char msg[128];
+            sprintf_s(msg,
+                "Video: source='%s' waiting for active speaker",
+                m_sourceUuid.c_str());
+            LogToFile(msg);
+            return;
+        }
+
         ZOOM_SDK_NAMESPACE::SDKError err =
             m_renderer->subscribe(m_userId,
                                    ZOOM_SDK_NAMESPACE::RAW_DATA_TYPE_VIDEO);
         char msg[128];
         if (err == ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
-            sprintf_s(msg, "Video: resubscribed source='%s' to userId=%u",
-                      m_sourceUuid.c_str(), m_userId);
+            sprintf_s(msg, "Video: resubscribed source='%s' to userId=%u%s",
+                      m_sourceUuid.c_str(), m_userId,
+                      m_followActiveSpeaker ? " [follow-speaker]" : "");
         } else {
             sprintf_s(msg, "Video: resubscribe(userId=%u) failed: %d",
                       m_userId, (int)err);
