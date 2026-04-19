@@ -26,6 +26,8 @@ namespace feeds_engine {
     void HandleLeaveMeeting(const std::string& json);
     void HandleGetParticipants(const std::string& json);
     void HandleLogout(const std::string& json);
+    void HandleParticipantSourceSubscribe(const std::string& json);
+    void HandleParticipantSourceUnsubscribe(const std::string& json);
 }
 
 // ---------------------------------------------------------------------------
@@ -274,10 +276,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     RegisterHandler("join_meeting",    feeds_engine::HandleJoinMeeting);
     RegisterHandler("leave_meeting",   feeds_engine::HandleLeaveMeeting);
     RegisterHandler("get_participants", feeds_engine::HandleGetParticipants);
+    RegisterHandler("participant_source_subscribe",
+                    feeds_engine::HandleParticipantSourceSubscribe);
+    RegisterHandler("participant_source_unsubscribe",
+                    feeds_engine::HandleParticipantSourceUnsubscribe);
     RegisterHandler("shutdown",        HandleShutdown);
 
-    // Announce we're ready
-    if (!SendToPlugin("{\"type\":\"engine_ready\",\"version\":\"1.0.0\"}")) {
+    // Announce we're ready. Include our PID so the plugin can construct
+    // the shared-memory region names used for video frames.
+    char readyMsg[128];
+    sprintf_s(readyMsg,
+        "{\"type\":\"engine_ready\",\"version\":\"1.0.0\",\"pid\":%lu}",
+        GetCurrentProcessId());
+    if (!SendToPlugin(readyMsg)) {
         LogToFile("Failed to send engine_ready");
         return 1;
     }
