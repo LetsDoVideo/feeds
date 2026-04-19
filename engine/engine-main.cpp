@@ -216,6 +216,11 @@ namespace feeds_engine {
     void HandleGetParticipants(const std::string&);
     void HandleLogout(const std::string&);
 }
+// Forward decls — defined in engine-video.cpp
+namespace feeds_engine {
+    void HandleParticipantSourceSubscribe(const std::string&);
+    void HandleParticipantSourceUnsubscribe(const std::string&);
+}
 
 static void HandleShutdown(const std::string& json)
 {
@@ -284,12 +289,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     }
 
     // Register handlers for messages we expect from the plugin
-    RegisterHandler("login_start",      HandleLoginStart);
-    RegisterHandler("logout",           feeds_engine::HandleLogout);
-    RegisterHandler("join_meeting",     feeds_engine::HandleJoinMeeting);
-    RegisterHandler("leave_meeting",    feeds_engine::HandleLeaveMeeting);
-    RegisterHandler("get_participants", feeds_engine::HandleGetParticipants);
-    RegisterHandler("shutdown",         HandleShutdown);
+    RegisterHandler("login_start",                    HandleLoginStart);
+    RegisterHandler("logout",                         feeds_engine::HandleLogout);
+    RegisterHandler("join_meeting",                   feeds_engine::HandleJoinMeeting);
+    RegisterHandler("leave_meeting",                  feeds_engine::HandleLeaveMeeting);
+    RegisterHandler("get_participants",               feeds_engine::HandleGetParticipants);
+    RegisterHandler("participant_source_subscribe",   feeds_engine::HandleParticipantSourceSubscribe);
+    RegisterHandler("participant_source_unsubscribe", feeds_engine::HandleParticipantSourceUnsubscribe);
+    RegisterHandler("shutdown",                       HandleShutdown);
 
     // Announce we're ready
     if (!SendToPlugin("{\"type\":\"engine_ready\",\"version\":\"1.0.0\"}")) {
