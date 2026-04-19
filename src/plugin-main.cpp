@@ -530,18 +530,14 @@ void SetupPluginMenu() {
 static void* zp_create(obs_data_t* settings, obs_source_t* source) {
     (void)settings;
 
-    // Tier gating: enforce max feeds per the current tier.
-    if (g_activeParticipantSources >= GetMaxFeedsForTier()) {
-        std::string msg = "Your current tier allows a maximum of " +
-                          std::to_string(GetMaxFeedsForTier()) +
-                          " participant feed(s).\n\nUpgrade your plan at:\n"
-                          "https://marketplace.zoom.us";
-        MessageBoxA(NULL, msg.c_str(), "Feeds - Upgrade Required",
-                    MB_OK | MB_ICONINFORMATION);
-        return nullptr;
-    }
-
-    // Essential for Zoom sync — prevents OBS from buffering frames.
+    // Tier gating is enforced at subscribe time (zp_update), not here.
+    // Reasoning: on OBS startup, saved sources are created before the
+    // engine finishes logging the user in, so g_currentTier is still 0
+    // (which caps to 1 feed). Popping up a dialog for every source beyond
+    // the first would be a papercut for every tier-2+ user who has more
+    // than one source in their saved scene. We defer the tier check until
+    // the user actually tries to subscribe a source to a participant, at
+    // which point g_currentTier is authoritative.
     obs_source_set_async_unbuffered(source, true);
 
     ZpSourceData* data = new ZpSourceData();
@@ -584,6 +580,33 @@ static void zp_destroy(void* vdata) {
     delete data;
 }
 
+// Throttle for the "upgrade required" popup. When OBS loads a saved scene,
+// zp_update fires for every source in rapid succession — if the user has
+// more saved sources than their current tier allows, we don't want to
+// stack N popups. Show at most one per throttle window.
+static std::atomic<uint64_t> g_lastTierPopupMs{0};
+static constexpr uint64_t TIER_POPUP_THROTTLE_MS = 3000;
+
+static bool ShouldShowTierPopup() {
+    uint64_t now  = GetTickCount64();
+    uint64_t last = g_lastTierPopupMs.load();
+    if (now - last < TIER_POPUP_THROTTLE_MS) return false;
+    g_lastTierPopupMs.store(now);
+    return true;
+}
+
+// Count participant sources that are currently subscribed (have a non-zero
+// selected participant). This is the "real" feed count for tier purposes —
+// a source sitting on "--- Select Participant ---" doesn't cost anything.
+static int CountSubscribedParticipantSources() {
+    std::lock_guard<std::mutex> lock(g_sourcesMutex);
+    int count = 0;
+    for (ZpSourceData* s : g_allParticipantSources) {
+        if (s && s->current_user_id != 0) count++;
+    }
+    return count;
+}
+
 static void zp_update(void* vdata, obs_data_t* settings) {
     if (!vdata) return;
     ZpSourceData* data = static_cast<ZpSourceData*>(vdata);
@@ -592,10 +615,10 @@ static void zp_update(void* vdata, obs_data_t* settings) {
         (unsigned int)obs_data_get_int(settings, "participant_id");
 
     if (selected_id == data->current_user_id) return;
-    data->current_user_id = selected_id;
 
     // 0 is "--- Select Participant ---" — no subscription.
     if (selected_id == 0) {
+        data->current_user_id = 0;
         if (!data->uuid.empty()) {
             std::string msg = "{\"type\":\"participant_source_unsubscribe\","
                               "\"source_id\":\"" + data->uuid + "\"}";
@@ -604,6 +627,35 @@ static void zp_update(void* vdata, obs_data_t* settings) {
         CloseSharedMemory(data);
         return;
     }
+
+    // Tier enforcement. We only gate on the transition from "unsubscribed"
+    // to "subscribed" — switching between participants on an already-
+    // subscribed source doesn't count against the tier because we're not
+    // adding a feed, just retargeting one. Also only enforce once logged
+    // in; before that g_currentTier is 0 and would spuriously block
+    // users restoring a saved scene.
+    bool becomingSubscribed = (data->current_user_id == 0);
+    if (becomingSubscribed && g_isLoggedIn) {
+        int currentFeeds = CountSubscribedParticipantSources();
+        int maxFeeds     = GetMaxFeedsForTier();
+        if (currentFeeds >= maxFeeds) {
+            if (ShouldShowTierPopup()) {
+                std::string msg = "Your current tier allows a maximum of " +
+                                  std::to_string(maxFeeds) +
+                                  " participant feed(s).\n\nUpgrade your plan at:\n"
+                                  "https://marketplace.zoom.us";
+                MessageBoxA(NULL, msg.c_str(), "Feeds - Upgrade Required",
+                            MB_OK | MB_ICONINFORMATION);
+            }
+            // Revert the dropdown back to "--- Select Participant ---" so
+            // the saved scene doesn't re-trigger this on next launch.
+            obs_data_set_int(settings, "participant_id", 0);
+            data->current_user_id = 0;
+            return;
+        }
+    }
+
+    data->current_user_id = selected_id;
 
     // selected_id == 1 is [Active Speaker] sentinel. Engine handles the
     // follow-speaker routing — we just pass the sentinel through.
@@ -952,9 +1004,23 @@ static obs_properties_t* zs_properties(void* data) {
                 });
         }
     } else {
-        std::string status_text = (g_activeSharerUserId != 0)
-            ? "Status: Receiving screenshare"
-            : "Status: Connected - waiting for screenshare";
+        std::string status_text;
+        if (g_activeSharerUserId == 0) {
+            status_text = "Status: Connected - waiting for screenshare";
+        } else if (g_cachedMyUserId != 0 &&
+                   g_activeSharerUserId == g_cachedMyUserId) {
+            // The Feeds user is sharing their own screen. Not blocked —
+            // it works fine and is sometimes useful (different encoder
+            // path than OBS display capture, testing workflow, etc.) —
+            // but we flag it because OBS's own Display Capture source
+            // is usually lower-latency for one's own screen.
+            status_text =
+                "Status: Receiving screenshare (your own)\n"
+                "Tip: OBS Display Capture may give lower latency for "
+                "your own screen.";
+        } else {
+            status_text = "Status: Receiving screenshare";
+        }
         obs_properties_add_text(props, "status_label", status_text.c_str(),
                                 OBS_TEXT_INFO);
     }
