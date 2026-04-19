@@ -350,6 +350,14 @@ static void CloseSharedMemory(ZpSourceData* data) {
     data->header = nullptr;
     data->frameSlots  = nullptr;
     data->lastReadIndex = 0;
+
+    // Clear the OBS source's current frame. Without this, OBS keeps
+    // displaying the last frame we delivered, producing a frozen image
+    // when the user unsubscribes. Per OBS docs: "Outputs async video
+    // data. Set to NULL to deactivate the texture."
+    if (data->source) {
+        obs_source_output_video(data->source, nullptr);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -580,10 +588,8 @@ static void zp_update(void* vdata, obs_data_t* settings) {
     if (selected_id == data->current_user_id) return;
     data->current_user_id = selected_id;
 
-    // 0 is "--- Select Participant ---", 1 is [Active Speaker].
-    // For now, both result in no video. Active Speaker wiring is a
-    // follow-up commit.
-    if (selected_id == 0 || selected_id == 1) {
+    // 0 is "--- Select Participant ---" — no subscription.
+    if (selected_id == 0) {
         if (!data->uuid.empty()) {
             std::string msg = "{\"type\":\"participant_source_unsubscribe\","
                               "\"source_id\":\"" + data->uuid + "\"}";
@@ -593,7 +599,9 @@ static void zp_update(void* vdata, obs_data_t* settings) {
         return;
     }
 
-    // Real user ID: subscribe.
+    // selected_id == 1 is [Active Speaker] sentinel. Engine handles the
+    // follow-speaker routing — we just pass the sentinel through.
+    // selected_id > 1 is a real Zoom SDK user ID.
     if (!data->uuid.empty() && g_isInMeeting && g_rawLiveStreamGranted) {
         std::string msg = "{\"type\":\"participant_source_subscribe\","
                           "\"source_id\":\"" + data->uuid + "\","
@@ -935,12 +943,13 @@ static void RegisterEngineHandlers() {
         blog(LOG_INFO, "[feeds] raw_livestream_granted");
         g_rawLiveStreamGranted = true;
 
-        // Auto-subscribe any sources that had a participant picked before
-        // the meeting was joined / privilege was granted.
+        // Auto-subscribe any sources that had a participant (including
+        // [Active Speaker], sentinel 1) picked before the meeting was
+        // joined / privilege was granted.
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
             std::lock_guard<std::mutex> lock(g_sourcesMutex);
             for (ZpSourceData* s : g_allParticipantSources) {
-                if (s && s->current_user_id > 1 && !s->uuid.empty()) {
+                if (s && s->current_user_id >= 1 && !s->uuid.empty()) {
                     std::string msg = "{\"type\":\"participant_source_subscribe\","
                                       "\"source_id\":\"" + s->uuid + "\","
                                       "\"participant_id\":" +
