@@ -35,6 +35,14 @@ namespace feeds_engine {
 // From engine-api.cpp
 int GetCurrentTier();
 
+// From engine-meeting.cpp — needed for active-speaker filtering.
+ZOOM_SDK_NAMESPACE::IMeetingService* GetMeetingService();
+unsigned int GetMySelfUserId();
+
+// The sentinel user ID the plugin sends when a source is set to
+// "[Active Speaker]". Matches the sentinel in plugin-main.cpp.
+static constexpr unsigned int ACTIVE_SPEAKER_SENTINEL = 1;
+
 // Map the current tier to the SDK resolution enum. Same values as v1.0.0.
 // Tier 0 (Free) = 720p, everything else = 1080p.
 static ZOOM_SDK_NAMESPACE::ZoomSDKResolution GetResolutionForCurrentTier() {
@@ -215,15 +223,21 @@ private:
 class ParticipantSubscription
     : public ZOOM_SDK_NAMESPACE::IZoomSDKRendererDelegate {
 public:
-    ParticipantSubscription(const std::string& sourceUuid, unsigned int userId)
-        : m_sourceUuid(sourceUuid), m_userId(userId) {}
+    ParticipantSubscription(const std::string& sourceUuid,
+                            unsigned int userId,
+                            bool followActiveSpeaker)
+        : m_sourceUuid(sourceUuid),
+          m_userId(userId),
+          m_followActiveSpeaker(followActiveSpeaker) {}
 
     ~ParticipantSubscription() {
         TearDown();
     }
 
-    // Create the renderer, subscribe it, open shared memory. Returns true
-    // on success; on failure the caller can discard the object.
+    // Create the renderer and shared memory. If m_followActiveSpeaker is
+    // true and no speaker is yet known (m_userId == ACTIVE_SPEAKER_SENTINEL),
+    // we skip the subscribe call; caller should call Resubscribe once an
+    // active speaker is available. Returns true on success.
     bool Start() {
         // Shared memory first so it's ready before any frames arrive.
         uint32_t pid = GetCurrentProcessId();
@@ -252,25 +266,36 @@ public:
         // the tier resolution straight.
         m_renderer->setRawDataResolution(GetResolutionForCurrentTier());
 
-        // Subscribe to the user's video.
-        err = m_renderer->subscribe(m_userId,
-                                     ZOOM_SDK_NAMESPACE::RAW_DATA_TYPE_VIDEO);
-        if (err != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
-            char msg[128];
-            sprintf_s(msg, "Video: subscribe(userId=%u) failed: %d",
-                      m_userId, (int)err);
-            LogToFile(msg);
-            // Continue anyway — renderer exists, shared memory exists, we'll
-            // just never get frames. Not fatal.
+        // Subscribe to the user's video, unless we're in follow-active-
+        // speaker mode and no speaker has been designated yet.
+        if (!m_followActiveSpeaker || m_userId != ACTIVE_SPEAKER_SENTINEL) {
+            err = m_renderer->subscribe(m_userId,
+                                         ZOOM_SDK_NAMESPACE::RAW_DATA_TYPE_VIDEO);
+            if (err != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
+                char msg[128];
+                sprintf_s(msg, "Video: subscribe(userId=%u) failed: %d",
+                          m_userId, (int)err);
+                LogToFile(msg);
+                // Continue anyway — renderer exists, shared memory exists,
+                // we'll just never get frames. Not fatal.
+            } else {
+                char msg[128];
+                sprintf_s(msg, "Video: subscribed source='%s' to userId=%u%s",
+                          m_sourceUuid.c_str(), m_userId,
+                          m_followActiveSpeaker ? " [follow-speaker]" : "");
+                LogToFile(msg);
+            }
         } else {
             char msg[128];
-            sprintf_s(msg, "Video: subscribed source='%s' to userId=%u",
-                      m_sourceUuid.c_str(), m_userId);
+            sprintf_s(msg, "Video: source='%s' waiting for active speaker",
+                      m_sourceUuid.c_str());
             LogToFile(msg);
         }
 
         return true;
     }
+
+    bool FollowsActiveSpeaker() const { return m_followActiveSpeaker; }
 
     // Re-point this subscription at a different user without tearing down
     // the renderer or shared memory. Used when the plugin changes the
@@ -342,6 +367,7 @@ public:
 private:
     std::string  m_sourceUuid;
     unsigned int m_userId;
+    bool         m_followActiveSpeaker = false;
     ZOOM_SDK_NAMESPACE::IZoomSDKRenderer* m_renderer = nullptr;
     SharedMemoryWriter m_writer;
 };
@@ -355,6 +381,12 @@ static std::mutex g_subsMutex;
 // ---------------------------------------------------------------------------
 // Public entry points: teardown hook for meeting end / logout
 // ---------------------------------------------------------------------------
+
+// Current active speaker ID, updated by NotifyActiveSpeakerChanged. 0 if
+// no active speaker is known yet. Guarded by g_subsMutex for consistency
+// with the subscription map.
+static unsigned int g_currentActiveSpeaker = 0;
+
 void TearDownAllVideoSubscriptions() {
     std::lock_guard<std::mutex> lock(g_subsMutex);
     if (!g_subs.empty()) {
@@ -363,6 +395,7 @@ void TearDownAllVideoSubscriptions() {
         LogToFile(msg);
     }
     g_subs.clear();
+    g_currentActiveSpeaker = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -373,6 +406,10 @@ void TearDownAllVideoSubscriptions() {
 //   {"type":"participant_source_subscribe",
 //    "source_id":"<uuid>",
 //    "participant_id":<uint>}
+//
+// If participant_id == ACTIVE_SPEAKER_SENTINEL (1), this source follows
+// whoever is currently the active speaker — subscribe to the current
+// speaker now (if known) and re-point on speaker changes.
 //
 // If a subscription for this source already exists, we reuse the renderer
 // and just re-point it at the new user. Cheaper than tear-down + recreate,
@@ -386,15 +423,23 @@ void HandleParticipantSourceSubscribe(const std::string& json) {
         return;
     }
 
+    bool followActiveSpeaker = (userId == ACTIVE_SPEAKER_SENTINEL);
+
     std::lock_guard<std::mutex> lock(g_subsMutex);
+
+    // For follow-active-speaker subscriptions, resolve the actual user ID
+    // we should subscribe to right now. If no speaker is known yet, we
+    // pass the sentinel through and Start()/Resubscribe() will skip the
+    // SDK subscribe call until NotifyActiveSpeakerChanged re-points us.
+    unsigned int actualUserId = followActiveSpeaker
+        ? (g_currentActiveSpeaker != 0 ? g_currentActiveSpeaker : ACTIVE_SPEAKER_SENTINEL)
+        : userId;
 
     auto it = g_subs.find(sourceId);
     if (it != g_subs.end()) {
         // Existing subscription — just switch the user.
-        it->second->Resubscribe(userId);
-        // Still send source_texture_ready so the plugin knows the mapping
-        // is still valid. Plugin uses this to (re-)open the shared memory
-        // region if it hadn't already.
+        it->second->Resubscribe(actualUserId);
+
         uint32_t pid = GetCurrentProcessId();
         char resp[512];
         sprintf_s(resp,
@@ -411,7 +456,8 @@ void HandleParticipantSourceSubscribe(const std::string& json) {
     }
 
     // New subscription.
-    auto sub = std::make_unique<ParticipantSubscription>(sourceId, userId);
+    auto sub = std::make_unique<ParticipantSubscription>(
+        sourceId, actualUserId, followActiveSpeaker);
     if (!sub->Start()) {
         LogToFile("Video: subscription Start failed");
         return;
@@ -431,6 +477,64 @@ void HandleParticipantSourceSubscribe(const std::string& json) {
         feeds_shared::MAX_FRAME_WIDTH,
         feeds_shared::MAX_FRAME_HEIGHT);
     SendToPlugin(resp);
+}
+
+// Called from engine-meeting.cpp when the SDK reports an active speaker
+// change. Filters out the Feeds user (virtual-camera loop risk) and
+// speakers with video off (would show black frames — better to keep the
+// last valid speaker on screen). If the new speaker passes filters,
+// re-points all follow-speaker subscriptions to them.
+void NotifyActiveSpeakerChanged(unsigned int newSpeakerId) {
+    std::lock_guard<std::mutex> lock(g_subsMutex);
+
+    if (newSpeakerId == 0) return;
+
+    // Filter 1: Never subscribe to the Feeds user themselves. They're
+    // running OBS and likely using virtual camera back to Zoom —
+    // subscribing would create a recursive loop.
+    unsigned int myUserId = GetMySelfUserId();
+    if (myUserId != 0 && newSpeakerId == myUserId) {
+        LogToFile("Video: active speaker is Feeds user, ignoring");
+        return;
+    }
+
+    // Filter 2: Skip speakers with video off. Keeps the last valid
+    // speaker on screen rather than showing a black frame for someone
+    // who can't be displayed anyway.
+    ZOOM_SDK_NAMESPACE::IMeetingService* ms = GetMeetingService();
+    if (ms) {
+        auto* participantCtrl = ms->GetMeetingParticipantsController();
+        if (participantCtrl) {
+            auto* userInfo = participantCtrl->GetUserByUserID(newSpeakerId);
+            if (userInfo && !userInfo->IsVideoOn()) {
+                char msg[128];
+                sprintf_s(msg,
+                    "Video: active speaker userId=%u has video off, keeping previous",
+                    newSpeakerId);
+                LogToFile(msg);
+                return;
+            }
+        }
+    }
+
+    // Speaker passes both filters. Update state and retarget.
+    if (g_currentActiveSpeaker == newSpeakerId) return;
+    g_currentActiveSpeaker = newSpeakerId;
+
+    int retargeted = 0;
+    for (auto& kv : g_subs) {
+        if (kv.second->FollowsActiveSpeaker()) {
+            kv.second->Resubscribe(newSpeakerId);
+            retargeted++;
+        }
+    }
+    if (retargeted > 0) {
+        char msg[128];
+        sprintf_s(msg,
+            "Video: active speaker changed to userId=%u, retargeted %d source(s)",
+            newSpeakerId, retargeted);
+        LogToFile(msg);
+    }
 }
 
 // participant_source_unsubscribe — plugin no longer needs frames for this
