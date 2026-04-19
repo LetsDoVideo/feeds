@@ -64,6 +64,10 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     src/engine-client.cpp
 )
 
+target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/common"
+)
+
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
     FEEDS_ZOOM_CLIENT_ID="${FEEDS_ZOOM_CLIENT_ID}"
 )
@@ -88,8 +92,12 @@ add_executable(FeedsEngine WIN32
     engine/engine-sdk.cpp
     engine/engine-api.cpp
     engine/engine-meeting.cpp
+    engine/engine-video.cpp
 )
-target_include_directories(FeedsEngine PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/zoom-sdk/h")
+target_include_directories(FeedsEngine PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/zoom-sdk/h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/common"
+)
 target_link_directories(FeedsEngine PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/zoom-sdk/lib")
 target_link_libraries(FeedsEngine PRIVATE winhttp crypt32 advapi32 shell32 sdk)
 target_compile_definitions(FeedsEngine PRIVATE
