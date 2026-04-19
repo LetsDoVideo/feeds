@@ -31,8 +31,10 @@ jobs:
           install-deps: 'true'
       - name: Configure and Build
         shell: cmd
+        env:
+          FEEDS_ZOOM_CLIENT_ID: ${{ secrets.FEEDS_ZOOM_CLIENT_ID }}
         run: |
-          cmake -B build -G "Visual Studio 17 2022" -A x64
+          cmake -B build -G "Visual Studio 17 2022" -A x64 -DFEEDS_ZOOM_CLIENT_ID="%FEEDS_ZOOM_CLIENT_ID%"
           cmake --build build --config Release
       - name: Azure Login
         uses: azure/login@v2
