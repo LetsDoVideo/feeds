@@ -678,16 +678,255 @@ static obs_properties_t* zp_properties(void* data) {
 }
 
 // ---------------------------------------------------------------------------
-// Screenshare source (video path is Phase 7; stubs only for now)
+// Screenshare source
 // ---------------------------------------------------------------------------
+//
+// Multiple screenshare sources can coexist in a scene (for filter variants,
+// different crops, etc.). They all map the same shared-memory region —
+// written by the single engine-side SDK renderer — and each runs its own
+// pump thread to deliver frames to its own OBS source.
+//
+// No tier gating, no participant dropdown, no multi-select. The source
+// automatically follows whoever is currently sharing (state is driven
+// from the engine, forwarded to the plugin via share_status_changed).
+
+struct ZsSourceData {
+    obs_source_t* source = nullptr;
+
+    HANDLE mapping = nullptr;
+    void*  view    = nullptr;
+    feeds_shared::SharedFrameHeader* header     = nullptr;
+    feeds_shared::FrameSlot*         frameSlots = nullptr;
+
+    std::thread       pumpThread;
+    std::atomic<bool> pumpShouldExit{false};
+    HANDLE            pumpWakeEvent = nullptr;
+    uint32_t          lastReadIndex = 0;
+};
+
+static std::mutex                 g_screenshareSourcesMutex;
+static std::vector<ZsSourceData*> g_allScreenshareSources;
+
+static void ZsPumpThreadFunc(ZsSourceData* data) {
+    if (!data || !data->source) return;
+
+    blog(LOG_INFO, "[feeds] screenshare pump thread started");
+
+    while (!data->pumpShouldExit) {
+        WaitForSingleObject(data->pumpWakeEvent, 8);
+
+        if (data->pumpShouldExit) break;
+        if (!data->header || !data->frameSlots) continue;
+
+        uint32_t currentWrite = data->header->write_index;
+        if (currentWrite == data->lastReadIndex) continue;
+
+        uint32_t slotIdx = (currentWrite - 1) % feeds_shared::RING_SLOTS;
+        feeds_shared::FrameSlot* slot = &data->frameSlots[slotIdx];
+
+        MemoryBarrier();
+
+        uint32_t width  = slot->width;
+        uint32_t height = slot->height;
+
+        if (width  == 0 || height == 0 ||
+            width  > feeds_shared::MAX_FRAME_WIDTH ||
+            height > feeds_shared::MAX_FRAME_HEIGHT) {
+            data->lastReadIndex = currentWrite;
+            continue;
+        }
+
+        size_t ySize = (size_t)width * height;
+        size_t uSize = (size_t)(width / 2) * (height / 2);
+
+        struct obs_source_frame obsFrame = {};
+        obsFrame.format      = VIDEO_FORMAT_I420;
+        obsFrame.width       = width;
+        obsFrame.height      = height;
+        obsFrame.data[0]     = slot->data;
+        obsFrame.data[1]     = slot->data + ySize;
+        obsFrame.data[2]     = slot->data + ySize + uSize;
+        obsFrame.linesize[0] = slot->stride_y;
+        obsFrame.linesize[1] = slot->stride_u;
+        obsFrame.linesize[2] = slot->stride_v;
+
+        video_format_get_parameters(VIDEO_CS_DEFAULT, VIDEO_RANGE_PARTIAL,
+                                    obsFrame.color_matrix,
+                                    obsFrame.color_range_min,
+                                    obsFrame.color_range_max);
+
+        obsFrame.timestamp = os_gettime_ns();
+
+        obs_source_output_video(data->source, &obsFrame);
+
+        // NOTE: don't update header->last_read_index from here — multiple
+        // screenshare sources share the same region. If we each touched
+        // that field we'd be racing. The writer doesn't actually use it
+        // for flow control (it's informational only), so leaving it
+        // untouched is safe and correct.
+        data->lastReadIndex = currentWrite;
+    }
+
+    blog(LOG_INFO, "[feeds] screenshare pump thread exiting");
+}
+
+static void ZsStartPumpThread(ZsSourceData* data) {
+    if (!data) return;
+    if (data->pumpThread.joinable()) return;
+
+    data->pumpShouldExit = false;
+    if (!data->pumpWakeEvent) {
+        data->pumpWakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    }
+    data->pumpThread = std::thread(ZsPumpThreadFunc, data);
+}
+
+static void ZsStopPumpThread(ZsSourceData* data) {
+    if (!data) return;
+
+    data->pumpShouldExit = true;
+    if (data->pumpWakeEvent) SetEvent(data->pumpWakeEvent);
+
+    if (data->pumpThread.joinable()) {
+        data->pumpThread.join();
+    }
+
+    if (data->pumpWakeEvent) {
+        CloseHandle(data->pumpWakeEvent);
+        data->pumpWakeEvent = nullptr;
+    }
+}
+
+// Opens the well-known screenshare shared-memory region and starts the
+// pump thread. Safe to call before the engine has actually created the
+// region (we'll just fail silently and the source will stay black until
+// a later call succeeds).
+static void OpenShareSharedMemory(ZsSourceData* data) {
+    if (!data || g_enginePid == 0) return;
+
+    if (data->mapping) return;  // already open
+
+    std::string name = feeds_shared::MakeScreenShareRegionName(g_enginePid);
+
+    data->mapping = OpenFileMappingA(FILE_MAP_READ, FALSE, name.c_str());
+    if (!data->mapping) {
+        // Not yet created on engine side — that's fine. We'll try again
+        // next time share_status_changed arrives with a non-zero sharer.
+        return;
+    }
+
+    data->view = MapViewOfFile(data->mapping, FILE_MAP_READ, 0, 0,
+                               feeds_shared::REGION_SIZE);
+    if (!data->view) {
+        CloseHandle(data->mapping);
+        data->mapping = nullptr;
+        return;
+    }
+
+    data->header = (feeds_shared::SharedFrameHeader*)data->view;
+
+    // Defensive magic check — if the region exists but has the wrong
+    // magic, something is off. Don't trust it.
+    if (data->header->magic != feeds_shared::REGION_MAGIC) {
+        UnmapViewOfFile(data->view);
+        data->view = nullptr;
+        CloseHandle(data->mapping);
+        data->mapping = nullptr;
+        data->header = nullptr;
+        blog(LOG_WARNING,
+             "[feeds] screenshare shared memory has bad magic, ignoring");
+        return;
+    }
+
+    data->frameSlots = (feeds_shared::FrameSlot*)
+        ((uint8_t*)data->view + sizeof(feeds_shared::SharedFrameHeader));
+
+    // Start reading from the most recent frame — don't replay stale
+    // frames that were written before this source opened the region.
+    data->lastReadIndex = data->header->write_index;
+
+    blog(LOG_INFO, "[feeds] opened screenshare shared memory '%s'",
+         name.c_str());
+
+    ZsStartPumpThread(data);
+}
+
+// clearTexture: if true, call obs_source_output_video(nullptr) to clear
+// any lingering frame. Same reasoning as CloseSharedMemory — skip during
+// destruction to avoid touching a half-torn-down source.
+static void CloseShareSharedMemory(ZsSourceData* data, bool clearTexture = true) {
+    if (!data) return;
+    ZsStopPumpThread(data);
+
+    if (data->view)    { UnmapViewOfFile(data->view); data->view = nullptr; }
+    if (data->mapping) { CloseHandle(data->mapping); data->mapping = nullptr; }
+    data->header = nullptr;
+    data->frameSlots  = nullptr;
+    data->lastReadIndex = 0;
+
+    if (clearTexture && data->source) {
+        obs_source_output_video(data->source, nullptr);
+    }
+}
+
+// Open (or no-op) the shared memory on every live screenshare source.
+// Called when share_status_changed arrives with a non-zero sharer — at
+// that point the engine has definitely created the region.
+static void OpenSharedMemoryForAllScreenshareSources() {
+    std::lock_guard<std::mutex> lock(g_screenshareSourcesMutex);
+    for (ZsSourceData* s : g_allScreenshareSources) {
+        if (s && !s->mapping) OpenShareSharedMemory(s);
+    }
+}
+
+// Close the shared memory on every live screenshare source. Called when
+// share ends — we could leave the mappings open, but closing frees the
+// pump threads and any paused frame in OBS.
+static void CloseSharedMemoryForAllScreenshareSources() {
+    std::lock_guard<std::mutex> lock(g_screenshareSourcesMutex);
+    for (ZsSourceData* s : g_allScreenshareSources) {
+        if (s) CloseShareSharedMemory(s);
+    }
+}
+
 static void* zs_create(obs_data_t* settings, obs_source_t* source) {
     (void)settings;
     obs_source_set_async_unbuffered(source, true);
-    return bmalloc(1);
+
+    ZsSourceData* data = new ZsSourceData();
+    data->source = source;
+
+    {
+        std::lock_guard<std::mutex> lock(g_screenshareSourcesMutex);
+        g_allScreenshareSources.push_back(data);
+    }
+
+    // If we're already in a meeting with an active share, open the
+    // mapping immediately. Otherwise, wait for share_status_changed.
+    if (g_isInMeeting && g_rawLiveStreamGranted && g_activeSharerUserId != 0) {
+        OpenShareSharedMemory(data);
+    }
+
+    return data;
 }
 
-static void zs_destroy(void* data) {
-    if (data) bfree(data);
+static void zs_destroy(void* vdata) {
+    if (!vdata) return;
+    ZsSourceData* data = static_cast<ZsSourceData*>(vdata);
+
+    // clearTexture=false: source is being torn down, don't touch it.
+    // Same bug pattern that bit us on zp_destroy earlier.
+    CloseShareSharedMemory(data, false);
+
+    {
+        std::lock_guard<std::mutex> lock(g_screenshareSourcesMutex);
+        auto it = std::find(g_allScreenshareSources.begin(),
+                            g_allScreenshareSources.end(), data);
+        if (it != g_allScreenshareSources.end())
+            g_allScreenshareSources.erase(it);
+    }
+
+    delete data;
 }
 
 static obs_properties_t* zs_properties(void* data) {
@@ -828,6 +1067,7 @@ static void RegisterEngineHandlers() {
                 CloseSharedMemory(s);
             }
         }
+        CloseSharedMemoryForAllScreenshareSources();
 
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
             g_isLoggedIn           = false;
@@ -863,6 +1103,7 @@ static void RegisterEngineHandlers() {
                 CloseSharedMemory(s);
             }
         }
+        CloseSharedMemoryForAllScreenshareSources();
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
             g_isLoggedIn = false;
             g_isInMeeting = false;
@@ -927,6 +1168,7 @@ static void RegisterEngineHandlers() {
                 CloseSharedMemory(s);
             }
         }
+        CloseSharedMemoryForAllScreenshareSources();
 
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
             g_isInMeeting          = false;
@@ -1036,8 +1278,19 @@ static void RegisterEngineHandlers() {
 
     feeds::RegisterMessageHandler("share_status_changed",
     [](const std::string& json) {
-        g_activeSharerUserId =
+        unsigned int newSharer =
             (unsigned int)ExtractJsonNumber(json, "sharer_user_id");
+        g_activeSharerUserId = newSharer;
+
+        // On share start: open shared memory on all screenshare sources
+        // so they start pumping frames. On share end: close so the pump
+        // threads exit and the sources clear their last frame.
+        if (newSharer != 0) {
+            OpenSharedMemoryForAllScreenshareSources();
+        } else {
+            CloseSharedMemoryForAllScreenshareSources();
+        }
+
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
             RefreshAllSourceProperties();
         });
