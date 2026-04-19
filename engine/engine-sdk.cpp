@@ -134,8 +134,14 @@ bool AuthenticateSDK() {
         g_authService->SetEvent(&g_authListener);
     }
 
+    // Build the wide-string version of the client ID from the compile-time
+    // macro. Done once per-process at first auth.
+    static std::wstring s_clientId = []() {
+        std::string a = FEEDS_ZOOM_CLIENT_ID;
+        return std::wstring(a.begin(), a.end());
+    }();
+
     ZOOM_SDK_NAMESPACE::AuthContext authContext;
-    static std::wstring s_clientId = L"JlP6KfRqTt6r0t67FcDuqQ";
     authContext.publicAppKey = s_clientId.c_str();
 
     ZOOM_SDK_NAMESPACE::SDKError err = g_authService->SDKAuth(authContext);
