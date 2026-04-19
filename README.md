@@ -95,10 +95,6 @@ Upgrade your tier at the [Zoom App Marketplace](https://marketplace.zoom.us).
 
 ## Troubleshooting
 
-**Plugin fails to load**
-
-- Disable Smart App Control in Windows (Future verions will allow the plugin to load with Smart App Control enabled).
-
 **Participant list is empty after connecting**
 
 - Click the **Refresh Participant List** button in the source Properties window.
