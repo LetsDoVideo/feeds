@@ -120,7 +120,7 @@ static std::string ExchangeCodeForToken(const std::string& code, const std::stri
     std::string body =
         std::string("grant_type=authorization_code") +
         "&code="          + UrlEncode(code) +
-        "&client_id=JlP6KfRqTt6r0t67FcDuqQ" +
+        "&client_id="     + FEEDS_ZOOM_CLIENT_ID +
         "&redirect_uri="  + UrlEncode("https://letsdovideo.com/loginsuccess") +
         "&code_verifier=" + UrlEncode(verifier);
 
@@ -239,7 +239,7 @@ static void LoginThreadFunc()
     std::string authUrl =
         std::string("https://zoom.us/oauth/authorize") +
         "?response_type=code" +
-        "&client_id=JlP6KfRqTt6r0t67FcDuqQ" +
+        "&client_id="          + std::string(FEEDS_ZOOM_CLIENT_ID) +
         "&redirect_uri="       + UrlEncode("https://letsdovideo.com/loginsuccess") +
         "&code_challenge="     + challenge +
         "&code_challenge_method=S256" +
