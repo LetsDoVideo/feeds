@@ -264,8 +264,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     LogToFile("========================================");
     LogToFile("FeedsEngine.exe starting");
 
-    // Create a message-only window. The Zoom SDK requires a real HWND
-    // on the main thread for its async callbacks to fire.
+    // Create a real (but invisible) top-level window. The Zoom SDK requires
+    // a real HWND on the main thread for its async callbacks to fire, AND
+    // it looks for a top-level window in the process to anchor its own
+    // meeting UI to. A message-only window (HWND_MESSAGE parent) is not a
+    // true top-level window — the Zoom meeting window ends up in a
+    // confused initial state with a transparent top strip until the user
+    // presses Esc. A normal hidden popup window acts as the anchor the SDK
+    // wants without appearing in the taskbar or becoming visible.
     WNDCLASSW wc = {};
     wc.lpfnWndProc   = EngineWndProc;
     wc.hInstance     = hInstance;
@@ -273,15 +279,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     RegisterClassW(&wc);
 
     HWND hwnd = CreateWindowExW(
-        0, L"FeedsEngineWindow", L"FeedsEngine",
-        0, 0, 0, 0, 0,
-        HWND_MESSAGE, NULL, hInstance, NULL);
+        WS_EX_TOOLWINDOW,           // no taskbar entry
+        L"FeedsEngineWindow", L"FeedsEngine",
+        WS_POPUP,                   // top-level, not a child
+        0, 0, 1, 1,                 // 1x1 at origin; never shown
+        NULL, NULL, hInstance, NULL);
 
     if (!hwnd) {
-        LogToFile("Failed to create message-only window");
+        LogToFile("Failed to create anchor window");
         return 1;
     }
-    LogToFile("Created message-only window");
+    // Note: intentionally do NOT call ShowWindow. The window stays hidden.
+    LogToFile("Created anchor window");
 
     if (!ConnectToPipes()) {
         LogToFile("Could not connect to pipes, exiting");
@@ -298,8 +307,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     RegisterHandler("participant_source_unsubscribe", feeds_engine::HandleParticipantSourceUnsubscribe);
     RegisterHandler("shutdown",                       HandleShutdown);
 
-    // Announce we're ready
-    if (!SendToPlugin("{\"type\":\"engine_ready\",\"version\":\"1.0.0\"}")) {
+    // Announce we're ready. Include our PID so the plugin can construct
+    // the shared-memory region names used for video frames.
+    char readyMsg[128];
+    sprintf_s(readyMsg,
+        "{\"type\":\"engine_ready\",\"version\":\"1.0.0\",\"pid\":%lu}",
+        GetCurrentProcessId());
+    if (!SendToPlugin(readyMsg)) {
         LogToFile("Failed to send engine_ready");
         return 1;
     }
