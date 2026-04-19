@@ -22,6 +22,7 @@
 #include "zoom_sdk.h"
 #include "zoom_sdk_raw_data_def.h"
 #include "meeting_service_interface.h"
+#include "meeting_service_components/meeting_audio_interface.h"
 #include "meeting_service_components/meeting_participants_ctrl_interface.h"
 #include "rawdata/rawdata_renderer_interface.h"
 #include "rawdata/zoom_rawdata_api.h"
