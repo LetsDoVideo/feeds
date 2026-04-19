@@ -640,11 +640,26 @@ static void zp_update(void* vdata, obs_data_t* settings) {
         int maxFeeds     = GetMaxFeedsForTier();
         if (currentFeeds >= maxFeeds) {
             if (ShouldShowTierPopup()) {
-                std::string msg = "Your current tier allows a maximum of " +
-                                  std::to_string(maxFeeds) +
-                                  " participant feed(s).\n\nUpgrade your plan at:\n"
-                                  "https://marketplace.zoom.us";
-                MessageBoxA(NULL, msg.c_str(), "Feeds - Upgrade Required",
+                // Two cases: user can upgrade, or user is already at the
+                // top tier and literally cannot buy more feeds. Different
+                // messages for each.
+                std::string msg;
+                const char* title;
+                if (g_currentTier >= 3) {
+                    msg = "You've reached the " +
+                          std::to_string(maxFeeds) +
+                          "-feed limit for your tier (Broadcaster).\n\n"
+                          "This is the current maximum. If you need more, "
+                          "please contact support@letsdovideo.com.";
+                    title = "Feeds - Maximum Feeds Reached";
+                } else {
+                    msg = "Your current tier allows a maximum of " +
+                          std::to_string(maxFeeds) +
+                          " participant feed(s).\n\nUpgrade your plan at:\n"
+                          "https://marketplace.zoom.us";
+                    title = "Feeds - Upgrade Required";
+                }
+                MessageBoxA(NULL, msg.c_str(), title,
                             MB_OK | MB_ICONINFORMATION);
             }
             // Revert the dropdown back to "--- Select Participant ---" so
