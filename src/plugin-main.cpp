@@ -527,17 +527,67 @@ void SetupPluginMenu() {
 // ---------------------------------------------------------------------------
 // Source callbacks
 // ---------------------------------------------------------------------------
+// Throttle for the "upgrade required" popup. When OBS loads a saved scene,
+// zp_create fires for every source in rapid succession — if the user has
+// more saved sources than their current tier allows, we don't want to
+// stack N popups. Show at most one per throttle window.
+static std::atomic<uint64_t> g_lastTierPopupMs{0};
+static constexpr uint64_t TIER_POPUP_THROTTLE_MS = 3000;
+
+static bool ShouldShowTierPopup() {
+    uint64_t now  = GetTickCount64();
+    uint64_t last = g_lastTierPopupMs.load();
+    if (now - last < TIER_POPUP_THROTTLE_MS) return false;
+    g_lastTierPopupMs.store(now);
+    return true;
+}
+
 static void* zp_create(obs_data_t* settings, obs_source_t* source) {
     (void)settings;
 
-    // Tier gating is enforced at subscribe time (zp_update), not here.
-    // Reasoning: on OBS startup, saved sources are created before the
-    // engine finishes logging the user in, so g_currentTier is still 0
-    // (which caps to 1 feed). Popping up a dialog for every source beyond
-    // the first would be a papercut for every tier-2+ user who has more
-    // than one source in their saved scene. We defer the tier check until
-    // the user actually tries to subscribe a source to a participant, at
-    // which point g_currentTier is authoritative.
+    // Tier gating: enforce max feeds per the current tier, but only if
+    // logged in. On OBS startup, saved sources may be created before
+    // the engine finishes logging the user in — at that point
+    // g_currentTier is still 0 (default) and would spuriously block
+    // users restoring a saved scene. Skipping the check pre-login means
+    // the source gets created silently; we accept that if the user is
+    // over-tier at login time, nothing re-enforces until next restart.
+    // In practice this is fine: users don't log out and back in as a
+    // lower tier mid-session as a normal workflow.
+    //
+    // When the check does fire (interactive creation while logged in,
+    // or OBS restart after login completes), it's throttled so that
+    // loading a saved scene with many over-tier sources doesn't stack
+    // a popup per source — one popup per ~3 second window.
+    if (g_isLoggedIn &&
+        g_activeParticipantSources >= GetMaxFeedsForTier() &&
+        ShouldShowTierPopup()) {
+        int maxFeeds = GetMaxFeedsForTier();
+        std::string msg;
+        const char* title;
+        if (g_currentTier >= 3) {
+            msg = "You've reached the " + std::to_string(maxFeeds) +
+                  "-feed limit for your tier (Broadcaster).\n\n"
+                  "This is the current maximum. If you need more, "
+                  "please contact support@letsdovideo.com.";
+            title = "Feeds - Maximum Feeds Reached";
+        } else {
+            msg = "Your current tier allows a maximum of " +
+                  std::to_string(maxFeeds) +
+                  " participant feed(s).\n\nUpgrade your plan at:\n"
+                  "https://marketplace.zoom.us";
+            title = "Feeds - Upgrade Required";
+        }
+        MessageBoxA(NULL, msg.c_str(), title, MB_OK | MB_ICONINFORMATION);
+        return nullptr;
+    }
+    // If we're over-tier but the throttle suppressed the popup, still
+    // block creation silently — we don't want to let the user build
+    // past their tier just because we chose not to annoy them.
+    if (g_isLoggedIn && g_activeParticipantSources >= GetMaxFeedsForTier()) {
+        return nullptr;
+    }
+
     obs_source_set_async_unbuffered(source, true);
 
     ZpSourceData* data = new ZpSourceData();
@@ -580,33 +630,6 @@ static void zp_destroy(void* vdata) {
     delete data;
 }
 
-// Throttle for the "upgrade required" popup. When OBS loads a saved scene,
-// zp_update fires for every source in rapid succession — if the user has
-// more saved sources than their current tier allows, we don't want to
-// stack N popups. Show at most one per throttle window.
-static std::atomic<uint64_t> g_lastTierPopupMs{0};
-static constexpr uint64_t TIER_POPUP_THROTTLE_MS = 3000;
-
-static bool ShouldShowTierPopup() {
-    uint64_t now  = GetTickCount64();
-    uint64_t last = g_lastTierPopupMs.load();
-    if (now - last < TIER_POPUP_THROTTLE_MS) return false;
-    g_lastTierPopupMs.store(now);
-    return true;
-}
-
-// Count participant sources that are currently subscribed (have a non-zero
-// selected participant). This is the "real" feed count for tier purposes —
-// a source sitting on "--- Select Participant ---" doesn't cost anything.
-static int CountSubscribedParticipantSources() {
-    std::lock_guard<std::mutex> lock(g_sourcesMutex);
-    int count = 0;
-    for (ZpSourceData* s : g_allParticipantSources) {
-        if (s && s->current_user_id != 0) count++;
-    }
-    return count;
-}
-
 static void zp_update(void* vdata, obs_data_t* settings) {
     if (!vdata) return;
     ZpSourceData* data = static_cast<ZpSourceData*>(vdata);
@@ -628,48 +651,10 @@ static void zp_update(void* vdata, obs_data_t* settings) {
         return;
     }
 
-    // Tier enforcement. We only gate on the transition from "unsubscribed"
-    // to "subscribed" — switching between participants on an already-
-    // subscribed source doesn't count against the tier because we're not
-    // adding a feed, just retargeting one. Also only enforce once logged
-    // in; before that g_currentTier is 0 and would spuriously block
-    // users restoring a saved scene.
-    bool becomingSubscribed = (data->current_user_id == 0);
-    if (becomingSubscribed && g_isLoggedIn) {
-        int currentFeeds = CountSubscribedParticipantSources();
-        int maxFeeds     = GetMaxFeedsForTier();
-        if (currentFeeds >= maxFeeds) {
-            if (ShouldShowTierPopup()) {
-                // Two cases: user can upgrade, or user is already at the
-                // top tier and literally cannot buy more feeds. Different
-                // messages for each.
-                std::string msg;
-                const char* title;
-                if (g_currentTier >= 3) {
-                    msg = "You've reached the " +
-                          std::to_string(maxFeeds) +
-                          "-feed limit for your tier (Broadcaster).\n\n"
-                          "This is the current maximum. If you need more, "
-                          "please contact support@letsdovideo.com.";
-                    title = "Feeds - Maximum Feeds Reached";
-                } else {
-                    msg = "Your current tier allows a maximum of " +
-                          std::to_string(maxFeeds) +
-                          " participant feed(s).\n\nUpgrade your plan at:\n"
-                          "https://marketplace.zoom.us";
-                    title = "Feeds - Upgrade Required";
-                }
-                MessageBoxA(NULL, msg.c_str(), title,
-                            MB_OK | MB_ICONINFORMATION);
-            }
-            // Revert the dropdown back to "--- Select Participant ---" so
-            // the saved scene doesn't re-trigger this on next launch.
-            obs_data_set_int(settings, "participant_id", 0);
-            data->current_user_id = 0;
-            return;
-        }
-    }
-
+    // Tier enforcement lives in zp_create — by the time we get here the
+    // source already exists, so blocking subscription wouldn't prevent
+    // the user from creating over-tier sources. Create-time enforcement
+    // is the simpler and more honest gate.
     data->current_user_id = selected_id;
 
     // selected_id == 1 is [Active Speaker] sentinel. Engine handles the
