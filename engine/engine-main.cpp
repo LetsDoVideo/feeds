@@ -209,8 +209,13 @@ static void HandleLoginStart(const std::string& json)
     LogToFile("HandleLoginStart: starting OAuth flow");
     feeds_engine::StartLoginFlow();
 }
-// Forward decl — defined in engine-meeting.cpp
-namespace feeds_engine { void HandleLeaveMeeting(const std::string&); }
+// Forward decls — defined in engine-meeting.cpp
+namespace feeds_engine {
+    void HandleJoinMeeting(const std::string&);
+    void HandleLeaveMeeting(const std::string&);
+    void HandleGetParticipants(const std::string&);
+    void HandleLogout(const std::string&);
+}
 
 static void HandleShutdown(const std::string& json)
 {
@@ -279,8 +284,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     }
 
     // Register handlers for messages we expect from the plugin
-    RegisterHandler("login_start", HandleLoginStart);
-    RegisterHandler("shutdown", HandleShutdown);
+    RegisterHandler("login_start",      HandleLoginStart);
+    RegisterHandler("logout",           feeds_engine::HandleLogout);
+    RegisterHandler("join_meeting",     feeds_engine::HandleJoinMeeting);
+    RegisterHandler("leave_meeting",    feeds_engine::HandleLeaveMeeting);
+    RegisterHandler("get_participants", feeds_engine::HandleGetParticipants);
+    RegisterHandler("shutdown",         HandleShutdown);
 
     // Announce we're ready
     if (!SendToPlugin("{\"type\":\"engine_ready\",\"version\":\"1.0.0\"}")) {
