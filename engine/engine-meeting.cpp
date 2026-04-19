@@ -39,6 +39,10 @@ const std::string& GetUserPMI();
 void TearDownAllVideoSubscriptions();
 void NotifyActiveSpeakerChanged(unsigned int newSpeakerId);
 
+// From engine-screenshare.cpp
+void UpdateShareSubscription();
+void TearDownScreenShare();
+
 // ---------------------------------------------------------------------------
 // State owned by this translation unit
 // ---------------------------------------------------------------------------
@@ -66,6 +70,10 @@ unsigned int GetMySelfUserId() {
     if (!me) return 0;
     return me->GetUserID();
 }
+
+// engine-screenshare.cpp reads the current share state via these.
+unsigned int GetActiveSharerUserId()   { return g_activeSharerUserId;  }
+unsigned int GetActiveShareSourceId()  { return g_activeShareSourceId; }
 
 // ---------------------------------------------------------------------------
 // UTF-8 / wide-char helpers
@@ -216,9 +224,10 @@ public:
 static ZoomAudioListener g_audioListener;
 
 // ---------------------------------------------------------------------------
-// Share listener — tracks the active sharer. Phase 5 only forwards status to
-// the plugin (used in zs_properties for "Receiving screenshare" vs "Waiting").
-// Phase 6 will use these IDs to subscribe the share renderer.
+// Share listener — tracks the active sharer and drives the screenshare
+// SDK subscription via UpdateShareSubscription() in engine-screenshare.cpp.
+// Also forwards state to the plugin so zs_properties shows "Receiving"
+// vs "Waiting" text.
 // ---------------------------------------------------------------------------
 class ZoomShareListener : public ZOOM_SDK_NAMESPACE::IMeetingShareCtrlEvent {
 public:
@@ -228,6 +237,8 @@ public:
         switch (shareInfo.status) {
             case ZOOM_SDK_NAMESPACE::Sharing_Other_Share_Begin:
             case ZOOM_SDK_NAMESPACE::Sharing_Self_Send_Begin:
+                // v1.0.0 choice: "most recent sharer wins" if multiple
+                // people are sharing. We just overwrite the globals.
                 g_activeSharerUserId  = shareInfo.userid;
                 g_activeShareSourceId = shareInfo.shareSourceID;
                 changed = true;
@@ -242,6 +253,13 @@ public:
         }
 
         if (changed) {
+            // Drive the screenshare renderer — subscribe, resubscribe, or
+            // unsubscribe based on the new state.
+            UpdateShareSubscription();
+
+            // Tell the plugin so its zs_properties status text updates
+            // and any ready-to-open screenshare sources can start their
+            // pump threads.
             char buf[128];
             sprintf_s(buf,
                 "{\"type\":\"share_status_changed\",\"sharer_user_id\":%u}",
@@ -328,6 +346,12 @@ public:
 
         // Report current share state if someone is already sharing.
         if (g_activeSharerUserId != 0) {
+            // Drive the screenshare renderer to subscribe to the in-
+            // progress share. Same call the listener makes when new
+            // shares start — safe to call unconditionally since it
+            // handles the "no sharer" case as a no-op.
+            UpdateShareSubscription();
+
             char buf[128];
             sprintf_s(buf,
                 "{\"type\":\"share_status_changed\",\"sharer_user_id\":%u}",
@@ -416,6 +440,7 @@ public:
             g_activeShareSourceId  = 0;
             g_activeSpeakerUserId  = 0;
             TearDownAllVideoSubscriptions();
+            TearDownScreenShare();
             SendToPlugin("{\"type\":\"meeting_left\"}");
         }
 
