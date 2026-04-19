@@ -37,6 +37,7 @@ const std::string& GetUserPMI();
 
 // From engine-video.cpp
 void TearDownAllVideoSubscriptions();
+void NotifyActiveSpeakerChanged(unsigned int newSpeakerId);
 
 // ---------------------------------------------------------------------------
 // State owned by this translation unit
@@ -47,6 +48,24 @@ static bool         g_rawLiveStreamGranted = false;
 static unsigned int g_activeSpeakerUserId  = 0;
 static unsigned int g_activeSharerUserId   = 0;
 static unsigned int g_activeShareSourceId  = 0;
+
+// ---------------------------------------------------------------------------
+// Accessors exposed to other engine translation units (engine-video.cpp
+// needs the meeting service to check IsVideoOn() on a prospective active
+// speaker, and needs the Feeds user's own ID to filter them out).
+// ---------------------------------------------------------------------------
+ZOOM_SDK_NAMESPACE::IMeetingService* GetMeetingService() {
+    return g_meetingService;
+}
+
+unsigned int GetMySelfUserId() {
+    if (!g_meetingService) return 0;
+    auto* pc = g_meetingService->GetMeetingParticipantsController();
+    if (!pc) return 0;
+    auto* me = pc->GetMySelfUser();
+    if (!me) return 0;
+    return me->GetUserID();
+}
 
 // ---------------------------------------------------------------------------
 // UTF-8 / wide-char helpers
@@ -180,6 +199,11 @@ public:
         sprintf_s(buf, "{\"type\":\"active_speaker_changed\",\"participant_id\":%u}",
                   newSpeaker);
         SendToPlugin(buf);
+
+        // Let engine-video.cpp retarget any follow-active-speaker
+        // subscriptions. The function filters out the Feeds user and
+        // speakers with video off, so we just pass the raw ID.
+        NotifyActiveSpeakerChanged(newSpeaker);
     }
     virtual void onUserAudioStatusChange(
         ZOOM_SDK_NAMESPACE::IList<ZOOM_SDK_NAMESPACE::IUserAudioStatus*>*,
