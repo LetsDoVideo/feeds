@@ -32,6 +32,17 @@ extern bool SendToPlugin(const std::string& json);
 
 namespace feeds_engine {
 
+// From engine-api.cpp
+int GetCurrentTier();
+
+// Map the current tier to the SDK resolution enum. Same values as v1.0.0.
+// Tier 0 (Free) = 720p, everything else = 1080p.
+static ZOOM_SDK_NAMESPACE::ZoomSDKResolution GetResolutionForCurrentTier() {
+    return (GetCurrentTier() >= 1)
+        ? ZOOM_SDK_NAMESPACE::ZoomSDKResolution_1080P
+        : ZOOM_SDK_NAMESPACE::ZoomSDKResolution_720P;
+}
+
 // ---------------------------------------------------------------------------
 // JSON helpers (same primitives as elsewhere in the engine)
 // ---------------------------------------------------------------------------
@@ -233,11 +244,13 @@ public:
             return false;
         }
 
-        // Set resolution. For the first subscription we use 720p; multi-
-        // participant scenarios may lower this in a future commit. For
-        // Phase 6 we're single-participant.
-        m_renderer->setRawDataResolution(
-            ZOOM_SDK_NAMESPACE::ZoomSDKResolution_720P);
+        // Set resolution based on the current tier. Tier 0 caps at 720p;
+        // tiers 1+ get 1080p. Multi-participant support (future commit)
+        // will apply the "first feed gets full resolution, extras drop to
+        // 360p" rule — but Andy enabled an override on our account that
+        // allows 1080p for all feeds up to tier max. For now we just use
+        // the tier resolution straight.
+        m_renderer->setRawDataResolution(GetResolutionForCurrentTier());
 
         // Subscribe to the user's video.
         err = m_renderer->subscribe(m_userId,
