@@ -37,7 +37,6 @@ const std::string& GetUserPMI();
 
 // From engine-video.cpp
 void TearDownAllVideoSubscriptions();
-void NotifyActiveSpeakerChanged(unsigned int newSpeakerId);
 
 // ---------------------------------------------------------------------------
 // State owned by this translation unit
@@ -48,24 +47,6 @@ static bool         g_rawLiveStreamGranted = false;
 static unsigned int g_activeSpeakerUserId  = 0;
 static unsigned int g_activeSharerUserId   = 0;
 static unsigned int g_activeShareSourceId  = 0;
-
-// ---------------------------------------------------------------------------
-// Accessors exposed to other engine translation units (engine-video.cpp
-// needs the meeting service to check IsVideoOn() on a prospective active
-// speaker, and needs the Feeds user's own ID to filter them out).
-// ---------------------------------------------------------------------------
-ZOOM_SDK_NAMESPACE::IMeetingService* GetMeetingService() {
-    return g_meetingService;
-}
-
-unsigned int GetMySelfUserId() {
-    if (!g_meetingService) return 0;
-    auto* pc = g_meetingService->GetMeetingParticipantsController();
-    if (!pc) return 0;
-    auto* me = pc->GetMySelfUser();
-    if (!me) return 0;
-    return me->GetUserID();
-}
 
 // ---------------------------------------------------------------------------
 // UTF-8 / wide-char helpers
@@ -199,11 +180,6 @@ public:
         sprintf_s(buf, "{\"type\":\"active_speaker_changed\",\"participant_id\":%u}",
                   newSpeaker);
         SendToPlugin(buf);
-
-        // Let engine-video.cpp retarget any follow-active-speaker
-        // subscriptions. The function filters out the Feeds user and
-        // speakers with video off, so we just pass the raw ID.
-        NotifyActiveSpeakerChanged(newSpeaker);
     }
     virtual void onUserAudioStatusChange(
         ZOOM_SDK_NAMESPACE::IList<ZOOM_SDK_NAMESPACE::IUserAudioStatus*>*,
@@ -386,20 +362,27 @@ public:
             // current user is the host (e.g. joining via PMI), privilege
             // may be immediately available, or we have to request it and
             // the host clicks "Allow" in the Zoom client.
+            //
+            // Either way, we wait for the real onRawLiveStreamPrivilegeChanged
+            // callback rather than firing it manually. Firing it manually
+            // caused a race: the plugin would send subscribe before the
+            // SDK's internal state was ready, and createRenderer would
+            // return SDKERR_NO_PERMISSION (12).
             ZOOM_SDK_NAMESPACE::IMeetingLiveStreamController* lsc =
                 g_meetingService->GetMeetingLiveStreamController();
             if (!lsc) return;
             lsc->SetEvent(&g_liveStreamListener);
 
-            if (lsc->CanStartRawLiveStream() ==
+            if (lsc->CanStartRawLiveStream() !=
                 ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
-                // Host: privilege available, simulate the "granted" event.
-                g_liveStreamListener.onRawLiveStreamPrivilegeChanged(true);
-            } else {
                 LogToFile("Meeting: requesting raw livestream privilege from host");
                 lsc->RequestRawLiveStreaming(
                     L"https://letsdovideo.com/feeds-support/", L"Feeds");
             }
+            // Otherwise: we're the host, privilege is already available.
+            // The SDK will fire onRawLiveStreamPrivilegeChanged(true) on
+            // its own schedule. Waiting for that real event prevents the
+            // race that causes createRenderer to fail with NO_PERMISSION.
         }
 
         if (status == ZOOM_SDK_NAMESPACE::MEETING_STATUS_ENDED ||
