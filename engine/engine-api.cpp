@@ -311,15 +311,7 @@ void FetchAndApplyEntitlement() {
         g_currentTier = 2;
     else if (response.find("Basic") != std::string::npos)
         g_currentTier = 1;
-// ================================================================
-    // !! TESTING OVERRIDE — REMOVE BEFORE MARKETPLACE SUBMISSION !!
-    // Forces tier to 3 (Broadcaster) regardless of actual entitlement.
-    // Purpose: allow testing of multi-feed functionality before the
-    // Zoom App Marketplace entitlement system is live.
-    // ================================================================
-    g_currentTier = 3;
-    LogToFile("API: !! TIER TESTING OVERRIDE ACTIVE, tier forced to 3 !!");
-    // ================================================================
+
     char msg[128];
     sprintf_s(msg, "API: entitlement applied, tier=%d", g_currentTier);
     LogToFile(msg);
