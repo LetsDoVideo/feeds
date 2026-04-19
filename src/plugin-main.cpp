@@ -8,17 +8,21 @@
 //   - Launch and manage the engine subprocess (see engine-client.cpp)
 //   - Send IPC messages to the engine for user actions
 //   - React to IPC messages from the engine to update UI state
-//   - Cache state (user info, participant list, meeting status) received
-//     from the engine, so OBS's per-source properties UI can read it
-//     synchronously without an IPC round-trip
+//   - Cache state received from the engine so OBS property callbacks can
+//     read it synchronously
+//   - Read video frames from shared memory (written by the engine) and
+//     hand them to OBS via obs_source_output_video
 
 #include <obs-module.h>
 #include <obs-frontend-api.h>
 #include <util/platform.h>
+#include <media-io/video-frame.h>
 #include <string>
 #include <vector>
 #include <functional>
 #include <mutex>
+#include <atomic>
+#include <thread>
 #include <windows.h>
 
 #include <QMainWindow>
@@ -29,6 +33,8 @@
 #include <QLineEdit>
 #include <QRegularExpression>
 #include <QTimer>
+
+#include "shared-frame.h"
 
 // ---------------------------------------------------------------------------
 // Engine client API (from engine-client.cpp)
@@ -44,21 +50,22 @@ namespace feeds {
 // ---------------------------------------------------------------------------
 // Globals — menu actions
 // ---------------------------------------------------------------------------
-static QAction* g_loginAction      = nullptr;
-static QAction* g_logoutAction     = nullptr;
-static QAction* g_connectAction    = nullptr;
+static QAction* g_loginAction   = nullptr;
+static QAction* g_logoutAction  = nullptr;
+static QAction* g_connectAction = nullptr;
 
 // ---------------------------------------------------------------------------
 // Globals — cached state from engine
 // ---------------------------------------------------------------------------
 static bool g_isLoggedIn          = false;
-static bool g_isInMeeting         = false;   // set true on meeting_joined
-static bool g_rawLiveStreamGranted = false;  // set true on raw_livestream_granted
-static bool g_pendingMeetingJoin   = false;  // Connect-while-not-logged-in queue
+static bool g_isInMeeting         = false;
+static bool g_rawLiveStreamGranted = false;
+static bool g_pendingMeetingJoin   = false;
 
 static std::string g_userDisplayName;
 static std::string g_userPMI;
 static int         g_currentTier = 0;
+static uint32_t    g_enginePid   = 0;   // Populated from engine_ready
 
 static unsigned long long g_currentMeetingNumber = 0;
 static unsigned int       g_activeSharerUserId   = 0;
@@ -75,8 +82,11 @@ static std::mutex                     g_participantsMutex;
 static int g_activeParticipantSources = 0;
 
 // ---------------------------------------------------------------------------
-// Tier → limits
-// 0 = Free (1 feed), 1 = Basic (3), 2 = Streamer (5), 3 = Broadcaster (8)
+// Tier → limits (matches v1.0.0)
+// 0 = Free (1 feed, 720p)
+// 1 = Basic (3, 1080p30)
+// 2 = Streamer (5, 1080p30)
+// 3 = Broadcaster (8, 1080p30)
 // ---------------------------------------------------------------------------
 static int GetMaxFeedsForTier() {
     switch (g_currentTier) {
@@ -87,15 +97,41 @@ static int GetMaxFeedsForTier() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Forward declarations for menu-action handlers
-// ---------------------------------------------------------------------------
 void OnLoginClick();
 void OnLogoutClick();
 void OnConnectClick();
 
 // ---------------------------------------------------------------------------
-// JSON helpers (tiny, just for what the plugin needs to read)
+// Per-source data
+// ---------------------------------------------------------------------------
+struct ZpSourceData {
+    obs_source_t* source          = nullptr;
+    std::string   uuid;
+    unsigned int  current_user_id = 0;
+
+    HANDLE mapping = nullptr;
+    void*  view    = nullptr;
+    feeds_shared::SharedFrameHeader* header = nullptr;
+    feeds_shared::FrameSlot*         slots  = nullptr;
+
+    std::thread       pumpThread;
+    std::atomic<bool> pumpShouldExit{false};
+    HANDLE            pumpWakeEvent = nullptr;
+    uint32_t          lastReadIndex = 0;
+};
+
+static std::mutex g_sourcesMutex;
+static std::vector<ZpSourceData*> g_allParticipantSources;
+
+static ZpSourceData* FindSourceByUuid(const std::string& uuid) {
+    for (ZpSourceData* s : g_allParticipantSources) {
+        if (s && s->uuid == uuid) return s;
+    }
+    return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// JSON helpers
 // ---------------------------------------------------------------------------
 static std::string ExtractJsonString(const std::string& json, const std::string& key) {
     std::string search = "\"" + key + "\"";
@@ -121,9 +157,6 @@ static long long ExtractJsonNumber(const std::string& json, const std::string& k
     try { return std::stoll(numStr); } catch (...) { return 0; }
 }
 
-// Refresh all open source properties panels so OBS re-queries them
-// against the updated cache. Called after any state change that would
-// affect what sources display.
 static void RefreshAllSourceProperties() {
     obs_enum_sources([](void*, obs_source_t* src) -> bool {
         const char* id = obs_source_get_id(src);
@@ -136,7 +169,179 @@ static void RefreshAllSourceProperties() {
 }
 
 // ---------------------------------------------------------------------------
-// Menu action: Login
+// Pump thread — reads frames from shared memory, feeds them to OBS.
+//
+// One instance runs per active Zoom Participant source with a live shared
+// memory mapping. The thread waits on an event with an 8ms timeout; on
+// wake, checks for new frames. Max added latency: ~8ms worst case.
+//
+// Engine doesn't signal our event today (would require cross-process
+// event handle sharing). So we fall through on the timeout. Fine for
+// the latency budget — Zoom delivers at ~33ms (30fps) or ~16ms (60fps)
+// intervals, and 8ms is well under either.
+// ---------------------------------------------------------------------------
+static void PumpThreadFunc(ZpSourceData* data) {
+    if (!data || !data->source) return;
+
+    blog(LOG_INFO, "[feeds] pump thread started for source=%s",
+         data->uuid.c_str());
+
+    while (!data->pumpShouldExit) {
+        WaitForSingleObject(data->pumpWakeEvent, 8);
+
+        if (data->pumpShouldExit) break;
+        if (!data->header || !data->slots) continue;
+
+        uint32_t currentWrite = data->header->write_index;
+        if (currentWrite == data->lastReadIndex) continue;
+
+        // Read the most recent slot; skip older ones if we're behind.
+        // Zero-buffering philosophy: drop frames rather than buffer them.
+        uint32_t slotIdx = (currentWrite - 1) % feeds_shared::RING_SLOTS;
+        feeds_shared::FrameSlot* slot = &data->slots[slotIdx];
+
+        MemoryBarrier();
+
+        uint32_t width  = slot->width;
+        uint32_t height = slot->height;
+
+        if (width  == 0 || height == 0 ||
+            width  > feeds_shared::MAX_FRAME_WIDTH ||
+            height > feeds_shared::MAX_FRAME_HEIGHT) {
+            data->lastReadIndex = currentWrite;
+            continue;
+        }
+
+        size_t ySize = (size_t)width * height;
+        size_t uSize = (size_t)(width / 2) * (height / 2);
+
+        struct obs_source_frame obsFrame = {};
+        obsFrame.format      = VIDEO_FORMAT_I420;
+        obsFrame.width       = width;
+        obsFrame.height      = height;
+        obsFrame.data[0]     = slot->data;
+        obsFrame.data[1]     = slot->data + ySize;
+        obsFrame.data[2]     = slot->data + ySize + uSize;
+        obsFrame.linesize[0] = slot->stride_y;
+        obsFrame.linesize[1] = slot->stride_u;
+        obsFrame.linesize[2] = slot->stride_v;
+
+        video_format_get_parameters(VIDEO_CS_DEFAULT, VIDEO_RANGE_PARTIAL,
+                                    obsFrame.color_matrix,
+                                    obsFrame.color_range_min,
+                                    obsFrame.color_range_max);
+
+        // Wall-clock timestamp at delivery time. Zero added latency.
+        // See discussion in v1.0.0 — fixed-increment or SDK-provided
+        // timestamps caused OBS to accumulate buffered frames.
+        obsFrame.timestamp = os_gettime_ns();
+
+        obs_source_output_video(data->source, &obsFrame);
+
+        data->header->last_read_index = currentWrite;
+        data->lastReadIndex = currentWrite;
+    }
+
+    blog(LOG_INFO, "[feeds] pump thread exiting for source=%s",
+         data->uuid.c_str());
+}
+
+static void StartPumpThread(ZpSourceData* data) {
+    if (!data) return;
+    if (data->pumpThread.joinable()) return;
+
+    data->pumpShouldExit = false;
+    if (!data->pumpWakeEvent) {
+        data->pumpWakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    }
+    data->pumpThread = std::thread(PumpThreadFunc, data);
+}
+
+static void StopPumpThread(ZpSourceData* data) {
+    if (!data) return;
+
+    data->pumpShouldExit = true;
+    if (data->pumpWakeEvent) SetEvent(data->pumpWakeEvent);
+
+    if (data->pumpThread.joinable()) {
+        data->pumpThread.join();
+    }
+
+    if (data->pumpWakeEvent) {
+        CloseHandle(data->pumpWakeEvent);
+        data->pumpWakeEvent = nullptr;
+    }
+}
+
+static void OpenSharedMemory(ZpSourceData* data) {
+    if (!data || g_enginePid == 0) return;
+
+    if (data->mapping) {
+        StopPumpThread(data);
+        if (data->view)    { UnmapViewOfFile(data->view); data->view = nullptr; }
+        if (data->mapping) { CloseHandle(data->mapping); data->mapping = nullptr; }
+        data->header = nullptr;
+        data->slots  = nullptr;
+    }
+
+    std::string name = feeds_shared::MakeFrameRegionName(g_enginePid, data->uuid);
+
+    data->mapping = OpenFileMappingA(FILE_MAP_READ | FILE_MAP_WRITE, FALSE,
+                                     name.c_str());
+    if (!data->mapping) {
+        blog(LOG_ERROR, "[feeds] OpenFileMapping failed for '%s', err=%lu",
+             name.c_str(), GetLastError());
+        return;
+    }
+
+    data->view = MapViewOfFile(data->mapping, FILE_MAP_READ | FILE_MAP_WRITE,
+                               0, 0, feeds_shared::REGION_SIZE);
+    if (!data->view) {
+        blog(LOG_ERROR, "[feeds] MapViewOfFile failed for '%s', err=%lu",
+             name.c_str(), GetLastError());
+        CloseHandle(data->mapping);
+        data->mapping = nullptr;
+        return;
+    }
+
+    data->header = (feeds_shared::SharedFrameHeader*)data->view;
+    data->slots  = (feeds_shared::FrameSlot*)
+        ((uint8_t*)data->view + sizeof(feeds_shared::SharedFrameHeader));
+
+    if (data->header->magic != feeds_shared::REGION_MAGIC ||
+        data->header->version != feeds_shared::REGION_VERSION) {
+        blog(LOG_ERROR, "[feeds] shared memory wrong magic/version for '%s'",
+             name.c_str());
+        UnmapViewOfFile(data->view);
+        CloseHandle(data->mapping);
+        data->view = nullptr;
+        data->mapping = nullptr;
+        data->header = nullptr;
+        data->slots = nullptr;
+        return;
+    }
+
+    data->lastReadIndex = data->header->write_index;
+
+    blog(LOG_INFO, "[feeds] opened shared memory '%s' for source=%s",
+         name.c_str(), data->uuid.c_str());
+
+    StartPumpThread(data);
+}
+
+static void CloseSharedMemory(ZpSourceData* data) {
+    if (!data) return;
+    StopPumpThread(data);
+
+    if (data->view)    { UnmapViewOfFile(data->view); data->view = nullptr; }
+    if (data->mapping) { CloseHandle(data->mapping); data->mapping = nullptr; }
+    data->header = nullptr;
+    data->slots  = nullptr;
+    data->lastReadIndex = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Menu handlers
 // ---------------------------------------------------------------------------
 void OnLoginClick() {
     if (g_isLoggedIn) {
@@ -148,9 +353,6 @@ void OnLoginClick() {
     feeds::SendToEngine("{\"type\":\"login_start\"}");
 }
 
-// ---------------------------------------------------------------------------
-// Menu action: Logout
-// ---------------------------------------------------------------------------
 void OnLogoutClick() {
     if (!g_isLoggedIn) {
         MessageBoxA(NULL, "You are not currently logged in to Zoom.",
@@ -160,10 +362,6 @@ void OnLogoutClick() {
     feeds::SendToEngine("{\"type\":\"logout\"}");
 }
 
-// ---------------------------------------------------------------------------
-// Menu action: Connect to Meeting
-// Preserves v1.0.0 UX exactly: PMI-or-number dialog, then password prompt.
-// ---------------------------------------------------------------------------
 void OnConnectClick() {
     if (!g_isLoggedIn) {
         g_pendingMeetingJoin = true;
@@ -178,14 +376,13 @@ void OnConnectClick() {
     if (g_isInMeeting) {
         MessageBoxA(NULL,
             "You are already connected to a Zoom meeting.\n\n"
-            "Use 'Disconnect from Meeting' to leave first.",
+            "Use the Leave button in the Zoom window to disconnect.",
             "Feeds - Already Connected", MB_OK | MB_ICONINFORMATION);
         return;
     }
 
     QMainWindow* mainWindow = (QMainWindow*)obs_frontend_get_main_window();
 
-    // Dialog 1: choose PMI or other meeting
     QStringList options;
     QString pmiOption = "My Personal Meeting Room (PMI)";
     if (!g_userPMI.empty())
@@ -237,8 +434,6 @@ void OnConnectClick() {
         if (!okPwd) return;
     }
 
-    // Build join_meeting IPC message. Engine does the ZAK fetch and the
-    // actual SDK Join call.
     auto jsonEscape = [](const QString& s) -> std::string {
         std::string out;
         QByteArray utf8 = s.toUtf8();
@@ -266,13 +461,9 @@ void OnConnectClick() {
                       "\"is_pmi\":" + std::string(isPmi ? "true" : "false") + "}";
     feeds::SendToEngine(msg);
 
-    // Disable Connect while we wait for the join to either succeed or fail.
     if (g_connectAction) g_connectAction->setEnabled(false);
 }
 
-// ---------------------------------------------------------------------------
-// Menu setup
-// ---------------------------------------------------------------------------
 void SetupPluginMenu() {
     QMainWindow* mainWindow = (QMainWindow*)obs_frontend_get_main_window();
     QMenuBar*    menuBar    = mainWindow->menuBar();
@@ -309,20 +500,12 @@ void SetupPluginMenu() {
 }
 
 // ---------------------------------------------------------------------------
-// Source type callbacks — video rendering is Phase 6. These stubs manage
-// source lifetime and provide the properties UI.
+// Source callbacks
 // ---------------------------------------------------------------------------
-
-// Per-source data — just enough to identify the source for future IPC
-// subscription. Phase 6 will add the D3D11 shared texture state.
-struct ZpSourceData {
-    obs_source_t* source          = nullptr;
-    unsigned int  current_user_id = 0;
-};
-
 static void* zp_create(obs_data_t* settings, obs_source_t* source) {
     (void)settings;
 
+    // Tier gating: enforce max feeds per the current tier.
     if (g_activeParticipantSources >= GetMaxFeedsForTier()) {
         std::string msg = "Your current tier allows a maximum of " +
                           std::to_string(GetMaxFeedsForTier()) +
@@ -333,38 +516,86 @@ static void* zp_create(obs_data_t* settings, obs_source_t* source) {
         return nullptr;
     }
 
+    // Essential for Zoom sync — prevents OBS from buffering frames.
     obs_source_set_async_unbuffered(source, true);
+
     ZpSourceData* data = new ZpSourceData();
     data->source = source;
+
+    const char* uuid = obs_source_get_uuid(source);
+    data->uuid = uuid ? uuid : "";
+
+    {
+        std::lock_guard<std::mutex> lock(g_sourcesMutex);
+        g_allParticipantSources.push_back(data);
+    }
+
     g_activeParticipantSources++;
     return data;
 }
 
-static void zp_destroy(void* data) {
-    if (!data) return;
+static void zp_destroy(void* vdata) {
+    if (!vdata) return;
+    ZpSourceData* data = static_cast<ZpSourceData*>(vdata);
+
+    if (!data->uuid.empty()) {
+        std::string msg = "{\"type\":\"participant_source_unsubscribe\","
+                          "\"source_id\":\"" + data->uuid + "\"}";
+        feeds::SendToEngine(msg);
+    }
+
+    CloseSharedMemory(data);
+
+    {
+        std::lock_guard<std::mutex> lock(g_sourcesMutex);
+        auto it = std::find(g_allParticipantSources.begin(),
+                            g_allParticipantSources.end(), data);
+        if (it != g_allParticipantSources.end())
+            g_allParticipantSources.erase(it);
+    }
+
     g_activeParticipantSources--;
-    delete static_cast<ZpSourceData*>(data);
+    delete data;
 }
 
-static void zp_update(void* data, obs_data_t* settings) {
-    if (!data) return;
-    ZpSourceData* src = static_cast<ZpSourceData*>(data);
-    src->current_user_id =
+static void zp_update(void* vdata, obs_data_t* settings) {
+    if (!vdata) return;
+    ZpSourceData* data = static_cast<ZpSourceData*>(vdata);
+
+    unsigned int selected_id =
         (unsigned int)obs_data_get_int(settings, "participant_id");
-    // Phase 6 will send participant_source_subscribe here.
+
+    if (selected_id == data->current_user_id) return;
+    data->current_user_id = selected_id;
+
+    // 0 is "--- Select Participant ---", 1 is [Active Speaker].
+    // For now, both result in no video. Active Speaker wiring is a
+    // follow-up commit.
+    if (selected_id == 0 || selected_id == 1) {
+        if (!data->uuid.empty()) {
+            std::string msg = "{\"type\":\"participant_source_unsubscribe\","
+                              "\"source_id\":\"" + data->uuid + "\"}";
+            feeds::SendToEngine(msg);
+        }
+        CloseSharedMemory(data);
+        return;
+    }
+
+    // Real user ID: subscribe.
+    if (!data->uuid.empty() && g_isInMeeting && g_rawLiveStreamGranted) {
+        std::string msg = "{\"type\":\"participant_source_subscribe\","
+                          "\"source_id\":\"" + data->uuid + "\","
+                          "\"participant_id\":" + std::to_string(selected_id) + "}";
+        feeds::SendToEngine(msg);
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Participant source properties — full v1.0.0 parity, reading from cache.
-// Also sends get_participants on every open so the list stays fresh as
-// people join/leave (effectively live updates without live SDK events).
+// Properties panel
 // ---------------------------------------------------------------------------
 static obs_properties_t* zp_properties(void* data) {
     (void)data;
 
-    // Fire-and-forget refresh. Response arrives async; if the list has
-    // changed, we'll call obs_source_update_properties again and OBS
-    // will re-invoke this function with fresh data.
     if (g_isInMeeting)
         feeds::SendToEngine("{\"type\":\"get_participants\"}");
 
@@ -403,7 +634,6 @@ static obs_properties_t* zp_properties(void* data) {
             });
     }
 
-    // The participant dropdown — always present. Populated from cache.
     obs_property_t* list = obs_properties_add_list(
         props, "participant_id", "Select Participant",
         OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
@@ -413,7 +643,6 @@ static obs_properties_t* zp_properties(void* data) {
     if (g_isInMeeting) {
         std::lock_guard<std::mutex> lock(g_participantsMutex);
         for (const auto& p : g_cachedParticipants) {
-            // Skip ourselves — matches v1.0.0 "filter by ID, not name"
             if (g_cachedMyUserId != 0 && p.id == g_cachedMyUserId) continue;
             obs_property_list_add_int(list, p.name.c_str(), (long long)p.id);
         }
@@ -423,12 +652,11 @@ static obs_properties_t* zp_properties(void* data) {
 }
 
 // ---------------------------------------------------------------------------
-// Screenshare source
+// Screenshare source (video path is Phase 7; stubs only for now)
 // ---------------------------------------------------------------------------
 static void* zs_create(obs_data_t* settings, obs_source_t* source) {
     (void)settings;
     obs_source_set_async_unbuffered(source, true);
-    // Return a sentinel non-null pointer — we don't need per-source state yet
     return bmalloc(1);
 }
 
@@ -470,7 +698,7 @@ static obs_properties_t* zs_properties(void* data) {
 }
 
 // ---------------------------------------------------------------------------
-// Source info structs
+// Source info
 // ---------------------------------------------------------------------------
 struct obs_source_info zoom_participant_info = {};
 struct obs_source_info zoom_screenshare_info = {};
@@ -479,7 +707,7 @@ OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("feeds", "en-US")
 
 // ---------------------------------------------------------------------------
-// Protocol handler registration (for ldvfeeds:// URLs)
+// Protocol handler registration (ldvfeeds://)
 // ---------------------------------------------------------------------------
 static void RegisterProtocolHandler() {
     char pluginPath[MAX_PATH] = {};
@@ -507,19 +735,17 @@ static void RegisterProtocolHandler() {
 }
 
 // ---------------------------------------------------------------------------
-// IPC message handlers — all the engine → plugin messages.
-//
-// These run on the pipe reader thread. Any UI manipulation (menu actions,
-// message boxes, property refreshes) must be marshaled to the Qt main
-// thread via QTimer::singleShot.
+// IPC message handlers
 // ---------------------------------------------------------------------------
 static void RegisterEngineHandlers() {
+    feeds::RegisterMessageHandler("engine_ready", [](const std::string& json) {
+        std::string version = ExtractJsonString(json, "version");
+        g_enginePid = (uint32_t)ExtractJsonNumber(json, "pid");
+        blog(LOG_INFO, "[feeds] engine_ready: version=%s, pid=%u",
+             version.c_str(), g_enginePid);
+    });
 
-    // -----------------------------------------------------------------------
-    // Authentication
-    // -----------------------------------------------------------------------
     feeds::RegisterMessageHandler("login_succeeded", [](const std::string& json) {
-        // Populate cache from engine's post-auth user-info fetch.
         g_userDisplayName = ExtractJsonString(json, "display_name");
         g_userPMI         = ExtractJsonString(json, "pmi");
         g_currentTier     = (int)ExtractJsonNumber(json, "tier");
@@ -541,7 +767,7 @@ static void RegisterEngineHandlers() {
     });
 
     feeds::RegisterMessageHandler("sdk_authenticated", [](const std::string&) {
-        blog(LOG_INFO, "[feeds] sdk_authenticated: enabling Connect menu");
+        blog(LOG_INFO, "[feeds] sdk_authenticated");
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
             g_isLoggedIn = true;
             if (g_loginAction)   g_loginAction->setEnabled(false);
@@ -549,7 +775,6 @@ static void RegisterEngineHandlers() {
             if (g_connectAction) g_connectAction->setEnabled(true);
             RefreshAllSourceProperties();
 
-            // If the user clicked Connect while not logged in, fulfill it now.
             if (g_pendingMeetingJoin) {
                 g_pendingMeetingJoin = false;
                 QTimer::singleShot(500, []() { OnConnectClick(); });
@@ -570,6 +795,14 @@ static void RegisterEngineHandlers() {
 
     feeds::RegisterMessageHandler("logout_complete", [](const std::string&) {
         blog(LOG_INFO, "[feeds] logout_complete");
+
+        {
+            std::lock_guard<std::mutex> lock(g_sourcesMutex);
+            for (ZpSourceData* s : g_allParticipantSources) {
+                CloseSharedMemory(s);
+            }
+        }
+
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
             g_isLoggedIn           = false;
             g_isInMeeting          = false;
@@ -586,10 +819,9 @@ static void RegisterEngineHandlers() {
                 g_cachedParticipants.clear();
             }
 
-            if (g_loginAction)      g_loginAction->setEnabled(true);
-            if (g_logoutAction)     g_logoutAction->setEnabled(false);
-            if (g_connectAction)    g_connectAction->setEnabled(false);
-            
+            if (g_loginAction)   g_loginAction->setEnabled(true);
+            if (g_logoutAction)  g_logoutAction->setEnabled(false);
+            if (g_connectAction) g_connectAction->setEnabled(false);
             RefreshAllSourceProperties();
 
             MessageBoxA(NULL, "You have been logged out of Zoom.",
@@ -599,6 +831,12 @@ static void RegisterEngineHandlers() {
 
     feeds::RegisterMessageHandler("session_expired", [](const std::string&) {
         blog(LOG_WARNING, "[feeds] session_expired");
+        {
+            std::lock_guard<std::mutex> lock(g_sourcesMutex);
+            for (ZpSourceData* s : g_allParticipantSources) {
+                CloseSharedMemory(s);
+            }
+        }
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
             g_isLoggedIn = false;
             g_isInMeeting = false;
@@ -610,10 +848,9 @@ static void RegisterEngineHandlers() {
                 std::lock_guard<std::mutex> lock(g_participantsMutex);
                 g_cachedParticipants.clear();
             }
-            if (g_loginAction)      g_loginAction->setEnabled(true);
-            if (g_logoutAction)     g_logoutAction->setEnabled(false);
-            if (g_connectAction)    g_connectAction->setEnabled(false);
-            
+            if (g_loginAction)   g_loginAction->setEnabled(true);
+            if (g_logoutAction)  g_logoutAction->setEnabled(false);
+            if (g_connectAction) g_connectAction->setEnabled(false);
             RefreshAllSourceProperties();
 
             MessageBoxA(NULL,
@@ -623,9 +860,6 @@ static void RegisterEngineHandlers() {
         });
     });
 
-    // -----------------------------------------------------------------------
-    // Meeting
-    // -----------------------------------------------------------------------
     feeds::RegisterMessageHandler("meeting_joined", [](const std::string& json) {
         std::string mn = ExtractJsonString(json, "meeting_number");
         blog(LOG_INFO, "[feeds] meeting_joined: %s", mn.c_str());
@@ -633,8 +867,7 @@ static void RegisterEngineHandlers() {
         catch (...) { g_currentMeetingNumber = 0; }
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
             g_isInMeeting = true;
-            if (g_connectAction)    g_connectAction->setEnabled(false);
-            
+            if (g_connectAction) g_connectAction->setEnabled(false);
             RefreshAllSourceProperties();
         });
     });
@@ -652,7 +885,6 @@ static void RegisterEngineHandlers() {
             [msg]() {
                 if (g_connectAction && g_isLoggedIn)
                     g_connectAction->setEnabled(true);
-                
                 MessageBoxA(NULL, msg.c_str(), "Feeds - Join Failed",
                             MB_OK | MB_ICONERROR);
             });
@@ -660,6 +892,16 @@ static void RegisterEngineHandlers() {
 
     feeds::RegisterMessageHandler("meeting_left", [](const std::string&) {
         blog(LOG_INFO, "[feeds] meeting_left");
+
+        // Engine has torn down shared memory. Close our mappings to
+        // keep things clean. Safe on this thread — no OBS API calls.
+        {
+            std::lock_guard<std::mutex> lock(g_sourcesMutex);
+            for (ZpSourceData* s : g_allParticipantSources) {
+                CloseSharedMemory(s);
+            }
+        }
+
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
             g_isInMeeting          = false;
             g_rawLiveStreamGranted = false;
@@ -673,7 +915,6 @@ static void RegisterEngineHandlers() {
             }
             if (g_connectAction && g_isLoggedIn)
                 g_connectAction->setEnabled(true);
-            
             RefreshAllSourceProperties();
         });
     });
@@ -681,25 +922,31 @@ static void RegisterEngineHandlers() {
     feeds::RegisterMessageHandler("raw_livestream_granted", [](const std::string&) {
         blog(LOG_INFO, "[feeds] raw_livestream_granted");
         g_rawLiveStreamGranted = true;
-        // RefreshAllSourceProperties will be triggered by participant_list_changed
-        // which follows immediately.
+
+        // Auto-subscribe any sources that had a participant picked before
+        // the meeting was joined / privilege was granted.
+        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
+            std::lock_guard<std::mutex> lock(g_sourcesMutex);
+            for (ZpSourceData* s : g_allParticipantSources) {
+                if (s && s->current_user_id > 1 && !s->uuid.empty()) {
+                    std::string msg = "{\"type\":\"participant_source_subscribe\","
+                                      "\"source_id\":\"" + s->uuid + "\","
+                                      "\"participant_id\":" +
+                                      std::to_string(s->current_user_id) + "}";
+                    feeds::SendToEngine(msg);
+                }
+            }
+        });
     });
 
     feeds::RegisterMessageHandler("raw_livestream_timeout", [](const std::string&) {
         blog(LOG_WARNING, "[feeds] raw_livestream_timeout - host did not approve");
-        // Future enhancement: show user-visible notification.
-        // For Phase 5 we just log it.
     });
 
-    // -----------------------------------------------------------------------
-    // Participants
-    // -----------------------------------------------------------------------
     feeds::RegisterMessageHandler("participant_list_changed",
     [](const std::string& json) {
         unsigned int myUserId = (unsigned int)ExtractJsonNumber(json, "my_user_id");
 
-        // Parse the participants array. We do this by finding each
-        // "{\"id\":N,\"name\":\"...\"}" object and extracting fields.
         std::vector<CachedParticipant> newList;
         size_t pos = json.find("\"participants\"");
         if (pos != std::string::npos) {
@@ -725,9 +972,6 @@ static void RegisterEngineHandlers() {
             }
         }
 
-        // Compare against cached state. Only trigger a UI refresh if the
-        // list actually changed — otherwise we'd create a feedback loop
-        // because zp_properties fires get_participants on every refresh.
         bool changed = false;
         {
             std::lock_guard<std::mutex> lock(g_participantsMutex);
@@ -747,7 +991,7 @@ static void RegisterEngineHandlers() {
             g_cachedParticipants = std::move(newList);
         }
 
-        if (!changed) return;  // No-op: list identical to cache.
+        if (!changed) return;
 
         blog(LOG_INFO, "[feeds] participant_list_changed: %zu participants",
              (size_t)g_cachedParticipants.size());
@@ -761,29 +1005,49 @@ static void RegisterEngineHandlers() {
     [](const std::string& json) {
         g_activeSpeakerUserId =
             (unsigned int)ExtractJsonNumber(json, "participant_id");
-        // No UI refresh needed for the dropdown — [Active Speaker] is a
-        // fixed entry. Phase 6 uses this for the renderer subscription.
     });
 
     feeds::RegisterMessageHandler("share_status_changed",
     [](const std::string& json) {
         g_activeSharerUserId =
             (unsigned int)ExtractJsonNumber(json, "sharer_user_id");
-        blog(LOG_INFO, "[feeds] share_status_changed: sharer_user_id=%u",
-             g_activeSharerUserId);
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
             RefreshAllSourceProperties();
         });
     });
 
     feeds::RegisterMessageHandler("token_refreshed", [](const std::string&) {
-        blog(LOG_INFO, "[feeds] token_refreshed (engine refreshed silently)");
-        // No-op plugin-side; the engine already persisted the new token.
+        blog(LOG_INFO, "[feeds] token_refreshed");
     });
 
-    // -----------------------------------------------------------------------
-    // Diagnostics
-    // -----------------------------------------------------------------------
+    // ---- Video frame path ----
+
+    feeds::RegisterMessageHandler("source_texture_ready",
+    [](const std::string& json) {
+        std::string sourceId = ExtractJsonString(json, "source_id");
+        if (sourceId.empty()) return;
+
+        blog(LOG_INFO, "[feeds] source_texture_ready: source=%s",
+             sourceId.c_str());
+
+        std::lock_guard<std::mutex> lock(g_sourcesMutex);
+        ZpSourceData* s = FindSourceByUuid(sourceId);
+        if (s) OpenSharedMemory(s);
+    });
+
+    feeds::RegisterMessageHandler("source_texture_released",
+    [](const std::string& json) {
+        std::string sourceId = ExtractJsonString(json, "source_id");
+        if (sourceId.empty()) return;
+
+        blog(LOG_INFO, "[feeds] source_texture_released: source=%s",
+             sourceId.c_str());
+
+        std::lock_guard<std::mutex> lock(g_sourcesMutex);
+        ZpSourceData* s = FindSourceByUuid(sourceId);
+        if (s) CloseSharedMemory(s);
+    });
+
     feeds::RegisterMessageHandler("engine_log", [](const std::string& json) {
         std::string message = ExtractJsonString(json, "message");
         blog(LOG_INFO, "[engine] %s", message.c_str());
@@ -793,11 +1057,6 @@ static void RegisterEngineHandlers() {
         std::string code    = ExtractJsonString(json, "code");
         std::string message = ExtractJsonString(json, "message");
         blog(LOG_ERROR, "[engine] %s: %s", code.c_str(), message.c_str());
-    });
-
-    feeds::RegisterMessageHandler("engine_ready", [](const std::string& json) {
-        std::string version = ExtractJsonString(json, "version");
-        blog(LOG_INFO, "[feeds] engine_ready: version=%s", version.c_str());
     });
 }
 
