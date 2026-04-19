@@ -35,6 +35,9 @@ std::string       FetchZak();
 const std::string& GetUserDisplayName();
 const std::string& GetUserPMI();
 
+// From engine-video.cpp
+void TearDownAllVideoSubscriptions();
+
 // ---------------------------------------------------------------------------
 // State owned by this translation unit
 // ---------------------------------------------------------------------------
@@ -381,6 +384,7 @@ public:
             g_activeSharerUserId   = 0;
             g_activeShareSourceId  = 0;
             g_activeSpeakerUserId  = 0;
+            TearDownAllVideoSubscriptions();
             SendToPlugin("{\"type\":\"meeting_left\"}");
         }
 
