@@ -22,6 +22,19 @@ set_target_properties(
         AUTORCC ON
 )
 
+# Zoom OAuth Client ID. Injected at build time from a CMake variable (which
+# in CI comes from a GitHub Actions secret). Falls back to the production
+# client ID for local builds and forks where the secret isn't defined.
+# The client ID is not cryptographically secret (PKCE doesn't require one),
+# but keeping it out of the public repo reduces the surface for imposter-
+# app attacks — a concern raised by Zoom's developer relations team.
+if(NOT DEFINED FEEDS_ZOOM_CLIENT_ID OR FEEDS_ZOOM_CLIENT_ID STREQUAL "")
+    set(FEEDS_ZOOM_CLIENT_ID "JlP6KfRqTt6r0t67FcDuqQ")
+    message(STATUS "FEEDS_ZOOM_CLIENT_ID not provided; using default production ID")
+else()
+    message(STATUS "FEEDS_ZOOM_CLIENT_ID provided via build configuration")
+endif()
+
 find_package(libobs REQUIRED)
 
 if(MSVC)
@@ -51,6 +64,10 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     src/engine-client.cpp
 )
 
+target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
+    FEEDS_ZOOM_CLIENT_ID="${FEEDS_ZOOM_CLIENT_ID}"
+)
+
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
 
 install(TARGETS ${CMAKE_PROJECT_NAME}
@@ -75,5 +92,8 @@ add_executable(FeedsEngine WIN32
 target_include_directories(FeedsEngine PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/zoom-sdk/h")
 target_link_directories(FeedsEngine PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/zoom-sdk/lib")
 target_link_libraries(FeedsEngine PRIVATE winhttp crypt32 advapi32 shell32 sdk)
+target_compile_definitions(FeedsEngine PRIVATE
+    FEEDS_ZOOM_CLIENT_ID="${FEEDS_ZOOM_CLIENT_ID}"
+)
 
 add_executable(FeedsLogin WIN32 helper/FeedsAuthHelper.cpp)
