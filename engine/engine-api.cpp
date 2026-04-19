@@ -121,7 +121,7 @@ static bool RefreshAccessToken() {
     std::string body =
         std::string("grant_type=refresh_token") +
         "&refresh_token=" + g_refreshToken +   // refresh tokens are already URL-safe
-        "&client_id=JlP6KfRqTt6r0t67FcDuqQ";
+        "&client_id="     + std::string(FEEDS_ZOOM_CLIENT_ID);
 
     HINTERNET hSession = WinHttpOpen(L"Feeds/1.0",
                                       WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
@@ -296,9 +296,12 @@ std::string FetchZak() {
 // ---------------------------------------------------------------------------
 void FetchAndApplyEntitlement() {
     LogToFile("API: FetchAndApplyEntitlement starting");
-    std::string response = ZoomApiGet(
-        L"/v2/marketplace/users/me/entitlements"
-        L"?app_id=JlP6KfRqTt6r0t67FcDuqQ");
+    // Build the path with the app_id from the compile-time macro.
+    // WinHTTP wants wide strings; do the conversion once here.
+    std::string appIdA = FEEDS_ZOOM_CLIENT_ID;
+    std::wstring appIdW(appIdA.begin(), appIdA.end());
+    std::wstring path = L"/v2/marketplace/users/me/entitlements?app_id=" + appIdW;
+    std::string response = ZoomApiGet(path);
 
     g_currentTier = 0;  // Default to Free
 
