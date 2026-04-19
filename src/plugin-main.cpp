@@ -47,7 +47,6 @@ namespace feeds {
 static QAction* g_loginAction      = nullptr;
 static QAction* g_logoutAction     = nullptr;
 static QAction* g_connectAction    = nullptr;
-static QAction* g_disconnectAction = nullptr;
 
 // ---------------------------------------------------------------------------
 // Globals — cached state from engine
@@ -94,7 +93,6 @@ static int GetMaxFeedsForTier() {
 void OnLoginClick();
 void OnLogoutClick();
 void OnConnectClick();
-void OnDisconnectClick();
 
 // ---------------------------------------------------------------------------
 // JSON helpers (tiny, just for what the plugin needs to read)
@@ -273,14 +271,6 @@ void OnConnectClick() {
 }
 
 // ---------------------------------------------------------------------------
-// Menu action: Disconnect from Meeting
-// ---------------------------------------------------------------------------
-void OnDisconnectClick() {
-    if (!g_isInMeeting) return;
-    feeds::SendToEngine("{\"type\":\"leave_meeting\"}");
-}
-
-// ---------------------------------------------------------------------------
 // Menu setup
 // ---------------------------------------------------------------------------
 void SetupPluginMenu() {
@@ -289,22 +279,19 @@ void SetupPluginMenu() {
     QMenu*       feedsMenu  = new QMenu("Feeds", menuBar);
     menuBar->addMenu(feedsMenu);
 
-    g_loginAction      = feedsMenu->addAction("Login to Zoom");
-    g_logoutAction     = feedsMenu->addAction("Logout of Zoom");
+    g_loginAction   = feedsMenu->addAction("Login to Zoom");
+    g_logoutAction  = feedsMenu->addAction("Logout of Zoom");
     feedsMenu->addSeparator();
-    g_connectAction    = feedsMenu->addAction("Connect to Zoom Meeting...");
-    g_disconnectAction = feedsMenu->addAction("Disconnect from Meeting");
+    g_connectAction = feedsMenu->addAction("Connect to Zoom Meeting...");
     feedsMenu->addSeparator();
     QAction* aboutAction = feedsMenu->addAction("About / Tier Status");
 
     g_logoutAction->setEnabled(false);
     g_connectAction->setEnabled(false);
-    g_disconnectAction->setEnabled(false);
 
-    QObject::connect(g_loginAction,      &QAction::triggered, []() { OnLoginClick(); });
-    QObject::connect(g_logoutAction,     &QAction::triggered, []() { OnLogoutClick(); });
-    QObject::connect(g_connectAction,    &QAction::triggered, []() { OnConnectClick(); });
-    QObject::connect(g_disconnectAction, &QAction::triggered, []() { OnDisconnectClick(); });
+    QObject::connect(g_loginAction,   &QAction::triggered, []() { OnLoginClick(); });
+    QObject::connect(g_logoutAction,  &QAction::triggered, []() { OnLogoutClick(); });
+    QObject::connect(g_connectAction, &QAction::triggered, []() { OnConnectClick(); });
     QObject::connect(aboutAction, &QAction::triggered, []() {
         std::string tierName;
         switch (g_currentTier) {
@@ -602,7 +589,7 @@ static void RegisterEngineHandlers() {
             if (g_loginAction)      g_loginAction->setEnabled(true);
             if (g_logoutAction)     g_logoutAction->setEnabled(false);
             if (g_connectAction)    g_connectAction->setEnabled(false);
-            if (g_disconnectAction) g_disconnectAction->setEnabled(false);
+            
             RefreshAllSourceProperties();
 
             MessageBoxA(NULL, "You have been logged out of Zoom.",
@@ -626,7 +613,7 @@ static void RegisterEngineHandlers() {
             if (g_loginAction)      g_loginAction->setEnabled(true);
             if (g_logoutAction)     g_logoutAction->setEnabled(false);
             if (g_connectAction)    g_connectAction->setEnabled(false);
-            if (g_disconnectAction) g_disconnectAction->setEnabled(false);
+            
             RefreshAllSourceProperties();
 
             MessageBoxA(NULL,
@@ -647,7 +634,7 @@ static void RegisterEngineHandlers() {
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
             g_isInMeeting = true;
             if (g_connectAction)    g_connectAction->setEnabled(false);
-            if (g_disconnectAction) g_disconnectAction->setEnabled(true);
+            
             RefreshAllSourceProperties();
         });
     });
@@ -665,8 +652,7 @@ static void RegisterEngineHandlers() {
             [msg]() {
                 if (g_connectAction && g_isLoggedIn)
                     g_connectAction->setEnabled(true);
-                if (g_disconnectAction)
-                    g_disconnectAction->setEnabled(false);
+                
                 MessageBoxA(NULL, msg.c_str(), "Feeds - Join Failed",
                             MB_OK | MB_ICONERROR);
             });
@@ -687,8 +673,7 @@ static void RegisterEngineHandlers() {
             }
             if (g_connectAction && g_isLoggedIn)
                 g_connectAction->setEnabled(true);
-            if (g_disconnectAction)
-                g_disconnectAction->setEnabled(false);
+            
             RefreshAllSourceProperties();
         });
     });
@@ -711,7 +696,7 @@ static void RegisterEngineHandlers() {
     // -----------------------------------------------------------------------
     feeds::RegisterMessageHandler("participant_list_changed",
     [](const std::string& json) {
-        g_cachedMyUserId = (unsigned int)ExtractJsonNumber(json, "my_user_id");
+        unsigned int myUserId = (unsigned int)ExtractJsonNumber(json, "my_user_id");
 
         // Parse the participants array. We do this by finding each
         // "{\"id\":N,\"name\":\"...\"}" object and extracting fields.
@@ -740,10 +725,29 @@ static void RegisterEngineHandlers() {
             }
         }
 
+        // Compare against cached state. Only trigger a UI refresh if the
+        // list actually changed — otherwise we'd create a feedback loop
+        // because zp_properties fires get_participants on every refresh.
+        bool changed = false;
         {
             std::lock_guard<std::mutex> lock(g_participantsMutex);
+            if (myUserId != g_cachedMyUserId ||
+                newList.size() != g_cachedParticipants.size()) {
+                changed = true;
+            } else {
+                for (size_t i = 0; i < newList.size(); i++) {
+                    if (newList[i].id != g_cachedParticipants[i].id ||
+                        newList[i].name != g_cachedParticipants[i].name) {
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+            g_cachedMyUserId     = myUserId;
             g_cachedParticipants = std::move(newList);
         }
+
+        if (!changed) return;  // No-op: list identical to cache.
 
         blog(LOG_INFO, "[feeds] participant_list_changed: %zu participants",
              (size_t)g_cachedParticipants.size());
