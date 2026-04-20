@@ -502,8 +502,20 @@ void SetupPluginMenu() {
     feedsMenu->addSeparator();
     QAction* aboutAction = feedsMenu->addAction("About / Tier Status");
 
-    g_logoutAction->setEnabled(false);
-    g_connectAction->setEnabled(false);
+    // Sync menu action states to the current plugin state. If the engine
+    // has already finished authenticating (common on startup when a valid
+    // refresh token was persisted from a previous session), the login
+    // handler fired before this menu existed — its setEnabled() calls
+    // silently no-op'd against the then-null action pointers. We re-apply
+    // the correct state here now that the actions exist.
+    if (g_isLoggedIn) {
+        g_loginAction->setEnabled(false);
+        g_logoutAction->setEnabled(true);
+        g_connectAction->setEnabled(!g_isInMeeting);
+    } else {
+        g_logoutAction->setEnabled(false);
+        g_connectAction->setEnabled(false);
+    }
 
     QObject::connect(g_loginAction,   &QAction::triggered, []() { OnLoginClick(); });
     QObject::connect(g_logoutAction,  &QAction::triggered, []() { OnLogoutClick(); });
