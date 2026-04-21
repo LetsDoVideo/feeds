@@ -127,3 +127,5 @@ Feeds is an independent integration and is not officially endorsed by the OBS Pr
 OBS Studio is a trademark of the OBS Project. Zoom is a trademark of Zoom Communications, Inc.
 
 © 2026 Let's Do Video. Licensed under GPL-2.0.
+
+Last verified working: April 2026
