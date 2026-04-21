@@ -121,7 +121,7 @@ Upgrade your tier at the [Zoom App Marketplace](https://marketplace.zoom.us).
 
 ---
 
-## Legal
+## Legal 
 
 Feeds is an independent integration and is not officially endorsed by the OBS Project or Zoom Communications, Inc.
 OBS Studio is a trademark of the OBS Project. Zoom is a trademark of Zoom Communications, Inc.
