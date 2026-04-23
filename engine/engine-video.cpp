@@ -164,7 +164,6 @@ public:
     // Write one I420 frame. Called from the SDK's raw-data callback thread.
     // The three Y/U/V buffers are copied into the next ring slot.
     void WriteFrame(const uint8_t* y, const uint8_t* u, const uint8_t* v,
-                    const uint8_t* alpha, uint32_t alphaLen,
                     uint32_t width, uint32_t height)
     {
         if (!m_header || !m_slots) return;
@@ -204,22 +203,6 @@ public:
         memcpy(dest->data, y, ySize);
         memcpy(dest->data + ySize, u, uSize);
         memcpy(dest->data + ySize + uSize, v, vSize);
-
-        // Alpha plane (Phase 1 plumbing; callers pass nullptr/0 for now).
-        // stride_a must be set on every frame — a stale non-zero value
-        // from a previous write would cause the reader to misinterpret
-        // the slot as I40A.
-        if (alpha != nullptr && alphaLen > 0) {
-            if (alphaLen <= (size_t)width * height) {
-                memcpy(dest->data + ySize + uSize + vSize, alpha, alphaLen);
-                dest->stride_a = width;
-            } else {
-                // Malformed frame; refuse to overrun the slot.
-                dest->stride_a = 0;
-            }
-        } else {
-            dest->stride_a = 0;
-        }
 
         // Memory barrier before bumping write_index, so readers that see
         // the new index are guaranteed to see the new data.
@@ -381,7 +364,6 @@ public:
             (const uint8_t*)data->GetYBuffer(),
             (const uint8_t*)data->GetUBuffer(),
             (const uint8_t*)data->GetVBuffer(),
-            nullptr, 0,
             data->GetStreamWidth(),
             data->GetStreamHeight());
     }

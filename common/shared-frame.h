@@ -59,9 +59,9 @@ namespace feeds_shared {
 // does internal buffering) and the latency was perfect.
 static constexpr uint32_t RING_SLOTS = 3;
 
-// Max frame dimensions. 1920x1080 with I420+alpha = 1920*1080*2.5 bytes = ~5MB.
-// At 3 slots that's ~15MB per subscription. For a Broadcaster tier with
-// 8 feeds plus screenshare, ~135MB total. Comfortable.
+// Max frame dimensions. 1920x1080 in I420 = 1920*1080*1.5 bytes = ~3MB.
+// At 3 slots that's ~9MB per subscription. For a Broadcaster tier with
+// 8 feeds plus screenshare, ~80MB total. Comfortable.
 //
 // We size for 1080p because the Zoom Enhanced Media feature (enabled on
 // our app by Andy) can deliver 1080p60. We do not size for 4K; if we
@@ -69,13 +69,10 @@ static constexpr uint32_t RING_SLOTS = 3;
 static constexpr uint32_t MAX_FRAME_WIDTH  = 1920;
 static constexpr uint32_t MAX_FRAME_HEIGHT = 1080;
 
-// I420: Y plane is width*height, U/V planes are each (width/2)*(height/2);
-// total = width*height*1.5 (the 3/2 factor). In v1.0.3 we grew this to
-// 5/2 to accommodate an optional alpha plane the size of Y, so the sum
-// becomes 1.5x + 1x = 2.5x. At 1920x1080 that's ~5MB per slot and
-// ~15MB for a 3-slot subscription.
+// I420: Y plane is width*height, U/V planes are each (width/2)*(height/2).
+// Total = width*height*1.5.
 static constexpr uint32_t MAX_FRAME_BYTES =
-    (MAX_FRAME_WIDTH * MAX_FRAME_HEIGHT * 5) / 2;
+    (MAX_FRAME_WIDTH * MAX_FRAME_HEIGHT * 3) / 2;
 
 // Single frame slot in the ring. Each slot is self-describing so the
 // reader doesn't need to trust the header's dimensions — it uses the
@@ -92,12 +89,6 @@ struct FrameSlot {
     uint32_t stride_y;
     uint32_t stride_u;
     uint32_t stride_v;
-
-    // Stride of alpha plane in bytes. 0 = no alpha plane present in this
-    // frame (I420 only). Non-zero = alpha plane is present in data[]
-    // immediately after the V plane, with size (height * stride_a) bytes.
-    // Used from v1.0.3 onward.
-    uint32_t stride_a;
 
     // Engine's wall-clock timestamp at frame capture (QueryPerformanceCounter
     // or similar). Plugin may use this for debugging but the frame handed
@@ -136,7 +127,7 @@ struct SharedFrameHeader {
 };
 
 static constexpr uint32_t REGION_MAGIC   = 0x46454544; // 'FEED' in ASCII
-static constexpr uint32_t REGION_VERSION = 2; // bumped from 1 in v1.0.3 to add alpha plane support
+static constexpr uint32_t REGION_VERSION = 1;
 
 // Total size of the shared memory region.
 static constexpr size_t REGION_SIZE =
