@@ -1418,6 +1418,27 @@ static void RegisterEngineHandlers() {
     });
 }
 
+// Return the advertised native size of the source. OBS calls this to
+// determine how to lay out the source in scenes. By returning a constant
+// rather than letting OBS derive the size from per-frame dimensions, we
+// prevent Zoom's dynamic resolution changes from resizing the source in
+// the user's scene. The actual frame pixels are still rendered at their
+// native resolution; OBS's compositor scales them into the 1920x1080
+// bounding box we advertise here.
+//
+// This matches the behavior of other well-behaved OBS async sources
+// (webcam, NDI, Zoom ISO) which all report a stable native size despite
+// receiving frames at varying resolutions.
+static uint32_t zp_get_width(void* data) {
+    (void)data;
+    return feeds_shared::MAX_FRAME_WIDTH;
+}
+
+static uint32_t zp_get_height(void* data) {
+    (void)data;
+    return feeds_shared::MAX_FRAME_HEIGHT;
+}
+
 // ---------------------------------------------------------------------------
 // Module load/unload
 // ---------------------------------------------------------------------------
@@ -1430,6 +1451,8 @@ bool obs_module_load(void) {
     zoom_participant_info.destroy        = zp_destroy;
     zoom_participant_info.get_properties = zp_properties;
     zoom_participant_info.update         = zp_update;
+    zoom_participant_info.get_width      = zp_get_width;
+    zoom_participant_info.get_height     = zp_get_height;
     zoom_participant_info.icon_type      = OBS_ICON_TYPE_CAMERA;
     obs_register_source(&zoom_participant_info);
 
