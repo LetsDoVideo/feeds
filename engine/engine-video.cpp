@@ -361,28 +361,12 @@ public:
     virtual void onRawDataFrameReceived(YUVRawDataI420* data) override {
         if (!data) return;
 
-        uint32_t w = data->GetStreamWidth();
-        uint32_t h = data->GetStreamHeight();
-
-        // TEMPORARY (v1.0.3 diagnostic): log every dimension change so we can
-        // verify Zoom's variable-resolution behavior during testing. Remove
-        // before release.
-        if (w != m_lastLoggedWidth || h != m_lastLoggedHeight) {
-            char msg[192];
-            sprintf_s(msg, "Video: frame dimensions changed for source='%s': %ux%u -> %ux%u",
-                      m_sourceUuid.c_str(),
-                      m_lastLoggedWidth, m_lastLoggedHeight,
-                      w, h);
-            LogToFile(msg);
-            m_lastLoggedWidth  = w;
-            m_lastLoggedHeight = h;
-        }
-
         m_writer.WriteFrame(
             (const uint8_t*)data->GetYBuffer(),
             (const uint8_t*)data->GetUBuffer(),
             (const uint8_t*)data->GetVBuffer(),
-            w, h);
+            data->GetStreamWidth(),
+            data->GetStreamHeight());
     }
 
     virtual void onRawDataStatusChanged(RawDataStatus status) override {
@@ -409,8 +393,6 @@ private:
     bool         m_followActiveSpeaker = false;
     ZOOM_SDK_NAMESPACE::IZoomSDKRenderer* m_renderer = nullptr;
     SharedMemoryWriter m_writer;
-    uint32_t     m_lastLoggedWidth  = 0;
-    uint32_t     m_lastLoggedHeight = 0;
 };
 
 // ---------------------------------------------------------------------------
