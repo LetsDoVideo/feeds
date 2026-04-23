@@ -23,6 +23,8 @@
 #include <mutex>
 #include <atomic>
 #include <thread>
+#include <chrono>
+#include <cstring>
 #include <windows.h>
 
 #include <QMainWindow>
@@ -1418,25 +1420,86 @@ static void RegisterEngineHandlers() {
     });
 }
 
-// Return the advertised native size of the source. OBS calls this to
-// determine how to lay out the source in scenes. By returning a constant
-// rather than letting OBS derive the size from per-frame dimensions, we
-// prevent Zoom's dynamic resolution changes from resizing the source in
-// the user's scene. The actual frame pixels are still rendered at their
-// native resolution; OBS's compositor scales them into the 1920x1080
-// bounding box we advertise here.
-//
-// This matches the behavior of other well-behaved OBS async sources
-// (webcam, NDI, Zoom ISO) which all report a stable native size despite
-// receiving frames at varying resolutions.
-static uint32_t zp_get_width(void* data) {
-    (void)data;
-    return feeds_shared::MAX_FRAME_WIDTH;
+// Find the scene item(s) for a given source across all scenes and apply
+// our default Fit bounds at the current OBS canvas resolution. Called
+// deferred after source_create, because at source_create time the source
+// has not yet been added to any scene.
+static void ApplyFeedsBoundsToSceneItem(obs_source_t* source) {
+    if (!source) return;
+
+    // Determine bounds dimensions from the current OBS canvas. This makes
+    // the fix adaptive to unusual canvas sizes (vertical, 4K, 720p, etc.)
+    // rather than hardcoding 1920x1080.
+    obs_video_info ovi;
+    uint32_t boundsW = 1920;
+    uint32_t boundsH = 1080;
+    if (obs_get_video_info(&ovi)) {
+        boundsW = ovi.base_width;
+        boundsH = ovi.base_height;
+    }
+
+    struct SearchContext {
+        obs_source_t* target;
+        uint32_t w;
+        uint32_t h;
+    };
+    SearchContext ctx = { source, boundsW, boundsH };
+
+    auto enum_cb = [](void* param, obs_source_t* scene_src) -> bool {
+        SearchContext* c = (SearchContext*)param;
+        obs_scene_t* scene = obs_scene_from_source(scene_src);
+        if (!scene) return true;
+
+        auto item_cb = [](obs_scene_t*, obs_sceneitem_t* item, void* p) -> bool {
+            SearchContext* c = (SearchContext*)p;
+            obs_source_t* item_src = obs_sceneitem_get_source(item);
+            if (item_src == c->target) {
+                vec2 bounds;
+                bounds.x = (float)c->w;
+                bounds.y = (float)c->h;
+                obs_sceneitem_set_bounds_type(item, OBS_BOUNDS_SCALE_INNER);
+                obs_sceneitem_set_bounds(item, &bounds);
+                obs_sceneitem_set_bounds_alignment(item, OBS_ALIGN_CENTER);
+            }
+            return true;
+        };
+
+        obs_scene_enum_items(scene, item_cb, c);
+        return true;
+    };
+
+    obs_enum_scenes(enum_cb, &ctx);
 }
 
-static uint32_t zp_get_height(void* data) {
-    (void)data;
-    return feeds_shared::MAX_FRAME_HEIGHT;
+static void OnSourceCreated(void* /*data*/, calldata_t* cd) {
+    obs_source_t* source = (obs_source_t*)calldata_ptr(cd, "source");
+    if (!source) return;
+
+    const char* id = obs_source_get_id(source);
+    if (!id) return;
+
+    // Only apply to Feeds source types.
+    const bool isFeedsSource =
+        strcmp(id, "zoom_participant_source") == 0 ||
+        strcmp(id, "zoom_screenshare_source") == 0;
+    if (!isFeedsSource) return;
+
+    // Hold a weak reference; promote to strong reference inside the
+    // deferred callback. This avoids holding the source alive if the user
+    // (or OBS during shutdown) removes it in the interim.
+    obs_weak_source_t* weak = obs_source_get_weak_source(source);
+    if (!weak) return;
+
+    std::thread([weak]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        obs_source_t* strong = obs_weak_source_get_source(weak);
+        if (strong) {
+            ApplyFeedsBoundsToSceneItem(strong);
+            obs_source_release(strong);
+        }
+        obs_weak_source_release(weak);
+    }).detach();
 }
 
 // ---------------------------------------------------------------------------
@@ -1451,8 +1514,6 @@ bool obs_module_load(void) {
     zoom_participant_info.destroy        = zp_destroy;
     zoom_participant_info.get_properties = zp_properties;
     zoom_participant_info.update         = zp_update;
-    zoom_participant_info.get_width      = zp_get_width;
-    zoom_participant_info.get_height     = zp_get_height;
     zoom_participant_info.icon_type      = OBS_ICON_TYPE_CAMERA;
     obs_register_source(&zoom_participant_info);
 
@@ -1465,6 +1526,11 @@ bool obs_module_load(void) {
     zoom_screenshare_info.get_properties = zs_properties;
     zoom_screenshare_info.icon_type      = OBS_ICON_TYPE_DESKTOP_CAPTURE;
     obs_register_source(&zoom_screenshare_info);
+
+    signal_handler_t* sh = obs_get_signal_handler();
+    if (sh) {
+        signal_handler_connect(sh, "source_create", OnSourceCreated, nullptr);
+    }
 
     RegisterProtocolHandler();
 
@@ -1481,5 +1547,9 @@ bool obs_module_load(void) {
 }
 
 void obs_module_unload(void) {
+    signal_handler_t* sh = obs_get_signal_handler();
+    if (sh) {
+        signal_handler_disconnect(sh, "source_create", OnSourceCreated, nullptr);
+    }
     feeds::StopEngine();
 }
