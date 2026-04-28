@@ -59,15 +59,20 @@ namespace feeds_shared {
 // does internal buffering) and the latency was perfect.
 static constexpr uint32_t RING_SLOTS = 3;
 
-// Max frame dimensions. 1920x1080 in I420 = 1920*1080*1.5 bytes = ~3MB.
-// At 3 slots that's ~9MB per subscription. For a Broadcaster tier with
-// 8 feeds plus screenshare, ~80MB total. Comfortable.
+// Max frame dimensions. 3840x2160 in I420 = 3840*2160*1.5 bytes = ~12.4MB.
+// At 3 slots that's ~37MB per subscription. For a Broadcaster tier with
+// 8 feeds plus screenshare, ~330MB total. Acceptable on modern systems.
 //
-// We size for 1080p because the Zoom Enhanced Media feature (enabled on
-// our app by Andy) can deliver 1080p60. We do not size for 4K; if we
-// ever need 4K we revisit this number.
-static constexpr uint32_t MAX_FRAME_WIDTH  = 1920;
-static constexpr uint32_t MAX_FRAME_HEIGHT = 1080;
+// History: v1.0.0 through v1.0.3 used 1920x1080 here, sized for the Zoom
+// Enhanced Media 1080p60 path. v1.0.4 bumped to 4K because participant
+// video stays 1080p-capped by Zoom but screenshare frames can be much
+// larger — phone-portrait shares come through at 1080x1920 (height
+// exceeds 1080), and 1440p/4K monitor shares exceed the old buffer in
+// both dimensions. Frames exceeding the buffer are dropped by the
+// engine's WriteFrame, so the old 1080p ceiling silently broke
+// screenshare for any source larger than a 1080p landscape display.
+static constexpr uint32_t MAX_FRAME_WIDTH  = 3840;
+static constexpr uint32_t MAX_FRAME_HEIGHT = 2160;
 
 // I420: Y plane is width*height, U/V planes are each (width/2)*(height/2).
 // Total = width*height*1.5.
@@ -127,7 +132,7 @@ struct SharedFrameHeader {
 };
 
 static constexpr uint32_t REGION_MAGIC   = 0x46454544; // 'FEED' in ASCII
-static constexpr uint32_t REGION_VERSION = 1;
+static constexpr uint32_t REGION_VERSION = 2; // bumped from 1 in v1.0.4 to enlarge MAX_FRAME dimensions to 4K
 
 // Total size of the shared memory region.
 static constexpr size_t REGION_SIZE =
