@@ -3,9 +3,12 @@
 
 # Except for default project files
 !/.github
+!/assets
 !/build-aux
 !/cmake
+!/common
 !/data
+!/engine
 !/src
 !.clang-format
 !.gersemirc
