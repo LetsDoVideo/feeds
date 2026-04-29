@@ -957,6 +957,31 @@ static void CloseSharedMemoryForAllScreenshareSources() {
 
 static void* zs_create(obs_data_t* settings, obs_source_t* source) {
     (void)settings;
+
+    // Tier gating: screenshare is a paid feature (Basic tier and up).
+    // Same login-deferred logic as zp_create — if the user has a saved
+    // scene with a screenshare source and login hasn't completed yet,
+    // we don't want to spuriously block creation. Once logged in, free
+    // tier users get a friendly upgrade prompt.
+    if (g_isLoggedIn && g_currentTier == 0 && ShouldShowTierPopup()) {
+        std::string msg =
+            "Screenshare is a paid feature.\n\n"
+            "Your current tier is Free. Upgrade to Basic, Streamer, "
+            "or Broadcaster to use Zoom Screenshare in OBS.\n\n"
+            "Upgrade your plan at:\n"
+            "https://marketplace.zoom.us";
+        MessageBoxA(NULL, msg.c_str(),
+                    "Feeds - Upgrade Required",
+                    MB_OK | MB_ICONINFORMATION);
+        return nullptr;
+    }
+    // If popup was throttled, still block creation silently — same
+    // reasoning as zp_create: we don't grant the feature just because
+    // we chose not to annoy the user.
+    if (g_isLoggedIn && g_currentTier == 0) {
+        return nullptr;
+    }
+
     obs_source_set_async_unbuffered(source, true);
 
     ZsSourceData* data = new ZsSourceData();
