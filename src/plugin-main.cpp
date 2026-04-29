@@ -62,6 +62,12 @@ namespace feeds {
 }
 
 // ---------------------------------------------------------------------------
+// Plugin version. Update this in one place per release; everywhere else
+// (About dialog, log lines, telemetry) reads from this constant.
+// ---------------------------------------------------------------------------
+static constexpr const char* FEEDS_VERSION = "1.0.4";
+
+// ---------------------------------------------------------------------------
 // Globals — menu actions
 // ---------------------------------------------------------------------------
 static QAction* g_loginAction   = nullptr;
@@ -530,7 +536,7 @@ void SetupPluginMenu() {
             case 3:  tierName = "Broadcaster"; break;
             default: tierName = "Free";        break;
         }
-        std::string aboutText = "Feeds v1.0\n";
+        std::string aboutText = std::string("Feeds v") + FEEDS_VERSION + "\n";
         if (!g_userDisplayName.empty())
             aboutText += "Logged in as: " + g_userDisplayName + "\n";
         aboutText += "Tier: " + tierName;
@@ -692,7 +698,8 @@ static obs_properties_t* zp_properties(void* data) {
         feeds::SendToEngine("{\"type\":\"get_participants\"}");
 
     obs_properties_t* props = obs_properties_create();
-    obs_properties_add_text(props, "ver_label", "Feeds (v1.0)", OBS_TEXT_INFO);
+    std::string verLabel = std::string("Feeds (v") + FEEDS_VERSION + ")";
+    obs_properties_add_text(props, "ver_label", verLabel.c_str(), OBS_TEXT_INFO);
 
     if (!g_isInMeeting) {
         if (!g_isLoggedIn) {
@@ -1023,8 +1030,8 @@ static void zs_destroy(void* vdata) {
 static obs_properties_t* zs_properties(void* data) {
     (void)data;
     obs_properties_t* props = obs_properties_create();
-    obs_properties_add_text(props, "ver_label",
-                            "Feeds - Screenshare (v1.0)", OBS_TEXT_INFO);
+    std::string verLabel = std::string("Feeds - Screenshare (v") + FEEDS_VERSION + ")";
+    obs_properties_add_text(props, "ver_label", verLabel.c_str(), OBS_TEXT_INFO);
 
     if (!g_isInMeeting) {
         if (!g_isLoggedIn) {
