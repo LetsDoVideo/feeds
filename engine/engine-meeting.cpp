@@ -245,9 +245,19 @@ public:
                 break;
             case ZOOM_SDK_NAMESPACE::Sharing_Other_Share_End:
             case ZOOM_SDK_NAMESPACE::Sharing_Self_Send_End:
-                g_activeSharerUserId  = 0;
-                g_activeShareSourceId = 0;
-                changed = true;
+                // Only zero the globals if the user who stopped sharing is
+                // the user we were currently tracking. When one sharer
+                // replaces another, the SDK fires the new sharer's Begin
+                // event before the old sharer's End event. Without this
+                // check, the End event for the previous sharer would
+                // incorrectly zero out the globals we just set for the
+                // new sharer, causing the screenshare source to revert to
+                // "Waiting for screenshare" 300ms after the swap.
+                if (shareInfo.userid == g_activeSharerUserId) {
+                    g_activeSharerUserId  = 0;
+                    g_activeShareSourceId = 0;
+                    changed = true;
+                }
                 break;
             default: break;
         }
