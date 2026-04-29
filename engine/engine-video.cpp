@@ -18,9 +18,6 @@
 #include <mutex>
 #include <memory>
 #include <cstdio>
-#include <atomic>
-#include <thread>
-#include <chrono>
 
 #include "zoom_sdk.h"
 #include "zoom_sdk_raw_data_def.h"
@@ -452,22 +449,14 @@ static void RequestAlphaMode() {
         if (!ms) return;
         auto* vc = ms->GetMeetingVideoController();
         if (!vc) return;
-
-        // DIAGNOSTIC: log Can result, then attempt Enable regardless.
-        bool canResult = vc->CanEnableAlphaChannelMode();
-        char msg[128];
-        sprintf_s(msg, "DIAG2 Alpha: CanEnableAlphaChannelMode = %s",
-                  canResult ? "true" : "false");
-        LogToFile(msg);
-
+        if (!vc->CanEnableAlphaChannelMode()) {
+            LogToFile("Alpha: CanEnableAlphaChannelMode returned false");
+            return;
+        }
         auto err = vc->EnableAlphaChannelMode(true);
-        sprintf_s(msg, "DIAG2 Alpha: EnableAlphaChannelMode(true) returned %d",
+        char msg[128];
+        sprintf_s(msg, "Alpha: EnableAlphaChannelMode(true) returned %d",
                   (int)err);
-        LogToFile(msg);
-
-        bool isEnabled = vc->IsAlphaChannelModeEnabled();
-        sprintf_s(msg, "DIAG2 Alpha: IsAlphaChannelModeEnabled = %s",
-                  isEnabled ? "true" : "false");
         LogToFile(msg);
     }
 }
@@ -487,47 +476,6 @@ static void ReleaseAlphaMode() {
                   (int)err);
         LogToFile(msg);
     }
-}
-
-// ---------------------------------------------------------------------------
-// DIAGNOSTIC ONLY — to be reverted after investigation. Periodic recheck
-// of CanEnableAlphaChannelMode while subscriptions are active. Helps us
-// observe whether capability flips on/off as participants toggle VB.
-// ---------------------------------------------------------------------------
-static std::atomic<bool> g_diagThreadRunning{false};
-static std::thread       g_diagThread;
-
-static void DiagnosticAlphaCheckLoop() {
-    bool lastResult = false;
-    bool firstCheck = true;
-    while (g_diagThreadRunning.load()) {
-        auto* ms = GetMeetingService();
-        if (ms) {
-            auto* vc = ms->GetMeetingVideoController();
-            if (vc) {
-                bool canNow = vc->CanEnableAlphaChannelMode();
-                if (firstCheck || canNow != lastResult) {
-                    char msg[128];
-                    sprintf_s(msg, "DIAG Alpha: CanEnableAlphaChannelMode = %s",
-                              canNow ? "true" : "false");
-                    LogToFile(msg);
-                    lastResult = canNow;
-                    firstCheck = false;
-                }
-            }
-        }
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-    }
-}
-
-static void StartDiagnosticAlphaThread() {
-    if (g_diagThreadRunning.exchange(true)) return;
-    g_diagThread = std::thread(DiagnosticAlphaCheckLoop);
-}
-
-static void StopDiagnosticAlphaThread() {
-    if (!g_diagThreadRunning.exchange(false)) return;
-    if (g_diagThread.joinable()) g_diagThread.join();
 }
 
 // ---------------------------------------------------------------------------
@@ -558,9 +506,6 @@ void TearDownAllVideoSubscriptions() {
         std::lock_guard<std::mutex> alphaLock(g_alphaMutex);
         g_alphaRefCount = 0;
     }
-
-    // DIAGNOSTIC ONLY — bulk teardown also kills the recheck thread.
-    StopDiagnosticAlphaThread();
 }
 
 // ---------------------------------------------------------------------------
@@ -634,11 +579,6 @@ void HandleParticipantSourceSubscribe(const std::string& json) {
     // the full pipeline gets exercised end-to-end. Phase 3 will gate this
     // behind a per-source UI toggle.
     RequestAlphaMode();
-
-    // DIAGNOSTIC ONLY — kick off the periodic capability recheck. Idempotent
-    // (atomic exchange) so it's safe to call on every subscribe; the thread
-    // only actually starts on the 0→1 transition.
-    StartDiagnosticAlphaThread();
 
     uint32_t pid = GetCurrentProcessId();
     char resp[512];
@@ -729,13 +669,6 @@ void HandleParticipantSourceUnsubscribe(const std::string& json) {
     // alpha ref count and disables alpha at the meeting level if no
     // other source still wants it.
     ReleaseAlphaMode();
-
-    // DIAGNOSTIC ONLY — stop the recheck thread once the last subscription
-    // is gone. Joins the thread, so may briefly block (≤1s) waiting for
-    // the loop's sleep to wake.
-    if (g_subs.empty()) {
-        StopDiagnosticAlphaThread();
-    }
 
     char msg[256];
     sprintf_s(msg, "Video: unsubscribed source='%s'", sourceId.c_str());
