@@ -71,13 +71,20 @@ static constexpr uint32_t RING_SLOTS = 3;
 // both dimensions. Frames exceeding the buffer are dropped by the
 // engine's WriteFrame, so the old 1080p ceiling silently broke
 // screenshare for any source larger than a 1080p landscape display.
+//
+// v1.0.5 adds an optional alpha plane. Slot capacity grows from 1.5x to
+// 2.5x of width*height to fit Y+U+V+alpha simultaneously. Shared-memory
+// regions are fixed-size and we don't want to recreate them when alpha
+// toggles, so the slot is sized for the worst case (alpha present) and
+// frames without alpha simply leave the trailing region unused.
 static constexpr uint32_t MAX_FRAME_WIDTH  = 3840;
 static constexpr uint32_t MAX_FRAME_HEIGHT = 2160;
 
-// I420: Y plane is width*height, U/V planes are each (width/2)*(height/2).
-// Total = width*height*1.5.
+// I420: Y plane is width*height, U/V planes are each (width/2)*(height/2),
+// total = width*height*1.5. v1.0.5 adds an optional alpha plane the same
+// size as Y, bringing the worst-case total to width*height*2.5 = 5/2.
 static constexpr uint32_t MAX_FRAME_BYTES =
-    (MAX_FRAME_WIDTH * MAX_FRAME_HEIGHT * 3) / 2;
+    (MAX_FRAME_WIDTH * MAX_FRAME_HEIGHT * 5) / 2;
 
 // Single frame slot in the ring. Each slot is self-describing so the
 // reader doesn't need to trust the header's dimensions — it uses the
@@ -95,16 +102,25 @@ struct FrameSlot {
     uint32_t stride_u;
     uint32_t stride_v;
 
+    // Stride of alpha plane in bytes. 0 = no alpha plane present
+    // (I420 only). Non-zero = alpha plane is present in data[]
+    // immediately after the V plane, with size (height * stride_a)
+    // bytes. Used from v1.0.5 onward. Fills the 4 bytes of padding the
+    // compiler would otherwise insert before timestamp_ns to keep it
+    // 8-byte aligned, so existing field offsets are unchanged.
+    uint32_t stride_a;
+
     // Engine's wall-clock timestamp at frame capture (QueryPerformanceCounter
     // or similar). Plugin may use this for debugging but the frame handed
     // to OBS gets a fresh os_gettime_ns() — this matches v1.0.0 behavior
     // where we use wall-clock-at-receive-time to avoid drift.
     uint64_t timestamp_ns;
 
-    // Actual payload. Fixed-size max; the actual used bytes are
-    // (width*height) for Y, (width/2 * height/2) each for U and V.
-    // Layout: Y buffer, then U buffer, then V buffer, all in this one
-    // byte array so the whole slot is a single contiguous blob.
+    // Actual payload. Fixed-size max. Layout: Y buffer (width*height),
+    // then U buffer (width/2 * height/2), then V buffer (same as U), then
+    // optional alpha buffer (width*height — same size as Y) when stride_a
+    // is non-zero. Readers must check stride_a before reading past the V
+    // plane.
     uint8_t data[MAX_FRAME_BYTES];
 };
 
@@ -132,7 +148,7 @@ struct SharedFrameHeader {
 };
 
 static constexpr uint32_t REGION_MAGIC   = 0x46454544; // 'FEED' in ASCII
-static constexpr uint32_t REGION_VERSION = 2; // bumped from 1 in v1.0.4 to enlarge MAX_FRAME dimensions to 4K
+static constexpr uint32_t REGION_VERSION = 3; // bumped to 3 in v1.0.5 to add alpha plane support
 
 // Total size of the shared memory region.
 static constexpr size_t REGION_SIZE =

@@ -246,6 +246,15 @@ static void PumpThreadFunc(ZpSourceData* data) {
         obsFrame.linesize[1] = slot->stride_u;
         obsFrame.linesize[2] = slot->stride_v;
 
+        if (slot->stride_a != 0) {
+            // Alpha plane is present immediately after V. Switch to I40A
+            // format and populate plane 3.
+            size_t vSize = uSize;
+            obsFrame.format      = VIDEO_FORMAT_I40A;
+            obsFrame.data[3]     = slot->data + ySize + uSize + vSize;
+            obsFrame.linesize[3] = slot->stride_a;
+        }
+
         video_format_get_parameters(VIDEO_CS_DEFAULT, VIDEO_RANGE_PARTIAL,
                                     obsFrame.color_matrix,
                                     obsFrame.color_range_min,

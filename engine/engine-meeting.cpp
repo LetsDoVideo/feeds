@@ -21,6 +21,7 @@
 #include "meeting_service_components/meeting_participants_ctrl_interface.h"
 #include "meeting_service_components/meeting_live_stream_interface.h"
 #include "meeting_service_components/meeting_sharing_interface.h"
+#include "meeting_service_components/meeting_video_interface.h"
 #include "setting_service_interface.h"
 
 // Defined elsewhere in the engine
@@ -294,6 +295,55 @@ public:
 static ZoomShareListener g_shareListener;
 
 // ---------------------------------------------------------------------------
+// Video controller listener — primarily here for v1.0.5's alpha channel
+// support. The SDK delivers onVideoAlphaChannelStatusChanged when alpha
+// mode is actually enabled/disabled at the meeting level (after our
+// EnableAlphaChannelMode call). All other callbacks are required to be
+// implemented (pure virtual) but we don't need any of them for current
+// functionality — they're left as no-op stubs.
+//
+// Declared before ZoomLiveStreamListener because that listener's
+// onRawLiveStreamPrivilegeChanged body references &g_videoListener;
+// namespace-scope name lookup from within an inline member function body
+// is performed as if at the closing brace of the enclosing class, so
+// later-declared globals would not be visible.
+// ---------------------------------------------------------------------------
+class ZoomVideoListener
+    : public ZOOM_SDK_NAMESPACE::IMeetingVideoCtrlEvent {
+public:
+    virtual void onVideoAlphaChannelStatusChanged(bool isAlphaModeOn) override {
+        char msg[128];
+        sprintf_s(msg, "Video: alpha channel mode %s",
+                  isAlphaModeOn ? "ENABLED" : "DISABLED");
+        LogToFile(msg);
+    }
+
+    virtual void onUserVideoStatusChange(
+        unsigned int, ZOOM_SDK_NAMESPACE::VideoStatus) override {}
+    virtual void onSpotlightedUserListChangeNotification(
+        ZOOM_SDK_NAMESPACE::IList<unsigned int>*) override {}
+    virtual void onHostRequestStartVideo(
+        ZOOM_SDK_NAMESPACE::IRequestStartVideoHandler*) override {}
+    virtual void onActiveSpeakerVideoUserChanged(unsigned int) override {}
+    virtual void onActiveVideoUserChanged(unsigned int) override {}
+    virtual void onHostVideoOrderUpdated(
+        ZOOM_SDK_NAMESPACE::IList<unsigned int>*) override {}
+    virtual void onLocalVideoOrderUpdated(
+        ZOOM_SDK_NAMESPACE::IList<unsigned int>*) override {}
+    virtual void onFollowHostVideoOrderChanged(bool) override {}
+    virtual void onUserVideoQualityChanged(
+        ZOOM_SDK_NAMESPACE::VideoConnectionQuality, unsigned int) override {}
+    virtual void onCameraControlRequestReceived(
+        unsigned int,
+        ZOOM_SDK_NAMESPACE::CameraControlRequestType,
+        ZOOM_SDK_NAMESPACE::ICameraControlRequestHandler*) override {}
+    virtual void onCameraControlRequestResult(
+        unsigned int,
+        ZOOM_SDK_NAMESPACE::CameraControlRequestResult) override {}
+};
+static ZoomVideoListener g_videoListener;
+
+// ---------------------------------------------------------------------------
 // Live stream listener — the critical one. onRawLiveStreamPrivilegeChanged
 // is where we get the green light to actually use the raw video stream.
 // ---------------------------------------------------------------------------
@@ -345,6 +395,20 @@ public:
         ZOOM_SDK_NAMESPACE::IMeetingAudioController* ac =
             g_meetingService->GetMeetingAudioController();
         if (ac) ac->SetEvent(&g_audioListener);
+
+        // Wire up video controller listener — primarily for the alpha
+        // channel mode status callback. engine-video.cpp's
+        // RequestAlphaMode/ReleaseAlphaMode call EnableAlphaChannelMode
+        // and the SDK fires onVideoAlphaChannelStatusChanged on this
+        // listener once the change actually takes effect.
+        ZOOM_SDK_NAMESPACE::IMeetingVideoController* vc =
+            g_meetingService->GetMeetingVideoController();
+        if (vc) {
+            vc->SetEvent(&g_videoListener);
+            LogToFile("Meeting: video controller listener attached");
+        } else {
+            LogToFile("Meeting: video controller unavailable");
+        }
 
         // Tell the plugin the meeting is fully ready. This is the signal
         // that zp_properties / zs_properties should flip from the "click to
