@@ -9,6 +9,7 @@
 #include <wincred.h>
 #include <string>
 #include <cstdio>
+#include <algorithm>
 
 // Defined in engine-main.cpp
 extern void LogToFile(const char* msg);
