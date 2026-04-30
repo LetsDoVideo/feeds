@@ -449,14 +449,21 @@ static void RequestAlphaMode() {
         if (!ms) return;
         auto* vc = ms->GetMeetingVideoController();
         if (!vc) return;
-        if (!vc->CanEnableAlphaChannelMode()) {
-            LogToFile("Alpha: CanEnableAlphaChannelMode returned false");
-            return;
-        }
-        auto err = vc->EnableAlphaChannelMode(true);
+        // DIAGNOSTIC: log Can result, then attempt Enable regardless.
+        bool canResult = vc->CanEnableAlphaChannelMode();
         char msg[128];
-        sprintf_s(msg, "Alpha: EnableAlphaChannelMode(true) returned %d",
+        sprintf_s(msg, "DIAG2 Alpha: CanEnableAlphaChannelMode = %s",
+                  canResult ? "true" : "false");
+        LogToFile(msg);
+
+        auto err = vc->EnableAlphaChannelMode(true);
+        sprintf_s(msg, "DIAG2 Alpha: EnableAlphaChannelMode(true) returned %d",
                   (int)err);
+        LogToFile(msg);
+
+        bool isEnabled = vc->IsAlphaChannelModeEnabled();
+        sprintf_s(msg, "DIAG2 Alpha: IsAlphaChannelModeEnabled = %s",
+                  isEnabled ? "true" : "false");
         LogToFile(msg);
     }
 }
