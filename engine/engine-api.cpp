@@ -303,6 +303,16 @@ void FetchAndApplyEntitlement() {
     std::wstring path = L"/v2/marketplace/users/me/entitlements?app_id=" + appIdW;
     std::string response = ZoomApiGet(path);
 
+    // DIAGNOSTIC: dump raw response to investigate tier resolution issues.
+    // Will be removed after Catalina's tier verification is complete.
+    {
+        char msg[8192];
+        int truncatedLen = (int)std::min(response.size(), (size_t)8000);
+        sprintf_s(msg, "API: entitlement raw response (%zu bytes): %.*s",
+                  response.size(), truncatedLen, response.c_str());
+        LogToFile(msg);
+    }
+
     g_currentTier = 0;  // Default to Free
 
     if (response.find("Broadcaster") != std::string::npos)
