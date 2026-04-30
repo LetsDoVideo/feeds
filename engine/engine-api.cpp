@@ -9,7 +9,6 @@
 #include <wincred.h>
 #include <string>
 #include <cstdio>
-#include <algorithm>
 
 // Defined in engine-main.cpp
 extern void LogToFile(const char* msg);
@@ -308,7 +307,7 @@ void FetchAndApplyEntitlement() {
     // Will be removed after Catalina's tier verification is complete.
     {
         char msg[8192];
-        int truncatedLen = (int)std::min(response.size(), (size_t)8000);
+        int truncatedLen = (response.size() < 8000) ? (int)response.size() : 8000;
         sprintf_s(msg, "API: entitlement raw response (%zu bytes): %.*s",
                   response.size(), truncatedLen, response.c_str());
         LogToFile(msg);
