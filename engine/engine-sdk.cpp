@@ -162,6 +162,11 @@ bool InitializeSDK() {
     ZOOM_SDK_NAMESPACE::InitParam initParam;
     initParam.strWebDomain = L"https://zoom.us";
 
+    // DIAGNOSTIC: enabled at Eyal Hadida's request to capture SDK
+    // internal logs for the alpha channel mode investigation. Will
+    // be reverted alongside the other Zoom-investigation diagnostics.
+    initParam.enableLogByDefault = true;
+
     ZOOM_SDK_NAMESPACE::SDKError err = ZOOM_SDK_NAMESPACE::InitSDK(initParam);
     if (err != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
         char msg[256];
