@@ -382,6 +382,32 @@ public:
     virtual void onRawDataFrameReceived(YUVRawDataI420* data) override {
         if (!data) return;
 
+        // DIAGNOSTIC: investigate whether alpha frames flow after
+        // EnableAlphaChannelMode succeeds. Per-subscription state tracks
+        // first alpha-present and first-no-alpha-after-N-frames events.
+        // Will be reverted with the other Zoom-investigation diagnostics.
+        {
+            unsigned int alphaLen = data->GetAlphaBufferLen();
+            m_diagFrameCount++;
+            if (alphaLen > 0 && !m_diagAlphaSeen) {
+                m_diagAlphaSeen = true;
+                char msg[160];
+                sprintf_s(msg,
+                    "DIAG3 Alpha: first alpha frame for source=%s userId=%u, "
+                    "alphaLen=%u, frameNum=%d",
+                    m_sourceUuid.c_str(), m_userId, alphaLen, m_diagFrameCount);
+                LogToFile(msg);
+            }
+            if (m_diagFrameCount == 30 && !m_diagAlphaSeen) {
+                char msg[160];
+                sprintf_s(msg,
+                    "DIAG3 Alpha: 30 frames received with no alpha for "
+                    "source=%s userId=%u",
+                    m_sourceUuid.c_str(), m_userId);
+                LogToFile(msg);
+            }
+        }
+
         // GetAlphaBuffer/GetAlphaBufferLen return null/0 when alpha mode
         // is off, so this handles both the alpha-on and alpha-off cases
         // without branching here — WriteFrame interprets null/0 as "no
@@ -420,6 +446,11 @@ private:
     bool         m_followActiveSpeaker = false;
     ZOOM_SDK_NAMESPACE::IZoomSDKRenderer* m_renderer = nullptr;
     SharedMemoryWriter m_writer;
+
+    // DIAGNOSTIC: per-subscription alpha-presence tracking. Will be
+    // reverted with the other Zoom-investigation diagnostics.
+    int  m_diagFrameCount = 0;
+    bool m_diagAlphaSeen  = false;
 };
 
 // ---------------------------------------------------------------------------
