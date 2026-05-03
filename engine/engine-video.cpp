@@ -240,6 +240,11 @@ private:
     feeds_shared::FrameSlot*         m_slots  = nullptr;
 };
 
+// Forward decl — defined below; needed because the diagnostic deferred-
+// activation block in onRawDataFrameReceived calls it from inside the
+// class body.
+static void RequestAlphaMode();
+
 // ---------------------------------------------------------------------------
 // Subscription — one renderer + one shared memory writer + the delegate
 // that bridges them. One Subscription per Zoom Participant source.
@@ -406,6 +411,17 @@ public:
                     m_sourceUuid.c_str(), m_userId);
                 LogToFile(msg);
             }
+
+            // DIAGNOSTIC: delayed alpha mode activation. We call
+            // RequestAlphaMode only after the SDK has begun delivering
+            // frames to this subscription, testing the hypothesis that
+            // EnableAlphaChannelMode requires an active rendering pipeline
+            // before it will actually transition state.
+            if (!m_alphaRequested && m_diagFrameCount == 30) {
+                m_alphaRequested = true;
+                LogToFile("DIAG4 Alpha: deferred RequestAlphaMode after 30 frames");
+                RequestAlphaMode();
+            }
         }
 
         // GetAlphaBuffer/GetAlphaBufferLen return null/0 when alpha mode
@@ -449,8 +465,9 @@ private:
 
     // DIAGNOSTIC: per-subscription alpha-presence tracking. Will be
     // reverted with the other Zoom-investigation diagnostics.
-    int  m_diagFrameCount = 0;
-    bool m_diagAlphaSeen  = false;
+    int  m_diagFrameCount  = 0;
+    bool m_diagAlphaSeen   = false;
+    bool m_alphaRequested  = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -616,7 +633,9 @@ void HandleParticipantSourceSubscribe(const std::string& json) {
     // Phase 1+2: every successful new subscription auto-requests alpha so
     // the full pipeline gets exercised end-to-end. Phase 3 will gate this
     // behind a per-source UI toggle.
-    RequestAlphaMode();
+    //
+    // DIAGNOSTIC: deferred until frames flow — see onRawDataFrameReceived.
+    // RequestAlphaMode();
 
     uint32_t pid = GetCurrentProcessId();
     char resp[512];
