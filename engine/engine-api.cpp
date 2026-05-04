@@ -9,6 +9,7 @@
 #include <wincred.h>
 #include <string>
 #include <cstdio>
+#include <cstdlib>
 
 // Defined in engine-main.cpp
 extern void LogToFile(const char* msg);
@@ -287,24 +288,92 @@ std::string FetchZak() {
 }
 
 // ---------------------------------------------------------------------------
-// Fetch the marketplace entitlement and map to a tier.
-// Defaults to tier 0 (Free) — for now, until the app is live on Marketplace,
-// this call returns nothing useful and the tier stays at 0. The substring
-// check is intentional: the shape of the response isn't locked in until we
-// see real responses post-launch, and presence of a tier name is a
-// reasonable proxy.
+// Fetch the user's tier from the Feeds entitlement backend.
+//
+// The backend at FEEDS_BACKEND_URL receives Zoom monetization webhooks and
+// exposes a /tier query that returns the caller's current tier (0-3) as a
+// JSON integer. We pass the user's Zoom access token as a Bearer credential;
+// the backend validates it and looks up the matching account.
+//
+// Why not Zoom's REST entitlements endpoint? Empirically that endpoint does
+// not return Local Test licenses, and Zoom's monetization signal lives in
+// webhooks rather than a queryable resource. The Feeds backend is the
+// authoritative source.
+//
+// On any failure (network, non-200 status, missing tier field) we log and
+// fall back to tier 0 (Free).
 // ---------------------------------------------------------------------------
+static const std::string FEEDS_BACKEND_URL =
+    "https://feeds-entitlement.square-dust-0e00.workers.dev/tier";
+
 void FetchAndApplyEntitlement() {
     LogToFile("API: FetchAndApplyEntitlement starting");
-    // Build the path with the app_id from the compile-time macro.
-    // WinHTTP wants wide strings; do the conversion once here.
-    std::string appIdA = FEEDS_ZOOM_CLIENT_ID;
-    std::wstring appIdW(appIdA.begin(), appIdA.end());
-    std::wstring path = L"/v2/marketplace/users/me/entitlements?app_id=" + appIdW;
-    std::string response = ZoomApiGet(path);
 
-    // DIAGNOSTIC: dump raw response to investigate tier resolution issues.
-    // Will be removed after Catalina's tier verification is complete.
+    g_currentTier = 0;  // Default to Free; updated only on a clean 200 + parse.
+
+    HINTERNET hSession = WinHttpOpen(L"Feeds/1.0",
+                                      WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                      WINHTTP_NO_PROXY_NAME,
+                                      WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) {
+        LogToFile("API: tier query failed (WinHttpOpen) — applying tier=0");
+        return;
+    }
+    HINTERNET hConnect = WinHttpConnect(hSession,
+        L"feeds-entitlement.square-dust-0e00.workers.dev",
+        INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConnect) {
+        WinHttpCloseHandle(hSession);
+        LogToFile("API: tier query failed (WinHttpConnect) — applying tier=0");
+        return;
+    }
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", L"/tier",
+                                             nullptr, WINHTTP_NO_REFERER,
+                                             WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                             WINHTTP_FLAG_SECURE);
+    if (!hRequest) {
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        LogToFile("API: tier query failed (WinHttpOpenRequest) — applying tier=0");
+        return;
+    }
+
+    std::wstring authHeader = L"Authorization: Bearer " +
+        std::wstring(g_accessToken.begin(), g_accessToken.end());
+    WinHttpAddRequestHeaders(hRequest, authHeader.c_str(),
+                             (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
+
+    BOOL sentOk = WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                      nullptr, 0, 0, 0);
+    if (!sentOk || !WinHttpReceiveResponse(hRequest, nullptr)) {
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        LogToFile("API: tier query failed (network error) — applying tier=0");
+        return;
+    }
+
+    DWORD statusCode = 0;
+    DWORD statusSize = sizeof(statusCode);
+    WinHttpQueryHeaders(hRequest,
+                        WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                        WINHTTP_HEADER_NAME_BY_INDEX,
+                        &statusCode, &statusSize,
+                        WINHTTP_NO_HEADER_INDEX);
+
+    std::string response;
+    char buf[4096];
+    DWORD bytesRead = 0;
+    while (WinHttpReadData(hRequest, buf, sizeof(buf) - 1, &bytesRead)
+           && bytesRead > 0) {
+        buf[bytesRead] = '\0';
+        response += buf;
+    }
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+
+    // DIAGNOSTIC: dump raw response so we can verify what the backend returns.
     {
         char msg[8192];
         int truncatedLen = (response.size() < 8000) ? (int)response.size() : 8000;
@@ -313,17 +382,30 @@ void FetchAndApplyEntitlement() {
         LogToFile(msg);
     }
 
-    g_currentTier = 0;  // Default to Free
+    if (statusCode == 401) {
+        LogToFile("API: tier query auth failed — applying tier=0");
+        return;
+    }
 
-    if (response.find("Broadcaster") != std::string::npos)
-        g_currentTier = 3;
-    else if (response.find("Streamer") != std::string::npos)
-        g_currentTier = 2;
-    else if (response.find("Basic") != std::string::npos)
-        g_currentTier = 1;
+    if (statusCode != 200) {
+        char msg[128];
+        sprintf_s(msg, "API: tier query failed (HTTP %lu) — applying tier=0",
+                  statusCode);
+        LogToFile(msg);
+        return;
+    }
+
+    std::string tierStr = JsonExtractNumber(response, "tier");
+    if (tierStr.empty()) {
+        LogToFile("API: tier query response missing tier field — applying tier=0");
+        return;
+    }
+
+    g_currentTier = atoi(tierStr.c_str());
 
     char msg[128];
-    sprintf_s(msg, "API: entitlement applied, tier=%d", g_currentTier);
+    sprintf_s(msg, "API: entitlement applied, tier=%d (from backend)",
+              g_currentTier);
     LogToFile(msg);
 }
 
