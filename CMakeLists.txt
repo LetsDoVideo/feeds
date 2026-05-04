@@ -22,18 +22,16 @@ set_target_properties(
         AUTORCC ON
 )
 
-# Zoom OAuth Client ID. Injected at build time from a CMake variable (which
-# in CI comes from a GitHub Actions secret). Falls back to the production
-# client ID for local builds and forks where the secret isn't defined.
-# The client ID is not cryptographically secret (PKCE doesn't require one),
-# but keeping it out of the public repo reduces the surface for imposter-
-# app attacks — a concern raised by Zoom's developer relations team.
+# Zoom OAuth Client ID. Must be supplied at configure time via -D or env
+# variable; in CI this comes from a GitHub Actions secret. The client ID is
+# not cryptographically secret (PKCE doesn't require one), but keeping it
+# out of the public repo reduces the surface for imposter-app attacks — a
+# concern raised by Zoom's developer relations team. We fail loudly when
+# missing rather than baking a fallback into the source tree.
 if(NOT DEFINED FEEDS_ZOOM_CLIENT_ID OR FEEDS_ZOOM_CLIENT_ID STREQUAL "")
-    set(FEEDS_ZOOM_CLIENT_ID "JlP6KfRqTt6r0t67FcDuqQ")
-    message(STATUS "FEEDS_ZOOM_CLIENT_ID not provided; using default production ID")
-else()
-    message(STATUS "FEEDS_ZOOM_CLIENT_ID provided via build configuration")
+    message(FATAL_ERROR "FEEDS_ZOOM_CLIENT_ID is required at build time. Set via -D or env variable.")
 endif()
+message(STATUS "FEEDS_ZOOM_CLIENT_ID provided via build configuration")
 
 find_package(libobs REQUIRED)
 
