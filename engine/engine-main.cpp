@@ -311,7 +311,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     // the shared-memory region names used for video frames.
     char readyMsg[128];
     sprintf_s(readyMsg,
-        "{\"type\":\"engine_ready\",\"version\":\"1.0.4\",\"pid\":%lu}",
+        "{\"type\":\"engine_ready\",\"version\":\"1.0.5\",\"pid\":%lu}",
         GetCurrentProcessId());
     if (!SendToPlugin(readyMsg)) {
         LogToFile("Failed to send engine_ready");
