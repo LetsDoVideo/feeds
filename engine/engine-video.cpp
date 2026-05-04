@@ -24,7 +24,6 @@
 #include "meeting_service_interface.h"
 #include "meeting_service_components/meeting_audio_interface.h"
 #include "meeting_service_components/meeting_participants_ctrl_interface.h"
-#include "meeting_service_components/meeting_video_interface.h"
 #include "rawdata/rawdata_renderer_interface.h"
 #include "rawdata/zoom_rawdata_api.h"
 
@@ -162,12 +161,9 @@ public:
         m_slots  = nullptr;
     }
 
-    // Write one I420 (or I40A, when alpha is present) frame. Called from
-    // the SDK's raw-data callback thread. The Y/U/V buffers are copied
-    // into the next ring slot; an optional alpha buffer is copied
-    // immediately after the V plane.
+    // Write one I420 frame. Called from the SDK's raw-data callback thread.
+    // The three Y/U/V buffers are copied into the next ring slot.
     void WriteFrame(const uint8_t* y, const uint8_t* u, const uint8_t* v,
-                    const uint8_t* alpha, uint32_t alphaLen,
                     uint32_t width, uint32_t height)
     {
         if (!m_header || !m_slots) return;
@@ -208,23 +204,6 @@ public:
         memcpy(dest->data + ySize, u, uSize);
         memcpy(dest->data + ySize + uSize, v, vSize);
 
-        // Alpha plane. Caller passes nullptr/0 when alpha mode is off,
-        // in which case we explicitly zero stride_a so the reader knows
-        // this slot has no alpha. When alpha is present, copy it to the
-        // slot immediately after the V plane.
-        if (alpha != nullptr && alphaLen > 0) {
-            if (alphaLen <= (size_t)width * height) {
-                memcpy(dest->data + ySize + uSize + vSize, alpha, alphaLen);
-                dest->stride_a = width;
-            } else {
-                // Malformed frame — alpha length exceeds Y plane size.
-                // Refuse to overrun the slot.
-                dest->stride_a = 0;
-            }
-        } else {
-            dest->stride_a = 0;
-        }
-
         // Memory barrier before bumping write_index, so readers that see
         // the new index are guaranteed to see the new data.
         MemoryBarrier();
@@ -239,11 +218,6 @@ private:
     feeds_shared::SharedFrameHeader* m_header = nullptr;
     feeds_shared::FrameSlot*         m_slots  = nullptr;
 };
-
-// Forward decl — defined below; needed because the diagnostic deferred-
-// activation block in onRawDataFrameReceived calls it from inside the
-// class body.
-static void RequestAlphaMode();
 
 // ---------------------------------------------------------------------------
 // Subscription — one renderer + one shared memory writer + the delegate
@@ -387,53 +361,10 @@ public:
     virtual void onRawDataFrameReceived(YUVRawDataI420* data) override {
         if (!data) return;
 
-        // DIAGNOSTIC: investigate whether alpha frames flow after
-        // EnableAlphaChannelMode succeeds. Per-subscription state tracks
-        // first alpha-present and first-no-alpha-after-N-frames events.
-        // Will be reverted with the other Zoom-investigation diagnostics.
-        {
-            unsigned int alphaLen = data->GetAlphaBufferLen();
-            m_diagFrameCount++;
-            if (alphaLen > 0 && !m_diagAlphaSeen) {
-                m_diagAlphaSeen = true;
-                char msg[160];
-                sprintf_s(msg,
-                    "DIAG3 Alpha: first alpha frame for source=%s userId=%u, "
-                    "alphaLen=%u, frameNum=%d",
-                    m_sourceUuid.c_str(), m_userId, alphaLen, m_diagFrameCount);
-                LogToFile(msg);
-            }
-            if (m_diagFrameCount == 30 && !m_diagAlphaSeen) {
-                char msg[160];
-                sprintf_s(msg,
-                    "DIAG3 Alpha: 30 frames received with no alpha for "
-                    "source=%s userId=%u",
-                    m_sourceUuid.c_str(), m_userId);
-                LogToFile(msg);
-            }
-
-            // DIAGNOSTIC: delayed alpha mode activation. We call
-            // RequestAlphaMode only after the SDK has begun delivering
-            // frames to this subscription, testing the hypothesis that
-            // EnableAlphaChannelMode requires an active rendering pipeline
-            // before it will actually transition state.
-            if (!m_alphaRequested && m_diagFrameCount == 30) {
-                m_alphaRequested = true;
-                LogToFile("DIAG4 Alpha: deferred RequestAlphaMode after 30 frames");
-                RequestAlphaMode();
-            }
-        }
-
-        // GetAlphaBuffer/GetAlphaBufferLen return null/0 when alpha mode
-        // is off, so this handles both the alpha-on and alpha-off cases
-        // without branching here — WriteFrame interprets null/0 as "no
-        // alpha plane" and zeros stride_a accordingly.
         m_writer.WriteFrame(
             (const uint8_t*)data->GetYBuffer(),
             (const uint8_t*)data->GetUBuffer(),
             (const uint8_t*)data->GetVBuffer(),
-            (const uint8_t*)data->GetAlphaBuffer(),
-            data->GetAlphaBufferLen(),
             data->GetStreamWidth(),
             data->GetStreamHeight());
     }
@@ -462,12 +393,6 @@ private:
     bool         m_followActiveSpeaker = false;
     ZOOM_SDK_NAMESPACE::IZoomSDKRenderer* m_renderer = nullptr;
     SharedMemoryWriter m_writer;
-
-    // DIAGNOSTIC: per-subscription alpha-presence tracking. Will be
-    // reverted with the other Zoom-investigation diagnostics.
-    int  m_diagFrameCount  = 0;
-    bool m_diagAlphaSeen   = false;
-    bool m_alphaRequested  = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -475,63 +400,6 @@ private:
 // ---------------------------------------------------------------------------
 static std::map<std::string, std::unique_ptr<ParticipantSubscription>> g_subs;
 static std::mutex g_subsMutex;
-
-// ---------------------------------------------------------------------------
-// Reference-counted alpha-mode activation. The SDK enables alpha mode at
-// the meeting level — it's not per-source — so we track how many
-// participant sources have requested alpha and only call
-// EnableAlphaChannelMode(false) when the count reaches zero.
-//
-// For Phase 1+2, every participant subscription auto-requests alpha.
-// Phase 3 will introduce a per-source UI toggle and only sources that
-// have it enabled will increment the count.
-// ---------------------------------------------------------------------------
-static std::mutex g_alphaMutex;
-static int        g_alphaRefCount = 0;
-
-static void RequestAlphaMode() {
-    std::lock_guard<std::mutex> lock(g_alphaMutex);
-    g_alphaRefCount++;
-    if (g_alphaRefCount == 1) {
-        auto* ms = GetMeetingService();
-        if (!ms) return;
-        auto* vc = ms->GetMeetingVideoController();
-        if (!vc) return;
-        // DIAGNOSTIC: log Can result, then attempt Enable regardless.
-        bool canResult = vc->CanEnableAlphaChannelMode();
-        char msg[128];
-        sprintf_s(msg, "DIAG2 Alpha: CanEnableAlphaChannelMode = %s",
-                  canResult ? "true" : "false");
-        LogToFile(msg);
-
-        auto err = vc->EnableAlphaChannelMode(true);
-        sprintf_s(msg, "DIAG2 Alpha: EnableAlphaChannelMode(true) returned %d",
-                  (int)err);
-        LogToFile(msg);
-
-        bool isEnabled = vc->IsAlphaChannelModeEnabled();
-        sprintf_s(msg, "DIAG2 Alpha: IsAlphaChannelModeEnabled = %s",
-                  isEnabled ? "true" : "false");
-        LogToFile(msg);
-    }
-}
-
-static void ReleaseAlphaMode() {
-    std::lock_guard<std::mutex> lock(g_alphaMutex);
-    if (g_alphaRefCount <= 0) return;
-    g_alphaRefCount--;
-    if (g_alphaRefCount == 0) {
-        auto* ms = GetMeetingService();
-        if (!ms) return;
-        auto* vc = ms->GetMeetingVideoController();
-        if (!vc) return;
-        auto err = vc->EnableAlphaChannelMode(false);
-        char msg[128];
-        sprintf_s(msg, "Alpha: EnableAlphaChannelMode(false) returned %d",
-                  (int)err);
-        LogToFile(msg);
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Public entry points: teardown hook for meeting end / logout
@@ -551,16 +419,6 @@ void TearDownAllVideoSubscriptions() {
     }
     g_subs.clear();
     g_currentActiveSpeaker = 0;
-
-    // Bulk teardown bypasses the unsubscribe IPC, so the alpha ref count
-    // would otherwise stay stuck at its prior value across meetings.
-    // Reset directly without calling EnableAlphaChannelMode(false) — the
-    // SDK's alpha state is tied to the meeting and is reset implicitly
-    // when the meeting ends.
-    {
-        std::lock_guard<std::mutex> alphaLock(g_alphaMutex);
-        g_alphaRefCount = 0;
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -629,13 +487,6 @@ void HandleParticipantSourceSubscribe(const std::string& json) {
     }
 
     g_subs[sourceId] = std::move(sub);
-
-    // Phase 1+2: every successful new subscription auto-requests alpha so
-    // the full pipeline gets exercised end-to-end. Phase 3 will gate this
-    // behind a per-source UI toggle.
-    //
-    // DIAGNOSTIC: deferred until frames flow — see onRawDataFrameReceived.
-    // RequestAlphaMode();
 
     uint32_t pid = GetCurrentProcessId();
     char resp[512];
@@ -721,11 +572,6 @@ void HandleParticipantSourceUnsubscribe(const std::string& json) {
     if (it == g_subs.end()) return;
 
     g_subs.erase(it);
-
-    // Symmetric with the RequestAlphaMode() in subscribe — drops the
-    // alpha ref count and disables alpha at the meeting level if no
-    // other source still wants it.
-    ReleaseAlphaMode();
 
     char msg[256];
     sprintf_s(msg, "Video: unsubscribed source='%s'", sourceId.c_str());
