@@ -19,17 +19,17 @@ Feeds is a native Windows plugin for OBS Studio that uses the Zoom Meeting SDK t
 
 ## Installation
 
-1. Download the latest **Feeds.exe** from the [Releases](https://github.com/LetsDoVideo/feeds/releases) page
-2. Run the installation file.
-3. or
-4. Download the latest **Feeds.zip** from the [Releases](https://github.com/LetsDoVideo/feeds/releases) page
-5.Extract the ZIP file
-6. Copy the extracted contents into your OBS Studio root folder
+Download the latest **Feeds.exe** from the [Releases](https://github.com/LetsDoVideo/feeds/releases) page
+   - Run the installation file
+
+or
+
+Download the latest **Feeds.zip** from the [Releases](https://github.com/LetsDoVideo/feeds/releases) page
+   - Extract the ZIP file
+   - Copy the extracted contents into your OBS Studio root folder
    - For standard OBS installs: `C:\Program Files\obs-studio\`
    - For portable OBS installs: your portable OBS root folder
-7. Restart OBS Studio
-8. The plugin is ready. No Zoom Marketplace activation required for the Free tier
-
+   
 ---
 
 ## Quick Start
@@ -38,7 +38,7 @@ Feeds is a native Windows plugin for OBS Studio that uses the Zoom Meeting SDK t
 2. In the source Properties window, click **Not connected to Zoom. Click to Connect...**
 3. Enter your Zoom meeting number or link when prompted
 4. Enter the meeting password if required
-5. The host will see a **"Request to livestream"** popup in Zoom — click **Allow**
+5. The host will see a **"Request to livestream"** popup in Zoom. Have them click **Allow**
 6. Once connected, select a participant from the dropdown to display their feed
 7. Add additional **Zoom Participant** sources for more feeds
 8. Add a **Zoom Screenshare** source to capture active screenshares
