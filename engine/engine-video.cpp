@@ -211,6 +211,32 @@ public:
         m_header->write_index++;
     }
 
+    // Write a "blank" sentinel slot. The plugin reads (width==0 ||
+    // height==0) as "clear the OBS source" rather than render a frame.
+    // Used when the SDK signals raw-data-off so the source goes
+    // transparent instead of freezing on the last received frame.
+    void WriteBlankSignal()
+    {
+        if (!m_header || !m_slots) return;
+
+        uint32_t slot = m_header->write_index % feeds_shared::RING_SLOTS;
+        feeds_shared::FrameSlot* dest = &m_slots[slot];
+
+        dest->width    = 0;
+        dest->height   = 0;
+        dest->stride_y = 0;
+        dest->stride_u = 0;
+        dest->stride_v = 0;
+
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        dest->timestamp_ns = (uint64_t)now.QuadPart;
+
+        MemoryBarrier();
+
+        m_header->write_index++;
+    }
+
 private:
     std::string m_regionName;
     HANDLE m_mapping = nullptr;
@@ -374,13 +400,27 @@ public:
         sprintf_s(msg, "Video: source='%s' raw data status=%d",
                   m_sourceUuid.c_str(), (int)status);
         LogToFile(msg);
+
+        // RawData_Off means frames have stopped flowing (camera off, user
+        // left, host removed, network disconnect). Push a blank-sentinel
+        // slot so the plugin clears its OBS source instead of freezing on
+        // the last received frame. Recovery is automatic: when frames
+        // resume the SDK fires onRawDataFrameReceived again and the plugin
+        // renders the new slot normally.
+        if (status == RawData_Off) {
+            m_writer.WriteBlankSignal();
+        }
     }
 
     virtual void onRendererBeDestroyed() override {
-        // SDK destroyed our renderer (probably meeting ended). Drop the
-        // pointer so we don't try to use it. Our destructor's TearDown
-        // will skip it.
+        // SDK destroyed our renderer (probably meeting ended). Push a
+        // blank sentinel before nulling the renderer pointer — defensive
+        // cover in case the SDK doesn't fire RawData_Off first on this
+        // path. m_writer is still valid here: this callback runs while
+        // our object is alive (either before TearDown starts, or
+        // synchronously inside destroyRenderer before m_writer.Close()).
         LogToFile("Video: SDK destroyed renderer");
+        m_writer.WriteBlankSignal();
         m_renderer = nullptr;
     }
 

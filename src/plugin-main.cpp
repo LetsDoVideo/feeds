@@ -225,8 +225,20 @@ static void PumpThreadFunc(ZpSourceData* data) {
         uint32_t width  = slot->width;
         uint32_t height = slot->height;
 
-        if (width  == 0 || height == 0 ||
-            width  > feeds_shared::MAX_FRAME_WIDTH ||
+        // width==0 (or height==0) is the engine's "blank" sentinel,
+        // written when the SDK signals raw-data-off. Clear the OBS
+        // source so it goes transparent instead of freezing on the
+        // last frame. When frames resume, the engine writes a normal
+        // slot with real dimensions and the source renders again.
+        if (width == 0 || height == 0) {
+            obs_source_output_video(data->source, nullptr);
+            data->lastReadIndex = currentWrite;
+            continue;
+        }
+
+        // Genuine corruption guard — refuse oversized frames rather
+        // than overrunning the slot's data buffer.
+        if (width  > feeds_shared::MAX_FRAME_WIDTH ||
             height > feeds_shared::MAX_FRAME_HEIGHT) {
             data->lastReadIndex = currentWrite;
             continue;
