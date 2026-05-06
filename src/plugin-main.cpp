@@ -736,14 +736,37 @@ static obs_properties_t* zp_properties(void* data) {
     obs_property_t* list = obs_properties_add_list(
         props, "participant_id", "Select Participant",
         OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-    obs_property_list_add_int(list, "--- Select Participant ---", 0);
-    obs_property_list_add_int(list, "[Active Speaker]", 1);
 
-    if (g_isInMeeting) {
+    // Mirror the login/join button's state machine: the dropdown is only
+    // enabled when there's actually someone selectable. In every other
+    // state we replace the list with a single contextual placeholder and
+    // grey the control out so users can't open it before login/meeting.
+    // RefreshAllSourceProperties() is already called on login_success,
+    // meeting_joined, meeting_ended, logout, and participant_list_changed,
+    // so this re-evaluates live without a properties-dialog reopen.
+    if (!g_isLoggedIn) {
+        obs_property_list_add_int(list, "Login to Zoom first", 0);
+        obs_property_set_enabled(list, false);
+    } else if (!g_isInMeeting) {
+        obs_property_list_add_int(list, "Join a meeting first", 0);
+        obs_property_set_enabled(list, false);
+    } else {
         std::lock_guard<std::mutex> lock(g_participantsMutex);
+        size_t selectable = 0;
         for (const auto& p : g_cachedParticipants) {
             if (g_cachedMyUserId != 0 && p.id == g_cachedMyUserId) continue;
-            obs_property_list_add_int(list, p.name.c_str(), (long long)p.id);
+            ++selectable;
+        }
+        if (selectable == 0) {
+            obs_property_list_add_int(list, "Waiting for participants...", 0);
+            obs_property_set_enabled(list, false);
+        } else {
+            obs_property_list_add_int(list, "--- Select Participant ---", 0);
+            obs_property_list_add_int(list, "[Active Speaker]", 1);
+            for (const auto& p : g_cachedParticipants) {
+                if (g_cachedMyUserId != 0 && p.id == g_cachedMyUserId) continue;
+                obs_property_list_add_int(list, p.name.c_str(), (long long)p.id);
+            }
         }
     }
 
