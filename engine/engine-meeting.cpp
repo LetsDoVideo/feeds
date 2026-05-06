@@ -294,6 +294,65 @@ public:
 static ZoomShareListener g_shareListener;
 
 // ---------------------------------------------------------------------------
+// Participants listener — tracks meeting membership so the plugin's
+// participant dropdown can auto-refresh on user join/leave/rename without
+// the user clicking "Refresh Participant List". Independent of raw-
+// livestream privilege: the participants controller is available from
+// MEETING_STATUS_INMEETING because membership is meeting state, not
+// stream data. Gating this on livestream-grant would create a window
+// where joins/leaves go undetected.
+// ---------------------------------------------------------------------------
+class ZoomParticipantsListener
+    : public ZOOM_SDK_NAMESPACE::IMeetingParticipantsCtrlEvent {
+public:
+    virtual void onUserJoin(
+        ZOOM_SDK_NAMESPACE::IList<unsigned int>*,
+        const zchar_t* = nullptr) override {
+        SendParticipantList();
+    }
+    virtual void onUserLeft(
+        ZOOM_SDK_NAMESPACE::IList<unsigned int>*,
+        const zchar_t* = nullptr) override {
+        SendParticipantList();
+    }
+    virtual void onUserNamesChanged(
+        ZOOM_SDK_NAMESPACE::IList<unsigned int>*) override {
+        SendParticipantList();
+    }
+
+    // Other IMeetingParticipantsCtrlEvent callbacks — required by the
+    // pure-virtual interface but not currently used by Feeds.
+    virtual void onHostChangeNotification(unsigned int) override {}
+    virtual void onLowOrRaiseHandStatusChanged(bool, unsigned int) override {}
+    virtual void onCoHostChangeNotification(unsigned int, bool) override {}
+    virtual void onInvalidReclaimHostkey() override {}
+    virtual void onAllHandsLowered() override {}
+    virtual void onLocalRecordingStatusChanged(
+        unsigned int, ZOOM_SDK_NAMESPACE::RecordingStatus) override {}
+    virtual void onAllowParticipantsRenameNotification(bool) override {}
+    virtual void onAllowParticipantsUnmuteSelfNotification(bool) override {}
+    virtual void onAllowParticipantsStartVideoNotification(bool) override {}
+    virtual void onAllowParticipantsShareWhiteBoardNotification(bool) override {}
+    virtual void onRequestLocalRecordingPrivilegeChanged(
+        ZOOM_SDK_NAMESPACE::LocalRecordingRequestPrivilegeStatus) override {}
+    virtual void onAllowParticipantsRequestCloudRecording(bool) override {}
+    virtual void onInMeetingUserAvatarPathUpdated(unsigned int) override {}
+    virtual void onParticipantProfilePictureStatusChange(bool) override {}
+    virtual void onFocusModeStateChanged(bool) override {}
+    virtual void onFocusModeShareTypeChanged(
+        ZOOM_SDK_NAMESPACE::FocusModeShareType) override {}
+    virtual void onBotAuthorizerRelationChanged(unsigned int) override {}
+    virtual void onVirtualNameTagStatusChanged(bool, unsigned int) override {}
+    virtual void onVirtualNameTagRosterInfoUpdated(unsigned int) override {}
+#if defined(WIN32)
+    virtual void onCreateCompanionRelation(unsigned int, unsigned int) override {}
+    virtual void onRemoveCompanionRelation(unsigned int) override {}
+#endif
+    virtual void onGrantCoOwnerPrivilegeChanged(bool) override {}
+};
+static ZoomParticipantsListener g_participantsListener;
+
+// ---------------------------------------------------------------------------
 // Live stream listener — the critical one. onRawLiveStreamPrivilegeChanged
 // is where we get the green light to actually use the raw video stream.
 // ---------------------------------------------------------------------------
@@ -351,8 +410,9 @@ public:
         // connect" prompt to the connected state.
         SendToPlugin("{\"type\":\"raw_livestream_granted\"}");
 
-        // Send the initial participant list.
-        SendParticipantList();
+        // (Initial participant list and listener are wired at meeting-join
+        // in onMeetingStatusChanged — they don't depend on livestream
+        // privilege, only on meeting membership being available.)
 
         // Report current share state if someone is already sharing.
         if (g_activeSharerUserId != 0) {
@@ -415,6 +475,20 @@ public:
                 "{\"type\":\"meeting_joined\",\"meeting_number\":\"%llu\"}",
                 meetingNumber);
             SendToPlugin(joinMsg);
+
+            // Send the initial participant list and wire up the
+            // participants listener so the plugin's dropdown can refresh
+            // live on user join/leave/rename. Done here at meeting-join
+            // (not at livestream-grant) so we don't miss membership
+            // changes during the privilege-request window.
+            ZOOM_SDK_NAMESPACE::IMeetingParticipantsController* pc =
+                g_meetingService->GetMeetingParticipantsController();
+            if (pc) {
+                SendParticipantList();
+                pc->SetEvent(&g_participantsListener);
+            } else {
+                LogToFile("Meeting: participants controller unavailable at join");
+            }
 
             // Attach the livestream listener. Depending on whether the
             // current user is the host (e.g. joining via PMI), privilege
