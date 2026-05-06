@@ -427,6 +427,16 @@ public:
     const std::string& SourceUuid() const { return m_sourceUuid; }
     unsigned int UserId() const { return m_userId; }
 
+    // Push a blank-sentinel slot to the plugin without touching the SDK
+    // renderer or our subscription state. Used when the bound participant
+    // leaves the meeting — Zoom doesn't fire RawData_Off in that path,
+    // so the plugin would otherwise freeze on the last received frame.
+    // Keeping the renderer alive means a same-user-id rejoin resumes
+    // automatically when frames flow again.
+    void BlankSource() {
+        m_writer.WriteBlankSignal();
+    }
+
 private:
     std::string  m_sourceUuid;
     unsigned int m_userId;
@@ -459,6 +469,32 @@ void TearDownAllVideoSubscriptions() {
     }
     g_subs.clear();
     g_currentActiveSpeaker = 0;
+}
+
+// Blank any subscriptions currently bound to the given user ID. Called
+// from the participants listener's onUserLeft so OBS sources tied to a
+// departed participant clear immediately instead of freezing on the last
+// frame — Zoom does not fire RawData_Off when a user leaves the meeting,
+// only when their video stops while they remain in the meeting.
+//
+// We deliberately leave the subscription record and SDK renderer in
+// place: the user_id binding is preserved so a same-id rejoin resumes
+// automatically, and the OBS source stays positioned in the scene.
+void BlankSubscriptionsForUser(unsigned int userId) {
+    std::lock_guard<std::mutex> lock(g_subsMutex);
+    int blanked = 0;
+    for (auto& kv : g_subs) {
+        if (kv.second && kv.second->UserId() == userId) {
+            kv.second->BlankSource();
+            ++blanked;
+        }
+    }
+    if (blanked > 0) {
+        char msg[128];
+        sprintf_s(msg, "Video: blanked %d subscription(s) for departed user %u",
+                  blanked, userId);
+        LogToFile(msg);
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -38,6 +38,7 @@ const std::string& GetUserPMI();
 // From engine-video.cpp
 void TearDownAllVideoSubscriptions();
 void NotifyActiveSpeakerChanged(unsigned int newSpeakerId);
+void BlankSubscriptionsForUser(unsigned int userId);
 
 // From engine-screenshare.cpp
 void UpdateShareSubscription();
@@ -311,8 +312,17 @@ public:
         SendParticipantList();
     }
     virtual void onUserLeft(
-        ZOOM_SDK_NAMESPACE::IList<unsigned int>*,
+        ZOOM_SDK_NAMESPACE::IList<unsigned int>* lstUserID,
         const zchar_t* = nullptr) override {
+        // Blank any subscriptions bound to the departing users. Zoom does
+        // not fire RawData_Off on participant-leave (only on camera-off
+        // while still in the meeting), so without this hook the plugin
+        // would freeze on the last received frame.
+        if (lstUserID) {
+            for (int i = 0; i < lstUserID->GetCount(); ++i) {
+                BlankSubscriptionsForUser(lstUserID->GetItem(i));
+            }
+        }
         SendParticipantList();
     }
     virtual void onUserNamesChanged(
