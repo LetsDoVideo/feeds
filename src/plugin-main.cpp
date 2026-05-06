@@ -65,7 +65,7 @@ namespace feeds {
 // Plugin version. Update this in one place per release; everywhere else
 // (About dialog, log lines, telemetry) reads from this constant.
 // ---------------------------------------------------------------------------
-static constexpr const char* FEEDS_VERSION = "1.0.5";
+static constexpr const char* FEEDS_VERSION = "1.0.6";
 
 // ---------------------------------------------------------------------------
 // Globals — menu actions
