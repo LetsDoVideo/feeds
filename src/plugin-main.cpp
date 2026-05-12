@@ -35,6 +35,11 @@
 #include <QLineEdit>
 #include <QRegularExpression>
 #include <QTimer>
+#include <QDialog>
+#include <QLabel>
+#include <QPushButton>
+#include <QVBoxLayout>
+#include <QHBoxLayout>
 
 // Qt defines `slots` and `signals` as preprocessor macros (expanding to
 // empty or to annotations for the Meta-Object Compiler). Any non-Qt code
@@ -574,6 +579,45 @@ static bool ShouldShowTierPopup() {
     return true;
 }
 
+// Modal popup with a clickable hyperlink, parented to the OBS main window
+// so it inherits OBS title-bar chrome. Called from zp_create / zs_create,
+// which may run on non-UI threads — dispatch to the main thread via
+// QTimer::singleShot, matching the pattern used elsewhere in this file.
+// Uses show() + ApplicationModal + WA_DeleteOnClose rather than exec(),
+// since we're inside a queued lambda and don't want to nest event loops.
+static void ShowTierLimitDialog(const QString& title, const QString& html) {
+    QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
+        [title, html]() {
+            QMainWindow* mainWindow =
+                (QMainWindow*)obs_frontend_get_main_window();
+
+            QDialog* dlg = new QDialog(mainWindow);
+            dlg->setAttribute(Qt::WA_DeleteOnClose);
+            dlg->setWindowTitle(title);
+            dlg->setWindowModality(Qt::ApplicationModal);
+
+            QLabel* label = new QLabel(html, dlg);
+            label->setTextFormat(Qt::RichText);
+            label->setTextInteractionFlags(Qt::TextBrowserInteraction);
+            label->setOpenExternalLinks(true);
+            label->setWordWrap(true);
+
+            QPushButton* okBtn = new QPushButton("OK", dlg);
+            okBtn->setDefault(true);
+            QObject::connect(okBtn, &QPushButton::clicked,
+                             dlg, &QDialog::accept);
+
+            QVBoxLayout* layout = new QVBoxLayout(dlg);
+            layout->addWidget(label);
+            QHBoxLayout* btnRow = new QHBoxLayout();
+            btnRow->addStretch();
+            btnRow->addWidget(okBtn);
+            layout->addLayout(btnRow);
+
+            dlg->show();
+        });
+}
+
 static void* zp_create(obs_data_t* settings, obs_source_t* source) {
     (void)settings;
 
@@ -594,23 +638,21 @@ static void* zp_create(obs_data_t* settings, obs_source_t* source) {
     if (g_isLoggedIn &&
         g_activeParticipantSources >= GetMaxFeedsForTier() &&
         ShouldShowTierPopup()) {
-        int maxFeeds = GetMaxFeedsForTier();
-        std::string msg;
-        const char* title;
         if (g_currentTier >= 3) {
-            msg = "You've reached the " + std::to_string(maxFeeds) +
-                  "-feed limit for your tier (Broadcaster).\n\n"
-                  "This is the current maximum. If you need more, "
-                  "please contact support@letsdovideo.com.";
-            title = "Feeds - Maximum Feeds Reached";
+            ShowTierLimitDialog(
+                "Feeds - Maximum Feeds Reached",
+                "You've reached the maximum number of feeds for "
+                "the Broadcaster plan.<br><br>"
+                "<a href=\"mailto:support@letsdovideo.com\">Contact "
+                "support</a> if you need a custom solution.");
         } else {
-            msg = "Your current tier allows a maximum of " +
-                  std::to_string(maxFeeds) +
-                  " participant feed(s).\n\nUpgrade your plan at:\n"
-                  "https://marketplace.zoom.us";
-            title = "Feeds - Upgrade Required";
+            ShowTierLimitDialog(
+                "Feeds - Upgrade Required",
+                "You've reached the maximum number of feeds for "
+                "your current plan.<br><br>"
+                "<a href=\"https://letsdovideo.com/feeds-upgrade\">"
+                "Upgrade your plan</a> to add more.");
         }
-        MessageBoxA(NULL, msg.c_str(), title, MB_OK | MB_ICONINFORMATION);
         return nullptr;
     }
     // If we're over-tier but the throttle suppressed the popup, still
@@ -1006,15 +1048,13 @@ static void* zs_create(obs_data_t* settings, obs_source_t* source) {
     // we don't want to spuriously block creation. Once logged in, free
     // tier users get a friendly upgrade prompt.
     if (g_isLoggedIn && g_currentTier == 0 && ShouldShowTierPopup()) {
-        std::string msg =
-            "Screenshare is a paid feature.\n\n"
+        ShowTierLimitDialog(
+            "Feeds - Upgrade Required",
+            "Screenshare is a paid feature.<br><br>"
             "Your current tier is Free. Upgrade to Basic, Streamer, "
-            "or Broadcaster to use Zoom Screenshare in OBS.\n\n"
-            "Upgrade your plan at:\n"
-            "https://marketplace.zoom.us";
-        MessageBoxA(NULL, msg.c_str(),
-                    "Feeds - Upgrade Required",
-                    MB_OK | MB_ICONINFORMATION);
+            "or Broadcaster to use Zoom Screenshare in OBS.<br><br>"
+            "<a href=\"https://letsdovideo.com/feeds-upgrade\">"
+            "Upgrade your plan</a>");
         return nullptr;
     }
     // If popup was throttled, still block creation silently — same
