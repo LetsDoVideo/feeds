@@ -447,6 +447,7 @@ void OnConnectClick() {
 
     QString input;
     QString password;
+    QString displayName;
     bool    isPmi = false;
 
     if (choice.startsWith("My Personal")) {
@@ -459,12 +460,37 @@ void OnConnectClick() {
         }
         input = QString::fromStdString(g_userPMI);
         isPmi = true;
-        bool okPwd = false;
-        password = QInputDialog::getText(
-            mainWindow, "Meeting Password",
-            "Enter your PMI password (leave blank if none):",
-            QLineEdit::Normal, "", &okPwd);
-        if (!okPwd) return;
+
+        // PMI dialog: password + optional display-name override. Styled to
+        // match the by-number-or-link dialog below for consistency.
+        QDialog dlg(mainWindow);
+        dlg.setWindowTitle("Join Personal Meeting Room");
+
+        QLabel* pwdLabel = new QLabel(
+            "Enter your PMI password (leave blank if none):", &dlg);
+        QLineEdit* pwdEdit = new QLineEdit(&dlg);
+        QLabel* nameLabel = new QLabel(
+            "Display name (optional):", &dlg);
+        QLineEdit* nameEdit = new QLineEdit(&dlg);
+        nameEdit->setPlaceholderText("Leave blank to use your Zoom name");
+
+        QDialogButtonBox* buttons = new QDialogButtonBox(
+            QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+        QObject::connect(buttons, &QDialogButtonBox::accepted,
+                         &dlg, &QDialog::accept);
+        QObject::connect(buttons, &QDialogButtonBox::rejected,
+                         &dlg, &QDialog::reject);
+
+        QVBoxLayout* layout = new QVBoxLayout(&dlg);
+        layout->addWidget(pwdLabel);
+        layout->addWidget(pwdEdit);
+        layout->addWidget(nameLabel);
+        layout->addWidget(nameEdit);
+        layout->addWidget(buttons);
+
+        if (dlg.exec() != QDialog::Accepted) return;
+        password    = pwdEdit->text();
+        displayName = nameEdit->text().trimmed();
     } else {
         // Single dialog with both fields visible so that pasting a Zoom
         // URL with a pwd= query parameter auto-fills the password field.
@@ -477,6 +503,10 @@ void OnConnectClick() {
         QLabel* pwdLabel = new QLabel(
             "Meeting password (leave blank if none):", &dlg);
         QLineEdit* pwdEdit = new QLineEdit(&dlg);
+        QLabel* nameLabel = new QLabel(
+            "Display name (optional):", &dlg);
+        QLineEdit* nameEdit = new QLineEdit(&dlg);
+        nameEdit->setPlaceholderText("Leave blank to use your Zoom name");
 
         QDialogButtonBox* buttons = new QDialogButtonBox(
             QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
@@ -523,12 +553,15 @@ void OnConnectClick() {
         layout->addWidget(meetingEdit);
         layout->addWidget(pwdLabel);
         layout->addWidget(pwdEdit);
+        layout->addWidget(nameLabel);
+        layout->addWidget(nameEdit);
         layout->addWidget(buttons);
 
         if (dlg.exec() != QDialog::Accepted) return;
         input = meetingEdit->text().trimmed();
         if (input.isEmpty()) return;
-        password = pwdEdit->text();
+        password    = pwdEdit->text();
+        displayName = nameEdit->text().trimmed();
     }
 
     auto jsonEscape = [](const QString& s) -> std::string {
@@ -553,8 +586,9 @@ void OnConnectClick() {
     };
 
     std::string msg = "{\"type\":\"join_meeting\","
-                      "\"input\":\"" + jsonEscape(input) + "\","
-                      "\"password\":\"" + jsonEscape(password) + "\","
+                      "\"input\":\""        + jsonEscape(input)       + "\","
+                      "\"password\":\""     + jsonEscape(password)    + "\","
+                      "\"display_name\":\"" + jsonEscape(displayName) + "\","
                       "\"is_pmi\":" + std::string(isPmi ? "true" : "false") + "}";
     feeds::SendToEngine(msg);
 

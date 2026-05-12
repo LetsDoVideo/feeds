@@ -703,11 +703,17 @@ bool InitializeMeetingSession() {
 //   {"type":"join_meeting",
 //    "input":"<raw user input or PMI number>",
 //    "password":"<optional password or empty>",
+//    "display_name":"<optional session-only name override or empty>",
 //    "is_pmi":true|false}
 //
 // Plugin is responsible for the user dialog; it passes us the raw text from
 // the input box plus whether this was the PMI choice. We parse URL forms
 // here (matching v1.0.0 behavior exactly) and fetch a fresh ZAK.
+//
+// display_name, when non-empty, overrides the Zoom-account display name for
+// this session only — used by producers who want to appear as "LDV Studio"
+// or similar instead of their personal name. Empty falls back to the
+// account name fetched at login.
 // ---------------------------------------------------------------------------
 void HandleJoinMeeting(const std::string& json) {
     LogToFile("Meeting: HandleJoinMeeting called");
@@ -719,8 +725,9 @@ void HandleJoinMeeting(const std::string& json) {
         return;
     }
 
-    std::string input    = JsonExtractString(json, "input");
-    std::string password = JsonExtractString(json, "password");
+    std::string input       = JsonExtractString(json, "input");
+    std::string password    = JsonExtractString(json, "password");
+    std::string customName  = JsonExtractString(json, "display_name");
     // is_pmi is informational for logging; parsing is the same either way
     (void)JsonExtractString(json, "is_pmi");
 
@@ -753,8 +760,17 @@ void HandleJoinMeeting(const std::string& json) {
     param.isAudioOff = true;
     param.isVideoOff = true;
 
+    // Custom display name overrides the account name for this session.
+    // Account-name guard above still applies — we don't relax it when a
+    // custom name is provided, since the prefetch always completes after
+    // login and a missing account name signals a real auth-state problem.
+    const std::string& effectiveName =
+        customName.empty() ? displayName : customName;
+    if (!customName.empty()) {
+        LogToFile("Meeting: using custom display name override");
+    }
     static std::wstring s_userName;
-    s_userName     = Utf8ToWide(displayName);
+    s_userName     = Utf8ToWide(effectiveName);
     param.userName = s_userName.c_str();
 
     static std::wstring s_zak;
