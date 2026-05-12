@@ -36,10 +36,13 @@
 #include <QRegularExpression>
 #include <QTimer>
 #include <QDialog>
+#include <QDialogButtonBox>
 #include <QLabel>
 #include <QPushButton>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
+#include <QUrl>
+#include <QUrlQuery>
 
 // Qt defines `slots` and `signals` as preprocessor macros (expanding to
 // empty or to annotations for the Meta-Object Compiler). Any non-Qt code
@@ -468,20 +471,69 @@ void OnConnectClick() {
             QLineEdit::Normal, "", &okPwd);
         if (!okPwd) return;
     } else {
-        bool okInput = false;
-        input = QInputDialog::getText(
-            mainWindow, "Join Zoom Meeting",
-            "Enter your Zoom Meeting number or link:",
-            QLineEdit::Normal, "", &okInput);
-        if (!okInput || input.trimmed().isEmpty()) return;
-        input = input.trimmed();
+        // Single dialog with both fields visible so that pasting a Zoom
+        // URL with a pwd= query parameter auto-fills the password field.
+        QDialog dlg(mainWindow);
+        dlg.setWindowTitle("Join Zoom Meeting");
 
-        bool okPwd = false;
-        password = QInputDialog::getText(
-            mainWindow, "Meeting Password",
-            "Enter meeting password (leave blank if none):",
-            QLineEdit::Normal, "", &okPwd);
-        if (!okPwd) return;
+        QLabel* meetingLabel = new QLabel(
+            "Enter your Zoom Meeting number or link:", &dlg);
+        QLineEdit* meetingEdit = new QLineEdit(&dlg);
+        QLabel* pwdLabel = new QLabel(
+            "Meeting password (leave blank if none):", &dlg);
+        QLineEdit* pwdEdit = new QLineEdit(&dlg);
+
+        QDialogButtonBox* buttons = new QDialogButtonBox(
+            QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+        QObject::connect(buttons, &QDialogButtonBox::accepted,
+                         &dlg, &QDialog::accept);
+        QObject::connect(buttons, &QDialogButtonBox::rejected,
+                         &dlg, &QDialog::reject);
+
+        // Auto-extract pwd= from a pasted Zoom URL. Cheap substring gate
+        // first so we don't run QUrl on every keystroke for plain meeting
+        // numbers. Overwrite the password field on success — the spec
+        // explicitly prefers paste-clobbers-manual-edit since the more
+        // likely flow is paste-URL → password just appears.
+        auto extractPwd = [](const QString& text) -> QString {
+            QString t = text.trimmed();
+            if (!t.contains("zoom.us", Qt::CaseInsensitive)) return QString();
+            if (!t.contains("pwd=", Qt::CaseInsensitive))    return QString();
+
+            QUrl url = QUrl::fromUserInput(t);
+            if (!url.isValid()) return QString();
+
+            QUrlQuery q(url);
+            if (q.hasQueryItem("pwd"))
+                return q.queryItemValue("pwd", QUrl::FullyDecoded);
+
+            // Some Zoom share links put pwd in the fragment (#pwd=...).
+            QString frag = url.fragment();
+            if (!frag.isEmpty()) {
+                QUrlQuery fq(frag);
+                if (fq.hasQueryItem("pwd"))
+                    return fq.queryItemValue("pwd", QUrl::FullyDecoded);
+            }
+            return QString();
+        };
+
+        QObject::connect(meetingEdit, &QLineEdit::textChanged, &dlg,
+            [pwdEdit, extractPwd](const QString& text) {
+                QString pwd = extractPwd(text);
+                if (!pwd.isEmpty()) pwdEdit->setText(pwd);
+            });
+
+        QVBoxLayout* layout = new QVBoxLayout(&dlg);
+        layout->addWidget(meetingLabel);
+        layout->addWidget(meetingEdit);
+        layout->addWidget(pwdLabel);
+        layout->addWidget(pwdEdit);
+        layout->addWidget(buttons);
+
+        if (dlg.exec() != QDialog::Accepted) return;
+        input = meetingEdit->text().trimmed();
+        if (input.isEmpty()) return;
+        password = pwdEdit->text();
     }
 
     auto jsonEscape = [](const QString& s) -> std::string {
