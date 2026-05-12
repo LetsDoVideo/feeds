@@ -11,6 +11,8 @@
 #include <thread>
 #include <atomic>
 
+#include "feeds-version.h"
+
 
 static const wchar_t* P2E_PIPE_NAME = L"\\\\.\\pipe\\FeedsEngine_P2E";
 static const wchar_t* E2P_PIPE_NAME = L"\\\\.\\pipe\\FeedsEngine_E2P";
@@ -311,8 +313,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     // the shared-memory region names used for video frames.
     char readyMsg[128];
     sprintf_s(readyMsg,
-        "{\"type\":\"engine_ready\",\"version\":\"1.0.6\",\"pid\":%lu}",
-        GetCurrentProcessId());
+        "{\"type\":\"engine_ready\",\"version\":\"%s\",\"pid\":%lu}",
+        feeds_shared::VERSION, GetCurrentProcessId());
     if (!SendToPlugin(readyMsg)) {
         LogToFile("Failed to send engine_ready");
         return 1;
