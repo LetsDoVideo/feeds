@@ -443,7 +443,8 @@ void OnConnectClick() {
         mainWindow, "Join Zoom Meeting",
         "How would you like to join?<br><br>"
         "<span style=\"color:gray;font-style:italic\">"
-        "Tip: Hosting your own meeting avoids permission prompts."
+        "Tip: Joining your own meeting (like your PMI) avoids "
+        "permission prompts."
         "</span>",
         options, 0, false, &ok);
     if (!ok) return;
