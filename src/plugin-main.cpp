@@ -1551,6 +1551,17 @@ static void OnSourceCreated(void* /*data*/, calldata_t* cd) {
         strcmp(id, "zoom_screenshare_source") == 0;
     if (!isFeedsSource) return;
 
+    // [v1.0.7 verification step — temporary] When our create callback
+    // returns NULL on a tier block, OBS keeps the obs_source_t alive
+    // with context.data == NULL ("husk"). obs_obj_invalid() reads
+    // context.data via libobs's public obj-accessor API and returns
+    // true when it's NULL. Log so we can confirm husks reach this
+    // signal handler before wiring up the real removal fix.
+    const bool is_husk = obs_obj_invalid(source);
+    blog(LOG_INFO,
+         "[feeds][verify] source_create id=%s ptr=%p husk=%d",
+         id, (void*)source, is_husk ? 1 : 0);
+
     // Hold a weak reference; promote to strong reference inside the
     // deferred callback. This avoids holding the source alive if the user
     // (or OBS during shutdown) removes it in the interim.
