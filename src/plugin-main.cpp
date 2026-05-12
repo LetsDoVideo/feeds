@@ -474,6 +474,12 @@ void OnConnectClick() {
         QLineEdit* nameEdit = new QLineEdit(&dlg);
         nameEdit->setPlaceholderText("Leave blank to use your Zoom name");
 
+        QLabel* tipLabel = new QLabel(
+            "<span style=\"color:gray;font-style:italic\">"
+            "Tip: Hosting your own meetings avoids permission prompts."
+            "</span>", &dlg);
+        tipLabel->setTextFormat(Qt::RichText);
+
         QDialogButtonBox* buttons = new QDialogButtonBox(
             QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
         QObject::connect(buttons, &QDialogButtonBox::accepted,
@@ -486,6 +492,7 @@ void OnConnectClick() {
         layout->addWidget(pwdEdit);
         layout->addWidget(nameLabel);
         layout->addWidget(nameEdit);
+        layout->addWidget(tipLabel);
         layout->addWidget(buttons);
 
         if (dlg.exec() != QDialog::Accepted) return;
@@ -548,6 +555,12 @@ void OnConnectClick() {
                 if (!pwd.isEmpty()) pwdEdit->setText(pwd);
             });
 
+        QLabel* tipLabel = new QLabel(
+            "<span style=\"color:gray;font-style:italic\">"
+            "Tip: Hosting your own meetings avoids permission prompts."
+            "</span>", &dlg);
+        tipLabel->setTextFormat(Qt::RichText);
+
         QVBoxLayout* layout = new QVBoxLayout(&dlg);
         layout->addWidget(meetingLabel);
         layout->addWidget(meetingEdit);
@@ -555,6 +568,7 @@ void OnConnectClick() {
         layout->addWidget(pwdEdit);
         layout->addWidget(nameLabel);
         layout->addWidget(nameEdit);
+        layout->addWidget(tipLabel);
         layout->addWidget(buttons);
 
         if (dlg.exec() != QDialog::Accepted) return;
@@ -904,6 +918,18 @@ static obs_properties_t* zp_properties(void* data) {
             }
         }
     }
+
+    // Contextual hints for users who skipped the tutorial video. Plain
+    // OBS_TEXT_INFO entries render as muted info text in the properties
+    // panel — visually distinct from the interactive controls above.
+    obs_properties_add_text(props, "tip_audio",
+        "Tip: For participant audio, use OBS's default desktop audio "
+        "source — it captures what you hear from Zoom.",
+        OBS_TEXT_INFO);
+    obs_properties_add_text(props, "tip_vcam",
+        "Tip: Use OBS Virtual Camera to send your show back to Zoom "
+        "so participants can see it.",
+        OBS_TEXT_INFO);
 
     return props;
 }
