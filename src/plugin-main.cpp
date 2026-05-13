@@ -464,7 +464,6 @@ void OnConnectClick() {
     {
         QDialog dlg(mainWindow);
         dlg.setWindowTitle("Connect to Zoom Meeting");
-        dlg.setMinimumSize(500, 240);
 
         QString pmiLabel = "My Personal Meeting Room";
         if (!g_userPMI.empty())
@@ -509,14 +508,13 @@ void OnConnectClick() {
 
         QVBoxLayout* layout = new QVBoxLayout(&dlg);
         // Tip first so the user reads "why PMI" before seeing the choice.
-        // Margins give breathing room on all sides; the button row's
-        // min-height creates enough separation from the tip on its own,
-        // so no extra spacing between them. Dialog size is set explicitly
-        // above — the auto-compute path squeezed everything to the
-        // button row's min-height.
-        layout->setContentsMargins(16, 16, 16, 16);
+        // Trailing addSpacing keeps the buttons from sitting flush against
+        // the dialog's bottom edge — letting Qt auto-size the dialog gives
+        // the cleanest result, we just need a bit of breathing room below.
         layout->addWidget(tipLabel);
+        layout->addSpacing(8);
         layout->addLayout(row);
+        layout->addSpacing(16);
 
         if (dlg.exec() != QDialog::Accepted || choice == 0) return;
     }
