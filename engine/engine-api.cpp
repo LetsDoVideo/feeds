@@ -338,7 +338,13 @@ std::string ZoomApiPost(const std::wstring& path, const std::string& jsonBody) {
 // POST /v2/users/me/meetings  with  {"type":1, "topic":"...", "settings":{...}}
 //   type=1               instant meeting (provisioned, not yet started)
 //   approval_type=2      no registration required (open join)
-//   join_before_host=true so participants don't wait if host is slow to enter
+//   use_pmi=false        force a fresh meeting number — without this Zoom's
+//                        type:1 default is to recycle the user's PMI, which
+//                        defeats the point of "create a new meeting"
+//
+// Note: even with use_pmi=false, a Zoom account-level setting ("Use PMI for
+// instant meetings") can still override and produce a PMI-numbered meeting.
+// If that happens, the user must disable it at zoom.us/profile/setting.
 //
 // On success populates outId / outPassword / outJoinUrl and returns true.
 // The host then enters this meeting via IMeetingService::Start() — REST
@@ -367,8 +373,8 @@ bool CreateInstantMeeting(const std::string& topic,
         else                escTopic += c;
     }
     std::string body = "{\"type\":1,\"topic\":\"" + escTopic + "\","
-                       "\"settings\":{\"join_before_host\":true,"
-                                     "\"approval_type\":2}}";
+                       "\"settings\":{\"approval_type\":2,"
+                                     "\"use_pmi\":false}}";
 
     LogToFile("API: CreateInstantMeeting POST /v2/users/me/meetings");
     std::string response = ZoomApiPost(L"/v2/users/me/meetings", body);
