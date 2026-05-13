@@ -500,6 +500,10 @@ void OnConnectClick() {
             "</span>", &dlg);
         tipLabel->setTextFormat(Qt::RichText);
         tipLabel->setAlignment(Qt::AlignCenter);
+        // Fixed vertical policy — without this Qt lets the label expand
+        // vertically to absorb spare space, which manifests as a big gap
+        // between the tip and the buttons below it.
+        tipLabel->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
 
         QHBoxLayout* row = new QHBoxLayout();
         row->addWidget(pmiBtn);
