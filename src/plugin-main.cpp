@@ -496,8 +496,7 @@ void OnConnectClick() {
 
         QLabel* tipLabel = new QLabel(
             "<span style=\"color:gray;font-style:italic\">"
-            "Tip: Joining your own meeting (like your PMI) avoids "
-            "permission prompts."
+            "Tip: Joining your own meeting avoids permission prompts."
             "</span>", &dlg);
         tipLabel->setTextFormat(Qt::RichText);
         tipLabel->setAlignment(Qt::AlignCenter);
@@ -505,6 +504,10 @@ void OnConnectClick() {
         QHBoxLayout* row = new QHBoxLayout();
         row->addWidget(pmiBtn);
         row->addWidget(linkBtn);
+        // Top-align the row so Qt doesn't dump excess vertical space
+        // between the tip and the buttons. addLayout doesn't take an
+        // alignment parameter, so set it on the row layout itself.
+        row->setAlignment(Qt::AlignTop);
 
         QVBoxLayout* layout = new QVBoxLayout(&dlg);
         // Tip first so the user reads "why PMI" before seeing the choice.
