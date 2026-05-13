@@ -509,11 +509,12 @@ void OnConnectClick() {
         QVBoxLayout* layout = new QVBoxLayout(&dlg);
         // Tip first so the user reads "why PMI" before seeing the choice.
         // SetMinimumSize lets Qt compute a size that fits all children
-        // without overlap — the auto-computed default was too tight and
-        // crowded the tip into the buttons.
+        // without overlap. Margins give breathing room on all sides; the
+        // button row's min-height creates enough separation from the tip
+        // on its own, so no extra spacing between them.
         layout->setSizeConstraint(QLayout::SetMinimumSize);
+        layout->setContentsMargins(16, 16, 16, 16);
         layout->addWidget(tipLabel);
-        layout->addSpacing(8);
         layout->addLayout(row);
 
         if (dlg.exec() != QDialog::Accepted || choice == 0) return;
