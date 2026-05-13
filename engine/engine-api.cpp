@@ -333,6 +333,72 @@ std::string ZoomApiPost(const std::wstring& path, const std::string& jsonBody) {
 }
 
 // ---------------------------------------------------------------------------
+// Create an instant meeting via Zoom REST API.
+//
+// POST /v2/users/me/meetings  with  {"type":1, "topic":"...", "settings":{...}}
+//   type=1               instant meeting (provisioned, not yet started)
+//   approval_type=2      no registration required (open join)
+//   join_before_host=true so participants don't wait if host is slow to enter
+//
+// On success populates outId / outPassword / outJoinUrl and returns true.
+// The host then enters this meeting via IMeetingService::Start() — REST
+// creates it, SDK starts it. Don't try to Join() — a freshly-created
+// meeting is in MEETING_STATUS_WAITINGFORHOST until Start() is called.
+//
+// Requires meeting:write:meeting OAuth scope on the access token.
+// Without the scope the call returns 403, which ZoomApiPost surfaces in
+// the engine log and we return false (caller emits meeting_failed).
+// ---------------------------------------------------------------------------
+bool CreateInstantMeeting(const std::string& topic,
+                          unsigned long long& outId,
+                          std::string& outPassword,
+                          std::string& outJoinUrl) {
+    outId = 0;
+    outPassword.clear();
+    outJoinUrl.clear();
+
+    // Minimal JSON escape on the topic — quote and backslash only. Feeds
+    // generates the topic internally so it's already controlled input,
+    // but defensive in case the caller ever passes user-provided text.
+    std::string escTopic;
+    for (char c : topic) {
+        if      (c == '"')  escTopic += "\\\"";
+        else if (c == '\\') escTopic += "\\\\";
+        else                escTopic += c;
+    }
+    std::string body = "{\"type\":1,\"topic\":\"" + escTopic + "\","
+                       "\"settings\":{\"join_before_host\":true,"
+                                     "\"approval_type\":2}}";
+
+    LogToFile("API: CreateInstantMeeting POST /v2/users/me/meetings");
+    std::string response = ZoomApiPost(L"/v2/users/me/meetings", body);
+    if (response.empty()) {
+        LogToFile("API: CreateInstantMeeting got empty response "
+                  "(session expired or network error)");
+        return false;
+    }
+
+    std::string idStr = JsonExtractNumber(response, "id");
+    if (idStr.empty()) {
+        LogToFile("API: CreateInstantMeeting response missing 'id' field");
+        // First 200 chars of response to help diagnose what came back
+        // (likely a 403 error body with a missing-scope message).
+        std::string snippet = response.substr(0, 200);
+        LogToFile(("API: response snippet: " + snippet).c_str());
+        return false;
+    }
+    outId       = _strtoui64(idStr.c_str(), nullptr, 10);
+    outPassword = JsonExtractString(response, "password");
+    outJoinUrl  = JsonExtractString(response, "join_url");
+
+    char log[256];
+    sprintf_s(log, "API: CreateInstantMeeting got id=%llu (pwd=%s)",
+              outId, outPassword.empty() ? "empty" : "present");
+    LogToFile(log);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Fetch user display name + PMI. Caches results in engine-side globals.
 // Called once after SDK auth succeeds (pre-fetch so Connect is snappy).
 // ---------------------------------------------------------------------------

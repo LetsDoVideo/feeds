@@ -34,6 +34,10 @@ std::string       ZoomApiGet(const std::wstring& path);
 std::string       FetchZak();
 const std::string& GetUserDisplayName();
 const std::string& GetUserPMI();
+bool              CreateInstantMeeting(const std::string& topic,
+                                       unsigned long long& outId,
+                                       std::string& outPassword,
+                                       std::string& outJoinUrl);
 
 // From engine-video.cpp
 void TearDownAllVideoSubscriptions();
@@ -847,6 +851,111 @@ void HandleJoinMeeting(const std::string& json) {
     }
 
     LogToFile("Meeting: Join() call returned SUCCESS, waiting for status events");
+}
+
+// ---------------------------------------------------------------------------
+// IPC handler: create_instant_meeting
+// Message shape (from plugin):
+//   {"type":"create_instant_meeting",
+//    "display_name":"<optional session-only name override or empty>"}
+//
+// Two-step flow:
+//   1. CreateInstantMeeting() REST call provisions a new meeting on Zoom's
+//      servers and returns the meeting id + password. Consumes the
+//      meeting:write:meeting OAuth scope.
+//   2. IMeetingService::Start() enters that meeting as host. Uses the
+//      meeting id from step 1 + the user's ZAK. The user owns the meeting
+//      (they just created it), so Zoom accepts the Start() call against
+//      a real meeting number without needing meeting:write at the SDK
+//      layer — that scope was already consumed in step 1.
+//
+// Why not Join()? A freshly-created meeting is in MEETING_STATUS_WAITINGFORHOST
+// until Start() runs. Calling Join() would fail with MEETING_FAIL_MEETING_NOT_START
+// (code 7), or with join_before_host enabled would put the user in as a
+// regular participant rather than host. Start() is the correct entry.
+// ---------------------------------------------------------------------------
+void HandleCreateInstantMeeting(const std::string& json) {
+    LogToFile("Meeting: HandleCreateInstantMeeting called");
+
+    if (!g_meetingService) {
+        LogToFile("Meeting: create requested but meeting service not initialized");
+        SendToPlugin("{\"type\":\"meeting_failed\",\"code\":-1,"
+                     "\"message\":\"Zoom SDK is not ready. Please try logging in again.\"}");
+        return;
+    }
+
+    std::string customName = JsonExtractString(json, "display_name");
+
+    std::string zak = FetchZak();
+    const std::string& displayName = GetUserDisplayName();
+
+    if (zak.empty() || displayName.empty()) {
+        LogToFile("Meeting: could not retrieve ZAK or display name");
+        SendToPlugin("{\"type\":\"meeting_failed\",\"code\":-3,"
+                     "\"message\":\"Could not retrieve your Zoom account details. "
+                     "Please log out and log in again.\"}");
+        return;
+    }
+
+    // Step 1: provision the meeting via REST.
+    unsigned long long meetingId = 0;
+    std::string meetingPassword;
+    std::string joinUrl;
+    if (!CreateInstantMeeting("Feeds Instant Meeting",
+                              meetingId, meetingPassword, joinUrl)) {
+        LogToFile("Meeting: CreateInstantMeeting REST call failed");
+        SendToPlugin("{\"type\":\"meeting_failed\",\"code\":-4,"
+                     "\"message\":\"Could not create instant meeting. "
+                     "Check the engine log for details.\"}");
+        return;
+    }
+    // Consumed in commit 4 for the share-this-meeting popup. Engine-side
+    // state to plumb them into the IPC message gets added then; for now
+    // just suppress the unused-variable warning.
+    (void)meetingPassword;
+    (void)joinUrl;
+
+    // Step 2: enter the meeting as host via SDK Start(). Storage lifetimes
+    // must outlive Start() — static, distinct names from the Join() statics
+    // so the two paths don't share state if called in sequence.
+    ZOOM_SDK_NAMESPACE::StartParam startParam;
+    startParam.userType = ZOOM_SDK_NAMESPACE::SDK_UT_WITHOUT_LOGIN;
+    ZOOM_SDK_NAMESPACE::StartParam4WithoutLogin& param =
+        startParam.param.withoutloginStart;
+    param.isAudioOff    = true;
+    param.isVideoOff    = true;
+    param.zoomuserType  = ZOOM_SDK_NAMESPACE::ZoomUserType_APIUSER;
+    param.meetingNumber = meetingId;   // real id from REST, NOT 0
+    param.vanityID      = nullptr;
+    param.customer_key  = nullptr;
+
+    const std::string& effectiveName =
+        customName.empty() ? displayName : customName;
+    if (!customName.empty()) {
+        LogToFile("Meeting: instant meeting using custom display name");
+    }
+    static std::wstring s_startUserName;
+    s_startUserName = Utf8ToWide(effectiveName);
+    param.userName  = s_startUserName.c_str();
+
+    static std::wstring s_startZak;
+    s_startZak    = std::wstring(zak.begin(), zak.end());
+    param.userZAK = s_startZak.c_str();
+
+    ZOOM_SDK_NAMESPACE::SDKError startErr = g_meetingService->Start(startParam);
+    if (startErr != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
+        char buf[256];
+        sprintf_s(buf, "Meeting: Start() failed: %d", (int)startErr);
+        LogToFile(buf);
+        sprintf_s(buf,
+            "{\"type\":\"meeting_failed\",\"code\":%d,"
+            "\"message\":\"Could not start instant meeting. SDK error: %d\"}",
+            (int)startErr, (int)startErr);
+        SendToPlugin(buf);
+        return;
+    }
+
+    LogToFile("Meeting: Start() returned SUCCESS, waiting for status events");
 }
 
 // ---------------------------------------------------------------------------
