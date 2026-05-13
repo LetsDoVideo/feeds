@@ -508,13 +508,15 @@ void OnConnectClick() {
 
         QVBoxLayout* layout = new QVBoxLayout(&dlg);
         // Tip first so the user reads "why PMI" before seeing the choice.
-        // Trailing addSpacing keeps the buttons from sitting flush against
-        // the dialog's bottom edge — letting Qt auto-size the dialog gives
-        // the cleanest result, we just need a bit of breathing room below.
+        // A QLabel with just spaces acts as a bottom spacer: Qt distributes
+        // extra vertical space differently between widgets vs addSpacing,
+        // and having a real widget below the buttons anchors the layout
+        // so Qt stops dumping all the slack between tip and buttons.
+        QLabel* bottomSpacer = new QLabel("   ", &dlg);
         layout->addWidget(tipLabel);
         layout->addSpacing(8);
         layout->addLayout(row);
-        layout->addSpacing(16);
+        layout->addWidget(bottomSpacer);
 
         if (dlg.exec() != QDialog::Accepted || choice == 0) return;
     }
