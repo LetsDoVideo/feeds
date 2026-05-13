@@ -525,7 +525,21 @@ void OnConnectClick() {
         layout->addLayout(row);
         layout->addWidget(bottomSpacer);
 
-        if (dlg.exec() != QDialog::Accepted || choice == 0) return;
+        int execResult = dlg.exec();
+        // Temporary diagnostic: log the actual rendered dimensions of
+        // every widget in the choice dialog so we can see where the
+        // unexpected vertical space is coming from. Remove once the
+        // layout problem is diagnosed.
+        blog(LOG_INFO,
+            "[feeds][layout-debug] dialog=%dx%d tip=%dx%d "
+            "row=%dx%d pmiBtn=%dx%d linkBtn=%dx%d bottomSpacer=%dx%d",
+            dlg.width(), dlg.height(),
+            tipLabel->width(), tipLabel->height(),
+            row->geometry().width(), row->geometry().height(),
+            pmiBtn->width(), pmiBtn->height(),
+            linkBtn->width(), linkBtn->height(),
+            bottomSpacer->width(), bottomSpacer->height());
+        if (execResult != QDialog::Accepted || choice == 0) return;
     }
 
     QString input;
