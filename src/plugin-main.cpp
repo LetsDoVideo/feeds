@@ -488,6 +488,13 @@ void OnConnectClick() {
                 "padding: 12px 16px; "
                 "min-height: 70px; "
             "}");
+        // Pin button heights to match their stylesheet min-heights so the
+        // QHBoxLayout's vertical sizeHint == its content's actual height.
+        // Without this, Qt allocates the row extra vertical space (the
+        // buttons' sizeHint exceeds their min-height when style padding
+        // is factored in), which manifests as a gap between tip and row.
+        pmiBtn ->setMaximumHeight(80);
+        linkBtn->setMaximumHeight(70);
 
         QObject::connect(pmiBtn,  &QPushButton::clicked, &dlg,
                          [&]() { choice = 1; dlg.accept(); });
@@ -525,21 +532,7 @@ void OnConnectClick() {
         layout->addLayout(row);
         layout->addWidget(bottomSpacer);
 
-        int execResult = dlg.exec();
-        // Temporary diagnostic: log the actual rendered dimensions of
-        // every widget in the choice dialog so we can see where the
-        // unexpected vertical space is coming from. Remove once the
-        // layout problem is diagnosed.
-        blog(LOG_INFO,
-            "[feeds][layout-debug] dialog=%dx%d tip=%dx%d "
-            "row=%dx%d pmiBtn=%dx%d linkBtn=%dx%d bottomSpacer=%dx%d",
-            dlg.width(), dlg.height(),
-            tipLabel->width(), tipLabel->height(),
-            row->geometry().width(), row->geometry().height(),
-            pmiBtn->width(), pmiBtn->height(),
-            linkBtn->width(), linkBtn->height(),
-            bottomSpacer->width(), bottomSpacer->height());
-        if (execResult != QDialog::Accepted || choice == 0) return;
+        if (dlg.exec() != QDialog::Accepted || choice == 0) return;
     }
 
     QString input;
