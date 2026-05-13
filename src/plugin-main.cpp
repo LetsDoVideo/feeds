@@ -91,6 +91,13 @@ static int         g_currentTier = 0;
 static uint32_t    g_enginePid   = 0;   // Populated from engine_ready
 
 static unsigned long long g_currentMeetingNumber = 0;
+
+// Set when the plugin sends create_instant_meeting, consumed (and cleared)
+// by the meeting_joined handler so it knows to surface the share-this-meeting
+// popup, plus defensively cleared on meeting_failed / meeting_left. The
+// consumer is wired in commit 4; commit 3 only sets this so the protocol
+// shape is in place when commit 4 lands.
+static std::atomic<bool> g_pendingInstantMeeting{false};
 static unsigned int       g_activeSharerUserId   = 0;
 static unsigned int       g_cachedMyUserId       = 0;
 static unsigned int       g_activeSpeakerUserId  = 0;
@@ -452,14 +459,10 @@ void OnConnectClick() {
         return out;
     };
 
-    // Two-button choice screen. PMI is visually emphasized as the
-    // recommended path (you're host of your own room, no permission
+    // Three-button choice screen. PMI is visually emphasized in the center
+    // as the recommended path (you're host of your own room, no permission
     // prompts). Captured `choice` discriminates the branches:
-    // 1 = PMI, 2 = Join by Number or Link.
-    //
-    // A third "Create Instant Meeting" button is planned for v1.0.9 once
-    // the meeting:write:meeting OAuth scope is approved. The engine-side
-    // SDK Start() approach attempted in v1.0.8 won't work without it.
+    // 1 = Create Instant Meeting, 2 = PMI, 3 = Join by Number or Link.
     int choice = 0;
     {
         QDialog dlg(mainWindow);
@@ -469,12 +472,14 @@ void OnConnectClick() {
         if (!g_userPMI.empty())
             pmiLabel += "\n(" + QString::fromStdString(g_userPMI) + ")";
 
-        QPushButton* pmiBtn  = new QPushButton(pmiLabel, &dlg);
-        QPushButton* linkBtn = new QPushButton("Join by Number\nor Link", &dlg);
+        QPushButton* instantBtn = new QPushButton("Create Instant\nMeeting", &dlg);
+        QPushButton* pmiBtn     = new QPushButton(pmiLabel, &dlg);
+        QPushButton* linkBtn    = new QPushButton("Join by Number\nor Link", &dlg);
 
         // min-height: multi-line labels + padding need vertical room or
         // Qt crops the second line on some platforms. PMI gets extra room
-        // for its bigger padding.
+        // for its bigger padding. Instant + Link share the same sizing so
+        // the row feels balanced around the emphasized center button.
         pmiBtn->setStyleSheet(
             "QPushButton { "
                 "background-color: palette(highlight); "
@@ -483,23 +488,28 @@ void OnConnectClick() {
                 "padding: 18px 28px; "
                 "min-height: 80px; "
             "}");
-        linkBtn->setStyleSheet(
+        const char* sideBtnStyle =
             "QPushButton { "
                 "padding: 12px 16px; "
                 "min-height: 70px; "
-            "}");
+            "}";
+        instantBtn->setStyleSheet(sideBtnStyle);
+        linkBtn   ->setStyleSheet(sideBtnStyle);
         // Pin button heights to match their stylesheet min-heights so the
         // QHBoxLayout's vertical sizeHint == its content's actual height.
         // Without this, Qt allocates the row extra vertical space (the
         // buttons' sizeHint exceeds their min-height when style padding
         // is factored in), which manifests as a gap between tip and row.
-        pmiBtn ->setMaximumHeight(80);
-        linkBtn->setMaximumHeight(70);
+        pmiBtn    ->setMaximumHeight(80);
+        instantBtn->setMaximumHeight(70);
+        linkBtn   ->setMaximumHeight(70);
 
-        QObject::connect(pmiBtn,  &QPushButton::clicked, &dlg,
+        QObject::connect(instantBtn, &QPushButton::clicked, &dlg,
                          [&]() { choice = 1; dlg.accept(); });
-        QObject::connect(linkBtn, &QPushButton::clicked, &dlg,
+        QObject::connect(pmiBtn,     &QPushButton::clicked, &dlg,
                          [&]() { choice = 2; dlg.accept(); });
+        QObject::connect(linkBtn,    &QPushButton::clicked, &dlg,
+                         [&]() { choice = 3; dlg.accept(); });
 
         QLabel* tipLabel = new QLabel(
             "<span style=\"color:gray;font-style:italic\">"
@@ -517,8 +527,10 @@ void OnConnectClick() {
         // this, the row anchors the buttons to its vertical center / bottom
         // even though row->setAlignment(Qt::AlignTop) below positions the
         // row itself. Per-widget alignment is what controls in-row anchoring.
-        row->addWidget(pmiBtn,  0, Qt::AlignTop);
-        row->addWidget(linkBtn, 0, Qt::AlignTop);
+        // Order: Instant (left) — PMI (center, emphasized) — Link (right).
+        row->addWidget(instantBtn, 0, Qt::AlignTop);
+        row->addWidget(pmiBtn,     0, Qt::AlignTop);
+        row->addWidget(linkBtn,    0, Qt::AlignTop);
         // Top-align the row so Qt doesn't dump excess vertical space
         // between the tip and the buttons. addLayout doesn't take an
         // alignment parameter, so set it on the row layout itself.
@@ -536,12 +548,55 @@ void OnConnectClick() {
         if (dlg.exec() != QDialog::Accepted || choice == 0) return;
     }
 
+    // ----- Create Instant Meeting branch -----
+    if (choice == 1) {
+        // Single dialog with just the display-name field (prefilled). No
+        // password — host doesn't enter their own meeting's password. No
+        // meeting input — the engine provisions a fresh meeting via REST.
+        QString instantName;
+        {
+            QDialog dlg(mainWindow);
+            dlg.setWindowTitle("Create Instant Meeting");
+
+            QLabel* nameLabel = new QLabel("Display name:", &dlg);
+            QLineEdit* nameEdit = new QLineEdit(
+                QString::fromStdString(g_userDisplayName), &dlg);
+
+            QDialogButtonBox* buttons = new QDialogButtonBox(
+                QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+            QObject::connect(buttons, &QDialogButtonBox::accepted,
+                             &dlg, &QDialog::accept);
+            QObject::connect(buttons, &QDialogButtonBox::rejected,
+                             &dlg, &QDialog::reject);
+
+            QVBoxLayout* layout = new QVBoxLayout(&dlg);
+            layout->addWidget(nameLabel);
+            layout->addWidget(nameEdit);
+            layout->addWidget(buttons);
+
+            if (dlg.exec() != QDialog::Accepted) return;
+            instantName = nameEdit->text().trimmed();
+        }
+
+        // Set the flag BEFORE sending the IPC — engine's meeting_joined
+        // reply could arrive on the read thread before SendToEngine even
+        // returns here, so the flag must be visible by then. (Reader is
+        // wired in commit 4.)
+        g_pendingInstantMeeting = true;
+        std::string msg = "{\"type\":\"create_instant_meeting\","
+                          "\"display_name\":\""
+                          + jsonEscape(instantName) + "\"}";
+        feeds::SendToEngine(msg);
+        if (g_connectAction) g_connectAction->setEnabled(false);
+        return;
+    }
+
     QString input;
     QString password;
     QString displayName;
     bool    isPmi = false;
 
-    if (choice == 1) {
+    if (choice == 2) {
         if (g_userPMI.empty()) {
             MessageBoxA(NULL,
                 "Could not retrieve your Personal Meeting Room ID.\n"
