@@ -247,6 +247,92 @@ std::string ZoomApiGet(const std::wstring& path) {
 }
 
 // ---------------------------------------------------------------------------
+// Authenticated POST to api.zoom.us with a JSON body. Mirrors ZoomApiGet's
+// 401 → refresh → retry-once semantics and session-expired notification.
+// Returns the response body on success, or empty on session-expired.
+//
+// Non-401 4xx/5xx responses return the body unchanged so the caller can
+// surface the JSON error from Zoom (e.g. for a 403 with a missing-scope
+// message). Status code is intentionally not exposed — callers should
+// validate the response by parsing expected fields out of the body.
+// ---------------------------------------------------------------------------
+std::string ZoomApiPost(const std::wstring& path, const std::string& jsonBody) {
+    auto doRequest = [&]() -> std::string {
+        HINTERNET hSession = WinHttpOpen(L"Feeds/1.0",
+                                          WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                          WINHTTP_NO_PROXY_NAME,
+                                          WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!hSession) return "";
+        HINTERNET hConnect = WinHttpConnect(hSession, L"api.zoom.us",
+                                             INTERNET_DEFAULT_HTTPS_PORT, 0);
+        HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", path.c_str(),
+                                                 nullptr, WINHTTP_NO_REFERER,
+                                                 WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                                 WINHTTP_FLAG_SECURE);
+        std::wstring authHeader = L"Authorization: Bearer " +
+            std::wstring(g_accessToken.begin(), g_accessToken.end());
+        WinHttpAddRequestHeaders(hRequest, authHeader.c_str(),
+                                 (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
+        WinHttpAddRequestHeaders(hRequest,
+                                 L"Content-Type: application/json",
+                                 (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
+        WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                           (LPVOID)jsonBody.c_str(), (DWORD)jsonBody.size(),
+                           (DWORD)jsonBody.size(), 0);
+        WinHttpReceiveResponse(hRequest, nullptr);
+
+        DWORD statusCode = 0;
+        DWORD statusSize = sizeof(statusCode);
+        WinHttpQueryHeaders(hRequest,
+                            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            WINHTTP_HEADER_NAME_BY_INDEX,
+                            &statusCode, &statusSize,
+                            WINHTTP_NO_HEADER_INDEX);
+
+        std::string response;
+        char buf[4096];
+        DWORD bytesRead = 0;
+        while (WinHttpReadData(hRequest, buf, sizeof(buf) - 1, &bytesRead)
+               && bytesRead > 0) {
+            buf[bytesRead] = '\0';
+            response += buf;
+        }
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+
+        return std::to_string(statusCode) + "|" + response;
+    };
+
+    std::string result = doRequest();
+    size_t sep = result.find('|');
+    if (sep == std::string::npos) return "";
+    std::string status = result.substr(0, sep);
+    std::string body   = result.substr(sep + 1);
+
+    if (status == "401") {
+        LogToFile("API: POST got 401, attempting refresh");
+        if (RefreshAccessToken()) {
+            result = doRequest();
+            sep = result.find('|');
+            body = (sep == std::string::npos) ? "" : result.substr(sep + 1);
+        } else {
+            LogToFile("API: refresh failed, session expired");
+            SendToPlugin("{\"type\":\"session_expired\"}");
+            return "";
+        }
+    }
+
+    // Surface non-success status (403 missing-scope, 5xx, etc.) in the
+    // engine log. 200/201 are the happy paths; 401 already logged above.
+    if (status != "200" && status != "201" && status != "401") {
+        LogToFile(("API: POST got HTTP " + status).c_str());
+    }
+
+    return body;
+}
+
+// ---------------------------------------------------------------------------
 // Fetch user display name + PMI. Caches results in engine-side globals.
 // Called once after SDK auth succeeds (pre-fetch so Connect is snappy).
 // ---------------------------------------------------------------------------
