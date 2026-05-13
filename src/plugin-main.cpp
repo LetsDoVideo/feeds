@@ -464,6 +464,9 @@ void OnConnectClick() {
     {
         QDialog dlg(mainWindow);
         dlg.setWindowTitle("Connect to Zoom Meeting");
+        // Temporary: tint the dialog background so we can see which
+        // pixels of the rendered dialog belong to it vs. its children.
+        dlg.setStyleSheet("QDialog { background-color: lightblue; }");
 
         QString pmiLabel = "My Personal Meeting Room";
         if (!g_userPMI.empty())
@@ -511,6 +514,9 @@ void OnConnectClick() {
         // vertically to absorb spare space, which manifests as a big gap
         // between the tip and the buttons below it.
         tipLabel->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
+        // Temporary: visualize the tip label's painted region.
+        tipLabel->setStyleSheet(tipLabel->styleSheet() +
+                                " background-color: yellow;");
 
         QHBoxLayout* row = new QHBoxLayout();
         row->addWidget(pmiBtn);
@@ -527,12 +533,27 @@ void OnConnectClick() {
         // and having a real widget below the buttons anchors the layout
         // so Qt stops dumping all the slack between tip and buttons.
         QLabel* bottomSpacer = new QLabel("   ", &dlg);
+        // Temporary: visualize the bottom spacer's painted region.
+        bottomSpacer->setStyleSheet("background-color: pink;");
         layout->addWidget(tipLabel);
         layout->addSpacing(8);
         layout->addLayout(row);
         layout->addWidget(bottomSpacer);
 
-        if (dlg.exec() != QDialog::Accepted || choice == 0) return;
+        int execResult = dlg.exec();
+        // Temporary: log rendered dimensions alongside the colored
+        // backgrounds so the screenshot + log line together pinpoint
+        // exactly which region is absorbing the unexplained space.
+        blog(LOG_INFO,
+            "[feeds][layout-debug] dialog=%dx%d tip=%dx%d row=%dx%d "
+            "pmiBtn=%dx%d linkBtn=%dx%d bottomSpacer=%dx%d",
+            dlg.width(), dlg.height(),
+            tipLabel->width(), tipLabel->height(),
+            row->geometry().width(), row->geometry().height(),
+            pmiBtn->width(), pmiBtn->height(),
+            linkBtn->width(), linkBtn->height(),
+            bottomSpacer->width(), bottomSpacer->height());
+        if (execResult != QDialog::Accepted || choice == 0) return;
     }
 
     QString input;
