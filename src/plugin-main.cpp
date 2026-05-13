@@ -43,6 +43,8 @@
 #include <QHBoxLayout>
 #include <QUrl>
 #include <QUrlQuery>
+#include <QApplication>
+#include <QClipboard>
 
 // Qt defines `slots` and `signals` as preprocessor macros (expanding to
 // empty or to annotations for the Meta-Object Compiler). Any non-Qt code
@@ -1535,11 +1537,87 @@ static void RegisterEngineHandlers() {
         blog(LOG_INFO, "[feeds] meeting_joined: %s", mn.c_str());
         try { g_currentMeetingNumber = std::stoull(mn); }
         catch (...) { g_currentMeetingNumber = 0; }
-        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
-            g_isInMeeting = true;
-            if (g_connectAction) g_connectAction->setEnabled(false);
-            RefreshAllSourceProperties();
-        });
+
+        // Engine attaches join_url + password to meeting_joined ONLY for
+        // the instant-meeting Start() flow (regular Join paths omit them).
+        // Combined with the plugin-side g_pendingInstantMeeting flag, this
+        // tells us whether to show the share-this-meeting popup.
+        bool wasInstant = g_pendingInstantMeeting.exchange(false);
+        std::string joinUrl  = ExtractJsonString(json, "join_url");
+        std::string password = ExtractJsonString(json, "password");
+        unsigned long long meetingNum = g_currentMeetingNumber;
+
+        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
+            [wasInstant, meetingNum, joinUrl, password]() {
+                g_isInMeeting = true;
+                if (g_connectAction) g_connectAction->setEnabled(false);
+                RefreshAllSourceProperties();
+
+                if (!wasInstant || meetingNum == 0) return;
+
+                // Share-this-meeting popup: modal, self-cleaning. Gives
+                // the user the number + password + join URL with a
+                // one-click copy so they can share with viewers.
+                QMainWindow* main =
+                    (QMainWindow*)obs_frontend_get_main_window();
+                QDialog* dlg = new QDialog(main);
+                dlg->setAttribute(Qt::WA_DeleteOnClose);
+                dlg->setWindowTitle("Instant Meeting Started");
+                dlg->setWindowModality(Qt::ApplicationModal);
+
+                QString qJoinUrl  = QString::fromStdString(joinUrl);
+                QString qPassword = QString::fromStdString(password);
+
+                QLabel* numLabel = new QLabel(
+                    "<b>Meeting Number:</b> " +
+                    QString::number(meetingNum), dlg);
+                numLabel->setTextFormat(Qt::RichText);
+                numLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+
+                QLabel* pwdLabel = nullptr;
+                if (!qPassword.isEmpty()) {
+                    pwdLabel = new QLabel(
+                        "<b>Password:</b> " + qPassword, dlg);
+                    pwdLabel->setTextFormat(Qt::RichText);
+                    pwdLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+                }
+
+                QLabel* urlLabel = nullptr;
+                if (!qJoinUrl.isEmpty()) {
+                    urlLabel = new QLabel(
+                        "<b>Join URL:</b> <a href=\"" + qJoinUrl + "\">" +
+                        qJoinUrl + "</a>", dlg);
+                    urlLabel->setTextFormat(Qt::RichText);
+                    urlLabel->setTextInteractionFlags(Qt::TextBrowserInteraction);
+                    urlLabel->setOpenExternalLinks(true);
+                }
+
+                QPushButton* copyBtn = new QPushButton("Copy Link", dlg);
+                copyBtn->setEnabled(!qJoinUrl.isEmpty());
+                QObject::connect(copyBtn, &QPushButton::clicked, dlg,
+                    [copyBtn, qJoinUrl]() {
+                        QApplication::clipboard()->setText(qJoinUrl);
+                        copyBtn->setText("Copied!");
+                    });
+                QPushButton* okBtn = new QPushButton("OK", dlg);
+                okBtn->setDefault(true);
+                QObject::connect(okBtn, &QPushButton::clicked,
+                                 dlg, &QDialog::accept);
+
+                QHBoxLayout* btnRow = new QHBoxLayout();
+                btnRow->addWidget(copyBtn);
+                btnRow->addStretch();
+                btnRow->addWidget(okBtn);
+
+                QVBoxLayout* layout = new QVBoxLayout(dlg);
+                layout->addWidget(numLabel);
+                if (pwdLabel) layout->addWidget(pwdLabel);
+                if (urlLabel) layout->addWidget(urlLabel);
+                layout->addSpacing(8);
+                layout->addLayout(btnRow);
+
+                dlg->show();
+            });
     });
 
     feeds::RegisterMessageHandler("meeting_failed", [](const std::string& json) {
@@ -1547,6 +1625,10 @@ static void RegisterEngineHandlers() {
         std::string msg  = ExtractJsonString(json, "message");
         blog(LOG_ERROR, "[feeds] meeting_failed: code=%d, msg=%s",
              code, msg.c_str());
+
+        // Defensive: instant flow set the flag; meeting_joined would have
+        // cleared it on success, so on failure we need to.
+        g_pendingInstantMeeting = false;
 
         if (msg.empty())
             msg = "Failed to join meeting. Error code: " + std::to_string(code);
@@ -1562,6 +1644,8 @@ static void RegisterEngineHandlers() {
 
     feeds::RegisterMessageHandler("meeting_left", [](const std::string&) {
         blog(LOG_INFO, "[feeds] meeting_left");
+        // Defensive — already cleared in meeting_joined / meeting_failed.
+        g_pendingInstantMeeting = false;
 
         // Engine has torn down shared memory. Close our mappings to
         // keep things clean. Safe on this thread — no OBS API calls.

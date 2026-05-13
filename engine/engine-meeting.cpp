@@ -58,6 +58,15 @@ static unsigned int g_activeSpeakerUserId  = 0;
 static unsigned int g_activeSharerUserId   = 0;
 static unsigned int g_activeShareSourceId  = 0;
 
+// Populated by HandleCreateInstantMeeting from the REST response and
+// consumed (+ cleared) by onMeetingStatusChanged when MEETING_STATUS_INMEETING
+// fires, so they're attached to the meeting_joined IPC for the plugin's
+// share-this-meeting popup. Empty means "not an instant-meeting join"
+// — the regular Join() path leaves these untouched and the plugin sees
+// no extra fields in meeting_joined.
+static std::string  g_pendingInstantJoinUrl;
+static std::string  g_pendingInstantPassword;
+
 // ---------------------------------------------------------------------------
 // Accessors exposed to other engine translation units (engine-video.cpp
 // needs the meeting service to check IsVideoOn() on a prospective active
@@ -480,15 +489,32 @@ public:
             if (!g_meetingService) return;
 
             // Tell the plugin we're in. Meeting number is available from
-            // GetMeetingInfo().
+            // GetMeetingInfo(). For an instant-meeting Start() flow, the
+            // REST response's join_url + password are attached so the
+            // plugin can render its share-this-meeting popup. Regular
+            // Join() paths leave those globals empty and the fields are
+            // omitted from the payload.
             ZOOM_SDK_NAMESPACE::IMeetingInfo* info =
                 g_meetingService->GetMeetingInfo();
             unsigned long long meetingNumber = info ? info->GetMeetingNumber() : 0;
-            char joinMsg[256];
-            sprintf_s(joinMsg,
-                "{\"type\":\"meeting_joined\",\"meeting_number\":\"%llu\"}",
-                meetingNumber);
+
+            std::string joinMsg = "{\"type\":\"meeting_joined\","
+                                  "\"meeting_number\":\"" +
+                                  std::to_string(meetingNumber) + "\"";
+            if (!g_pendingInstantJoinUrl.empty()) {
+                joinMsg += ",\"join_url\":\"" +
+                           JsonEscape(g_pendingInstantJoinUrl) + "\"";
+            }
+            if (!g_pendingInstantPassword.empty()) {
+                joinMsg += ",\"password\":\"" +
+                           JsonEscape(g_pendingInstantPassword) + "\"";
+            }
+            joinMsg += "}";
             SendToPlugin(joinMsg);
+            // Consumed — clear so a subsequent non-instant Join doesn't
+            // see leftover fields.
+            g_pendingInstantJoinUrl.clear();
+            g_pendingInstantPassword.clear();
 
             // Send the initial participant list and wire up the
             // participants listener so the plugin's dropdown can refresh
@@ -909,11 +935,10 @@ void HandleCreateInstantMeeting(const std::string& json) {
                      "Check the engine log for details.\"}");
         return;
     }
-    // Consumed in commit 4 for the share-this-meeting popup. Engine-side
-    // state to plumb them into the IPC message gets added then; for now
-    // just suppress the unused-variable warning.
-    (void)meetingPassword;
-    (void)joinUrl;
+    // Stash for the meeting_joined IPC payload — onMeetingStatusChanged
+    // reads these when MEETING_STATUS_INMEETING fires and clears them.
+    g_pendingInstantJoinUrl  = joinUrl;
+    g_pendingInstantPassword = meetingPassword;
 
     // Step 2: enter the meeting as host via SDK Start(). Storage lifetimes
     // must outlive Start() — static, distinct names from the Join() statics
@@ -944,6 +969,11 @@ void HandleCreateInstantMeeting(const std::string& json) {
 
     ZOOM_SDK_NAMESPACE::SDKError startErr = g_meetingService->Start(startParam);
     if (startErr != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
+        // Clear the pending fields so they don't leak into a subsequent
+        // non-instant Join's meeting_joined payload.
+        g_pendingInstantJoinUrl.clear();
+        g_pendingInstantPassword.clear();
+
         char buf[256];
         sprintf_s(buf, "Meeting: Start() failed: %d", (int)startErr);
         LogToFile(buf);
