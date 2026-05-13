@@ -214,7 +214,6 @@ static void HandleLoginStart(const std::string& json)
 // Forward decls — defined in engine-meeting.cpp
 namespace feeds_engine {
     void HandleJoinMeeting(const std::string&);
-    void HandleCreateInstantMeeting(const std::string&);
     void HandleLeaveMeeting(const std::string&);
     void HandleGetParticipants(const std::string&);
     void HandleLogout(const std::string&);
@@ -304,7 +303,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     RegisterHandler("login_start",                    HandleLoginStart);
     RegisterHandler("logout",                         feeds_engine::HandleLogout);
     RegisterHandler("join_meeting",                   feeds_engine::HandleJoinMeeting);
-    RegisterHandler("create_instant_meeting",         feeds_engine::HandleCreateInstantMeeting);
     RegisterHandler("leave_meeting",                  feeds_engine::HandleLeaveMeeting);
     RegisterHandler("get_participants",               feeds_engine::HandleGetParticipants);
     RegisterHandler("participant_source_subscribe",   feeds_engine::HandleParticipantSourceSubscribe);

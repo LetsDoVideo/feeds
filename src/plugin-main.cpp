@@ -43,8 +43,6 @@
 #include <QHBoxLayout>
 #include <QUrl>
 #include <QUrlQuery>
-#include <QApplication>
-#include <QClipboard>
 
 // Qt defines `slots` and `signals` as preprocessor macros (expanding to
 // empty or to annotations for the Meta-Object Compiler). Any non-Qt code
@@ -93,12 +91,6 @@ static int         g_currentTier = 0;
 static uint32_t    g_enginePid   = 0;   // Populated from engine_ready
 
 static unsigned long long g_currentMeetingNumber = 0;
-
-// Set when the plugin sends create_instant_meeting, cleared on meeting_joined
-// (after the share-this-meeting popup fires), meeting_failed, and meeting_left.
-// Tells the meeting_joined handler that this join was an instant-meeting
-// creation so it knows to surface the meeting number for sharing.
-static std::atomic<bool> g_pendingInstantMeeting{false};
 static unsigned int       g_activeSharerUserId   = 0;
 static unsigned int       g_cachedMyUserId       = 0;
 static unsigned int       g_activeSpeakerUserId  = 0;
@@ -460,10 +452,14 @@ void OnConnectClick() {
         return out;
     };
 
-    // Three-button choice screen. PMI is centered and visually emphasized
-    // because it's the recommended path (you're host of your own room, no
-    // permission prompts). Captured `choice` discriminates the branches:
-    // 1 = Create Instant Meeting, 2 = PMI, 3 = Join by Number or Link.
+    // Two-button choice screen. PMI is visually emphasized as the
+    // recommended path (you're host of your own room, no permission
+    // prompts). Captured `choice` discriminates the branches:
+    // 1 = PMI, 2 = Join by Number or Link.
+    //
+    // A third "Create Instant Meeting" button is planned for v1.0.9 once
+    // the meeting:write:meeting OAuth scope is approved. The engine-side
+    // SDK Start() approach attempted in v1.0.8 won't work without it.
     int choice = 0;
     {
         QDialog dlg(mainWindow);
@@ -473,28 +469,30 @@ void OnConnectClick() {
         if (!g_userPMI.empty())
             pmiLabel += "\n(" + QString::fromStdString(g_userPMI) + ")";
 
-        QPushButton* instantBtn = new QPushButton("Create Instant\nMeeting", &dlg);
-        QPushButton* pmiBtn     = new QPushButton(pmiLabel, &dlg);
-        QPushButton* linkBtn    = new QPushButton("Join by Number\nor Link", &dlg);
+        QPushButton* pmiBtn  = new QPushButton(pmiLabel, &dlg);
+        QPushButton* linkBtn = new QPushButton("Join by Number\nor Link", &dlg);
 
-        // Emphasize PMI: highlight palette, bold, larger padding. The other
-        // two get a minimum height so the row feels balanced.
+        // min-height: multi-line labels + padding need vertical room or
+        // Qt crops the second line on some platforms. PMI gets extra room
+        // for its bigger padding.
         pmiBtn->setStyleSheet(
             "QPushButton { "
                 "background-color: palette(highlight); "
                 "color: palette(highlighted-text); "
                 "font-weight: bold; "
                 "padding: 18px 28px; "
+                "min-height: 80px; "
             "}");
-        instantBtn->setStyleSheet("QPushButton { padding: 12px 16px; }");
-        linkBtn   ->setStyleSheet("QPushButton { padding: 12px 16px; }");
+        linkBtn->setStyleSheet(
+            "QPushButton { "
+                "padding: 12px 16px; "
+                "min-height: 70px; "
+            "}");
 
-        QObject::connect(instantBtn, &QPushButton::clicked, &dlg,
+        QObject::connect(pmiBtn,  &QPushButton::clicked, &dlg,
                          [&]() { choice = 1; dlg.accept(); });
-        QObject::connect(pmiBtn,     &QPushButton::clicked, &dlg,
+        QObject::connect(linkBtn, &QPushButton::clicked, &dlg,
                          [&]() { choice = 2; dlg.accept(); });
-        QObject::connect(linkBtn,    &QPushButton::clicked, &dlg,
-                         [&]() { choice = 3; dlg.accept(); });
 
         QLabel* tipLabel = new QLabel(
             "<span style=\"color:gray;font-style:italic\">"
@@ -505,7 +503,6 @@ void OnConnectClick() {
         tipLabel->setAlignment(Qt::AlignCenter);
 
         QHBoxLayout* row = new QHBoxLayout();
-        row->addWidget(instantBtn);
         row->addWidget(pmiBtn);
         row->addWidget(linkBtn);
 
@@ -517,50 +514,12 @@ void OnConnectClick() {
         if (dlg.exec() != QDialog::Accepted || choice == 0) return;
     }
 
-    // ----- Create Instant Meeting branch -----
-    if (choice == 1) {
-        // Just the display-name field — no password, no meeting input. The
-        // engine creates a fresh instant meeting and the user is the host.
-        QString instantName;
-        {
-            QDialog dlg(mainWindow);
-            dlg.setWindowTitle("Create Instant Meeting");
-
-            QLabel* nameLabel = new QLabel("Display name (optional):", &dlg);
-            QLineEdit* nameEdit = new QLineEdit(&dlg);
-            nameEdit->setPlaceholderText("Leave blank to use your Zoom name");
-
-            QDialogButtonBox* buttons = new QDialogButtonBox(
-                QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
-            QObject::connect(buttons, &QDialogButtonBox::accepted,
-                             &dlg, &QDialog::accept);
-            QObject::connect(buttons, &QDialogButtonBox::rejected,
-                             &dlg, &QDialog::reject);
-
-            QVBoxLayout* layout = new QVBoxLayout(&dlg);
-            layout->addWidget(nameLabel);
-            layout->addWidget(nameEdit);
-            layout->addWidget(buttons);
-
-            if (dlg.exec() != QDialog::Accepted) return;
-            instantName = nameEdit->text().trimmed();
-        }
-
-        g_pendingInstantMeeting = true;
-        std::string msg = "{\"type\":\"create_instant_meeting\","
-                          "\"display_name\":\""
-                          + jsonEscape(instantName) + "\"}";
-        feeds::SendToEngine(msg);
-        if (g_connectAction) g_connectAction->setEnabled(false);
-        return;
-    }
-
     QString input;
     QString password;
     QString displayName;
     bool    isPmi = false;
 
-    if (choice == 2) {
+    if (choice == 1) {
         if (g_userPMI.empty()) {
             MessageBoxA(NULL,
                 "Could not retrieve your Personal Meeting Room ID.\n"
@@ -579,10 +538,9 @@ void OnConnectClick() {
         QLabel* pwdLabel = new QLabel(
             "Enter your PMI password (leave blank if none):", &dlg);
         QLineEdit* pwdEdit = new QLineEdit(&dlg);
-        QLabel* nameLabel = new QLabel(
-            "Display name (optional):", &dlg);
-        QLineEdit* nameEdit = new QLineEdit(&dlg);
-        nameEdit->setPlaceholderText("Leave blank to use your Zoom name");
+        QLabel* nameLabel = new QLabel("Display name:", &dlg);
+        QLineEdit* nameEdit = new QLineEdit(
+            QString::fromStdString(g_userDisplayName), &dlg);
 
         QDialogButtonBox* buttons = new QDialogButtonBox(
             QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
@@ -613,10 +571,9 @@ void OnConnectClick() {
         QLabel* pwdLabel = new QLabel(
             "Meeting password (leave blank if none):", &dlg);
         QLineEdit* pwdEdit = new QLineEdit(&dlg);
-        QLabel* nameLabel = new QLabel(
-            "Display name (optional):", &dlg);
-        QLineEdit* nameEdit = new QLineEdit(&dlg);
-        nameEdit->setPlaceholderText("Leave blank to use your Zoom name");
+        QLabel* nameLabel = new QLabel("Display name:", &dlg);
+        QLineEdit* nameEdit = new QLineEdit(
+            QString::fromStdString(g_userDisplayName), &dlg);
 
         QDialogButtonBox* buttons = new QDialogButtonBox(
             QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
@@ -1501,68 +1458,11 @@ static void RegisterEngineHandlers() {
         blog(LOG_INFO, "[feeds] meeting_joined: %s", mn.c_str());
         try { g_currentMeetingNumber = std::stoull(mn); }
         catch (...) { g_currentMeetingNumber = 0; }
-
-        bool wasInstant = g_pendingInstantMeeting.exchange(false);
-        unsigned long long meetingNum = g_currentMeetingNumber;
-
-        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
-            [wasInstant, meetingNum]() {
-                g_isInMeeting = true;
-                if (g_connectAction) g_connectAction->setEnabled(false);
-                RefreshAllSourceProperties();
-
-                if (!wasInstant || meetingNum == 0) return;
-
-                // Share-this-meeting popup: shown only for instant-meeting
-                // creation. Gives the user the number and a one-click way
-                // to grab the join URL to send to their viewers.
-                QMainWindow* main =
-                    (QMainWindow*)obs_frontend_get_main_window();
-                QDialog* dlg = new QDialog(main);
-                dlg->setAttribute(Qt::WA_DeleteOnClose);
-                dlg->setWindowTitle("Instant Meeting Started");
-                dlg->setWindowModality(Qt::ApplicationModal);
-
-                QString joinUrl =
-                    QString("https://zoom.us/j/%1").arg(meetingNum);
-                QString numFormatted = QString::number(meetingNum);
-
-                QLabel* numLabel = new QLabel(
-                    "<b>Meeting Number:</b> " + numFormatted, dlg);
-                numLabel->setTextFormat(Qt::RichText);
-                numLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
-
-                QLabel* urlLabel = new QLabel(
-                    "<b>Join URL:</b> <a href=\"" + joinUrl + "\">" +
-                    joinUrl + "</a>", dlg);
-                urlLabel->setTextFormat(Qt::RichText);
-                urlLabel->setTextInteractionFlags(Qt::TextBrowserInteraction);
-                urlLabel->setOpenExternalLinks(true);
-
-                QPushButton* copyBtn = new QPushButton("Copy Link", dlg);
-                QObject::connect(copyBtn, &QPushButton::clicked, dlg,
-                    [copyBtn, joinUrl]() {
-                        QApplication::clipboard()->setText(joinUrl);
-                        copyBtn->setText("Copied!");
-                    });
-                QPushButton* okBtn = new QPushButton("OK", dlg);
-                okBtn->setDefault(true);
-                QObject::connect(okBtn, &QPushButton::clicked,
-                                 dlg, &QDialog::accept);
-
-                QHBoxLayout* btnRow = new QHBoxLayout();
-                btnRow->addWidget(copyBtn);
-                btnRow->addStretch();
-                btnRow->addWidget(okBtn);
-
-                QVBoxLayout* layout = new QVBoxLayout(dlg);
-                layout->addWidget(numLabel);
-                layout->addWidget(urlLabel);
-                layout->addSpacing(8);
-                layout->addLayout(btnRow);
-
-                dlg->show();
-            });
+        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
+            g_isInMeeting = true;
+            if (g_connectAction) g_connectAction->setEnabled(false);
+            RefreshAllSourceProperties();
+        });
     });
 
     feeds::RegisterMessageHandler("meeting_failed", [](const std::string& json) {
@@ -1570,8 +1470,6 @@ static void RegisterEngineHandlers() {
         std::string msg  = ExtractJsonString(json, "message");
         blog(LOG_ERROR, "[feeds] meeting_failed: code=%d, msg=%s",
              code, msg.c_str());
-
-        g_pendingInstantMeeting = false;
 
         if (msg.empty())
             msg = "Failed to join meeting. Error code: " + std::to_string(code);
@@ -1587,7 +1485,6 @@ static void RegisterEngineHandlers() {
 
     feeds::RegisterMessageHandler("meeting_left", [](const std::string&) {
         blog(LOG_INFO, "[feeds] meeting_left");
-        g_pendingInstantMeeting = false;
 
         // Engine has torn down shared memory. Close our mappings to
         // keep things clean. Safe on this thread — no OBS API calls.
