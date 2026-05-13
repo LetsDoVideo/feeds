@@ -464,6 +464,9 @@ void OnConnectClick() {
     {
         QDialog dlg(mainWindow);
         dlg.setWindowTitle("Connect to Zoom Meeting");
+        // Temporary: tint the dialog background so the screenshot
+        // correlates with the per-item geometry log below.
+        dlg.setStyleSheet("QDialog { background-color: lightblue; }");
 
         QString pmiLabel = "My Personal Meeting Room";
         if (!g_userPMI.empty())
@@ -511,6 +514,9 @@ void OnConnectClick() {
         // vertically to absorb spare space, which manifests as a big gap
         // between the tip and the buttons below it.
         tipLabel->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
+        // Temporary: visualize the tip label's painted region.
+        tipLabel->setStyleSheet(tipLabel->styleSheet() +
+                                " background-color: yellow;");
 
         QHBoxLayout* row = new QHBoxLayout();
         row->addWidget(pmiBtn);
@@ -527,6 +533,8 @@ void OnConnectClick() {
         // and having a real widget below the buttons anchors the layout
         // so Qt stops dumping all the slack between tip and buttons.
         QLabel* bottomSpacer = new QLabel("   ", &dlg);
+        // Temporary: visualize the bottom spacer's painted region.
+        bottomSpacer->setStyleSheet("background-color: pink;");
         // SetFixedSize sizes the dialog to exactly the layout's sizeHint
         // with no slack — this is what eliminates the gap that
         // SetMinimumSize couldn't, because the dialog's natural sizeHint
@@ -537,7 +545,26 @@ void OnConnectClick() {
         layout->addLayout(row);
         layout->addWidget(bottomSpacer);
 
-        if (dlg.exec() != QDialog::Accepted || choice == 0) return;
+        int execResult = dlg.exec();
+        // Temporary: walk every item in the QVBoxLayout and log its
+        // rendered geometry — pinpoints which item is contributing the
+        // unexplained vertical band. widget/layout/spacer pointers let
+        // us identify the item type (only one of the three is non-null
+        // per item per Qt convention).
+        blog(LOG_INFO, "[feeds][layout-debug] === layout items ===");
+        for (int i = 0; i < layout->count(); i++) {
+            QLayoutItem* item = layout->itemAt(i);
+            QRect g = item->geometry();
+            QWidget* w = item->widget();
+            QLayout* l = item->layout();
+            QSpacerItem* s = item->spacerItem();
+            blog(LOG_INFO,
+                "[feeds][layout-debug] item %d: geometry=%dx%d at (%d,%d) "
+                "widget=%p layout=%p spacer=%p",
+                i, g.width(), g.height(), g.x(), g.y(),
+                (void*)w, (void*)l, (void*)s);
+        }
+        if (execResult != QDialog::Accepted || choice == 0) return;
     }
 
     QString input;
