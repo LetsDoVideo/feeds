@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cstring>
 #include <windows.h>
+#include <winhttp.h>
 
 #include <QMainWindow>
 #include <QMenuBar>
@@ -45,6 +46,7 @@
 #include <QUrlQuery>
 #include <QApplication>
 #include <QClipboard>
+#include <QDesktopServices>
 
 // Qt defines `slots` and `signals` as preprocessor macros (expanding to
 // empty or to annotations for the Meta-Object Compiler). Any non-Qt code
@@ -187,6 +189,183 @@ static long long ExtractJsonNumber(const std::string& json, const std::string& k
     std::string numStr = json.substr(pos, end == std::string::npos
                                           ? std::string::npos : end - pos);
     try { return std::stoll(numStr); } catch (...) { return 0; }
+}
+
+// ---------------------------------------------------------------------------
+// Update check — polls GitHub Releases on plugin load, surfaces a one-time
+// modal popup when a newer Feeds version is available. Failure-silent: any
+// network/parse/rate-limit error just suppresses the popup, never blocks
+// startup or shows an error. One popup per OBS session; the user sees it
+// again on the next OBS start until they update.
+// ---------------------------------------------------------------------------
+static std::atomic<bool> g_updatePopupShown{false};
+static std::thread       g_updateCheckThread;
+
+static bool ParseSemver(const std::string& s, int& maj, int& min, int& patch) {
+    std::string v = s;
+    if (!v.empty() && (v[0] == 'v' || v[0] == 'V')) v.erase(0, 1);
+
+    size_t dot1 = v.find('.');
+    if (dot1 == std::string::npos) return false;
+    size_t dot2 = v.find('.', dot1 + 1);
+    if (dot2 == std::string::npos) return false;
+
+    try {
+        maj   = std::stoi(v.substr(0, dot1));
+        min   = std::stoi(v.substr(dot1 + 1, dot2 - dot1 - 1));
+        patch = std::stoi(v.substr(dot2 + 1));
+    } catch (...) {
+        return false;
+    }
+    return maj >= 0 && min >= 0 && patch >= 0;
+}
+
+static bool IsNewer(const std::string& latest, const std::string& current) {
+    int lM, lm, lp, cM, cm, cp;
+    if (!ParseSemver(latest,  lM, lm, lp)) return false;
+    if (!ParseSemver(current, cM, cm, cp)) return false;
+    if (lM != cM) return lM > cM;
+    if (lm != cm) return lm > cm;
+    return lp > cp;
+}
+
+// One-shot GET against api.github.com. Returns response body on HTTP 200,
+// empty string on any failure. Mirrors the engine's WinHTTP pattern
+// (engine/engine-api.cpp::FetchAndApplyEntitlement). Tight timeouts so
+// plugin unload never waits more than a few seconds for this to finish.
+static std::string FetchGitHubLatestRelease() {
+    HINTERNET hSession = WinHttpOpen(
+        L"Feeds-OBS-Plugin/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return "";
+
+    WinHttpSetTimeouts(hSession, 5000, 5000, 5000, 5000);
+
+    HINTERNET hConnect = WinHttpConnect(hSession, L"api.github.com",
+                                        INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConnect) {
+        WinHttpCloseHandle(hSession);
+        return "";
+    }
+
+    HINTERNET hRequest = WinHttpOpenRequest(
+        hConnect, L"GET",
+        L"/repos/LetsDoVideo/feeds/releases/latest",
+        nullptr, WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES,
+        WINHTTP_FLAG_SECURE);
+    if (!hRequest) {
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return "";
+    }
+
+    WinHttpAddRequestHeaders(hRequest,
+        L"Accept: application/vnd.github+json",
+        (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
+
+    std::string response;
+    BOOL sentOk = WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS,
+                                     0, nullptr, 0, 0, 0);
+    if (sentOk && WinHttpReceiveResponse(hRequest, nullptr)) {
+        DWORD status = 0;
+        DWORD statusSize = sizeof(status);
+        WinHttpQueryHeaders(hRequest,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX,
+            &status, &statusSize, WINHTTP_NO_HEADER_INDEX);
+
+        if (status == 200) {
+            char buf[4096];
+            DWORD bytesRead = 0;
+            while (WinHttpReadData(hRequest, buf, sizeof(buf), &bytesRead)
+                   && bytesRead > 0) {
+                response.append(buf, bytesRead);
+            }
+        }
+    }
+
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+    return response;
+}
+
+// Must run on the Qt main thread.
+static void ShowUpdatePopup(const std::string& latestVer) {
+    QMainWindow* main = (QMainWindow*)obs_frontend_get_main_window();
+    QDialog* dlg = new QDialog(main);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    dlg->setWindowTitle("Feeds Update Available");
+    dlg->setWindowModality(Qt::ApplicationModal);
+
+    QLabel* intro = new QLabel(
+        "A new version of Feeds is available.", dlg);
+
+    QLabel* curLabel = new QLabel(
+        QString("<b>Current version:</b> ") + feeds_shared::VERSION, dlg);
+    curLabel->setTextFormat(Qt::RichText);
+    curLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+
+    QLabel* latestLabel = new QLabel(
+        QString("<b>Latest version:</b> ") +
+        QString::fromStdString(latestVer), dlg);
+    latestLabel->setTextFormat(Qt::RichText);
+    latestLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+
+    QPushButton* notesBtn = new QPushButton("View Release Notes", dlg);
+    QObject::connect(notesBtn, &QPushButton::clicked, dlg, [dlg]() {
+        QDesktopServices::openUrl(
+            QUrl("https://github.com/LetsDoVideo/feeds/releases"));
+        dlg->accept();
+    });
+
+    QPushButton* laterBtn = new QPushButton("Later", dlg);
+    laterBtn->setDefault(true);
+    QObject::connect(laterBtn, &QPushButton::clicked,
+                     dlg, &QDialog::accept);
+
+    QHBoxLayout* btnRow = new QHBoxLayout();
+    btnRow->addWidget(notesBtn);
+    btnRow->addStretch();
+    btnRow->addWidget(laterBtn);
+
+    QVBoxLayout* layout = new QVBoxLayout(dlg);
+    layout->addWidget(intro);
+    layout->addSpacing(4);
+    layout->addWidget(curLabel);
+    layout->addWidget(latestLabel);
+    layout->addSpacing(8);
+    layout->addLayout(btnRow);
+
+    dlg->show();
+}
+
+static void CheckForUpdateAsync() {
+    if (g_updatePopupShown.load()) return;
+
+    g_updateCheckThread = std::thread([]() {
+        std::string json = FetchGitHubLatestRelease();
+        if (json.empty()) return;
+
+        std::string tag = ExtractJsonString(json, "tag_name");
+        if (tag.empty()) return;
+
+        if (!IsNewer(tag, feeds_shared::VERSION)) return;
+
+        if (g_updatePopupShown.exchange(true)) return;
+
+        std::string displayTag = tag;
+        if (!displayTag.empty() &&
+            (displayTag[0] == 'v' || displayTag[0] == 'V'))
+            displayTag.erase(0, 1);
+
+        QTimer::singleShot(0,
+            (QObject*)obs_frontend_get_main_window(),
+            [displayTag]() { ShowUpdatePopup(displayTag); });
+    });
 }
 
 static void RefreshAllSourceProperties() {
@@ -1961,6 +2140,9 @@ bool obs_module_load(void) {
     obs_frontend_add_event_callback([](enum obs_frontend_event event, void*) {
         if (event == OBS_FRONTEND_EVENT_FINISHED_LOADING) {
             SetupPluginMenu();
+            QTimer::singleShot(5000,
+                (QObject*)obs_frontend_get_main_window(),
+                []() { CheckForUpdateAsync(); });
         }
     }, nullptr);
 
@@ -1972,5 +2154,6 @@ void obs_module_unload(void) {
     if (sh) {
         signal_handler_disconnect(sh, "source_create", OnSourceCreated, nullptr);
     }
+    if (g_updateCheckThread.joinable()) g_updateCheckThread.join();
     feeds::StopEngine();
 }
