@@ -640,9 +640,11 @@ void OnConnectClick() {
         return out;
     };
 
-    // Three-button choice screen. PMI is visually emphasized in the center
-    // as the recommended path (you're host of your own room, no permission
-    // prompts). Captured `choice` discriminates the branches:
+    // Two-row choice screen. Top row groups the two "host your own meeting"
+    // paths (Instant + PMI) — both put the user in as host with no permission
+    // prompt and get equal emphasis. Bottom row holds the "join someone
+    // else's meeting" path in the demoted secondary style. Captured `choice`
+    // discriminates the branches:
     // 1 = Create Instant Meeting, 2 = PMI, 3 = Join by Number or Link.
     int choice = 0;
     {
@@ -657,32 +659,33 @@ void OnConnectClick() {
         QPushButton* pmiBtn     = new QPushButton(pmiLabel, &dlg);
         QPushButton* linkBtn    = new QPushButton("Join by Number\nor Link", &dlg);
 
-        // min-height: multi-line labels + padding need vertical room or
-        // Qt crops the second line on some platforms. PMI gets extra room
-        // for its bigger padding. Instant + Link share the same sizing so
-        // the row feels balanced around the emphasized center button.
-        pmiBtn->setStyleSheet(
+        // min-height: multi-line labels + padding need vertical room or Qt
+        // crops the second line on some platforms. Both top-row buttons use
+        // the emphasized style with the larger padding → 80px. Link uses
+        // the compact secondary style → 70px.
+        const char* emphasizedBtnStyle =
             "QPushButton { "
                 "background-color: palette(highlight); "
                 "color: palette(highlighted-text); "
                 "font-weight: bold; "
                 "padding: 18px 28px; "
                 "min-height: 80px; "
-            "}");
-        const char* sideBtnStyle =
+            "}";
+        const char* secondaryBtnStyle =
             "QPushButton { "
                 "padding: 12px 16px; "
                 "min-height: 70px; "
             "}";
-        instantBtn->setStyleSheet(sideBtnStyle);
-        linkBtn   ->setStyleSheet(sideBtnStyle);
+        instantBtn->setStyleSheet(emphasizedBtnStyle);
+        pmiBtn    ->setStyleSheet(emphasizedBtnStyle);
+        linkBtn   ->setStyleSheet(secondaryBtnStyle);
         // Pin button heights to match their stylesheet min-heights so the
         // QHBoxLayout's vertical sizeHint == its content's actual height.
         // Without this, Qt allocates the row extra vertical space (the
         // buttons' sizeHint exceeds their min-height when style padding
         // is factored in), which manifests as a gap between tip and row.
+        instantBtn->setMaximumHeight(80);
         pmiBtn    ->setMaximumHeight(80);
-        instantBtn->setMaximumHeight(70);
         linkBtn   ->setMaximumHeight(70);
 
         QObject::connect(instantBtn, &QPushButton::clicked, &dlg,
@@ -703,19 +706,24 @@ void OnConnectClick() {
         // between the tip and the buttons below it.
         tipLabel->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
 
-        QHBoxLayout* row = new QHBoxLayout();
-        // Top-align each button within the row's allocated rect — without
-        // this, the row anchors the buttons to its vertical center / bottom
-        // even though row->setAlignment(Qt::AlignTop) below positions the
-        // row itself. Per-widget alignment is what controls in-row anchoring.
-        // Order: Instant (left) — PMI (center, emphasized) — Link (right).
-        row->addWidget(instantBtn, 0, Qt::AlignTop);
-        row->addWidget(pmiBtn,     0, Qt::AlignTop);
-        row->addWidget(linkBtn,    0, Qt::AlignTop);
-        // Top-align the row so Qt doesn't dump excess vertical space
-        // between the tip and the buttons. addLayout doesn't take an
-        // alignment parameter, so set it on the row layout itself.
-        row->setAlignment(Qt::AlignTop);
+        // Top row — the two "host your own meeting" paths, equal emphasis.
+        // Per-widget Qt::AlignTop anchors each button to the top of the row's
+        // allocated rect; row->setAlignment(Qt::AlignTop) positions the row
+        // itself within the parent VBox. Both are needed (per the v1.0.8
+        // debug session) to keep Qt from injecting vertical dead space.
+        QHBoxLayout* topRow = new QHBoxLayout();
+        topRow->addWidget(instantBtn, 0, Qt::AlignTop);
+        topRow->addWidget(pmiBtn,     0, Qt::AlignTop);
+        topRow->setAlignment(Qt::AlignTop);
+
+        // Bottom row — the "join someone else's meeting" path, centered with
+        // stretch on both sides so the button keeps its natural size rather
+        // than spanning the row's full width.
+        QHBoxLayout* bottomRow = new QHBoxLayout();
+        bottomRow->addStretch();
+        bottomRow->addWidget(linkBtn, 0, Qt::AlignTop);
+        bottomRow->addStretch();
+        bottomRow->setAlignment(Qt::AlignTop);
 
         QVBoxLayout* layout = new QVBoxLayout(&dlg);
         // SetFixedSize sizes the dialog to exactly the layout's sizeHint
@@ -724,7 +732,8 @@ void OnConnectClick() {
         layout->setSizeConstraint(QLayout::SetFixedSize);
         layout->addWidget(tipLabel);
         layout->addSpacing(8);
-        layout->addLayout(row);
+        layout->addLayout(topRow);
+        layout->addLayout(bottomRow);
 
         if (dlg.exec() != QDialog::Accepted || choice == 0) return;
     }
