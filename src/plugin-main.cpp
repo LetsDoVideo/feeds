@@ -688,6 +688,16 @@ void OnConnectClick() {
         pmiBtn    ->setMaximumHeight(80);
         linkBtn   ->setMaximumHeight(70);
 
+        // Both emphasized buttons get the same minimum width so they render
+        // at equal sizes regardless of their text content lengths. Without
+        // this, QPushButton sizes each button to fit its own label, which
+        // makes PMI (long account name + meeting number) much wider than
+        // Instant Meeting. The minimum is sized to comfortably fit
+        // "My Personal Meeting Room" plus padding — the longest expected
+        // label.
+        instantBtn->setMinimumWidth(240);
+        pmiBtn    ->setMinimumWidth(240);
+
         QObject::connect(instantBtn, &QPushButton::clicked, &dlg,
                          [&]() { choice = 1; dlg.accept(); });
         QObject::connect(pmiBtn,     &QPushButton::clicked, &dlg,
