@@ -663,6 +663,9 @@ void OnConnectClick() {
         // crops the second line on some platforms. Both top-row buttons use
         // the emphasized style with the larger padding → 80px. Link uses
         // the compact secondary style → 70px.
+        // Transparent border in the base state reserves space so the button
+        // doesn't grow by 2px when the hover border appears — without this
+        // reservation, Qt would re-layout on hover, jittering the row.
         const char* emphasizedBtnStyle =
             "QPushButton { "
                 "background-color: palette(highlight); "
@@ -670,6 +673,10 @@ void OnConnectClick() {
                 "font-weight: bold; "
                 "padding: 18px 28px; "
                 "min-height: 80px; "
+                "border: 1px solid transparent; "
+            "} "
+            "QPushButton:hover { "
+                "border: 1px solid palette(highlighted-text); "
             "}";
         const char* secondaryBtnStyle =
             "QPushButton { "
@@ -697,6 +704,15 @@ void OnConnectClick() {
         // label.
         instantBtn->setMinimumWidth(240);
         pmiBtn    ->setMinimumWidth(240);
+
+        // Mouse-driven dialog — disable keyboard focus on all three buttons
+        // so the initially-focused button doesn't render with a focus border
+        // that looks identical to a hover border (made Instant appear "stuck
+        // highlighted" until OBS lost Windows focus). Esc-to-cancel still
+        // works because that's handled by the QDialog itself, not the buttons.
+        instantBtn->setFocusPolicy(Qt::NoFocus);
+        pmiBtn    ->setFocusPolicy(Qt::NoFocus);
+        linkBtn   ->setFocusPolicy(Qt::NoFocus);
 
         QObject::connect(instantBtn, &QPushButton::clicked, &dlg,
                          [&]() { choice = 1; dlg.accept(); });
