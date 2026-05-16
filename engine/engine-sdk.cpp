@@ -18,6 +18,7 @@ bool FetchUserInfo();
 void FetchAndApplyEntitlement();
 const std::string& GetUserDisplayName();
 const std::string& GetUserPMI();
+const std::string& GetUserEmail();
 int                GetCurrentTier();
 
 // From engine-meeting.cpp

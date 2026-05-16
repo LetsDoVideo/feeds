@@ -34,6 +34,7 @@ std::string       ZoomApiGet(const std::wstring& path);
 std::string       FetchZak();
 const std::string& GetUserDisplayName();
 const std::string& GetUserPMI();
+const std::string& GetUserEmail();
 bool              CreateInstantMeeting(const std::string& topic,
                                        unsigned long long& outId,
                                        std::string& outPassword,

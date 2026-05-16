@@ -27,6 +27,7 @@ static std::string g_accessToken;
 static std::string g_refreshToken;
 static std::string g_userDisplayName;
 static std::string g_userPMI;
+static std::string g_userEmail;
 static int         g_currentTier = 0;   // 0 = Free until proven otherwise
 
 // ---------------------------------------------------------------------------
@@ -35,6 +36,7 @@ static int         g_currentTier = 0;   // 0 = Free until proven otherwise
 const std::string& GetAccessToken()     { return g_accessToken; }
 const std::string& GetUserDisplayName() { return g_userDisplayName; }
 const std::string& GetUserPMI()         { return g_userPMI; }
+const std::string& GetUserEmail()       { return g_userEmail; }
 int                GetCurrentTier()     { return g_currentTier; }
 
 void SetAccessToken(const std::string& t)  { g_accessToken  = t; }
@@ -45,6 +47,7 @@ void ClearUserInfo() {
     g_refreshToken.clear();
     g_userDisplayName.clear();
     g_userPMI.clear();
+    g_userEmail.clear();
     g_currentTier = 0;
 }
 
@@ -421,10 +424,12 @@ bool FetchUserInfo() {
         name = JsonExtractString(response, "first_name");
     g_userDisplayName = name;
     g_userPMI         = JsonExtractNumber(response, "pmi");
+    g_userEmail       = JsonExtractString(response, "email");
 
     char msg[512];
-    sprintf_s(msg, "API: FetchUserInfo got name='%s', pmi='%s'",
-              g_userDisplayName.c_str(), g_userPMI.c_str());
+    sprintf_s(msg, "API: FetchUserInfo got name='%s', pmi='%s', email_present=%d",
+              g_userDisplayName.c_str(), g_userPMI.c_str(),
+              g_userEmail.empty() ? 0 : 1);
     LogToFile(msg);
 
     return !g_userDisplayName.empty();
