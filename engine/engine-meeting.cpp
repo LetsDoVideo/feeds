@@ -657,6 +657,16 @@ public:
             g_pendingInstantJoinUrl.clear();
             g_pendingInstantPassword.clear();
 
+            // Diagnostic logs: meeting type and local user role. Useful
+            // for confirming webinar joins succeed and identifying the
+            // role we got. Fire for every meeting, regardless of type.
+            if (info) {
+                char buf[128];
+                sprintf_s(buf, "Meeting: type=%d (1=normal, 2=webinar, 3=breakout)",
+                          (int)info->GetMeetingType());
+                LogToFile(buf);
+            }
+
             // Send the initial participant list and wire up the
             // participants listener so the plugin's dropdown can refresh
             // live on user join/leave/rename. Done here at meeting-join
@@ -665,6 +675,14 @@ public:
             ZOOM_SDK_NAMESPACE::IMeetingParticipantsController* pc =
                 g_meetingService->GetMeetingParticipantsController();
             if (pc) {
+                auto* me = pc->GetMySelfUser();
+                if (me) {
+                    char buf[128];
+                    sprintf_s(buf, "Meeting: local user role=%d "
+                                   "(1=host, 2=cohost, 3=panelist, 5=attendee)",
+                              (int)me->GetUserRole());
+                    LogToFile(buf);
+                }
                 SendParticipantList();
                 pc->SetEvent(&g_participantsListener);
             } else {
@@ -779,6 +797,33 @@ public:
                                   "\"code\":" + std::to_string(iResult) + ","
                                   "\"message\":\"" + escaped + "\"}";
             SendToPlugin(failMsg);
+        }
+
+        if (status == ZOOM_SDK_NAMESPACE::MEETING_STATUS_WEBINAR_PROMOTE) {
+            LogToFile("Meeting: WEBINAR_PROMOTE — local user promoted to panelist");
+            if (g_meetingService) {
+                ZOOM_SDK_NAMESPACE::IMeetingParticipantsController* pc =
+                    g_meetingService->GetMeetingParticipantsController();
+                if (pc) {
+                    auto* me = pc->GetMySelfUser();
+                    if (me) {
+                        char buf[128];
+                        sprintf_s(buf, "Meeting: post-promote role=%d",
+                                  (int)me->GetUserRole());
+                        LogToFile(buf);
+                    }
+                    SendParticipantList();
+                }
+            }
+        }
+
+        if (status == ZOOM_SDK_NAMESPACE::MEETING_STATUS_WEBINAR_DEPROMOTE) {
+            LogToFile("Meeting: WEBINAR_DEPROMOTE — local user demoted to attendee");
+            if (g_meetingService) {
+                ZOOM_SDK_NAMESPACE::IMeetingParticipantsController* pc =
+                    g_meetingService->GetMeetingParticipantsController();
+                if (pc) SendParticipantList();
+            }
         }
     }
     virtual void onMeetingStatisticsWarningNotification(
