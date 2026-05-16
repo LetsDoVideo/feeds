@@ -18,6 +18,7 @@
 #include "meeting_service_interface.h"
 #include "auth_service_interface.h"
 #include "meeting_service_components/meeting_audio_interface.h"
+#include "meeting_service_components/meeting_configuration_interface.h"
 #include "meeting_service_components/meeting_participants_ctrl_interface.h"
 #include "meeting_service_components/meeting_live_stream_interface.h"
 #include "meeting_service_components/meeting_sharing_interface.h"
@@ -475,6 +476,145 @@ public:
 static ZoomLiveStreamListener g_liveStreamListener;
 
 // ---------------------------------------------------------------------------
+// Configuration listener — required for webinar joins. Without a subscribed
+// IMeetingConfigurationEvent, the SDK's webinar code path falls through to
+// MEETING_FAIL_UNKNOWN (65535) because callbacks like
+// onWebinarNeedRegisterNotification have nowhere to deliver.
+// ---------------------------------------------------------------------------
+class ZoomConfigurationListener
+    : public ZOOM_SDK_NAMESPACE::IMeetingConfigurationEvent {
+public:
+    // Set by HandleJoinMeeting before each Join() so the effective per-session
+    // name (possibly user-overridden) is what callbacks respond with.
+    void SetEffectiveDisplayName(const std::wstring& name) {
+        m_displayName = name;
+    }
+
+    virtual void onWebinarNeedRegisterNotification(
+        ZOOM_SDK_NAMESPACE::IWebinarNeedRegisterHandler* handler) override {
+        if (!handler) {
+            LogToFile("Config: onWebinarNeedRegisterNotification handler null");
+            return;
+        }
+        auto regType = handler->GetWebinarNeedRegisterType();
+        char buf[256];
+        sprintf_s(buf, "Config: onWebinarNeedRegisterNotification type=%d",
+                  (int)regType);
+        LogToFile(buf);
+
+        if (regType == ZOOM_SDK_NAMESPACE::IWebinarNeedRegisterHandler::
+                       WebinarReg_By_Email_and_DisplayName) {
+            auto* emailHandler = dynamic_cast<
+                ZOOM_SDK_NAMESPACE::IWebinarNeedRegisterHandlerByEmail*>(
+                    handler);
+            if (!emailHandler) {
+                LogToFile("Config: cast to IWebinarNeedRegisterHandlerByEmail failed");
+                return;
+            }
+            const std::string& email = GetUserEmail();
+            std::wstring wEmail = Utf8ToWide(email);
+            std::wstring wName  = EffectiveName();
+            ZOOM_SDK_NAMESPACE::SDKError err =
+                emailHandler->InputWebinarRegisterEmailAndScreenName(
+                    wEmail.c_str(), wName.c_str());
+            sprintf_s(buf,
+                "Config: InputWebinarRegisterEmailAndScreenName returned %d "
+                "(email_present=%d)", (int)err, email.empty() ? 0 : 1);
+            LogToFile(buf);
+        } else if (regType == ZOOM_SDK_NAMESPACE::IWebinarNeedRegisterHandler::
+                              WebinarReg_By_Register_Url) {
+            auto* urlHandler = dynamic_cast<
+                ZOOM_SDK_NAMESPACE::IWebinarNeedRegisterHandlerByUrl*>(handler);
+            if (urlHandler) {
+                LogToFile("Config: webinar requires browser-based registration; "
+                          "releasing handler");
+                urlHandler->Release();
+            } else {
+                LogToFile("Config: cast to IWebinarNeedRegisterHandlerByUrl failed");
+            }
+            SendToPlugin("{\"type\":\"meeting_failed\",\"code\":-5,"
+                         "\"message\":\"This webinar requires you to register "
+                         "in your browser before joining. Please complete "
+                         "registration on Zoom's website first.\"}");
+        } else {
+            LogToFile("Config: WebinarReg_NONE or unknown register type, ignoring");
+        }
+    }
+
+    virtual void onWebinarNeedInputScreenName(
+        ZOOM_SDK_NAMESPACE::IWebinarInputScreenNameHandler* handler) override {
+        if (!handler) {
+            LogToFile("Config: onWebinarNeedInputScreenName handler null");
+            return;
+        }
+        LogToFile("Config: onWebinarNeedInputScreenName fired");
+        std::wstring wName = EffectiveName();
+        ZOOM_SDK_NAMESPACE::SDKError err = handler->InputName(wName.c_str());
+        char buf[128];
+        sprintf_s(buf, "Config: InputName returned %d", (int)err);
+        LogToFile(buf);
+    }
+
+    virtual void onJoinMeetingNeedUserInfo(
+        ZOOM_SDK_NAMESPACE::IMeetingInputUserInfoHandler* handler) override {
+        if (!handler) {
+            LogToFile("Config: onJoinMeetingNeedUserInfo handler null");
+            return;
+        }
+        LogToFile("Config: onJoinMeetingNeedUserInfo fired");
+        const std::string& email = GetUserEmail();
+        std::wstring wEmail = Utf8ToWide(email);
+        std::wstring wName  = EffectiveName();
+        ZOOM_SDK_NAMESPACE::SDKError err =
+            handler->InputUserInfo(wName.c_str(), wEmail.c_str());
+        char buf[128];
+        sprintf_s(buf, "Config: InputUserInfo returned %d (email_present=%d)",
+                  (int)err, email.empty() ? 0 : 1);
+        LogToFile(buf);
+    }
+
+    // Remaining IMeetingConfigurationEvent callbacks — their corresponding
+    // RedirectXxx(true) toggles aren't enabled, so these shouldn't fire. Log
+    // if they do; that's a signal something unexpected is happening.
+    virtual void onInputMeetingPasswordAndScreenNameNotification(
+        ZOOM_SDK_NAMESPACE::IMeetingPasswordAndScreenNameHandler*) override {
+        LogToFile("Config: onInputMeetingPasswordAndScreenName fired (unexpected)");
+    }
+    virtual void onEndOtherMeetingToJoinMeetingNotification(
+        ZOOM_SDK_NAMESPACE::IEndOtherMeetingToJoinMeetingHandler*) override {
+        LogToFile("Config: onEndOtherMeetingToJoinMeeting fired (unexpected)");
+    }
+    virtual void onUserConfirmToStartArchive(
+        ZOOM_SDK_NAMESPACE::IMeetingArchiveConfirmHandler*) override {
+        LogToFile("Config: onUserConfirmToStartArchive fired (unexpected)");
+    }
+    virtual void onUserConfirmRecoverMeeting(
+        ZOOM_SDK_NAMESPACE::IMeetingConfirmRecoverHandler*) override {
+        LogToFile("Config: onUserConfirmRecoverMeeting fired (unexpected)");
+    }
+
+    // IMeetingConfigurationFreeMeetingEvent — free-tier callbacks, not
+    // relevant to Feeds. Empty bodies satisfy the pure-virtual contract.
+    virtual void onFreeMeetingRemainTime(unsigned int) override {}
+    virtual void onFreeMeetingRemainTimeStopCountDown() override {}
+    virtual void onFreeMeetingNeedToUpgrade(
+        FreeMeetingNeedUpgradeType, const zchar_t*) override {}
+    virtual void onFreeMeetingUpgradeToGiftFreeTrialStart() override {}
+    virtual void onFreeMeetingUpgradeToGiftFreeTrialStop() override {}
+    virtual void onFreeMeetingUpgradeToProMeeting() override {}
+
+private:
+    std::wstring EffectiveName() const {
+        return m_displayName.empty()
+            ? Utf8ToWide(GetUserDisplayName())
+            : m_displayName;
+    }
+
+    std::wstring m_displayName;
+};
+static ZoomConfigurationListener g_configurationListener;
+
+// ---------------------------------------------------------------------------
 // Meeting listener — status transitions.
 // ---------------------------------------------------------------------------
 class ZoomMeetingListener : public ZOOM_SDK_NAMESPACE::IMeetingServiceEvent {
@@ -723,6 +863,18 @@ bool InitializeMeetingSession() {
     g_meetingService->SetEvent(&g_meetingListener);
     LogToFile("Meeting: service created and listener attached");
 
+    ZOOM_SDK_NAMESPACE::IMeetingConfiguration* config =
+        g_meetingService->GetMeetingConfiguration();
+    if (config) {
+        config->SetEvent(&g_configurationListener);
+        config->RedirectWebinarNeedRegister(true);
+        config->RedirectWebinarNameInputDialog(true);
+        config->RedirectMeetingInputUserInfoDialog(true);
+        LogToFile("Meeting: configuration listener attached, webinar redirects enabled");
+    } else {
+        LogToFile("Meeting: GetMeetingConfiguration returned null — webinar joins may fail");
+    }
+
     ApplyDefaultSettings();
 
     return true;
@@ -803,6 +955,9 @@ void HandleJoinMeeting(const std::string& json) {
     static std::wstring s_userName;
     s_userName     = Utf8ToWide(effectiveName);
     param.userName = s_userName.c_str();
+
+    // Webinar registration callbacks (if they fire) respond with this name.
+    g_configurationListener.SetEffectiveDisplayName(s_userName);
 
     static std::wstring s_zak;
     s_zak         = std::wstring(zak.begin(), zak.end());
