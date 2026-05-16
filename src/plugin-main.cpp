@@ -810,6 +810,7 @@ void OnConnectClick() {
     QString input;
     QString password;
     QString displayName;
+    QString webinarToken;
     bool    isPmi = false;
 
     if (choice == 2) {
@@ -902,10 +903,35 @@ void OnConnectClick() {
             return QString();
         };
 
+        // Panelist invite URLs carry a tk= per-panelist registration token.
+        // Silent extraction — no UI; the engine consumes it.
+        auto extractTk = [](const QString& text) -> QString {
+            QString t = text.trimmed();
+            if (!t.contains("zoom.us", Qt::CaseInsensitive)) return QString();
+            if (!t.contains("tk=", Qt::CaseInsensitive))     return QString();
+
+            QUrl url = QUrl::fromUserInput(t);
+            if (!url.isValid()) return QString();
+
+            QUrlQuery q(url);
+            if (q.hasQueryItem("tk"))
+                return q.queryItemValue("tk", QUrl::FullyDecoded);
+
+            QString frag = url.fragment();
+            if (!frag.isEmpty()) {
+                QUrlQuery fq(frag);
+                if (fq.hasQueryItem("tk"))
+                    return fq.queryItemValue("tk", QUrl::FullyDecoded);
+            }
+            return QString();
+        };
+
         QObject::connect(meetingEdit, &QLineEdit::textChanged, &dlg,
-            [pwdEdit, extractPwd](const QString& text) {
+            [pwdEdit, extractPwd, extractTk, &webinarToken](const QString& text) {
                 QString pwd = extractPwd(text);
                 if (!pwd.isEmpty()) pwdEdit->setText(pwd);
+                QString tk = extractTk(text);
+                if (!tk.isEmpty()) webinarToken = tk;
             });
 
         QVBoxLayout* layout = new QVBoxLayout(&dlg);
@@ -925,9 +951,10 @@ void OnConnectClick() {
     }
 
     std::string msg = "{\"type\":\"join_meeting\","
-                      "\"input\":\""        + jsonEscape(input)       + "\","
-                      "\"password\":\""     + jsonEscape(password)    + "\","
-                      "\"display_name\":\"" + jsonEscape(displayName) + "\","
+                      "\"input\":\""         + jsonEscape(input)        + "\","
+                      "\"password\":\""      + jsonEscape(password)     + "\","
+                      "\"webinar_token\":\"" + jsonEscape(webinarToken) + "\","
+                      "\"display_name\":\""  + jsonEscape(displayName)  + "\","
                       "\"is_pmi\":" + std::string(isPmi ? "true" : "false") + "}";
     feeds::SendToEngine(msg);
 

@@ -953,11 +953,16 @@ void HandleJoinMeeting(const std::string& json) {
         return;
     }
 
-    std::string input       = JsonExtractString(json, "input");
-    std::string password    = JsonExtractString(json, "password");
-    std::string customName  = JsonExtractString(json, "display_name");
+    std::string input        = JsonExtractString(json, "input");
+    std::string password     = JsonExtractString(json, "password");
+    std::string customName   = JsonExtractString(json, "display_name");
+    std::string webinarToken = JsonExtractString(json, "webinar_token");
     // is_pmi is informational for logging; parsing is the same either way
     (void)JsonExtractString(json, "is_pmi");
+
+    LogToFile(webinarToken.empty()
+        ? "Meeting: join request received with webinar_token=empty"
+        : "Meeting: join request received with webinar_token=present");
 
     if (input.empty()) {
         LogToFile("Meeting: join_meeting received with empty input");
@@ -1014,6 +1019,14 @@ void HandleJoinMeeting(const std::string& json) {
         param.psw  = s_password.c_str();
     } else {
         param.psw = nullptr;
+    }
+
+    static std::wstring s_webinarToken;
+    if (!webinarToken.empty()) {
+        s_webinarToken     = Utf8ToWide(webinarToken);
+        param.webinarToken = s_webinarToken.c_str();
+    } else {
+        param.webinarToken = nullptr;
     }
 
     static std::wstring s_vanityId;
