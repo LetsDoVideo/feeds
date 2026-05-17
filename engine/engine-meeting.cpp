@@ -18,6 +18,7 @@
 #include "meeting_service_interface.h"
 #include "auth_service_interface.h"
 #include "meeting_service_components/meeting_audio_interface.h"
+#include "meeting_service_components/meeting_chat_interface.h"
 #include "meeting_service_components/meeting_configuration_interface.h"
 #include "meeting_service_components/meeting_participants_ctrl_interface.h"
 #include "meeting_service_components/meeting_live_stream_interface.h"
@@ -378,6 +379,107 @@ public:
 static ZoomParticipantsListener g_participantsListener;
 
 // ---------------------------------------------------------------------------
+// Chat listener — receives messages from the SDK's chat controller and
+// forwards public ("to everyone") messages to the plugin via the
+// chat_message IPC. Non-public messages (DMs, panelist-only, waiting room)
+// are filtered out here at the engine boundary and never reach the plugin.
+// This is structural: the plugin literally cannot leak private chat
+// because it never receives it. Filtering at the source is the correct
+// security posture for this feature.
+// ---------------------------------------------------------------------------
+class ZoomChatListener : public ZOOM_SDK_NAMESPACE::IMeetingChatCtrlEvent {
+public:
+    virtual void onChatMsgNotification(
+        ZOOM_SDK_NAMESPACE::IChatMsgInfo* chatMsg,
+        const zchar_t* /*content*/ = nullptr) override {
+        if (!chatMsg) {
+            LogToFile("Chat: onChatMsgNotification with null chatMsg");
+            return;
+        }
+
+        if (!chatMsg->IsChatToAll()) {
+            // Privacy filter. Log only the chat-type enum — never include
+            // the content or sender of a non-public message, even at debug
+            // level, so engine logs cannot leak DMs.
+            char buf[128];
+            sprintf_s(buf, "Chat: filtered non-public message (type=%d)",
+                      (int)chatMsg->GetChatMessageType());
+            LogToFile(buf);
+            return;
+        }
+
+        std::string messageId  = WideToUtf8(chatMsg->GetMessageID());
+        unsigned int senderId  = chatMsg->GetSenderUserId();
+        std::string senderName = WideToUtf8(chatMsg->GetSenderDisplayName());
+        std::string content    = WideToUtf8(chatMsg->GetContent());
+        time_t timestamp       = chatMsg->GetTimeStamp();
+
+        std::ostringstream out;
+        out << "{\"type\":\"chat_message\","
+            << "\"message_id\":\"" << JsonEscape(messageId) << "\","
+            << "\"sender_id\":" << senderId << ","
+            << "\"sender_name\":\"" << JsonEscape(senderName) << "\","
+            << "\"content\":\"" << JsonEscape(content) << "\","
+            << "\"timestamp\":" << (long long)timestamp << "}";
+        SendToPlugin(out.str());
+
+        // Debug-visibility log only — the full content lives in the IPC.
+        // Truncate the preview so log lines stay tidy.
+        std::string preview = content.size() > 40
+            ? content.substr(0, 40) + "..."
+            : content;
+        char buf[512];
+        sprintf_s(buf, "Chat: public message from %s: %s",
+                  senderName.c_str(), preview.c_str());
+        LogToFile(buf);
+    }
+
+    virtual void onChatStatusChangedNotification(
+        ZOOM_SDK_NAMESPACE::ChatStatus*) override {
+        LogToFile("Chat: onChatStatusChangedNotification fired");
+    }
+
+    virtual void onChatMsgDeleteNotification(
+        const zchar_t* msgID,
+        ZOOM_SDK_NAMESPACE::SDKChatMessageDeleteType deleteBy) override {
+        std::string id = WideToUtf8(msgID);
+        char buf[256];
+        sprintf_s(buf, "Chat: onChatMsgDeleteNotification id=%s deleteBy=%d",
+                  id.c_str(), (int)deleteBy);
+        LogToFile(buf);
+    }
+
+    virtual void onChatMessageEditNotification(
+        ZOOM_SDK_NAMESPACE::IChatMsgInfo* chatMsg) override {
+        std::string id = chatMsg ? WideToUtf8(chatMsg->GetMessageID()) : "";
+        char buf[256];
+        sprintf_s(buf, "Chat: onChatMessageEditNotification id=%s",
+                  id.c_str());
+        LogToFile(buf);
+    }
+
+    virtual void onShareMeetingChatStatusChanged(bool) override {
+        LogToFile("Chat: onShareMeetingChatStatusChanged fired");
+    }
+
+    virtual void onFileSendStart(
+        ZOOM_SDK_NAMESPACE::ISDKFileSender*) override {
+        LogToFile("Chat: onFileSendStart fired");
+    }
+
+    virtual void onFileReceived(
+        ZOOM_SDK_NAMESPACE::ISDKFileReceiver*) override {
+        LogToFile("Chat: onFileReceived fired");
+    }
+
+    virtual void onFileTransferProgress(
+        ZOOM_SDK_NAMESPACE::SDKFileTransferInfo*) override {
+        LogToFile("Chat: onFileTransferProgress fired");
+    }
+};
+static ZoomChatListener g_chatListener;
+
+// ---------------------------------------------------------------------------
 // Live stream listener — the critical one. onRawLiveStreamPrivilegeChanged
 // is where we get the green light to actually use the raw video stream.
 // ---------------------------------------------------------------------------
@@ -687,6 +789,20 @@ public:
                 pc->SetEvent(&g_participantsListener);
             } else {
                 LogToFile("Meeting: participants controller unavailable at join");
+            }
+
+            // Attach the chat listener. Independent of livestream
+            // privilege — chat is meeting state, not stream data, so
+            // it's available from MEETING_STATUS_INMEETING. Gating on
+            // livestream-grant would miss messages sent during the
+            // privilege-request window.
+            ZOOM_SDK_NAMESPACE::IMeetingChatController* cc =
+                g_meetingService->GetMeetingChatController();
+            if (cc) {
+                cc->SetEvent(&g_chatListener);
+                LogToFile("Meeting: chat controller listener attached");
+            } else {
+                LogToFile("Meeting: chat controller unavailable at join");
             }
 
             // Attach the livestream listener. Depending on whether the
