@@ -776,6 +776,21 @@ public:
                 case ZOOM_SDK_NAMESPACE::MEETING_FAIL_ENFORCE_LOGIN:
                     errMsg = "This meeting requires you to be logged in to Zoom.";
                     break;
+                case ZOOM_SDK_NAMESPACE::MEETING_FAIL_REGISTERWEBINAR_FULL:
+                    errMsg = "This webinar has reached its registration limit and is not accepting new attendees.";
+                    break;
+                case ZOOM_SDK_NAMESPACE::MEETING_FAIL_REGISTERWEBINAR_HOSTREGISTER:
+                    errMsg = "This webinar requires the host to complete registration before joining.";
+                    break;
+                case ZOOM_SDK_NAMESPACE::MEETING_FAIL_REGISTERWEBINAR_PANELISTREGISTER:
+                    errMsg = "Unable to join as panelist. The webinar host may need to add you as a panelist on Zoom's website first.";
+                    break;
+                case ZOOM_SDK_NAMESPACE::MEETING_FAIL_REGISTERWEBINAR_DENIED_EMAIL:
+                    errMsg = "Your email address is not authorized to register for this webinar.";
+                    break;
+                case ZOOM_SDK_NAMESPACE::CONF_FAIL_JOIN_WEBINAR_WITHSAMEEMAIL:
+                    errMsg = "You are already in this webinar from another session. Please leave the other session and try again.";
+                    break;
                 default: {
                     static char generic[128];
                     sprintf_s(generic, "Failed to join meeting. Error code: %d", iResult);
@@ -1036,6 +1051,7 @@ void HandleJoinMeeting(const std::string& json) {
     // Parse the input — same rules as v1.0.0:
     //   - "zoom.us/my/<vanityid>" → vanity ID
     //   - "zoom.us/j/<number>"    → meeting number
+    //   - "zoom.us/w/<number>"    → webinar number
     //   - anything else           → strip non-digits, treat as meeting number
     auto findSubstr = [](const std::string& s, const std::string& sub) {
         return s.find(sub);
@@ -1064,6 +1080,19 @@ void HandleJoinMeeting(const std::string& json) {
         }
         param.meetingNumber = _strtoui64(digits.c_str(), nullptr, 10);
         LogToFile("Meeting: parsed as /j/ URL");
+    } else if ((pos = findSubstr(input, "zoom.us/w/")) != std::string::npos) {
+        std::string rest = input.substr(pos + 10);
+        size_t end = rest.find_first_of("?& \r\n");
+        if (end != std::string::npos) rest = rest.substr(0, end);
+        std::string digits;
+        for (char c : rest) if (c >= '0' && c <= '9') digits += c;
+        if (digits.empty()) {
+            SendToPlugin("{\"type\":\"meeting_failed\",\"code\":-2,"
+                         "\"message\":\"Could not parse webinar number from link.\"}");
+            return;
+        }
+        param.meetingNumber = _strtoui64(digits.c_str(), nullptr, 10);
+        LogToFile("Meeting: parsed as /w/ URL");
     } else {
         // Raw meeting number or PMI — strip whitespace/dashes/non-digits
         std::string digits;
