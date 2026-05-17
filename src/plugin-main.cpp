@@ -2231,10 +2231,19 @@ bool obs_module_load(void) {
     feeds::StartEngine();
     RegisterEngineHandlers();
 
+    // Register the chat dock here, not in FINISHED_LOADING. OBSBasic::OBSInit
+    // calls restoreState() before plugins finish loading, so a dock added
+    // post-FINISHED_LOADING gets default state instead of the user's saved
+    // visibility/position/floating settings. Registering at module-load
+    // means the dock exists in the QMainWindow when restoreState runs, and
+    // saved state applies the normal way. Three reference OBS plugins
+    // (Countdown, AudioMonitor, DSK) all do dock registration here for the
+    // same reason.
+    SetupChatDock();
+
     obs_frontend_add_event_callback([](enum obs_frontend_event event, void*) {
         if (event == OBS_FRONTEND_EVENT_FINISHED_LOADING) {
             SetupPluginMenu();
-            SetupChatDock();
             QTimer::singleShot(5000,
                 (QObject*)obs_frontend_get_main_window(),
                 []() { CheckForUpdateAsync(); });
