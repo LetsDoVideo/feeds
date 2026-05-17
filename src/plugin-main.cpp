@@ -34,6 +34,7 @@
 #include <QAction>
 #include <QInputDialog>
 #include <QLineEdit>
+#include <QListWidget>
 #include <QRegularExpression>
 #include <QTimer>
 #include <QDialog>
@@ -959,6 +960,37 @@ void OnConnectClick() {
     feeds::SendToEngine(msg);
 
     if (g_connectAction) g_connectAction->setEnabled(false);
+}
+
+// ---------------------------------------------------------------------------
+// Zoom Chat dock. Phase 1: register a dock that displays placeholder content.
+// Commit 3 wires the chat_message IPC from the engine into this widget so it
+// reflects live meeting chat. Once handed to obs_frontend_add_dock_by_id,
+// OBS owns the widget's lifetime — no destruction logic needed here.
+// ---------------------------------------------------------------------------
+class FeedsChatDock : public QWidget {
+public:
+    explicit FeedsChatDock(QWidget* parent = nullptr) : QWidget(parent) {
+        m_list = new QListWidget(this);
+        m_list->addItem("Not connected to a meeting");
+
+        QVBoxLayout* layout = new QVBoxLayout(this);
+        layout->setContentsMargins(0, 0, 0, 0);
+        layout->addWidget(m_list);
+
+        setMinimumSize(200, 300);
+    }
+
+private:
+    QListWidget* m_list = nullptr;
+};
+
+static void SetupChatDock() {
+    // Stable id — never change this across versions; OBS uses it as the
+    // key for the user's saved dock visibility/position state.
+    obs_frontend_add_dock_by_id(
+        "feeds_chat_dock", "Zoom Chat", new FeedsChatDock());
+    blog(LOG_INFO, "[feeds] chat dock registered");
 }
 
 void SetupPluginMenu() {
@@ -2202,6 +2234,7 @@ bool obs_module_load(void) {
     obs_frontend_add_event_callback([](enum obs_frontend_event event, void*) {
         if (event == OBS_FRONTEND_EVENT_FINISHED_LOADING) {
             SetupPluginMenu();
+            SetupChatDock();
             QTimer::singleShot(5000,
                 (QObject*)obs_frontend_get_main_window(),
                 []() { CheckForUpdateAsync(); });
