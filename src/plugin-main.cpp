@@ -32,6 +32,7 @@
 #include <QMenuBar>
 #include <QMenu>
 #include <QAction>
+#include <QDateTime>
 #include <QInputDialog>
 #include <QLineEdit>
 #include <QListWidget>
@@ -190,6 +191,45 @@ static long long ExtractJsonNumber(const std::string& json, const std::string& k
     std::string numStr = json.substr(pos, end == std::string::npos
                                           ? std::string::npos : end - pos);
     try { return std::stoll(numStr); } catch (...) { return 0; }
+}
+
+// JSON-escape-aware string extractor. ExtractJsonString stops at the first
+// quote without handling escapes, which truncates chat content containing
+// quotes — extremely common in actual chat traffic. This walks the value
+// and decodes the escape sequences emitted by the engine's JsonEscape: \",
+// \\, \/, \b, \f, \n, \r, \t, and \uXXXX. \uXXXX is dropped silently —
+// engine only emits it for control chars below 0x20, which aren't visible
+// in QListWidget items anyway.
+static std::string ExtractJsonStringEscaped(const std::string& json,
+                                            const std::string& key) {
+    std::string search = "\"" + key + "\":\"";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return "";
+    pos += search.size();
+
+    std::string out;
+    out.reserve(json.size() - pos);
+    while (pos < json.size()) {
+        char c = json[pos];
+        if (c == '"') break;
+        if (c == '\\' && pos + 1 < json.size()) {
+            char n = json[pos + 1];
+            switch (n) {
+                case '"': case '\\': case '/': out += n;   pos += 2; break;
+                case 'b': out += '\b'; pos += 2; break;
+                case 'f': out += '\f'; pos += 2; break;
+                case 'n': out += '\n'; pos += 2; break;
+                case 'r': out += '\r'; pos += 2; break;
+                case 't': out += '\t'; pos += 2; break;
+                case 'u': pos += 6; break;
+                default:  out += n; pos += 2; break;
+            }
+        } else {
+            out += c;
+            pos += 1;
+        }
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -981,15 +1021,43 @@ public:
         setMinimumSize(200, 300);
     }
 
+    // Must be called from the Qt main thread — the IPC handler marshals
+    // via QTimer::singleShot onto the main window before invoking this.
+    void AppendMessage(const QString& senderName,
+                       const QString& content,
+                       qint64 timestamp) {
+        if (!m_messagesStarted) {
+            // First real message — drop the placeholder. From here on the
+            // dock shows only real chat history for the rest of the OBS
+            // session. We don't re-add the placeholder after a meeting
+            // ends; preserving history across meetings is the Phase 1
+            // behavior per spec.
+            m_list->clear();
+            m_messagesStarted = true;
+        }
+        QString time = QDateTime::fromSecsSinceEpoch(timestamp)
+                           .toString("HH:mm");
+        m_list->addItem(QString("[%1] %2: %3")
+                            .arg(time, senderName, content));
+        m_list->scrollToBottom();
+    }
+
 private:
-    QListWidget* m_list = nullptr;
+    QListWidget* m_list             = nullptr;
+    bool         m_messagesStarted  = false;
 };
+
+// Non-owning pointer to the registered dock instance. OBS owns the widget's
+// lifetime once it's been handed to obs_frontend_add_dock_by_id; we hold
+// this only so the chat_message IPC handler can route messages to it.
+static FeedsChatDock* g_chatDock = nullptr;
 
 static void SetupChatDock() {
     // Stable id — never change this across versions; OBS uses it as the
     // key for the user's saved dock visibility/position state.
+    g_chatDock = new FeedsChatDock();
     obs_frontend_add_dock_by_id(
-        "feeds_chat_dock", "Zoom Chat", new FeedsChatDock());
+        "feeds_chat_dock", "Zoom Chat", g_chatDock);
     blog(LOG_INFO, "[feeds] chat dock registered");
 }
 
@@ -2028,6 +2096,32 @@ static void RegisterEngineHandlers() {
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
             RefreshAllSourceProperties();
         });
+    });
+
+    feeds::RegisterMessageHandler("chat_message",
+    [](const std::string& json) {
+        // Handler runs on the IPC reader thread; parse here, dispatch
+        // UI mutation to the Qt main thread via QTimer::singleShot —
+        // same pattern the participant_list_changed handler above uses.
+        // Engine already filtered to public ("to everyone") messages,
+        // so we just render whatever arrives. message_id is parsed for
+        // logging only in Phase 1; future phases may use it for edit/
+        // delete propagation or dedup.
+        std::string messageId  = ExtractJsonString(json, "message_id");
+        std::string senderName = ExtractJsonStringEscaped(json, "sender_name");
+        std::string content    = ExtractJsonStringEscaped(json, "content");
+        qint64      timestamp  = (qint64)ExtractJsonNumber(json, "timestamp");
+
+        blog(LOG_INFO, "[feeds] chat_message id=%s", messageId.c_str());
+
+        QString qSender  = QString::fromStdString(senderName);
+        QString qContent = QString::fromStdString(content);
+
+        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
+            [qSender, qContent, timestamp]() {
+                if (g_chatDock)
+                    g_chatDock->AppendMessage(qSender, qContent, timestamp);
+            });
     });
 
     feeds::RegisterMessageHandler("active_speaker_changed",
