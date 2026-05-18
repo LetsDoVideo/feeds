@@ -36,7 +36,10 @@
 #include <QInputDialog>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QPainter>
 #include <QRegularExpression>
+#include <QStyledItemDelegate>
+#include <QTextLayout>
 #include <QTimer>
 #include <QDialog>
 #include <QDialogButtonBox>
@@ -1003,6 +1006,93 @@ void OnConnectClick() {
 }
 
 // ---------------------------------------------------------------------------
+// Item delegate for the chat dock's QListWidget. setWordWrap(true) alone
+// handles soft-wrapping at whitespace but breaks down on long unbreakable
+// tokens (URLs without spaces, hashes, "ooooo..." spam): the viewport
+// widens to fit the token, a horizontal scrollbar appears, and prior
+// wrapped messages re-flow to the new width.
+//
+// QTextLayout with WrapAtWordBoundaryOrAnywhere fixes that: wrap at word
+// boundaries by default, fall back to mid-token breaks only when no word
+// boundary fits inside the available width. sizeHint and paint share the
+// same LayoutLines helper so reported heights match what we actually draw.
+//
+// Width comes from option.rect.width(), which the view keeps in sync with
+// viewport-minus-scrollbar thanks to setResizeMode(QListView::Adjust) on
+// the list.
+// ---------------------------------------------------------------------------
+class ChatMessageDelegate : public QStyledItemDelegate {
+public:
+    using QStyledItemDelegate::QStyledItemDelegate;
+
+    QSize sizeHint(const QStyleOptionViewItem& option,
+                   const QModelIndex& index) const override {
+        int width = option.rect.width();
+        if (width <= 0) {
+            // First-layout pass — the view hasn't assigned a width yet.
+            // Fall back to the base implementation; the next layout
+            // pass will re-call us with a real width.
+            return QStyledItemDelegate::sizeHint(option, index);
+        }
+
+        QString text = index.data(Qt::DisplayRole).toString();
+        QTextLayout layout(text, option.font);
+        layout.setTextOption(MakeTextOption());
+
+        qreal y = LayoutLines(layout, width);
+        // +2 px so adjacent items aren't visually flush.
+        return QSize(width, static_cast<int>(y) + 2);
+    }
+
+    void paint(QPainter* painter,
+               const QStyleOptionViewItem& option,
+               const QModelIndex& index) const override {
+        painter->save();
+
+        if (option.state & QStyle::State_Selected) {
+            painter->fillRect(option.rect, option.palette.highlight());
+            painter->setPen(option.palette.highlightedText().color());
+        } else {
+            painter->setPen(option.palette.text().color());
+        }
+
+        QString text = index.data(Qt::DisplayRole).toString();
+        QTextLayout layout(text, option.font);
+        layout.setTextOption(MakeTextOption());
+
+        LayoutLines(layout, option.rect.width());
+        layout.draw(painter, option.rect.topLeft());
+
+        painter->restore();
+    }
+
+private:
+    static QTextOption MakeTextOption() {
+        QTextOption opt;
+        opt.setWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
+        opt.setAlignment(Qt::AlignLeft | Qt::AlignTop);
+        return opt;
+    }
+
+    // Lays out lines into `layout` at the given width; returns total
+    // text height. Shared by sizeHint and paint so both compute against
+    // the same wrap rules.
+    static qreal LayoutLines(QTextLayout& layout, int width) {
+        layout.beginLayout();
+        qreal y = 0;
+        while (true) {
+            QTextLine line = layout.createLine();
+            if (!line.isValid()) break;
+            line.setLineWidth(width);
+            line.setPosition(QPointF(0, y));
+            y += line.height();
+        }
+        layout.endLayout();
+        return y;
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Zoom Chat dock. Phase 1: register a dock that displays placeholder content.
 // Commit 3 wires the chat_message IPC from the engine into this widget so it
 // reflects live meeting chat. Once handed to obs_frontend_add_dock_by_id,
@@ -1018,9 +1108,13 @@ public:
         // line with a horizontal scrollbar. setResizeMode(Adjust) makes
         // item heights recompute when the dock is resized; disabling
         // uniform item sizes lets each item have its own wrapped height.
+        // setWordWrap remains as a fallback if the custom delegate is
+        // ever bypassed; the delegate is what enforces mid-token breaks
+        // for unbreakable strings (long URLs, hashes, etc.).
         m_list->setWordWrap(true);
         m_list->setResizeMode(QListView::Adjust);
         m_list->setUniformItemSizes(false);
+        m_list->setItemDelegate(new ChatMessageDelegate(m_list));
 
         QVBoxLayout* layout = new QVBoxLayout(this);
         layout->setContentsMargins(0, 0, 0, 0);
