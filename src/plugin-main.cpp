@@ -1014,6 +1014,14 @@ public:
         m_list = new QListWidget(this);
         m_list->addItem("Not connected to a meeting");
 
+        // Word wrap — without these three, long messages render on one
+        // line with a horizontal scrollbar. setResizeMode(Adjust) makes
+        // item heights recompute when the dock is resized; disabling
+        // uniform item sizes lets each item have its own wrapped height.
+        m_list->setWordWrap(true);
+        m_list->setResizeMode(QListView::Adjust);
+        m_list->setUniformItemSizes(false);
+
         QVBoxLayout* layout = new QVBoxLayout(this);
         layout->setContentsMargins(0, 0, 0, 0);
         layout->addWidget(m_list);
@@ -1021,8 +1029,10 @@ public:
         setMinimumSize(200, 300);
     }
 
-    // Must be called from the Qt main thread — the IPC handler marshals
-    // via QTimer::singleShot onto the main window before invoking this.
+    // All three methods below must run on the Qt main thread. The IPC
+    // handlers marshal via QTimer::singleShot onto the main window before
+    // invoking them.
+
     void AppendMessage(const QString& senderName,
                        const QString& content,
                        qint64 timestamp) {
@@ -1042,7 +1052,19 @@ public:
         m_list->scrollToBottom();
     }
 
+    void OnMeetingJoined() { SetPlaceholder("Connected"); }
+    void OnMeetingLeft()   { SetPlaceholder("Not connected to a meeting"); }
+
 private:
+    void SetPlaceholder(const QString& text) {
+        // Once real messages have arrived, the placeholder is permanently
+        // off for the rest of the OBS session — joining/leaving meetings
+        // must not stomp on accumulated chat history.
+        if (m_messagesStarted) return;
+        m_list->clear();
+        m_list->addItem(text);
+    }
+
     QListWidget* m_list             = nullptr;
     bool         m_messagesStarted  = false;
 };
@@ -1893,6 +1915,7 @@ static void RegisterEngineHandlers() {
                 g_isInMeeting = true;
                 if (g_connectAction) g_connectAction->setEnabled(false);
                 RefreshAllSourceProperties();
+                if (g_chatDock) g_chatDock->OnMeetingJoined();
 
                 if (!wasInstant || meetingNum == 0) return;
 
@@ -2012,6 +2035,7 @@ static void RegisterEngineHandlers() {
             if (g_connectAction && g_isLoggedIn)
                 g_connectAction->setEnabled(true);
             RefreshAllSourceProperties();
+            if (g_chatDock) g_chatDock->OnMeetingLeft();
         });
     });
 
