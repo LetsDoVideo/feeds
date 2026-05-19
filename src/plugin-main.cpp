@@ -1739,6 +1739,25 @@ static void* zs_create(obs_data_t* settings, obs_source_t* source) {
         return nullptr;
     }
 
+    // One screenshare source per scene. Zoom only exposes a single
+    // active sharer at a time, so a second source would render the
+    // same stream.
+    bool alreadyHaveScreenshare;
+    {
+        std::lock_guard<std::mutex> lock(g_screenshareSourcesMutex);
+        alreadyHaveScreenshare = !g_allScreenshareSources.empty();
+    }
+    if (alreadyHaveScreenshare) {
+        if (ShouldShowTierPopup()) {
+            ShowTierLimitDialog(
+                "Feeds: Screenshare Source Already Exists",
+                "Feeds only supports one screenshare source. "
+                "You can create copies of that source to place "
+                "it in multiple locations.");
+        }
+        return nullptr;
+    }
+
     obs_source_set_async_unbuffered(source, true);
 
     ZsSourceData* data = new ZsSourceData();
