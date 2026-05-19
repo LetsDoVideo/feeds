@@ -153,6 +153,10 @@ struct ZpSourceData {
     // over-tier for another (Broadcaster sharing an OBS config with a
     // Basic user, etc.).
     bool          tier_disabled   = false;
+    // 1-based position across all participant sources in the scene
+    // collection (vector order = creation order). Set by
+    // ReconcileSourcesToTier. 0 means "not yet computed."
+    int           source_position = 0;
 
     HANDLE mapping = nullptr;
     void*  view    = nullptr;
@@ -1421,6 +1425,21 @@ static void zp_update(void* vdata, obs_data_t* settings) {
 // ---------------------------------------------------------------------------
 // Properties panel
 // ---------------------------------------------------------------------------
+// English ordinal suffix for a positive integer. 11/12/13 are the
+// classic exceptions ("11th" not "11st"); written defensively even
+// though tier limits cap us at 8 today.
+static const char* OrdinalSuffix(int n) {
+    int abs_n = n < 0 ? -n : n;
+    int lastTwo = abs_n % 100;
+    if (lastTwo >= 11 && lastTwo <= 13) return "th";
+    switch (abs_n % 10) {
+        case 1:  return "st";
+        case 2:  return "nd";
+        case 3:  return "rd";
+        default: return "th";
+    }
+}
+
 static obs_properties_t* zp_properties(void* data) {
     // data can be nullptr in some Qt code paths (e.g., properties
     // queried before source creation completes); null-guard the
@@ -1434,12 +1453,12 @@ static obs_properties_t* zp_properties(void* data) {
                                 OBS_TEXT_INFO);
 
         int maxFeeds = GetMaxFeedsForTier();
+        int pos      = d->source_position;
         std::string msg =
-            "This source is over the participant feed limit for your "
-            "current Feeds tier. Only the first " +
-            std::to_string(maxFeeds) + " participant source" +
-            (maxFeeds == 1 ? "" : "s") +
-            " in your scene are active.";
+            "Your current tier only allows " + std::to_string(maxFeeds) +
+            " participant source" + (maxFeeds == 1 ? "" : "s") +
+            ". This is your " + std::to_string(pos) + OrdinalSuffix(pos) +
+            " participant source. Please upgrade to activate this feed.";
         obs_properties_add_text(props, "tier_disabled_msg", msg.c_str(),
                                 OBS_TEXT_INFO);
         obs_properties_add_button(props, "upgrade_btn",
@@ -1996,7 +2015,8 @@ static void ReconcileSourcesToTier() {
                 s->current_user_id = 0;
                 CloseSharedMemory(s);
             }
-            s->tier_disabled = shouldDisable;
+            s->tier_disabled   = shouldDisable;
+            s->source_position = idx;
         }
     }
 
