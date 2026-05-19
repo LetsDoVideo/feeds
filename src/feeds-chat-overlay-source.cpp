@@ -77,17 +77,16 @@ struct OverlayMessage {
     qint64       timestamp   = 0;
 };
 
-// Hardcoded test data. Replaced in O2 by real chat history pushed in from
-// the chat IPC handler. Five entries so wrapping behaviour, emoji rendering,
-// and the bottom-newest stacking can be eyeballed at multiple canvas sizes
-// without a meeting running.
-static const std::vector<OverlayMessage> g_testMessages = {
-    {1001, QStringLiteral("Alice"),   QStringLiteral("Hello everyone!"),                              1779200000},
-    {1002, QStringLiteral("Bob"),     QStringLiteral("Good morning"),                                  1779200060},
-    {1003, QStringLiteral("Charlie"), QStringLiteral("This is a longer test message to see wrapping"), 1779200120},
-    {1004, QStringLiteral("Dana"),    QString::fromUtf8("\xF0\x9F\x91\x8B"),                           1779200180},  // 👋
-    {1005, QStringLiteral("Eve"),     QStringLiteral("Looks good!"),                                   1779200240},
-};
+// Bounded ring of recent chat messages — single source of truth for every
+// overlay source instance. Mutated from the IPC reader thread (append /
+// clear) and read from the graphics thread (render). HISTORY_CAP keeps
+// memory predictable across long meetings; only the most recent few are
+// typically visible, but extras are retained so a user-resized overlay
+// can show more context without losing earlier lines.
+static constexpr size_t       HISTORY_CAP = 50;
+
+std::mutex                    g_overlayHistoryMutex;
+std::vector<OverlayMessage>   g_overlayHistory;
 
 // ---------------------------------------------------------------------------
 // Per-instance state. Same layout as the popup's data struct minus the
@@ -190,8 +189,11 @@ static void RenderOverlayToImage(FeedsChatOverlayData* d,
         QTextDocument doc;
         doc.setDocumentMargin(0);
         doc.setTextWidth(textWidth);
+        // Colon is inside the bold/orange span so it shares the username's
+        // styling; the space between spans is plain so the colon hugs the
+        // username and the message text reads as "Alice: Hello everyone!".
         const QString html = QStringLiteral(
-            "<span style='color:#FFA500; font-weight:bold; font-size:%1px'>%2</span>"
+            "<span style='color:#FFA500; font-weight:bold; font-size:%1px'>%2:</span>"
             " "
             "<span style='color:#FFFFFF; font-size:%3px'>%4</span>")
             .arg(USER_FONT_PIXEL_SIZE)
@@ -241,12 +243,36 @@ static void RenderOverlayToImage(FeedsChatOverlayData* d,
     p.end();
 }
 
+// Mark every overlay instance as dirty so the next video_render rebuilds
+// its texture from the current history. Called after history mutations
+// from the IPC thread. Holding g_overlayInstancesMutex only — never the
+// history mutex — keeps lock ordering simple.
+static void MarkAllOverlayInstancesDirty() {
+    std::lock_guard<std::mutex> lock(g_overlayInstancesMutex);
+    for (FeedsChatOverlayData* d : g_overlayInstances) {
+        // bool write read on graphics thread without explicit
+        // synchronisation; worst case is a one-frame delay before the
+        // new message appears, which is well below human perception.
+        d->texture_dirty = true;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Upload the current QImage to GPU. Called from video_render when dirty;
-// graphics context is already active (custom-draw path).
+// graphics context is already active (custom-draw path). Snapshots the
+// global history under g_overlayHistoryMutex so the paint sees a stable
+// list even if the IPC thread appends mid-render. Doesn't clear
+// texture_dirty itself — fcr_video_render does that under
+// g_overlayInstancesMutex so a concurrent append from the IPC thread
+// can't lose its dirty bit.
 // ---------------------------------------------------------------------------
 static void RegenerateTexture(FeedsChatOverlayData* d) {
-    RenderOverlayToImage(d, g_testMessages);
+    std::vector<OverlayMessage> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(g_overlayHistoryMutex);
+        snapshot = g_overlayHistory;
+    }
+    RenderOverlayToImage(d, snapshot);
 
     const QImage& img = d->rendered_image;
     const uint8_t* pixels = nullptr;
@@ -269,7 +295,6 @@ static void RegenerateTexture(FeedsChatOverlayData* d) {
     }
     d->texture = gs_texture_create(d->width, d->height, GS_RGBA, 1,
                                    &pixels, 0);
-    d->texture_dirty = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -341,7 +366,18 @@ static void fcr_video_render(void* data, gs_effect_t* /*effect*/) {
     FeedsChatOverlayData* d = static_cast<FeedsChatOverlayData*>(data);
     if (!d) return;
 
-    if (d->texture_dirty || !d->texture) {
+    // Clear dirty under the instances mutex so a concurrent
+    // MarkAllOverlayInstancesDirty call from the IPC thread can't lose
+    // its bit: if a new message arrives after we release the lock, it
+    // re-sets dirty=true and we catch it on the next frame.
+    bool dirty;
+    {
+        std::lock_guard<std::mutex> lock(g_overlayInstancesMutex);
+        dirty = d->texture_dirty;
+        if (dirty) d->texture_dirty = false;
+    }
+
+    if (dirty || !d->texture) {
         RegenerateTexture(d);
     }
     if (!d->texture) return;
@@ -430,6 +466,38 @@ void RegisterChatOverlaySource() {
     feeds_chat_overlay_info.video_render   = fcr_video_render;
     feeds_chat_overlay_info.icon_type      = OBS_ICON_TYPE_TEXT;
     obs_register_source(&feeds_chat_overlay_info);
+}
+
+void AppendChatMessageToOverlay(unsigned int       senderId,
+                                const std::string& senderName,
+                                const std::string& content,
+                                qint64             timestamp) {
+    {
+        std::lock_guard<std::mutex> lock(g_overlayHistoryMutex);
+        OverlayMessage msg;
+        msg.sender_id   = senderId;
+        msg.sender_name = QString::fromStdString(senderName);
+        msg.content     = QString::fromStdString(content);
+        msg.timestamp   = timestamp;
+        g_overlayHistory.push_back(std::move(msg));
+
+        // Trim oldest. erase-from-begin on a vector is O(N), but with
+        // HISTORY_CAP of 50 and chat-message rates measured in
+        // messages-per-minute, the cost is negligible. std::deque or a
+        // ring buffer would be the move if the cap ever climbs.
+        if (g_overlayHistory.size() > HISTORY_CAP) {
+            g_overlayHistory.erase(g_overlayHistory.begin());
+        }
+    }
+    MarkAllOverlayInstancesDirty();
+}
+
+void ClearChatOverlay() {
+    {
+        std::lock_guard<std::mutex> lock(g_overlayHistoryMutex);
+        g_overlayHistory.clear();
+    }
+    MarkAllOverlayInstancesDirty();
 }
 
 }  // namespace feeds

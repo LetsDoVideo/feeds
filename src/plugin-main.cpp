@@ -1243,8 +1243,10 @@ public:
         SetPlaceholder(CurrentPlaceholderText());
         m_input->setEnabled(false);
         m_sendBtn->setEnabled(false);
-        // Hide any active popup so it doesn't carry into the next meeting.
+        // Hide any active popup and drop the overlay history so stale
+        // messages don't carry into the next meeting.
         feeds::ClearChatPopup();
+        feeds::ClearChatOverlay();
     }
 
     // Called from the IPC handlers when login state changes, so the
@@ -2658,6 +2660,12 @@ static void RegisterEngineHandlers() {
         // chat popup source (coming in a later Phase 2 commit) can hit
         // the cache synchronously. Return value unused in this commit.
         (void)GetAvatarForSender(senderId, avatarPath);
+
+        // Push into the overlay's centralised history. Thread-safe; no
+        // need to marshal to the Qt main thread — the overlay source
+        // reads under its own mutex on the graphics thread.
+        feeds::AppendChatMessageToOverlay(senderId, senderName, content,
+                                          timestamp);
 
         QString qSender  = QString::fromStdString(senderName);
         QString qContent = QString::fromStdString(content);
