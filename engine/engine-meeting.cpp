@@ -160,6 +160,42 @@ static std::string JsonExtractString(const std::string& json,
     return json.substr(pos, end - pos);
 }
 
+// Escape-aware JSON string extractor. JsonExtractString breaks at the
+// first quote without honouring escapes, which truncates any field
+// containing \" — fine for plain identifiers, broken for user-entered
+// chat content. Mirrors the plugin's ExtractJsonStringEscaped.
+static std::string JsonExtractStringEscaped(const std::string& json,
+                                            const std::string& key) {
+    std::string search = "\"" + key + "\":\"";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return "";
+    pos += search.size();
+
+    std::string out;
+    out.reserve(json.size() - pos);
+    while (pos < json.size()) {
+        char c = json[pos];
+        if (c == '"') break;
+        if (c == '\\' && pos + 1 < json.size()) {
+            char n = json[pos + 1];
+            switch (n) {
+                case '"': case '\\': case '/': out += n;   pos += 2; break;
+                case 'b': out += '\b'; pos += 2; break;
+                case 'f': out += '\f'; pos += 2; break;
+                case 'n': out += '\n'; pos += 2; break;
+                case 'r': out += '\r'; pos += 2; break;
+                case 't': out += '\t'; pos += 2; break;
+                case 'u': pos += 6; break;
+                default:  out += n; pos += 2; break;
+            }
+        } else {
+            out += c;
+            pos++;
+        }
+    }
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // Send the current participant list to the plugin. Called on explicit
 // get_participants request, and after joining a meeting once
@@ -1392,6 +1428,79 @@ void HandleLeaveMeeting(const std::string& /*json*/) {
 void HandleGetParticipants(const std::string& /*json*/) {
     LogToFile("Meeting: HandleGetParticipants called");
     SendParticipantList();
+}
+
+// ---------------------------------------------------------------------------
+// IPC handler: send_chat_message
+// Sends a public ("to all") chat message via the SDK and replies with a
+// chat_send_result. Failure reasons are written as short, user-facing
+// strings — the plugin shows them verbatim in a MessageBox.
+// ---------------------------------------------------------------------------
+void HandleSendChatMessage(const std::string& json) {
+    std::string content = JsonExtractStringEscaped(json, "content");
+
+    auto reply = [](bool success, const std::string& error) {
+        std::string out;
+        if (success) {
+            out = "{\"type\":\"chat_send_result\",\"success\":true}";
+        } else {
+            out = "{\"type\":\"chat_send_result\",\"success\":false,"
+                  "\"error\":\"" + JsonEscape(error) + "\"}";
+        }
+        SendToPlugin(out);
+    };
+
+    if (!g_meetingService) {
+        LogToFile("Chat: send_chat_message — no meeting service");
+        reply(false, "Not in a meeting");
+        return;
+    }
+    if (g_meetingService->GetMeetingStatus() !=
+        ZOOM_SDK_NAMESPACE::MEETING_STATUS_INMEETING) {
+        LogToFile("Chat: send_chat_message — not in meeting");
+        reply(false, "Not in a meeting");
+        return;
+    }
+
+    ZOOM_SDK_NAMESPACE::IMeetingChatController* cc =
+        g_meetingService->GetMeetingChatController();
+    if (!cc) {
+        LogToFile("Chat: send_chat_message — chat controller unavailable");
+        reply(false, "Chat is unavailable in this meeting");
+        return;
+    }
+
+    ZOOM_SDK_NAMESPACE::IChatMsgInfoBuilder* builder =
+        cc->GetChatMessageBuilder();
+    if (!builder) {
+        LogToFile("Chat: send_chat_message — chat builder unavailable");
+        reply(false, "Chat is unavailable in this meeting");
+        return;
+    }
+
+    std::wstring wContent = Utf8ToWide(content);
+    builder->SetContent(wContent.c_str());
+    builder->SetMessageType(ZOOM_SDK_NAMESPACE::SDKChatMessageType_To_All);
+    ZOOM_SDK_NAMESPACE::IChatMsgInfo* msg = builder->Build();
+    if (!msg) {
+        LogToFile("Chat: send_chat_message — Build returned null");
+        reply(false, "Failed to build chat message");
+        return;
+    }
+
+    ZOOM_SDK_NAMESPACE::SDKError err = cc->SendChatMsgTo(msg);
+    if (err != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
+        char buf[128];
+        sprintf_s(buf, "Chat: SendChatMsgTo returned %d", (int)err);
+        LogToFile(buf);
+        char errBuf[96];
+        sprintf_s(errBuf, "Failed to send (SDK error %d)", (int)err);
+        reply(false, errBuf);
+        return;
+    }
+
+    LogToFile("Chat: send_chat_message sent successfully");
+    reply(true, "");
 }
 
 // ---------------------------------------------------------------------------

@@ -45,6 +45,7 @@
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QLabel>
+#include <QMessageBox>
 #include <QPushButton>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -206,6 +207,34 @@ static long long ExtractJsonNumber(const std::string& json, const std::string& k
     std::string numStr = json.substr(pos, end == std::string::npos
                                           ? std::string::npos : end - pos);
     try { return std::stoll(numStr); } catch (...) { return 0; }
+}
+
+// JSON string escaper for outgoing IPC. Mirrors the engine's JsonEscape
+// — they need to agree on what counts as an escape so both sides can
+// round-trip user-entered chat content (quotes, backslashes, newlines).
+static std::string JsonEscape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 2);
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (c < 0x20) {
+                    char buf[8];
+                    sprintf_s(buf, "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += (char)c;
+                }
+        }
+    }
+    return out;
 }
 
 // JSON-escape-aware string extractor. ExtractJsonString stops at the first
@@ -1128,9 +1157,28 @@ public:
         m_list->setUniformItemSizes(false);
         m_list->setItemDelegate(new ChatMessageDelegate(m_list));
 
+        m_input = new QLineEdit(this);
+        m_input->setPlaceholderText("Send message to everyone...");
+        m_sendBtn = new QPushButton("Send", this);
+
+        // Disabled until we're in a meeting. OnMeetingJoined/OnMeetingLeft
+        // toggle these based on engine state.
+        m_input->setEnabled(false);
+        m_sendBtn->setEnabled(false);
+
+        QObject::connect(m_input, &QLineEdit::returnPressed,
+                         this, [this]() { SendCurrentMessage(); });
+        QObject::connect(m_sendBtn, &QPushButton::clicked,
+                         this, [this]() { SendCurrentMessage(); });
+
+        QHBoxLayout* inputRow = new QHBoxLayout();
+        inputRow->addWidget(m_input);
+        inputRow->addWidget(m_sendBtn);
+
         QVBoxLayout* layout = new QVBoxLayout(this);
         layout->setContentsMargins(0, 0, 0, 0);
         layout->addWidget(m_list);
+        layout->addLayout(inputRow);
 
         setMinimumSize(200, 300);
     }
@@ -1161,8 +1209,16 @@ public:
         m_list->scrollToBottom();
     }
 
-    void OnMeetingJoined() { SetPlaceholder("Connected"); }
-    void OnMeetingLeft()   { SetPlaceholder("Not connected to a meeting"); }
+    void OnMeetingJoined() {
+        SetPlaceholder("Connected");
+        m_input->setEnabled(true);
+        m_sendBtn->setEnabled(true);
+    }
+    void OnMeetingLeft() {
+        SetPlaceholder("Not connected to a meeting");
+        m_input->setEnabled(false);
+        m_sendBtn->setEnabled(false);
+    }
 
 private:
     void SetPlaceholder(const QString& text) {
@@ -1174,7 +1230,31 @@ private:
         m_list->addItem(text);
     }
 
+    void SendCurrentMessage() {
+        QString text = m_input->text().trimmed();
+        if (text.isEmpty()) return;
+
+        // Disable while sending to absorb double-clicks / mash-enter.
+        // We don't await the engine's response — re-enabling immediately
+        // after dispatch keeps the input responsive; if the send fails,
+        // chat_send_result surfaces it via MessageBox.
+        m_input->setEnabled(false);
+        m_sendBtn->setEnabled(false);
+
+        std::string msg =
+            "{\"type\":\"send_chat_message\",\"content\":\"" +
+            JsonEscape(text.toStdString()) + "\"}";
+        feeds::SendToEngine(msg);
+
+        m_input->clear();
+        m_input->setEnabled(true);
+        m_sendBtn->setEnabled(true);
+        m_input->setFocus();
+    }
+
     QListWidget* m_list             = nullptr;
+    QLineEdit*   m_input            = nullptr;
+    QPushButton* m_sendBtn          = nullptr;
     bool         m_messagesStarted  = false;
 };
 
@@ -2494,6 +2574,28 @@ static void RegisterEngineHandlers() {
             [qSender, qContent, timestamp]() {
                 if (g_chatDock)
                     g_chatDock->AppendMessage(qSender, qContent, timestamp);
+            });
+    });
+
+    feeds::RegisterMessageHandler("chat_send_result",
+    [](const std::string& json) {
+        // Success path: nothing to do — Zoom echoes our message back via
+        // onChatMsgNotification and it renders through the normal chat
+        // pipeline. Only surface failures, since the user otherwise has
+        // no indication that the send didn't land.
+        bool success =
+            json.find("\"success\":true") != std::string::npos;
+        if (success) return;
+
+        std::string error = ExtractJsonStringEscaped(json, "error");
+        if (error.empty()) error = "Unknown error";
+        QString qError = QString::fromStdString(error);
+
+        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
+            [qError]() {
+                QMainWindow* main =
+                    (QMainWindow*)obs_frontend_get_main_window();
+                QMessageBox::warning(main, "Feeds — Send Failed", qError);
             });
     });
 
