@@ -2890,13 +2890,13 @@ static void ApplyChatPopupDefaultPosition(obs_source_t* source) {
     obs_enum_scenes(enum_cb, &ctx);
 }
 
-// Place a newly-created overlay source at the top-right corner of the
-// canvas with a small inset (2% of width from the right edge, 5% of height
-// from the top). The overlay is a sidebar element complementing the
-// popup's bottom-centre callout. Top-right alignment keeps the overlay
-// glued to the corner regardless of its current rendered height — taller
-// histories grow downward from the anchor.
-static void ApplyChatOverlayDefaultPosition(obs_source_t* source) {
+// Apply the overlay's per-canvas defaults: a Width setting (35% of canvas
+// width) on the source itself, plus position (top-right, 2% × 5% inset)
+// and alignment on the scene-item. The Width default is only written if
+// the user hasn't already set a value — so a saved scene's width survives
+// reloads — but the position is written unconditionally (same pattern as
+// the popup's positioning hook).
+static void ApplyChatOverlayDefaults(obs_source_t* source) {
     if (!source) return;
 
     obs_video_info ovi;
@@ -2905,6 +2905,21 @@ static void ApplyChatOverlayDefaultPosition(obs_source_t* source) {
     if (obs_get_video_info(&ovi)) {
         canvasW = ovi.base_width;
         canvasH = ovi.base_height;
+    }
+
+    // Per-canvas Width default. obs_data_has_user_value returns false for
+    // fresh creations (only get_defaults values are present) and true for
+    // sources loaded from a saved scene — so we only write the canvas-
+    // relative default in the fresh case, preserving user-set widths
+    // across OBS restarts.
+    obs_data_t* settings = obs_source_get_settings(source);
+    if (settings) {
+        if (!obs_data_has_user_value(settings, "width")) {
+            const int defaultW = (int)((float)canvasW * 0.35f);
+            obs_data_set_int(settings, "width", defaultW);
+            obs_source_update(source, settings);
+        }
+        obs_data_release(settings);
     }
 
     const int marginFromRight = (int)((float)canvasW * 0.02f);
@@ -2986,7 +3001,7 @@ static void OnSourceCreated(void* /*data*/, calldata_t* cd) {
             if (isChatPopup) {
                 ApplyChatPopupDefaultPosition(strong);
             } else if (isChatOverlay) {
-                ApplyChatOverlayDefaultPosition(strong);
+                ApplyChatOverlayDefaults(strong);
             } else {
                 ApplyFeedsBoundsToSceneItem(strong);
             }

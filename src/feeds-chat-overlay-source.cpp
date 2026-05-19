@@ -43,25 +43,42 @@ extern QImage                           g_fallbackAvatar;
 namespace {
 
 // ---------------------------------------------------------------------------
-// Reference layout at 1080p (canvas 1920×1080, overlay 480 px = 25% wide).
-// All pixel dimensions multiply through `scale = overlayWidth / 480.0f`
-// inside RenderOverlayToImage so the overlay keeps the same proportions
-// at any canvas resolution — same idiom the popup uses for its 1536/1920
-// reference.
+// OBS Convention B: the source declares its own pixel dimensions through
+// editable properties; the scene-item handle drag scales the rendered
+// output (same as obs-text). The user controls Width and Visible Messages
+// directly; everything else (avatar size, font sizes, padding) is fixed
+// at a reference design and does NOT scale with canvas. If the canvas is
+// 720p, fonts/avatar render at the same pixel size — the user can resize
+// the source via properties or scene-item handles.
 // ---------------------------------------------------------------------------
-static constexpr int MAX_VISIBLE_MESSAGES = 6;
 
-// Width = 25% of the active canvas. Queried per render so the overlay
-// re-sizes correctly if the streamer changes canvas resolution. Falls
-// back to 480 (25% of 1920) if obs_get_video_info fails — only
-// possible before OBS finishes initialising.
-static uint32_t GetOverlayCanvasWidth() {
-    struct obs_video_info ovi;
-    if (obs_get_video_info(&ovi)) {
-        return (uint32_t)((float)ovi.base_width * 0.25f);
-    }
-    return 480;
-}
+// Settings keys used in obs_data_t blobs and properties UI.
+static constexpr const char* S_WIDTH            = "width";
+static constexpr const char* S_VISIBLE_MESSAGES = "visible_messages";
+
+// Width range and step. WIDTH_DEFAULT_PX is the property-system default
+// (35% of 1920 ≈ 672 px) — a baseline for sources loaded from saves
+// before the per-canvas override in ApplyChatOverlayDefaults runs.
+static constexpr int WIDTH_DEFAULT_PX = 672;
+static constexpr int WIDTH_MIN_PX     = 200;
+static constexpr int WIDTH_MAX_PX     = 3000;
+static constexpr int WIDTH_STEP_PX    = 10;
+
+static constexpr int VISIBLE_DEFAULT = 6;
+static constexpr int VISIBLE_MIN     = 1;
+static constexpr int VISIBLE_MAX     = 20;
+
+// Fixed reference-1080p layout values. These do NOT scale with canvas
+// resolution — the user resizes the overlay by changing Width and
+// Visible Messages in properties (or by accepting that handle-drag
+// stretches, same as obs-text).
+static constexpr int BG_PADDING           = 12;
+static constexpr int BG_CORNER_RADIUS     = 4;
+static constexpr int ROW_SPACING          = 8;
+static constexpr int AVATAR_SIZE          = 50;
+static constexpr int ROW_INNER_SPACING    = 10;
+static constexpr int USER_FONT_PIXEL_SIZE = 26;
+static constexpr int MSG_FONT_PIXEL_SIZE  = 24;
 
 // ---------------------------------------------------------------------------
 // Message record. Shared shape with what the popup consumes from the dock,
@@ -101,12 +118,16 @@ struct FeedsChatOverlayData {
     bool            texture_dirty = true;
     gs_texrender_t* texrender     = nullptr;
 
-    // Fallback dimensions at 1080p — first RenderOverlayToImage call
-    // queries OBS for the real canvas size and overwrites both. Pre-render
-    // fcr_get_width / fcr_get_height queries see a sensible stand-in
-    // rather than zero.
-    uint32_t        width  = 480;
-    uint32_t        height = 600;
+    // Configured via source properties — fcr_update mirrors the settings
+    // here, and RenderOverlayToImage uses them as the layout extents.
+    // Initial values match the get_defaults values so fcr_get_width /
+    // fcr_get_height return something sensible before fcr_update runs.
+    uint32_t        width             = (uint32_t)WIDTH_DEFAULT_PX;
+    int             visible_messages  = VISIBLE_DEFAULT;
+    uint32_t        height            = (uint32_t)(
+                                            VISIBLE_DEFAULT * AVATAR_SIZE +
+                                            (VISIBLE_DEFAULT - 1) * ROW_SPACING +
+                                            2 * BG_PADDING);
 };
 
 // Instance registry — separate from the popup's so future commits can fan
@@ -124,29 +145,21 @@ std::vector<FeedsChatOverlayData*>      g_overlayInstances;
 // ---------------------------------------------------------------------------
 static void RenderOverlayToImage(FeedsChatOverlayData* d,
                                  const std::vector<OverlayMessage>& messages) {
-    const int   overlayWidth = (int)GetOverlayCanvasWidth();
-    const float scale        = (float)overlayWidth / 480.0f;
-
-    // Scaled layout values. Same `(int)(literal * scale)` idiom the popup
-    // uses; the literals are the 1080p reference dimensions.
-    const int BG_PADDING            = (int)(12 * scale);
-    const int BG_CORNER_RADIUS      = (int)(4  * scale);
-    const int ROW_SPACING           = (int)(8  * scale);
-    const int AVATAR_SIZE           = (int)(50 * scale);
-    const int ROW_INNER_SPACING     = (int)(10 * scale);
-    const int USER_FONT_PIXEL_SIZE  = (int)(26 * scale);
-    const int MSG_FONT_PIXEL_SIZE   = (int)(24 * scale);
-
-    // Bbox height reserves MAX_VISIBLE_MESSAGES rows of bare avatar height
+    // Bbox height reserves `visible_messages` rows of bare avatar height
     // plus inter-row spacing plus background padding. Rows whose wrapped
-    // text exceeds avatar height push upward and clip at the top — visible
-    // by design (better to drop the oldest than to grow the bbox
+    // text exceeds avatar height push upward and clip at the top — by
+    // design (better to drop the oldest than to grow the bbox
     // unpredictably).
-    const int rowsReserveH = MAX_VISIBLE_MESSAGES * AVATAR_SIZE +
-                             (MAX_VISIBLE_MESSAGES - 1) * ROW_SPACING;
+    int visible = d->visible_messages;
+    if (visible < VISIBLE_MIN) visible = VISIBLE_MIN;
+    if (visible > VISIBLE_MAX) visible = VISIBLE_MAX;
+
+    const int rowsReserveH = visible * AVATAR_SIZE +
+                             (visible - 1) * ROW_SPACING;
     const int totalHeight  = rowsReserveH + 2 * BG_PADDING;
 
-    d->width  = (uint32_t)overlayWidth;
+    // d->width is the user-configured Width from settings; height is
+    // derived from Visible Messages here.
     d->height = (uint32_t)totalHeight;
 
     if (d->rendered_image.size() != QSize((int)d->width, (int)d->height) ||
@@ -167,7 +180,7 @@ static void RenderOverlayToImage(FeedsChatOverlayData* d,
     p.drawRoundedRect(bgRect, BG_CORNER_RADIUS, BG_CORNER_RADIUS);
 
     const size_t take = std::min<size_t>(messages.size(),
-                                          (size_t)MAX_VISIBLE_MESSAGES);
+                                          (size_t)visible);
 
     const int rowX     = BG_PADDING;
     const int rowWidth = (int)d->width  - 2 * BG_PADDING;
@@ -307,7 +320,40 @@ static const char* fcr_get_name(void*) {
     return "Zoom Chat Overlay";
 }
 
-static void* fcr_create(obs_data_t* /*settings*/, obs_source_t* source) {
+// Populate baseline defaults into the settings blob before the source's
+// create callback runs. The per-canvas Width override is applied by
+// ApplyChatOverlayDefaults in plugin-main.cpp for fresh creations; this
+// just guarantees a sensible value for sources loaded from saves before
+// any other code touches their settings.
+static void fcr_get_defaults(obs_data_t* settings) {
+    obs_data_set_default_int(settings, S_WIDTH,            WIDTH_DEFAULT_PX);
+    obs_data_set_default_int(settings, S_VISIBLE_MESSAGES, VISIBLE_DEFAULT);
+}
+
+// Pull the configured dimensions out of settings, clamp to ranges,
+// mirror onto the data struct, and mark the texture dirty so the next
+// video_render rebuilds at the new size. Lock the instances mutex so a
+// concurrent IPC-thread MarkAllOverlayInstancesDirty can't race the
+// dirty flag (same ordering used in fcr_video_render's dirty clear).
+static void fcr_update(void* data, obs_data_t* settings) {
+    FeedsChatOverlayData* d = static_cast<FeedsChatOverlayData*>(data);
+    if (!d || !settings) return;
+
+    int w = (int)obs_data_get_int(settings, S_WIDTH);
+    int v = (int)obs_data_get_int(settings, S_VISIBLE_MESSAGES);
+    if (w < WIDTH_MIN_PX) w = WIDTH_MIN_PX;
+    if (w > WIDTH_MAX_PX) w = WIDTH_MAX_PX;
+    if (v < VISIBLE_MIN)  v = VISIBLE_MIN;
+    if (v > VISIBLE_MAX)  v = VISIBLE_MAX;
+
+    std::lock_guard<std::mutex> lock(g_overlayInstancesMutex);
+    bool changed = false;
+    if (d->width != (uint32_t)w) { d->width = (uint32_t)w; changed = true; }
+    if (d->visible_messages != v) { d->visible_messages = v; changed = true; }
+    if (changed) d->texture_dirty = true;
+}
+
+static void* fcr_create(obs_data_t* settings, obs_source_t* source) {
     FeedsChatOverlayData* d = new FeedsChatOverlayData();
     d->source = source;
 
@@ -319,6 +365,11 @@ static void* fcr_create(obs_data_t* /*settings*/, obs_source_t* source) {
         std::lock_guard<std::mutex> lock(g_overlayInstancesMutex);
         g_overlayInstances.push_back(d);
     }
+
+    // Seed initial dimensions from settings (defaults populated by
+    // fcr_get_defaults are in effect here). fcr_update reads, clamps,
+    // and marks dirty.
+    fcr_update(d, settings);
     return d;
 }
 
@@ -359,7 +410,14 @@ static uint32_t fcr_get_height(void* data) {
 }
 
 static obs_properties_t* fcr_get_properties(void* /*data*/) {
-    return obs_properties_create();
+    obs_properties_t* props = obs_properties_create();
+    obs_properties_add_int_slider(props, S_WIDTH,
+                                  "Width",
+                                  WIDTH_MIN_PX, WIDTH_MAX_PX, WIDTH_STEP_PX);
+    obs_properties_add_int(props, S_VISIBLE_MESSAGES,
+                           "Visible Messages",
+                           VISIBLE_MIN, VISIBLE_MAX, 1);
+    return props;
 }
 
 static void fcr_video_render(void* data, gs_effect_t* /*effect*/) {
@@ -463,6 +521,8 @@ void RegisterChatOverlaySource() {
     feeds_chat_overlay_info.get_width      = fcr_get_width;
     feeds_chat_overlay_info.get_height     = fcr_get_height;
     feeds_chat_overlay_info.get_properties = fcr_get_properties;
+    feeds_chat_overlay_info.get_defaults   = fcr_get_defaults;
+    feeds_chat_overlay_info.update         = fcr_update;
     feeds_chat_overlay_info.video_render   = fcr_video_render;
     feeds_chat_overlay_info.icon_type      = OBS_ICON_TYPE_TEXT;
     obs_register_source(&feeds_chat_overlay_info);
