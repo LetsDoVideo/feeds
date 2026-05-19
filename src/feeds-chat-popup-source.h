@@ -1,13 +1,25 @@
 #pragma once
 
-// Registration entry point for the feeds_chat_popup OBS source. Called
-// once from obs_module_load. Source rendering, properties, and texture
-// management all live in feeds-chat-popup-source.cpp.
-//
-// In commit 3b the source renders a single hardcoded test message. The
-// dock-to-source signal that pushes real chat messages in arrives in
-// commit 3c, and animation in 3d.
+#include <string>
+
+// Public interface for the feeds_chat_popup OBS source. Registration is
+// called once from obs_module_load. ToggleChatPopup / ClearChatPopup are
+// called from the dock click handler and meeting-left handler to drive
+// popup visibility across all active popup instances.
 
 namespace feeds {
-    void RegisterChatPopupSource();
-}
+
+void RegisterChatPopupSource();
+
+// Show the given message in every active popup source instance. If the
+// same message (matched by sender_id + content) is currently showing,
+// hide instead — gives the dock a single click-to-toggle affordance.
+void ToggleChatPopup(unsigned int senderId,
+                     const std::string& senderName,
+                     const std::string& content);
+
+// Hide any active popup and clear the stored message. Called on
+// meeting-left so stale state doesn't carry into the next meeting.
+void ClearChatPopup();
+
+}  // namespace feeds

@@ -7,10 +7,12 @@
 // gs_draw_sprite. CPU work is amortised across frames — only the GPU
 // blit happens per-frame in steady state.
 //
-// Commit 3b (this commit) renders a hardcoded test message — enough
-// to validate registration, the QPainter pipeline, and texture upload.
-// Commit 3c wires the dock's send/receive path into the source so it
-// shows real chat. Commit 3d adds the slide-in / fade-out animation.
+// Commit 3c wires the dock's click handler into the source: clicking a
+// message in the dock toggles a popup showing that message across all
+// active popup instances; clicking the same message hides it; clicking
+// a different one replaces the content. Animation lands in 3d.
+
+#include "feeds-chat-popup-source.h"
 
 #include <obs-module.h>
 #include <graphics/graphics.h>
@@ -31,40 +33,18 @@
 // Avatar cache lives in plugin-main.cpp — declared with external linkage
 // there specifically so this TU can read it. The popup is a pure consumer:
 // the chat IPC handler populates the cache on receive, and we look up by
-// sender_id when rendering. For 3b we just use the fallback.
+// sender_id when rendering.
 extern std::mutex                       g_avatarCacheMutex;
 extern std::map<unsigned int, QImage>   g_avatarCache;
 extern QImage                           g_fallbackAvatar;
 
 namespace {
 
-struct FeedsChatPopupData {
-    obs_source_t* source = nullptr;
-
-    QImage        rendered_image;
-    gs_texture_t* texture       = nullptr;
-    bool          texture_dirty = true;
-
-    uint32_t      width  = 600;
-    uint32_t      height = 200;
-};
-
 // ---------------------------------------------------------------------------
-// QPainter rendering — paints the popup into d->rendered_image. Called only
-// when content changes (texture_dirty is set), not per frame.
-//
-// Layout (canvas 600 × 200, anchored top-left):
-//   Avatar:        128×128 circle at (15, 15) with 3px yellow ring
-//   Username pill: rounded rect starting at x=148, y=20, height ~36, width
-//                  text-driven. Overlaps the top of the bubble.
-//   Bubble:        rounded rect (10, 60, 580×130), #222 fill, hard offset
-//                  shadow (0,0,0,80) at +5,+5.
-//   Message text:  inside bubble, 145px left padding to clear the avatar,
-//                  35px right padding, 20px top/bottom, white bold word-wrap.
+// Canvas layout constants. Width is fixed (chat popups shouldn't span the
+// full stream); height grows downward to fit wrapped text. Short messages
+// get short popups, long messages get tall popups.
 // ---------------------------------------------------------------------------
-// Canvas layout constants. Width is fixed (chat popups shouldn't span
-// the full stream); height grows downward to fit wrapped text. Short
-// messages get short popups, long messages get tall popups.
 static constexpr int CANVAS_WIDTH            = 800;
 static constexpr int BUBBLE_LEFT_MARGIN      = 10;
 static constexpr int BUBBLE_RIGHT_MARGIN     = 10;
@@ -76,6 +56,48 @@ static constexpr int MIN_BUBBLE_HEIGHT       = 130;  // never shorter than avata
 static constexpr int BUBBLE_TOP_OFFSET       = 60;
 static constexpr int BOTTOM_MARGIN           = 15;   // room for shadow + breathing
 static constexpr int MESSAGE_FONT_PIXEL_SIZE = 32;
+
+// ---------------------------------------------------------------------------
+// Per-instance state. visible/sender_id/sender_name/content/texture_dirty
+// are mirrored into each instance from the file-scope globals below via
+// UpdateInstanceFromGlobal — protected by g_popupStateMutex on both
+// read and write paths. rendered_image/texture are touched only on the
+// graphics thread from fcp_video_render and need no extra locking.
+// ---------------------------------------------------------------------------
+struct FeedsChatPopupData {
+    obs_source_t* source = nullptr;
+
+    QImage        rendered_image;
+    gs_texture_t* texture       = nullptr;
+    bool          texture_dirty = true;
+
+    uint32_t      width  = CANVAS_WIDTH;
+    uint32_t      height = BUBBLE_TOP_OFFSET + MIN_BUBBLE_HEIGHT + BOTTOM_MARGIN;
+
+    bool          visible    = false;
+    unsigned int  sender_id  = 0;
+    QString       sender_name;
+    QString       content;
+};
+
+// ---------------------------------------------------------------------------
+// Instance registry — ToggleChatPopup / ClearChatPopup walk this list to
+// push state changes to every popup in every scene. Modified on
+// fcp_create / fcp_destroy.
+// ---------------------------------------------------------------------------
+std::mutex                            g_instancesMutex;
+std::vector<FeedsChatPopupData*>      g_instances;
+
+// ---------------------------------------------------------------------------
+// Current popup state. Single source of truth — instances mirror this.
+// Lives at file scope so a freshly-created popup instance can pick up
+// whatever is currently showing.
+// ---------------------------------------------------------------------------
+std::mutex     g_popupStateMutex;
+bool           g_popupVisible      = false;
+unsigned int   g_popupSenderId     = 0;
+QString        g_popupSenderName;
+QString        g_popupContent;
 
 static void RenderPopupToImage(FeedsChatPopupData* d,
                                const QString& senderName,
@@ -185,25 +207,31 @@ static void RenderPopupToImage(FeedsChatPopupData* d,
 }
 
 // ---------------------------------------------------------------------------
-// Upload the current QImage to GPU. Called from video_render when
-// texture_dirty is set. video_render runs on the graphics thread so the
-// graphics context is already active — no obs_enter_graphics needed.
+// Upload the current QImage to GPU. Called from video_render when the
+// per-instance state has changed. video_render runs on the graphics thread
+// so the graphics context is already active — no obs_enter_graphics needed.
+//
+// senderName/content are passed in as a snapshot to avoid touching d's
+// QString members (which the Qt main thread can mutate concurrently via
+// UpdateInstanceFromGlobal) while the slow paint is happening.
 // ---------------------------------------------------------------------------
-static void RegenerateTexture(FeedsChatPopupData* d) {
-    // 3b: hardcoded test content. 3c replaces with real data signalled
-    // from the dock. For the avatar, just use the fallback — exercises
-    // the load/scale/clip path without needing a real meeting.
+static void RegenerateTexture(FeedsChatPopupData* d,
+                              unsigned int   senderId,
+                              const QString& senderName,
+                              const QString& content) {
     QImage avatar;
     {
         std::lock_guard<std::mutex> lock(g_avatarCacheMutex);
-        avatar = g_fallbackAvatar;
+        auto it = g_avatarCache.find(senderId);
+        if (it != g_avatarCache.end()) {
+            avatar = it->second;
+        } else {
+            // Not in cache (rare — IPC handler usually warms it on
+            // arrival). Use the bundled fallback so we still draw a
+            // recognisable popup.
+            avatar = g_fallbackAvatar;
+        }
     }
-
-    const QString senderName = "Test User";
-    const QString content =
-        "This is what a Feeds chat popup looks like. Long messages will "
-        "wrap to multiple lines just like the dock does, using QPainter's "
-        "word-wrap rendering.";
 
     RenderPopupToImage(d, senderName, content, avatar);
 
@@ -236,6 +264,38 @@ static void RegenerateTexture(FeedsChatPopupData* d) {
 }
 
 // ---------------------------------------------------------------------------
+// Mirror the current global popup state into a single instance. Sets
+// texture_dirty if anything changed so the next video_render redraws.
+// Acquires g_popupStateMutex — must NOT be called with that mutex held.
+// ---------------------------------------------------------------------------
+static void UpdateInstanceFromGlobal(FeedsChatPopupData* d) {
+    std::lock_guard<std::mutex> lock(g_popupStateMutex);
+
+    bool         changed =
+        d->visible     != g_popupVisible    ||
+        d->sender_id   != g_popupSenderId   ||
+        d->sender_name != g_popupSenderName ||
+        d->content     != g_popupContent;
+
+    d->visible     = g_popupVisible;
+    d->sender_id   = g_popupSenderId;
+    d->sender_name = g_popupSenderName;
+    d->content     = g_popupContent;
+
+    if (changed) d->texture_dirty = true;
+}
+
+// Fan state changes out to every popup instance. Lock order is
+// instancesMutex (outer) → popupStateMutex (inner, inside the per-instance
+// call) — never reversed elsewhere, so no deadlock.
+static void UpdateAllInstances() {
+    std::lock_guard<std::mutex> lock(g_instancesMutex);
+    for (FeedsChatPopupData* d : g_instances) {
+        UpdateInstanceFromGlobal(d);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // OBS source callbacks
 // ---------------------------------------------------------------------------
 static const char* fcp_get_name(void*) {
@@ -249,12 +309,30 @@ static const char* fcp_get_name(void*) {
 static void* fcp_create(obs_data_t* /*settings*/, obs_source_t* source) {
     FeedsChatPopupData* d = new FeedsChatPopupData();
     d->source = source;
+
+    {
+        std::lock_guard<std::mutex> lock(g_instancesMutex);
+        g_instances.push_back(d);
+    }
+
+    // Pick up whatever message is currently showing (if any), so a popup
+    // added mid-conversation matches what the rest of the system sees.
+    UpdateInstanceFromGlobal(d);
+
     return d;
 }
 
 static void fcp_destroy(void* data) {
     FeedsChatPopupData* d = static_cast<FeedsChatPopupData*>(data);
     if (!d) return;
+
+    {
+        std::lock_guard<std::mutex> lock(g_instancesMutex);
+        g_instances.erase(
+            std::remove(g_instances.begin(), g_instances.end(), d),
+            g_instances.end());
+    }
+
     if (d->texture) {
         // gs_texture_destroy needs the graphics context — destroy is not
         // guaranteed to be on the graphics thread.
@@ -277,8 +355,8 @@ static uint32_t fcp_get_height(void* data) {
 }
 
 static obs_properties_t* fcp_get_properties(void* /*data*/) {
-    // 3b: no user-tunable settings yet. 3c+ will add layout / timeout /
-    // position controls as needed.
+    // No user-tunable settings yet — leave the properties panel empty
+    // rather than inventing knobs we don't know we need.
     return obs_properties_create();
 }
 
@@ -286,8 +364,30 @@ static void fcp_video_render(void* data, gs_effect_t* /*effect*/) {
     FeedsChatPopupData* d = static_cast<FeedsChatPopupData*>(data);
     if (!d) return;
 
-    if (d->texture_dirty || !d->texture) {
-        RegenerateTexture(d);
+    // Snapshot per-instance state under lock so an in-flight
+    // UpdateInstanceFromGlobal on the Qt main thread can't tear the
+    // QStrings or change visibility mid-render. Clear texture_dirty
+    // under the same lock — if a new update lands after we release,
+    // it'll set dirty=true again and the next frame catches up.
+    bool         visible;
+    bool         dirty;
+    unsigned int senderId;
+    QString      senderName;
+    QString      content;
+    {
+        std::lock_guard<std::mutex> lock(g_popupStateMutex);
+        visible    = d->visible;
+        dirty      = d->texture_dirty;
+        senderId   = d->sender_id;
+        senderName = d->sender_name;
+        content    = d->content;
+        if (dirty) d->texture_dirty = false;
+    }
+
+    if (!visible) return;
+
+    if (dirty || !d->texture) {
+        RegenerateTexture(d, senderId, senderName, content);
     }
     if (!d->texture) return;
 
@@ -326,6 +426,44 @@ void RegisterChatPopupSource() {
     feeds_chat_popup_info.video_render   = fcp_video_render;
     feeds_chat_popup_info.icon_type      = OBS_ICON_TYPE_TEXT;
     obs_register_source(&feeds_chat_popup_info);
+}
+
+void ToggleChatPopup(unsigned int senderId,
+                     const std::string& senderName,
+                     const std::string& content) {
+    {
+        std::lock_guard<std::mutex> lock(g_popupStateMutex);
+
+        // "Same message" = currently showing this same sender_id + content.
+        // Clicking it again dismisses; clicking a different one replaces.
+        bool sameMessage = g_popupVisible &&
+                           g_popupSenderId == senderId &&
+                           g_popupContent.toStdString() == content;
+
+        if (sameMessage) {
+            g_popupVisible = false;
+            g_popupSenderId = 0;
+            g_popupSenderName.clear();
+            g_popupContent.clear();
+        } else {
+            g_popupVisible    = true;
+            g_popupSenderId   = senderId;
+            g_popupSenderName = QString::fromStdString(senderName);
+            g_popupContent    = QString::fromStdString(content);
+        }
+    }
+    UpdateAllInstances();
+}
+
+void ClearChatPopup() {
+    {
+        std::lock_guard<std::mutex> lock(g_popupStateMutex);
+        g_popupVisible = false;
+        g_popupSenderId = 0;
+        g_popupSenderName.clear();
+        g_popupContent.clear();
+    }
+    UpdateAllInstances();
 }
 
 } // namespace feeds

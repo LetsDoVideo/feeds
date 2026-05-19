@@ -37,6 +37,7 @@
 #include <QInputDialog>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QListWidgetItem>
 #include <QPainter>
 #include <QRegularExpression>
 #include <QStyledItemDelegate>
@@ -52,6 +53,7 @@
 #include <QImage>
 #include <QUrl>
 #include <QUrlQuery>
+#include <QVariant>
 #include <QApplication>
 #include <QClipboard>
 #include <QDesktopServices>
@@ -1143,6 +1145,13 @@ private:
 // ---------------------------------------------------------------------------
 class FeedsChatDock : public QWidget {
 public:
+    // Custom QListWidgetItem data roles. Each dock item stores the
+    // sender_id, name, and content as item data so OnMessageClicked can
+    // recover them without re-parsing the rendered label.
+    static constexpr int RoleSenderId   = Qt::UserRole + 1;
+    static constexpr int RoleSenderName = Qt::UserRole + 2;
+    static constexpr int RoleContent    = Qt::UserRole + 3;
+
     explicit FeedsChatDock(QWidget* parent = nullptr) : QWidget(parent) {
         m_list = new QListWidget(this);
         m_list->addItem("Not connected to a meeting");
@@ -1158,6 +1167,11 @@ public:
         m_list->setResizeMode(QListView::Adjust);
         m_list->setUniformItemSizes(false);
         m_list->setItemDelegate(new ChatMessageDelegate(m_list));
+
+        QObject::connect(m_list, &QListWidget::itemClicked,
+                         this, [this](QListWidgetItem* item) {
+                             OnMessageClicked(item);
+                         });
 
         m_input = new QLineEdit(this);
         m_input->setPlaceholderText("Send message to everyone...");
@@ -1187,13 +1201,14 @@ public:
         setMinimumSize(200, 300);
     }
 
-    // All three methods below must run on the Qt main thread. The IPC
+    // All methods below must run on the Qt main thread. The IPC
     // handlers marshal via QTimer::singleShot onto the main window before
     // invoking them.
 
-    void AppendMessage(const QString& senderName,
+    void AppendMessage(unsigned int   senderId,
+                       const QString& senderName,
                        const QString& content,
-                       qint64 timestamp) {
+                       qint64         timestamp) {
         // timestamp is kept in the signature so the engine's value
         // flows through unchanged — future surfaces (tooltip, an
         // opt-in "show timestamps" preference, the overlay source)
@@ -1209,7 +1224,12 @@ public:
             m_list->clear();
             m_messagesStarted = true;
         }
-        m_list->addItem(QString("%1: %2").arg(senderName, content));
+        QListWidgetItem* item =
+            new QListWidgetItem(QString("%1: %2").arg(senderName, content));
+        item->setData(RoleSenderId,   senderId);
+        item->setData(RoleSenderName, senderName);
+        item->setData(RoleContent,    content);
+        m_list->addItem(item);
         m_list->scrollToBottom();
     }
 
@@ -1222,6 +1242,8 @@ public:
         SetPlaceholder("Not connected to a meeting");
         m_input->setEnabled(false);
         m_sendBtn->setEnabled(false);
+        // Hide any active popup so it doesn't carry into the next meeting.
+        feeds::ClearChatPopup();
     }
 
 private:
@@ -1232,6 +1254,24 @@ private:
         if (m_messagesStarted) return;
         m_list->clear();
         m_list->addItem(text);
+    }
+
+    void OnMessageClicked(QListWidgetItem* item) {
+        if (!item) return;
+
+        // Placeholder items ("Not connected to a meeting", etc.) carry no
+        // sender data — silently skip them so clicking a placeholder
+        // doesn't do anything weird.
+        QVariant idVar = item->data(RoleSenderId);
+        if (!idVar.isValid()) return;
+
+        unsigned int senderId = idVar.toUInt();
+        QString      sender   = item->data(RoleSenderName).toString();
+        QString      content  = item->data(RoleContent).toString();
+
+        feeds::ToggleChatPopup(senderId,
+                               sender.toStdString(),
+                               content.toStdString());
     }
 
     void SendCurrentMessage() {
@@ -2587,9 +2627,10 @@ static void RegisterEngineHandlers() {
         QString qContent = QString::fromStdString(content);
 
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
-            [qSender, qContent, timestamp]() {
+            [senderId, qSender, qContent, timestamp]() {
                 if (g_chatDock)
-                    g_chatDock->AppendMessage(qSender, qContent, timestamp);
+                    g_chatDock->AppendMessage(senderId, qSender, qContent,
+                                              timestamp);
             });
     });
 
