@@ -1172,6 +1172,8 @@ public:
                          this, [this]() { SendCurrentMessage(); });
 
         QHBoxLayout* inputRow = new QHBoxLayout();
+        inputRow->setContentsMargins(6, 6, 6, 6);
+        inputRow->setSpacing(6);
         inputRow->addWidget(m_input);
         inputRow->addWidget(m_sendBtn);
 
