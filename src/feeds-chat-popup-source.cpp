@@ -22,6 +22,8 @@
 #include <QFontMetrics>
 #include <QString>
 
+#include <algorithm>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -60,10 +62,48 @@ struct FeedsChatPopupData {
 //   Message text:  inside bubble, 145px left padding to clear the avatar,
 //                  35px right padding, 20px top/bottom, white bold word-wrap.
 // ---------------------------------------------------------------------------
+// Canvas layout constants. Width is fixed (chat popups shouldn't span
+// the full stream); height grows downward to fit wrapped text. Short
+// messages get short popups, long messages get tall popups.
+static constexpr int CANVAS_WIDTH            = 800;
+static constexpr int BUBBLE_LEFT_MARGIN      = 10;
+static constexpr int BUBBLE_RIGHT_MARGIN     = 10;
+static constexpr int BUBBLE_TEXT_LEFT_PAD    = 145;  // clears the avatar
+static constexpr int BUBBLE_TEXT_RIGHT_PAD   = 35;
+static constexpr int BUBBLE_TEXT_TOP_PAD     = 20;
+static constexpr int BUBBLE_TEXT_BOTTOM_PAD  = 20;
+static constexpr int MIN_BUBBLE_HEIGHT       = 130;  // never shorter than avatar
+static constexpr int BUBBLE_TOP_OFFSET       = 60;
+static constexpr int BOTTOM_MARGIN           = 15;   // room for shadow + breathing
+static constexpr int MESSAGE_FONT_PIXEL_SIZE = 32;
+
 static void RenderPopupToImage(FeedsChatPopupData* d,
                                const QString& senderName,
                                const QString& content,
                                const QImage&  avatar) {
+    // Measure wrapped text first so we know how tall the canvas needs
+    // to be. Width is fixed; height is content-driven.
+    QFont msgFont;
+    msgFont.setBold(true);
+    msgFont.setPixelSize(MESSAGE_FONT_PIXEL_SIZE);
+    QFontMetrics fm(msgFont);
+    const int textAreaWidth = CANVAS_WIDTH
+                              - BUBBLE_LEFT_MARGIN - BUBBLE_RIGHT_MARGIN
+                              - BUBBLE_TEXT_LEFT_PAD - BUBBLE_TEXT_RIGHT_PAD;
+    QRect textBounds = fm.boundingRect(
+        0, 0, textAreaWidth, std::numeric_limits<int>::max(),
+        Qt::TextWordWrap, content);
+    const int bubbleHeight = std::max(
+        MIN_BUBBLE_HEIGHT,
+        textBounds.height() + BUBBLE_TEXT_TOP_PAD + BUBBLE_TEXT_BOTTOM_PAD);
+
+    // Mutate the source dimensions before sizing the QImage so OBS's
+    // next get_width/get_height query sees the new canvas. First frame
+    // after a content change reports the old size for a single frame —
+    // not visible in practice for the use cases here.
+    d->width  = CANVAS_WIDTH;
+    d->height = (uint32_t)(BUBBLE_TOP_OFFSET + bubbleHeight + BOTTOM_MARGIN);
+
     if (d->rendered_image.size() != QSize((int)d->width, (int)d->height) ||
         d->rendered_image.format() != QImage::Format_RGBA8888) {
         d->rendered_image = QImage((int)d->width, (int)d->height,
@@ -75,7 +115,11 @@ static void RenderPopupToImage(FeedsChatPopupData* d,
     p.setRenderHint(QPainter::Antialiasing, true);
     p.setRenderHint(QPainter::SmoothPixmapTransform, true);
 
-    const QRect bubbleRect(10, 60, 580, 130);
+    const QRect bubbleRect(
+        BUBBLE_LEFT_MARGIN,
+        BUBBLE_TOP_OFFSET,
+        CANVAS_WIDTH - BUBBLE_LEFT_MARGIN - BUBBLE_RIGHT_MARGIN,
+        bubbleHeight);
 
     // Drop shadow first so the bubble draws over it. Hard offset shadow
     // (not a real gaussian blur) — cheap, correct-enough for v1.2.0.
@@ -88,12 +132,12 @@ static void RenderPopupToImage(FeedsChatPopupData* d,
     p.drawRoundedRect(bubbleRect, 4, 4);
 
     // Message text inside the bubble, padded left to clear avatar
-    QFont msgFont = p.font();
-    msgFont.setBold(true);
-    msgFont.setPixelSize(32);
     p.setFont(msgFont);
     p.setPen(Qt::white);
-    QRect textRect = bubbleRect.adjusted(145, 20, -35, -20);
+    QRect textRect = bubbleRect.adjusted(BUBBLE_TEXT_LEFT_PAD,
+                                          BUBBLE_TEXT_TOP_PAD,
+                                          -BUBBLE_TEXT_RIGHT_PAD,
+                                          -BUBBLE_TEXT_BOTTOM_PAD);
     p.drawText(textRect,
                Qt::TextWordWrap | Qt::AlignLeft | Qt::AlignTop,
                content);
