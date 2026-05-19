@@ -41,22 +41,14 @@ extern QImage                           g_fallbackAvatar;
 namespace {
 
 // ---------------------------------------------------------------------------
-// Canvas layout constants. Popup width is 80% of the OBS canvas (queried
-// via GetPopupCanvasWidth() per content change), so the popup keeps the
-// same screen proportion at 720p, 1080p, 4K, etc. Height grows downward
-// to fit wrapped text — short messages get short popups, long messages
-// get tall popups.
+// Canvas-relative layout. Reference design is a 1920×1080 canvas, where the
+// popup is 1536 px wide (80% of canvas) with the avatar/pill/font sizes
+// captured below as literals inside RenderPopupToImage. Every pixel
+// dimension is multiplied by `scale = canvas_width / 1536.0f` inside that
+// function so the popup looks proportionally identical at 720p, 1080p,
+// 1440p, 4K, etc. Width comes from GetPopupCanvasWidth(); height is
+// content-driven (wrapped-text measurement).
 // ---------------------------------------------------------------------------
-static constexpr int BUBBLE_LEFT_MARGIN      = 10;
-static constexpr int BUBBLE_RIGHT_MARGIN     = 10;
-static constexpr int BUBBLE_TEXT_LEFT_PAD    = 145;  // clears the avatar
-static constexpr int BUBBLE_TEXT_RIGHT_PAD   = 35;
-static constexpr int BUBBLE_TEXT_TOP_PAD     = 20;
-static constexpr int BUBBLE_TEXT_BOTTOM_PAD  = 20;
-static constexpr int MIN_BUBBLE_HEIGHT       = 130;  // never shorter than avatar
-static constexpr int BUBBLE_TOP_OFFSET       = 60;
-static constexpr int BOTTOM_MARGIN           = 15;   // room for shadow + breathing
-static constexpr int MESSAGE_FONT_PIXEL_SIZE = 32;
 
 // Slide animation duration per direction. Ease-out cubic — smooth
 // deceleration on arrival, smooth acceleration on departure. Matches
@@ -100,12 +92,13 @@ struct FeedsChatPopupData {
     // declared width/height when not going through an intermediate).
     gs_texrender_t* texrender     = nullptr;
 
-    // Width starts at the 1920p fallback (80% of 1920); first
+    // Width and height start at the 1920p fallback values; first
     // RenderPopupToImage call queries OBS for the real canvas size and
-    // corrects this. Pre-render fcp_get_width queries see a sensible
-    // stand-in rather than zero.
+    // corrects both. Pre-render fcp_get_width/height queries see a
+    // sensible stand-in rather than zero. Height is BUBBLE_TOP_OFFSET +
+    // MIN_BUBBLE_HEIGHT + BOTTOM_MARGIN at scale=1.0 (60 + 130 + 15).
     uint32_t      width  = 1536;
-    uint32_t      height = BUBBLE_TOP_OFFSET + MIN_BUBBLE_HEIGHT + BOTTOM_MARGIN;
+    uint32_t      height = 205;
 
     bool          visible    = false;
     unsigned int  sender_id  = 0;
@@ -165,11 +158,51 @@ static void RenderPopupToImage(FeedsChatPopupData* d,
                                const QString& content,
                                const QImage&  avatar) {
     // Width derives from the current OBS canvas (80% of canvas width).
-    // Captured once at the top so all layout maths see a consistent
-    // value even if the canvas changes mid-paint — unlikely, but cheap
-    // to be safe. Height is content-driven (wrapped-text measurement).
-    const int canvasWidth = (int)GetPopupCanvasWidth();
+    // `scale` is canvas_width / reference (1536 = 80% of 1920) so every
+    // pixel literal below stays proportional at any canvas resolution:
+    // scale=1 at 1080p, ~0.67 at 720p, 2 at 4K. Captured once so all
+    // layout maths see a consistent value even if the canvas changes
+    // mid-paint — unlikely, but cheap to be safe.
+    const int   canvasWidth = (int)GetPopupCanvasWidth();
+    const float scale       = (float)canvasWidth / 1536.0f;
 
+    // Bubble + message text
+    const int BUBBLE_LEFT_MARGIN      = (int)(10  * scale);
+    const int BUBBLE_RIGHT_MARGIN     = (int)(10  * scale);
+    const int BUBBLE_TOP_OFFSET       = (int)(60  * scale);
+    const int BOTTOM_MARGIN           = (int)(15  * scale);
+    const int BUBBLE_CORNER_RADIUS    = (int)(4   * scale);
+    const int MIN_BUBBLE_HEIGHT       = (int)(130 * scale);
+    const int BUBBLE_TEXT_LEFT_PAD    = (int)(145 * scale);  // clears avatar
+    const int BUBBLE_TEXT_RIGHT_PAD   = (int)(35  * scale);
+    const int BUBBLE_TEXT_TOP_PAD     = (int)(20  * scale);
+    const int BUBBLE_TEXT_BOTTOM_PAD  = (int)(20  * scale);
+    const int MESSAGE_FONT_PIXEL_SIZE = (int)(32  * scale);
+
+    // Username pill (PILL_H_PAD / PILL_V_PAD are *per-side*, so the
+    // pill's footprint is textWidth + 2*PILL_H_PAD wide.)
+    const int PILL_X                  = (int)(148 * scale);
+    const int PILL_Y                  = (int)(20  * scale);
+    const int PILL_H_PAD              = (int)(10  * scale);
+    const int PILL_V_PAD              = (int)(6   * scale);
+    const int PILL_CORNER_RADIUS      = (int)(6   * scale);
+    const int PILL_FONT_PIXEL_SIZE    = (int)(24  * scale);
+
+    // Avatar. AVATAR_BORDER_WIDTH and AVATAR_RING_INSET are clamped to
+    // at least 1 so the yellow ring never disappears at sub-1080p
+    // resolutions. Inset = border/2 keeps the stroke centred over the
+    // circle edge regardless of scale.
+    const int AVATAR_X                = (int)(15  * scale);
+    const int AVATAR_Y                = (int)(15  * scale);
+    const int AVATAR_SIZE             = (int)(128 * scale);
+    const int AVATAR_BORDER_WIDTH     = std::max(1, (int)(3 * scale));
+    const int AVATAR_RING_INSET       = std::max(1, AVATAR_BORDER_WIDTH / 2);
+
+    // Shadow offset (no real gaussian blur — hard offset).
+    const int SHADOW_OFFSET           = (int)(5   * scale);
+
+    // Measure wrapped text first so we know how tall the canvas needs
+    // to be. Width is determined; height is content-driven.
     QFont msgFont;
     msgFont.setBold(true);
     msgFont.setPixelSize(MESSAGE_FONT_PIXEL_SIZE);
@@ -208,15 +241,15 @@ static void RenderPopupToImage(FeedsChatPopupData* d,
         canvasWidth - BUBBLE_LEFT_MARGIN - BUBBLE_RIGHT_MARGIN,
         bubbleHeight);
 
-    // Drop shadow first so the bubble draws over it. Hard offset shadow
-    // (not a real gaussian blur) — cheap, correct-enough for v1.2.0.
+    // Drop shadow first so the bubble draws over it.
     p.setPen(Qt::NoPen);
     p.setBrush(QColor(0, 0, 0, 80));
-    p.drawRoundedRect(bubbleRect.translated(5, 5), 4, 4);
+    p.drawRoundedRect(bubbleRect.translated(SHADOW_OFFSET, SHADOW_OFFSET),
+                      BUBBLE_CORNER_RADIUS, BUBBLE_CORNER_RADIUS);
 
     // Bubble body
     p.setBrush(QColor("#222222"));
-    p.drawRoundedRect(bubbleRect, 4, 4);
+    p.drawRoundedRect(bubbleRect, BUBBLE_CORNER_RADIUS, BUBBLE_CORNER_RADIUS);
 
     // Message text inside the bubble, padded left to clear avatar
     p.setFont(msgFont);
@@ -232,27 +265,29 @@ static void RenderPopupToImage(FeedsChatPopupData* d,
     // Username pill — yellow rounded rect, dark text, sized to fit
     QFont pillFont = p.font();
     pillFont.setBold(true);
-    pillFont.setPixelSize(24);
+    pillFont.setPixelSize(PILL_FONT_PIXEL_SIZE);
     p.setFont(pillFont);
     QFontMetrics pillFm(pillFont);
     int textWidth  = pillFm.horizontalAdvance(senderName);
     int textHeight = pillFm.height();
-    QRect pillRect(148, 20, textWidth + 20, textHeight + 12);
+    QRect pillRect(PILL_X, PILL_Y,
+                   textWidth  + 2 * PILL_H_PAD,
+                   textHeight + 2 * PILL_V_PAD);
     p.setBrush(QColor("#FFA500"));
     p.setPen(Qt::NoPen);
-    p.drawRoundedRect(pillRect, 6, 6);
+    p.drawRoundedRect(pillRect, PILL_CORNER_RADIUS, PILL_CORNER_RADIUS);
     p.setPen(QColor("#222222"));
     p.drawText(pillRect, Qt::AlignCenter, senderName);
 
-    // Avatar — circular clip, then a 3px yellow ring on top
-    const QRect avatarRect(15, 15, 128, 128);
+    // Avatar — circular clip, then a scaled yellow ring on top
+    const QRect avatarRect(AVATAR_X, AVATAR_Y, AVATAR_SIZE, AVATAR_SIZE);
     p.save();
     QPainterPath circle;
     circle.addEllipse(avatarRect);
     p.setClipPath(circle);
     if (!avatar.isNull()) {
         p.drawImage(avatarRect,
-                    avatar.scaled(128, 128,
+                    avatar.scaled(AVATAR_SIZE, AVATAR_SIZE,
                                   Qt::KeepAspectRatioByExpanding,
                                   Qt::SmoothTransformation));
     } else {
@@ -262,11 +297,14 @@ static void RenderPopupToImage(FeedsChatPopupData* d,
     p.restore();
 
     QPen ring(QColor("#FFA500"));
-    ring.setWidth(3);
+    ring.setWidth(AVATAR_BORDER_WIDTH);
     p.setPen(ring);
     p.setBrush(Qt::NoBrush);
-    // Inset by 1px so the 3px ring sits visually around the 128px circle.
-    p.drawEllipse(avatarRect.adjusted(1, 1, -1, -1));
+    // Inset by half the stroke width so the ring sits visually centred
+    // over the avatar circle's edge (Qt strokes are centre-aligned by
+    // default; without the inset the outer half clips beyond the bbox).
+    p.drawEllipse(avatarRect.adjusted( AVATAR_RING_INSET,  AVATAR_RING_INSET,
+                                      -AVATAR_RING_INSET, -AVATAR_RING_INSET));
 
     p.end();
 }
