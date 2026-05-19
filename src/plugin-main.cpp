@@ -147,6 +147,12 @@ struct ZpSourceData {
     obs_source_t* source          = nullptr;
     std::string   uuid;
     unsigned int  current_user_id = 0;
+    // In-memory only; recomputed on every login_succeeded by
+    // ReconcileSourcesToTier. Not persisted in scene-collection data
+    // because the same scene can be tier-legal for one Feeds user and
+    // over-tier for another (Broadcaster sharing an OBS config with a
+    // Basic user, etc.).
+    bool          tier_disabled   = false;
 
     HANDLE mapping = nullptr;
     void*  view    = nullptr;
@@ -1371,6 +1377,13 @@ static void zp_update(void* vdata, obs_data_t* settings) {
     if (!vdata) return;
     ZpSourceData* data = static_cast<ZpSourceData*>(vdata);
 
+    // Defensive: zp_properties replaces the dropdown with an upgrade
+    // message for tier-disabled sources, so a normal user flow can't
+    // reach here. Guards against unexpected paths (scripted update,
+    // scene-collection import) that would otherwise let a disabled
+    // source send subscribe IPC.
+    if (data->tier_disabled) return;
+
     unsigned int selected_id =
         (unsigned int)obs_data_get_int(settings, "participant_id");
 
@@ -1409,7 +1422,35 @@ static void zp_update(void* vdata, obs_data_t* settings) {
 // Properties panel
 // ---------------------------------------------------------------------------
 static obs_properties_t* zp_properties(void* data) {
-    (void)data;
+    // data can be nullptr in some Qt code paths (e.g., properties
+    // queried before source creation completes); null-guard the
+    // tier_disabled access.
+    ZpSourceData* d = static_cast<ZpSourceData*>(data);
+    if (d && d->tier_disabled) {
+        obs_properties_t* props = obs_properties_create();
+        std::string verLabel = std::string("Feeds (v") +
+                               feeds_shared::VERSION + ")";
+        obs_properties_add_text(props, "ver_label", verLabel.c_str(),
+                                OBS_TEXT_INFO);
+
+        int maxFeeds = GetMaxFeedsForTier();
+        std::string msg =
+            "This source is over the participant feed limit for your "
+            "current Feeds tier. Only the first " +
+            std::to_string(maxFeeds) + " participant source" +
+            (maxFeeds == 1 ? "" : "s") +
+            " in your scene are active.";
+        obs_properties_add_text(props, "tier_disabled_msg", msg.c_str(),
+                                OBS_TEXT_INFO);
+        obs_properties_add_button(props, "upgrade_btn",
+            "Upgrade your plan to activate more feeds",
+            [](obs_properties_t*, obs_property_t*, void*) -> bool {
+                QDesktopServices::openUrl(
+                    QUrl("https://letsdovideo.com/feeds-upgrade"));
+                return true;
+            });
+        return props;
+    }
 
     if (g_isInMeeting)
         feeds::SendToEngine("{\"type\":\"get_participants\"}");
@@ -1517,6 +1558,9 @@ static obs_properties_t* zp_properties(void* data) {
 
 struct ZsSourceData {
     obs_source_t* source = nullptr;
+    // See ZpSourceData::tier_disabled — same semantics. For screenshare
+    // the rule is simpler: true iff g_currentTier == 0 (Free).
+    bool          tier_disabled = false;
 
     HANDLE mapping = nullptr;
     void*  view    = nullptr;
@@ -1700,7 +1744,10 @@ static void CloseShareSharedMemory(ZsSourceData* data, bool clearTexture = true)
 static void OpenSharedMemoryForAllScreenshareSources() {
     std::lock_guard<std::mutex> lock(g_screenshareSourcesMutex);
     for (ZsSourceData* s : g_allScreenshareSources) {
-        if (s && !s->mapping) OpenShareSharedMemory(s);
+        // Skip tier-disabled sources — share_status_changed firing
+        // mid-meeting shouldn't re-open mappings that reconciliation
+        // closed for over-tier sources.
+        if (s && !s->mapping && !s->tier_disabled) OpenShareSharedMemory(s);
     }
 }
 
@@ -1797,7 +1844,29 @@ static void zs_destroy(void* vdata) {
 }
 
 static obs_properties_t* zs_properties(void* data) {
-    (void)data;
+    // data can be nullptr in some Qt code paths; null-guard the
+    // tier_disabled access.
+    ZsSourceData* d = static_cast<ZsSourceData*>(data);
+    if (d && d->tier_disabled) {
+        obs_properties_t* props = obs_properties_create();
+        std::string verLabel = std::string("Feeds - Screenshare (v") +
+                               feeds_shared::VERSION + ")";
+        obs_properties_add_text(props, "ver_label", verLabel.c_str(),
+                                OBS_TEXT_INFO);
+        obs_properties_add_text(props, "tier_disabled_msg",
+            "Screenshare is a paid feature. Your current Feeds tier "
+            "is Free.",
+            OBS_TEXT_INFO);
+        obs_properties_add_button(props, "upgrade_btn",
+            "Upgrade your plan to activate screenshare",
+            [](obs_properties_t*, obs_property_t*, void*) -> bool {
+                QDesktopServices::openUrl(
+                    QUrl("https://letsdovideo.com/feeds-upgrade"));
+                return true;
+            });
+        return props;
+    }
+
     obs_properties_t* props = obs_properties_create();
     std::string verLabel = std::string("Feeds - Screenshare (v") + feeds_shared::VERSION + ")";
     obs_properties_add_text(props, "ver_label", verLabel.c_str(), OBS_TEXT_INFO);
@@ -1881,6 +1950,75 @@ static void RegisterProtocolHandler() {
 }
 
 // ---------------------------------------------------------------------------
+// Tier reconciliation
+// ---------------------------------------------------------------------------
+// Walks both source vectors and applies tier rules. Called on every
+// login_succeeded after g_currentTier is updated.
+//
+// The common scenario isn't an actual downgrade — it's a Broadcaster
+// who built an OBS scene with N participant sources and a screenshare
+// source, then shared the OBS configuration with a teammate who logs
+// into Feeds at a lower tier. Same scene, different user, different
+// rules. That's why this runs on every login rather than only on
+// detected tier changes, and why tier_disabled is recomputed each
+// time rather than persisted.
+//
+// Rules:
+//   Participant: the first GetMaxFeedsForTier() sources (creation
+//   order, which is vector order) stay active. The rest become
+//   tier-disabled.
+//   Screenshare: all sources become tier-disabled iff tier == 0.
+//
+// On false → true (newly disabled): unsubscribe via IPC, close
+// shared memory, reset current_user_id — leaving the source in the
+// same "fresh" state as just after construction.
+//
+// On true → false (re-enabled by upgrade): no engine state to set
+// up. The user picks a participant via the dropdown when they want
+// it back; that re-triggers the normal zp_update subscribe path.
+static void ReconcileSourcesToTier() {
+    int maxFeeds = GetMaxFeedsForTier();
+
+    {
+        std::lock_guard<std::mutex> lock(g_sourcesMutex);
+        int idx = 0;
+        for (ZpSourceData* s : g_allParticipantSources) {
+            if (!s) continue;
+            bool shouldDisable = (idx >= maxFeeds);
+            ++idx;
+            if (shouldDisable && !s->tier_disabled) {
+                if (!s->uuid.empty()) {
+                    std::string msg =
+                        "{\"type\":\"participant_source_unsubscribe\","
+                        "\"source_id\":\"" + s->uuid + "\"}";
+                    feeds::SendToEngine(msg);
+                }
+                s->current_user_id = 0;
+                CloseSharedMemory(s);
+            }
+            s->tier_disabled = shouldDisable;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_screenshareSourcesMutex);
+        bool shouldDisable = (g_currentTier == 0);
+        for (ZsSourceData* s : g_allScreenshareSources) {
+            if (!s) continue;
+            // Screenshare has no per-source IPC subscription — the
+            // engine streams one shared memory region to whoever
+            // wants it. Disabling is just "stop reading."
+            if (shouldDisable && !s->tier_disabled) {
+                CloseShareSharedMemory(s);
+            }
+            s->tier_disabled = shouldDisable;
+        }
+    }
+
+    RefreshAllSourceProperties();
+}
+
+// ---------------------------------------------------------------------------
 // IPC message handlers
 // ---------------------------------------------------------------------------
 static void RegisterEngineHandlers() {
@@ -1897,6 +2035,13 @@ static void RegisterEngineHandlers() {
         g_currentTier     = (int)ExtractJsonNumber(json, "tier");
         blog(LOG_INFO, "[feeds] login_succeeded: name='%s', pmi='%s', tier=%d",
              g_userDisplayName.c_str(), g_userPMI.c_str(), g_currentTier);
+
+        // Reconcile on the UI thread — ReconcileSourcesToTier touches
+        // OBS source state and refreshes properties, both of which
+        // belong on the main thread.
+        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
+            ReconcileSourcesToTier();
+        });
     });
 
     feeds::RegisterMessageHandler("login_failed", [](const std::string& json) {
