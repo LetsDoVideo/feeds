@@ -2815,9 +2815,19 @@ static void ApplyFeedsBoundsToSceneItem(obs_source_t* source) {
 // Place a newly-created popup source at bottom-center of the canvas with
 // a 50px margin from the bottom edge. Chat overlays conventionally live
 // there; the (0,0) default that OBS gives new sources is wrong for ~all
-// users. Shares the deferred-enumeration scaffolding with
-// ApplyFeedsBoundsToSceneItem — sets position rather than bounds, since
-// the popup is meant to keep its natural size, not fit the canvas.
+// users.
+//
+// Pairs the position with bottom-center alignment so taller popups (long
+// messages wrap and the source's height grows) extend upward from the
+// anchor rather than pushing the bubble's bottom edge offscreen. With
+// top-left alignment the bbox grows downward and a long message would
+// trail past the canvas edge; with bottom-center it grows upward and the
+// 50px gap from the bottom stays constant.
+//
+// Shares the deferred-enumeration scaffolding with
+// ApplyFeedsBoundsToSceneItem — sets position + alignment rather than
+// bounds, since the popup is meant to keep its natural size, not fit
+// the canvas.
 static void ApplyChatPopupDefaultPosition(obs_source_t* source) {
     if (!source) return;
 
@@ -2829,17 +2839,12 @@ static void ApplyChatPopupDefaultPosition(obs_source_t* source) {
         canvasH = ovi.base_height;
     }
 
-    uint32_t srcW = obs_source_get_width(source);
-    uint32_t srcH = obs_source_get_height(source);
-    if (srcW == 0 || srcH == 0) return;
-
+    // With OBS_ALIGN_BOTTOM | OBS_ALIGN_CENTER alignment the position is
+    // the anchor point — the bottom-center of the scene-item's bbox
+    // lands here, no source-dimension arithmetic needed.
     vec2 pos;
-    // Signed arithmetic so a source wider/taller than the canvas falls
-    // back to (0,0) rather than wrapping around via unsigned underflow.
-    const int x = ((int)canvasW - (int)srcW) / 2;
-    const int y = (int)canvasH - (int)srcH - 50;
-    pos.x = (float)(x < 0 ? 0 : x);
-    pos.y = (float)(y < 0 ? 0 : y);
+    pos.x = (float)canvasW * 0.5f;
+    pos.y = (float)canvasH - 50.0f;
 
     struct SearchContext {
         obs_source_t* target;
@@ -2856,7 +2861,12 @@ static void ApplyChatPopupDefaultPosition(obs_source_t* source) {
             SearchContext* c = (SearchContext*)p;
             obs_source_t* item_src = obs_sceneitem_get_source(item);
             if (item_src == c->target) {
+                // OBS_ALIGN_CENTER is the zero value (horizontal centre
+                // is the default when neither LEFT nor RIGHT is set);
+                // OR'ing it in is self-documentation.
                 obs_sceneitem_set_pos(item, &c->pos);
+                obs_sceneitem_set_alignment(
+                    item, OBS_ALIGN_BOTTOM | OBS_ALIGN_CENTER);
             }
             return true;
         };
