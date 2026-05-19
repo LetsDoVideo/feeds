@@ -432,6 +432,26 @@ public:
         sprintf_s(buf, "Chat: public message from %s: %s",
                   senderName.c_str(), preview.c_str());
         LogToFile(buf);
+
+        // TEMP DIAGNOSTIC — Phase 2 avatar work needs to know where the
+        // SDK writes avatar files. Static analysis was inconclusive
+        // (no APPDATA/cache references anywhere in headers or engine).
+        // Log the actual path returned by GetAvatarPath() so we can
+        // decide between path-over-IPC, bytes-over-IPC, or shared mem.
+        // Remove or downgrade once that decision is made.
+        ZOOM_SDK_NAMESPACE::IMeetingParticipantsController* pc =
+            g_meetingService
+                ? g_meetingService->GetMeetingParticipantsController()
+                : nullptr;
+        ZOOM_SDK_NAMESPACE::IUserInfo* info =
+            pc ? pc->GetUserByUserID(senderId) : nullptr;
+        const zchar_t* avatarPath = info ? info->GetAvatarPath() : nullptr;
+        std::string avatarPathUtf8 =
+            avatarPath ? WideToUtf8(avatarPath) : "(null)";
+        char abuf[1024];
+        sprintf_s(abuf, "Chat: avatar path for sender %s: %s",
+                  senderName.c_str(), avatarPathUtf8.c_str());
+        LogToFile(abuf);
     }
 
     virtual void onChatStatusChangedNotification(
