@@ -1290,14 +1290,16 @@ static FeedsChatDock* g_chatDock = nullptr;
 std::mutex                              g_avatarCacheMutex;
 std::map<unsigned int, QImage>          g_avatarCache;
 QImage                                  g_fallbackAvatar;
-static bool                             g_fallbackAvatarLoaded = false;
+static std::once_flag                   g_fallbackAvatarOnce;
 
-static QImage GetAvatarForSender(unsigned int senderId,
-                                 const std::string& avatarPath) {
-    std::lock_guard<std::mutex> lock(g_avatarCacheMutex);
-
-    if (!g_fallbackAvatarLoaded) {
-        g_fallbackAvatarLoaded = true;
+// Loads g_fallbackAvatar from the plugin data directory. Idempotent —
+// call_once guarantees the load body runs exactly once across all
+// threads, so callers don't need to coordinate. The chat IPC handler
+// hits this via GetAvatarForSender on the first message; the popup
+// source bypasses that path, so obs_module_load calls it eagerly to
+// ensure the fallback is ready before any render fires.
+static void EnsureFallbackAvatarLoaded() {
+    std::call_once(g_fallbackAvatarOnce, []() {
         char* path = obs_module_file("feeds-logo.png");
         if (path) {
             if (!g_fallbackAvatar.load(QString::fromUtf8(path))) {
@@ -1310,7 +1312,14 @@ static QImage GetAvatarForSender(unsigned int senderId,
             blog(LOG_WARNING,
                  "[feeds] feeds-logo.png not found in plugin data dir");
         }
-    }
+    });
+}
+
+static QImage GetAvatarForSender(unsigned int senderId,
+                                 const std::string& avatarPath) {
+    EnsureFallbackAvatarLoaded();
+
+    std::lock_guard<std::mutex> lock(g_avatarCacheMutex);
 
     auto it = g_avatarCache.find(senderId);
     if (it != g_avatarCache.end()) return it->second;
@@ -2798,6 +2807,12 @@ bool obs_module_load(void) {
     obs_register_source(&zoom_screenshare_info);
 
     feeds::RegisterChatPopupSource();
+
+    // Eagerly load the fallback avatar so the popup source renders the
+    // Feeds logo on its first frame (rather than the grey null-circle).
+    // The popup source bypasses GetAvatarForSender's lazy path; without
+    // this, the first render before any chat message has no fallback.
+    EnsureFallbackAvatarLoaded();
 
     signal_handler_t* sh = obs_get_signal_handler();
     if (sh) {

@@ -195,7 +195,11 @@ static void RegenerateTexture(FeedsChatPopupData* d) {
 // OBS source callbacks
 // ---------------------------------------------------------------------------
 static const char* fcp_get_name(void*) {
-    return "Feeds Chat Popup";
+    // Display name only — source ID ("feeds_chat_popup", in the
+    // registration struct below) is the stable key OBS uses in saved
+    // scene collections and must never change. The Z-prefix sorts the
+    // popup next to Zoom Participant / Zoom Screenshare in the picker.
+    return "Zoom Chat Popup";
 }
 
 static void* fcp_create(obs_data_t* /*settings*/, obs_source_t* source) {
