@@ -1274,7 +1274,15 @@ private:
         // call-to-action entry point.
         QVariant idVar = item->data(RoleSenderId);
         if (!idVar.isValid()) {
-            if (m_messagesStarted) return;  // "Connected" placeholder
+            // Bail on the "Connected" placeholder — already in a meeting,
+            // the dock click shouldn't re-enter the connect flow (which
+            // would hit the defensive Already-Connected MessageBox in
+            // OnConnectClick that's correct for menu/properties callers
+            // but noise here). g_isInMeeting is the truthful state;
+            // m_messagesStarted only flips on first chat message and
+            // would miss the "joined, no chat yet" window.
+            if (g_isInMeeting) return;
+
             if (!g_isLoggedIn) {
                 OnLoginClick();
             } else {
