@@ -2812,6 +2812,62 @@ static void ApplyFeedsBoundsToSceneItem(obs_source_t* source) {
     obs_enum_scenes(enum_cb, &ctx);
 }
 
+// Place a newly-created popup source at bottom-center of the canvas with
+// a 50px margin from the bottom edge. Chat overlays conventionally live
+// there; the (0,0) default that OBS gives new sources is wrong for ~all
+// users. Shares the deferred-enumeration scaffolding with
+// ApplyFeedsBoundsToSceneItem — sets position rather than bounds, since
+// the popup is meant to keep its natural size, not fit the canvas.
+static void ApplyChatPopupDefaultPosition(obs_source_t* source) {
+    if (!source) return;
+
+    obs_video_info ovi;
+    uint32_t canvasW = 1920;
+    uint32_t canvasH = 1080;
+    if (obs_get_video_info(&ovi)) {
+        canvasW = ovi.base_width;
+        canvasH = ovi.base_height;
+    }
+
+    uint32_t srcW = obs_source_get_width(source);
+    uint32_t srcH = obs_source_get_height(source);
+    if (srcW == 0 || srcH == 0) return;
+
+    vec2 pos;
+    // Signed arithmetic so a source wider/taller than the canvas falls
+    // back to (0,0) rather than wrapping around via unsigned underflow.
+    const int x = ((int)canvasW - (int)srcW) / 2;
+    const int y = (int)canvasH - (int)srcH - 50;
+    pos.x = (float)(x < 0 ? 0 : x);
+    pos.y = (float)(y < 0 ? 0 : y);
+
+    struct SearchContext {
+        obs_source_t* target;
+        vec2          pos;
+    };
+    SearchContext ctx = { source, pos };
+
+    auto enum_cb = [](void* param, obs_source_t* scene_src) -> bool {
+        SearchContext* c = (SearchContext*)param;
+        obs_scene_t* scene = obs_scene_from_source(scene_src);
+        if (!scene) return true;
+
+        auto item_cb = [](obs_scene_t*, obs_sceneitem_t* item, void* p) -> bool {
+            SearchContext* c = (SearchContext*)p;
+            obs_source_t* item_src = obs_sceneitem_get_source(item);
+            if (item_src == c->target) {
+                obs_sceneitem_set_pos(item, &c->pos);
+            }
+            return true;
+        };
+
+        obs_scene_enum_items(scene, item_cb, c);
+        return true;
+    };
+
+    obs_enum_scenes(enum_cb, &ctx);
+}
+
 static void OnSourceCreated(void* /*data*/, calldata_t* cd) {
     obs_source_t* source = (obs_source_t*)calldata_ptr(cd, "source");
     if (!source) return;
@@ -2820,10 +2876,11 @@ static void OnSourceCreated(void* /*data*/, calldata_t* cd) {
     if (!id) return;
 
     // Only apply to Feeds source types.
-    const bool isFeedsSource =
+    const bool isParticipantOrShare =
         strcmp(id, "zoom_participant_source") == 0 ||
         strcmp(id, "zoom_screenshare_source") == 0;
-    if (!isFeedsSource) return;
+    const bool isChatPopup = strcmp(id, "feeds_chat_popup") == 0;
+    if (!isParticipantOrShare && !isChatPopup) return;
 
     // When our create callback returns NULL on a tier block, OBS keeps
     // the obs_source_t alive with context.data == NULL ("husk"). Mark
@@ -2845,12 +2902,16 @@ static void OnSourceCreated(void* /*data*/, calldata_t* cd) {
     obs_weak_source_t* weak = obs_source_get_weak_source(source);
     if (!weak) return;
 
-    std::thread([weak]() {
+    std::thread([weak, isChatPopup]() {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
         obs_source_t* strong = obs_weak_source_get_source(weak);
         if (strong) {
-            ApplyFeedsBoundsToSceneItem(strong);
+            if (isChatPopup) {
+                ApplyChatPopupDefaultPosition(strong);
+            } else {
+                ApplyFeedsBoundsToSceneItem(strong);
+            }
             obs_source_release(strong);
         }
         obs_weak_source_release(weak);

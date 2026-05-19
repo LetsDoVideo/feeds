@@ -72,9 +72,18 @@ static constexpr float ANIM_DURATION_SECONDS = 0.5f;
 struct FeedsChatPopupData {
     obs_source_t* source = nullptr;
 
-    QImage        rendered_image;
-    gs_texture_t* texture       = nullptr;
-    bool          texture_dirty = true;
+    QImage          rendered_image;
+    gs_texture_t*   texture       = nullptr;
+    bool            texture_dirty = true;
+
+    // Intermediate render target for slide-animation clipping. The popup
+    // is drawn into this bbox-sized buffer (with its Y translation), then
+    // the buffer is composited into the scene as a flat sprite. Anything
+    // translated outside the buffer's bounds is discarded by the texrender,
+    // giving us the "slide behind an invisible barrier" effect that direct
+    // CUSTOM_DRAW translation can't provide (sources can draw outside their
+    // declared width/height when not going through an intermediate).
+    gs_texrender_t* texrender     = nullptr;
 
     uint32_t      width  = CANVAS_WIDTH;
     uint32_t      height = BUBBLE_TOP_OFFSET + MIN_BUBBLE_HEIGHT + BOTTOM_MARGIN;
@@ -426,6 +435,15 @@ static void* fcp_create(obs_data_t* /*settings*/, obs_source_t* source) {
     FeedsChatPopupData* d = new FeedsChatPopupData();
     d->source = source;
 
+    // Allocate the slide-clip texrender up front. gs_texrender_create
+    // requires the graphics context; create is called from the Qt main
+    // thread so we enter/leave manually. If allocation fails (rare,
+    // graphics-memory pressure), render falls back to direct draw and
+    // the source still works — just without slide-edge clipping.
+    obs_enter_graphics();
+    d->texrender = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+    obs_leave_graphics();
+
     {
         std::lock_guard<std::mutex> lock(g_instancesMutex);
         g_instances.push_back(d);
@@ -449,13 +467,20 @@ static void fcp_destroy(void* data) {
             g_instances.end());
     }
 
-    if (d->texture) {
-        // gs_texture_destroy needs the graphics context — destroy is not
-        // guaranteed to be on the graphics thread.
+    // gs_texture_destroy / gs_texrender_destroy need the graphics context —
+    // destroy is not guaranteed to be on the graphics thread. Wrap both
+    // teardowns in a single enter/leave to amortise the context switch.
+    if (d->texture || d->texrender) {
         obs_enter_graphics();
-        gs_texture_destroy(d->texture);
+        if (d->texture) {
+            gs_texture_destroy(d->texture);
+            d->texture = nullptr;
+        }
+        if (d->texrender) {
+            gs_texrender_destroy(d->texrender);
+            d->texrender = nullptr;
+        }
         obs_leave_graphics();
-        d->texture = nullptr;
     }
     delete d;
 }
@@ -524,19 +549,84 @@ static void fcp_video_render(void* data, gs_effect_t* /*effect*/) {
     if (!d->texture) return;
 
     // Translate by fraction × bbox-height: 0 = popup sits in its bbox;
-    // 1 = popup sits one bbox-height below (offscreen relative to bbox).
-    // Slide-in animates 1 → 0; slide-out animates 0 → 1. OBS doesn't
-    // clip a source to its bbox, so the popup is visible "below" its
-    // editor handles mid-slide — same convention SSN uses.
+    // 1 = popup sits one bbox-height below. Slide-in animates 1 → 0;
+    // slide-out animates 0 → 1. OBS_SOURCE_CUSTOM_DRAW draws straight to
+    // the scene render target with no per-source clipping, so a raw
+    // translated draw would show the popup spilling outside its bbox.
+    // We route through gs_texrender below so the bbox naturally clips
+    // the slide.
     const float yOffset = animFraction * (float)d->height;
 
+    if (d->texrender) {
+        // Phase 1: render the popup (with its Y translation) into a
+        // bbox-sized intermediate texture. Anything translated outside
+        // (0,0)-(width,height) is discarded by the texrender.
+        gs_texrender_reset(d->texrender);
+        if (gs_texrender_begin(d->texrender, d->width, d->height)) {
+            struct vec4 clear_color = { 0.0f, 0.0f, 0.0f, 0.0f };
+            gs_clear(GS_CLEAR_COLOR, &clear_color, 1.0f, 0);
+            gs_ortho(0.0f, (float)d->width,
+                     0.0f, (float)d->height,
+                     -100.0f, 100.0f);
+
+            // Straight copy from the popup texture into the texrender
+            // (which is pre-cleared to fully transparent). Using normal
+            // SRCALPHA/INVSRCALPHA against a transparent dest would
+            // square the alpha — dst.a = src.a*src.a — quietly making
+            // the drop shadow ~3× too transparent after the final
+            // composite. Replace blending (src=ONE, dst=ZERO) writes
+            // the popup's RGBA verbatim, including alpha; GPU scissor
+            // discards pixels translated outside (0,0)-(width,height).
+            gs_blend_state_push();
+            gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
+
+            gs_matrix_push();
+            gs_matrix_translate3f(0.0f, yOffset, 0.0f);
+
+            gs_effect_t* eff   = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+            gs_eparam_t* param = gs_effect_get_param_by_name(eff, "image");
+            gs_effect_set_texture(param, d->texture);
+            while (gs_effect_loop(eff, "Draw")) {
+                gs_draw_sprite(d->texture, 0, d->width, d->height);
+            }
+
+            gs_matrix_pop();
+            gs_blend_state_pop();
+
+            gs_texrender_end(d->texrender);
+        }
+
+        // Phase 2: composite the (clipped) intermediate texture into the
+        // scene at the source's natural position — no translation here,
+        // the slide offset is already baked into the texrender contents.
+        gs_texture_t* clipped = gs_texrender_get_texture(d->texrender);
+        if (clipped) {
+            gs_blend_state_push();
+            gs_blend_function(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA);
+
+            gs_effect_t* eff   = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+            gs_eparam_t* param = gs_effect_get_param_by_name(eff, "image");
+            gs_effect_set_texture(param, clipped);
+            while (gs_effect_loop(eff, "Draw")) {
+                gs_draw_sprite(clipped, 0, d->width, d->height);
+            }
+
+            gs_blend_state_pop();
+        }
+        return;
+    }
+
+    // Fallback: texrender allocation failed during fcp_create. Direct
+    // draw with translation — same behaviour as the 3d commit, popup
+    // is visible outside its bbox during the slide. Better than not
+    // rendering at all.
     gs_blend_state_push();
     gs_blend_function(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA);
 
     gs_matrix_push();
     gs_matrix_translate3f(0.0f, yOffset, 0.0f);
 
-    gs_effect_t* eff = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+    gs_effect_t* eff   = obs_get_base_effect(OBS_EFFECT_DEFAULT);
     gs_eparam_t* param = gs_effect_get_param_by_name(eff, "image");
     gs_effect_set_texture(param, d->texture);
     while (gs_effect_loop(eff, "Draw")) {
