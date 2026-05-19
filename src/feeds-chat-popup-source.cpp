@@ -41,11 +41,12 @@ extern QImage                           g_fallbackAvatar;
 namespace {
 
 // ---------------------------------------------------------------------------
-// Canvas layout constants. Width is fixed (chat popups shouldn't span the
-// full stream); height grows downward to fit wrapped text. Short messages
-// get short popups, long messages get tall popups.
+// Canvas layout constants. Popup width is 80% of the OBS canvas (queried
+// via GetPopupCanvasWidth() per content change), so the popup keeps the
+// same screen proportion at 720p, 1080p, 4K, etc. Height grows downward
+// to fit wrapped text — short messages get short popups, long messages
+// get tall popups.
 // ---------------------------------------------------------------------------
-static constexpr int CANVAS_WIDTH            = 800;
 static constexpr int BUBBLE_LEFT_MARGIN      = 10;
 static constexpr int BUBBLE_RIGHT_MARGIN     = 10;
 static constexpr int BUBBLE_TEXT_LEFT_PAD    = 145;  // clears the avatar
@@ -61,6 +62,20 @@ static constexpr int MESSAGE_FONT_PIXEL_SIZE = 32;
 // deceleration on arrival, smooth acceleration on departure. Matches
 // SSN's visual feel; not a bezier-perfect match (no overshoot).
 static constexpr float ANIM_DURATION_SECONDS = 0.5f;
+
+// 80% of the active OBS canvas width. Queried once per content change
+// inside RenderPopupToImage so the popup is the same proportion of the
+// screen regardless of the streamer's canvas resolution. Falls back to
+// 1536 (80% of 1920) if obs_get_video_info fails — shouldn't happen
+// during active rendering, but defensive against being called before
+// OBS finishes initialising.
+static uint32_t GetPopupCanvasWidth() {
+    struct obs_video_info ovi;
+    if (obs_get_video_info(&ovi)) {
+        return (uint32_t)((float)ovi.base_width * 0.8f);
+    }
+    return 1536;
+}
 
 // ---------------------------------------------------------------------------
 // Per-instance state. visible/sender_id/sender_name/content/texture_dirty
@@ -85,7 +100,11 @@ struct FeedsChatPopupData {
     // declared width/height when not going through an intermediate).
     gs_texrender_t* texrender     = nullptr;
 
-    uint32_t      width  = CANVAS_WIDTH;
+    // Width starts at the 1920p fallback (80% of 1920); first
+    // RenderPopupToImage call queries OBS for the real canvas size and
+    // corrects this. Pre-render fcp_get_width queries see a sensible
+    // stand-in rather than zero.
+    uint32_t      width  = 1536;
     uint32_t      height = BUBBLE_TOP_OFFSET + MIN_BUBBLE_HEIGHT + BOTTOM_MARGIN;
 
     bool          visible    = false;
@@ -145,13 +164,17 @@ static void RenderPopupToImage(FeedsChatPopupData* d,
                                const QString& senderName,
                                const QString& content,
                                const QImage&  avatar) {
-    // Measure wrapped text first so we know how tall the canvas needs
-    // to be. Width is fixed; height is content-driven.
+    // Width derives from the current OBS canvas (80% of canvas width).
+    // Captured once at the top so all layout maths see a consistent
+    // value even if the canvas changes mid-paint — unlikely, but cheap
+    // to be safe. Height is content-driven (wrapped-text measurement).
+    const int canvasWidth = (int)GetPopupCanvasWidth();
+
     QFont msgFont;
     msgFont.setBold(true);
     msgFont.setPixelSize(MESSAGE_FONT_PIXEL_SIZE);
     QFontMetrics fm(msgFont);
-    const int textAreaWidth = CANVAS_WIDTH
+    const int textAreaWidth = canvasWidth
                               - BUBBLE_LEFT_MARGIN - BUBBLE_RIGHT_MARGIN
                               - BUBBLE_TEXT_LEFT_PAD - BUBBLE_TEXT_RIGHT_PAD;
     QRect textBounds = fm.boundingRect(
@@ -165,7 +188,7 @@ static void RenderPopupToImage(FeedsChatPopupData* d,
     // next get_width/get_height query sees the new canvas. First frame
     // after a content change reports the old size for a single frame —
     // not visible in practice for the use cases here.
-    d->width  = CANVAS_WIDTH;
+    d->width  = (uint32_t)canvasWidth;
     d->height = (uint32_t)(BUBBLE_TOP_OFFSET + bubbleHeight + BOTTOM_MARGIN);
 
     if (d->rendered_image.size() != QSize((int)d->width, (int)d->height) ||
@@ -182,7 +205,7 @@ static void RenderPopupToImage(FeedsChatPopupData* d,
     const QRect bubbleRect(
         BUBBLE_LEFT_MARGIN,
         BUBBLE_TOP_OFFSET,
-        CANVAS_WIDTH - BUBBLE_LEFT_MARGIN - BUBBLE_RIGHT_MARGIN,
+        canvasWidth - BUBBLE_LEFT_MARGIN - BUBBLE_RIGHT_MARGIN,
         bubbleHeight);
 
     // Drop shadow first so the bubble draws over it. Hard offset shadow

@@ -2841,10 +2841,13 @@ static void ApplyChatPopupDefaultPosition(obs_source_t* source) {
 
     // With OBS_ALIGN_BOTTOM | OBS_ALIGN_CENTER alignment the position is
     // the anchor point — the bottom-center of the scene-item's bbox
-    // lands here, no source-dimension arithmetic needed.
+    // lands here, no source-dimension arithmetic needed. Margin from
+    // the bottom edge is 4% of canvas height (~43px at 1080p, ~86px at
+    // 4K) so the visual gap scales with the streamer's resolution.
+    const int marginFromBottom = (int)((float)canvasH * 0.04f);
     vec2 pos;
     pos.x = (float)canvasW * 0.5f;
-    pos.y = (float)canvasH - 50.0f;
+    pos.y = (float)canvasH - (float)marginFromBottom;
 
     struct SearchContext {
         obs_source_t* target;
