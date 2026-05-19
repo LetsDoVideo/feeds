@@ -414,12 +414,29 @@ public:
         std::string content    = WideToUtf8(chatMsg->GetContent());
         time_t timestamp       = chatMsg->GetTimeStamp();
 
+        // SDK writes avatars to %APPDATA%\ZoomSDK\data\ConfAvatar\ —
+        // a per-user roaming location accessible to both engine and
+        // plugin processes — so we can pass the path itself. Empty
+        // string when the user has no profile picture; plugin falls
+        // back to the bundled Feeds logo. JsonEscape handles the
+        // backslashes for us.
+        ZOOM_SDK_NAMESPACE::IMeetingParticipantsController* pc =
+            g_meetingService
+                ? g_meetingService->GetMeetingParticipantsController()
+                : nullptr;
+        ZOOM_SDK_NAMESPACE::IUserInfo* info =
+            pc ? pc->GetUserByUserID(senderId) : nullptr;
+        const zchar_t* avatarPathRaw = info ? info->GetAvatarPath() : nullptr;
+        std::string avatarPath =
+            avatarPathRaw ? WideToUtf8(avatarPathRaw) : "";
+
         std::ostringstream out;
         out << "{\"type\":\"chat_message\","
             << "\"message_id\":\"" << JsonEscape(messageId) << "\","
             << "\"sender_id\":" << senderId << ","
             << "\"sender_name\":\"" << JsonEscape(senderName) << "\","
             << "\"content\":\"" << JsonEscape(content) << "\","
+            << "\"avatar_path\":\"" << JsonEscape(avatarPath) << "\","
             << "\"timestamp\":" << (long long)timestamp << "}";
         SendToPlugin(out.str());
 
@@ -432,26 +449,6 @@ public:
         sprintf_s(buf, "Chat: public message from %s: %s",
                   senderName.c_str(), preview.c_str());
         LogToFile(buf);
-
-        // TEMP DIAGNOSTIC — Phase 2 avatar work needs to know where the
-        // SDK writes avatar files. Static analysis was inconclusive
-        // (no APPDATA/cache references anywhere in headers or engine).
-        // Log the actual path returned by GetAvatarPath() so we can
-        // decide between path-over-IPC, bytes-over-IPC, or shared mem.
-        // Remove or downgrade once that decision is made.
-        ZOOM_SDK_NAMESPACE::IMeetingParticipantsController* pc =
-            g_meetingService
-                ? g_meetingService->GetMeetingParticipantsController()
-                : nullptr;
-        ZOOM_SDK_NAMESPACE::IUserInfo* info =
-            pc ? pc->GetUserByUserID(senderId) : nullptr;
-        const zchar_t* avatarPath = info ? info->GetAvatarPath() : nullptr;
-        std::string avatarPathUtf8 =
-            avatarPath ? WideToUtf8(avatarPath) : "(null)";
-        char abuf[1024];
-        sprintf_s(abuf, "Chat: avatar path for sender %s: %s",
-                  senderName.c_str(), avatarPathUtf8.c_str());
-        LogToFile(abuf);
     }
 
     virtual void onChatStatusChangedNotification(

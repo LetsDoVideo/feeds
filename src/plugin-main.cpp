@@ -19,6 +19,7 @@
 #include <media-io/video-frame.h>
 #include <string>
 #include <vector>
+#include <map>
 #include <functional>
 #include <mutex>
 #include <atomic>
@@ -47,6 +48,7 @@
 #include <QPushButton>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
+#include <QImage>
 #include <QUrl>
 #include <QUrlQuery>
 #include <QApplication>
@@ -1140,6 +1142,12 @@ public:
     void AppendMessage(const QString& senderName,
                        const QString& content,
                        qint64 timestamp) {
+        // timestamp is kept in the signature so the engine's value
+        // flows through unchanged — future surfaces (tooltip, an
+        // opt-in "show timestamps" preference, the overlay source)
+        // can pick it up without an IPC change.
+        (void)timestamp;
+
         if (!m_messagesStarted) {
             // First real message — drop the placeholder. From here on the
             // dock shows only real chat history for the rest of the OBS
@@ -1149,10 +1157,7 @@ public:
             m_list->clear();
             m_messagesStarted = true;
         }
-        QString time = QDateTime::fromSecsSinceEpoch(timestamp)
-                           .toString("HH:mm");
-        m_list->addItem(QString("[%1] %2: %3")
-                            .arg(time, senderName, content));
+        m_list->addItem(QString("%1: %2").arg(senderName, content));
         m_list->scrollToBottom();
     }
 
@@ -1177,6 +1182,64 @@ private:
 // lifetime once it's been handed to obs_frontend_add_dock_by_id; we hold
 // this only so the chat_message IPC handler can route messages to it.
 static FeedsChatDock* g_chatDock = nullptr;
+
+// ---------------------------------------------------------------------------
+// Avatar cache
+// ---------------------------------------------------------------------------
+// Populated by the chat_message IPC handler as messages arrive (one entry
+// per distinct sender_id), consumed by the chat popup source in a later
+// Phase 2 commit. Keyed by Zoom SDK user ID; bounded by the number of
+// distinct senders in a session (~tens), entries ~10KB each.
+//
+// Zoom SDK writes avatars to %APPDATA%\ZoomSDK\data\ConfAvatar\ — a
+// per-user roaming location accessible to both engine and plugin
+// processes — so the IPC carries the path itself rather than image bytes.
+// QImage::load is thread-safe and runs off the IPC reader thread.
+//
+// GetAvatarPath() returns null for users without a profile picture
+// (engine sends empty string in that case). Falls back to the bundled
+// Feeds logo from the plugin's data directory. The fallback is loaded
+// lazily on first lookup so we pay nothing if chat is never used.
+static std::mutex                       g_avatarCacheMutex;
+static std::map<unsigned int, QImage>   g_avatarCache;
+static QImage                           g_fallbackAvatar;
+static bool                             g_fallbackAvatarLoaded = false;
+
+static QImage GetAvatarForSender(unsigned int senderId,
+                                 const std::string& avatarPath) {
+    std::lock_guard<std::mutex> lock(g_avatarCacheMutex);
+
+    if (!g_fallbackAvatarLoaded) {
+        g_fallbackAvatarLoaded = true;
+        char* path = obs_module_file("feeds-logo.png");
+        if (path) {
+            if (!g_fallbackAvatar.load(QString::fromUtf8(path))) {
+                blog(LOG_WARNING,
+                     "[feeds] failed to load fallback avatar from %s",
+                     path);
+            }
+            bfree(path);
+        } else {
+            blog(LOG_WARNING,
+                 "[feeds] feeds-logo.png not found in plugin data dir");
+        }
+    }
+
+    auto it = g_avatarCache.find(senderId);
+    if (it != g_avatarCache.end()) return it->second;
+
+    QImage img;
+    if (!avatarPath.empty()) {
+        img.load(QString::fromStdString(avatarPath));
+    }
+    // Null QImage means either no path or load failure. Cache the
+    // fallback so we don't re-try the load on every message.
+    if (img.isNull()) {
+        img = g_fallbackAvatar;
+    }
+    g_avatarCache[senderId] = img;
+    return img;
+}
 
 static void SetupChatDock() {
     // Stable id — never change this across versions; OBS uses it as the
@@ -2410,11 +2473,19 @@ static void RegisterEngineHandlers() {
         // logging only in Phase 1; future phases may use it for edit/
         // delete propagation or dedup.
         std::string messageId  = ExtractJsonString(json, "message_id");
+        unsigned int senderId  =
+            (unsigned int)ExtractJsonNumber(json, "sender_id");
         std::string senderName = ExtractJsonStringEscaped(json, "sender_name");
         std::string content    = ExtractJsonStringEscaped(json, "content");
+        std::string avatarPath = ExtractJsonStringEscaped(json, "avatar_path");
         qint64      timestamp  = (qint64)ExtractJsonNumber(json, "timestamp");
 
         blog(LOG_INFO, "[feeds] chat_message id=%s", messageId.c_str());
+
+        // Populate the avatar cache up-front on the IPC thread so the
+        // chat popup source (coming in a later Phase 2 commit) can hit
+        // the cache synchronously. Return value unused in this commit.
+        (void)GetAvatarForSender(senderId, avatarPath);
 
         QString qSender  = QString::fromStdString(senderName);
         QString qContent = QString::fromStdString(content);
@@ -2656,4 +2727,10 @@ void obs_module_unload(void) {
     }
     if (g_updateCheckThread.joinable()) g_updateCheckThread.join();
     feeds::StopEngine();
+
+    {
+        std::lock_guard<std::mutex> lock(g_avatarCacheMutex);
+        g_avatarCache.clear();
+        g_fallbackAvatar = QImage();
+    }
 }
