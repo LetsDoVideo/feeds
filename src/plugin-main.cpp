@@ -56,6 +56,8 @@
 #include <QClipboard>
 #include <QDesktopServices>
 
+#include "feeds-chat-popup-source.h"
+
 // Qt defines `slots` and `signals` as preprocessor macros (expanding to
 // empty or to annotations for the Meta-Object Compiler). Any non-Qt code
 // below that happens to use identifiers named `slots`, `signals`, or
@@ -1282,9 +1284,12 @@ static FeedsChatDock* g_chatDock = nullptr;
 // (engine sends empty string in that case). Falls back to the bundled
 // Feeds logo from the plugin's data directory. The fallback is loaded
 // lazily on first lookup so we pay nothing if chat is never used.
-static std::mutex                       g_avatarCacheMutex;
-static std::map<unsigned int, QImage>   g_avatarCache;
-static QImage                           g_fallbackAvatar;
+// External linkage — feeds-chat-popup-source.cpp consumes these via
+// extern declarations. Keeping them in plugin-main as the source of
+// truth; the popup source is a pure consumer.
+std::mutex                              g_avatarCacheMutex;
+std::map<unsigned int, QImage>          g_avatarCache;
+QImage                                  g_fallbackAvatar;
 static bool                             g_fallbackAvatarLoaded = false;
 
 static QImage GetAvatarForSender(unsigned int senderId,
@@ -2791,6 +2796,8 @@ bool obs_module_load(void) {
     zoom_screenshare_info.get_properties = zs_properties;
     zoom_screenshare_info.icon_type      = OBS_ICON_TYPE_DESKTOP_CAPTURE;
     obs_register_source(&zoom_screenshare_info);
+
+    feeds::RegisterChatPopupSource();
 
     signal_handler_t* sh = obs_get_signal_handler();
     if (sh) {

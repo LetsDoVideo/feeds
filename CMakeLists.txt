@@ -57,9 +57,10 @@ if(ENABLE_QT)
     endif()
 endif()
 
-target_sources(${CMAKE_PROJECT_NAME} PRIVATE 
+target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     src/plugin-main.cpp
     src/engine-client.cpp
+    src/feeds-chat-popup-source.cpp
 )
 
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
