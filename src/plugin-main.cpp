@@ -59,6 +59,7 @@
 #include <QDesktopServices>
 
 #include "feeds-chat-popup-source.h"
+#include "feeds-chat-overlay-source.h"
 
 // Qt defines `slots` and `signals` as preprocessor macros (expanding to
 // empty or to annotations for the Meta-Object Compiler). Any non-Qt code
@@ -2881,6 +2882,59 @@ static void ApplyChatPopupDefaultPosition(obs_source_t* source) {
     obs_enum_scenes(enum_cb, &ctx);
 }
 
+// Place a newly-created overlay source at the top-right corner of the
+// canvas with a small inset (2% of width from the right edge, 5% of height
+// from the top). The overlay is a sidebar element complementing the
+// popup's bottom-centre callout. Top-right alignment keeps the overlay
+// glued to the corner regardless of its current rendered height — taller
+// histories grow downward from the anchor.
+static void ApplyChatOverlayDefaultPosition(obs_source_t* source) {
+    if (!source) return;
+
+    obs_video_info ovi;
+    uint32_t canvasW = 1920;
+    uint32_t canvasH = 1080;
+    if (obs_get_video_info(&ovi)) {
+        canvasW = ovi.base_width;
+        canvasH = ovi.base_height;
+    }
+
+    const int marginFromRight = (int)((float)canvasW * 0.02f);
+    const int marginFromTop   = (int)((float)canvasH * 0.05f);
+
+    vec2 pos;
+    pos.x = (float)canvasW - (float)marginFromRight;
+    pos.y = (float)marginFromTop;
+
+    struct SearchContext {
+        obs_source_t* target;
+        vec2          pos;
+    };
+    SearchContext ctx = { source, pos };
+
+    auto enum_cb = [](void* param, obs_source_t* scene_src) -> bool {
+        SearchContext* c = (SearchContext*)param;
+        obs_scene_t* scene = obs_scene_from_source(scene_src);
+        if (!scene) return true;
+
+        auto item_cb = [](obs_scene_t*, obs_sceneitem_t* item, void* p) -> bool {
+            SearchContext* c = (SearchContext*)p;
+            obs_source_t* item_src = obs_sceneitem_get_source(item);
+            if (item_src == c->target) {
+                obs_sceneitem_set_pos(item, &c->pos);
+                obs_sceneitem_set_alignment(
+                    item, OBS_ALIGN_TOP | OBS_ALIGN_RIGHT);
+            }
+            return true;
+        };
+
+        obs_scene_enum_items(scene, item_cb, c);
+        return true;
+    };
+
+    obs_enum_scenes(enum_cb, &ctx);
+}
+
 static void OnSourceCreated(void* /*data*/, calldata_t* cd) {
     obs_source_t* source = (obs_source_t*)calldata_ptr(cd, "source");
     if (!source) return;
@@ -2892,8 +2946,9 @@ static void OnSourceCreated(void* /*data*/, calldata_t* cd) {
     const bool isParticipantOrShare =
         strcmp(id, "zoom_participant_source") == 0 ||
         strcmp(id, "zoom_screenshare_source") == 0;
-    const bool isChatPopup = strcmp(id, "feeds_chat_popup") == 0;
-    if (!isParticipantOrShare && !isChatPopup) return;
+    const bool isChatPopup   = strcmp(id, "feeds_chat_popup")   == 0;
+    const bool isChatOverlay = strcmp(id, "feeds_chat_overlay") == 0;
+    if (!isParticipantOrShare && !isChatPopup && !isChatOverlay) return;
 
     // When our create callback returns NULL on a tier block, OBS keeps
     // the obs_source_t alive with context.data == NULL ("husk"). Mark
@@ -2915,13 +2970,15 @@ static void OnSourceCreated(void* /*data*/, calldata_t* cd) {
     obs_weak_source_t* weak = obs_source_get_weak_source(source);
     if (!weak) return;
 
-    std::thread([weak, isChatPopup]() {
+    std::thread([weak, isChatPopup, isChatOverlay]() {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
         obs_source_t* strong = obs_weak_source_get_source(weak);
         if (strong) {
             if (isChatPopup) {
                 ApplyChatPopupDefaultPosition(strong);
+            } else if (isChatOverlay) {
+                ApplyChatOverlayDefaultPosition(strong);
             } else {
                 ApplyFeedsBoundsToSceneItem(strong);
             }
@@ -2957,6 +3014,7 @@ bool obs_module_load(void) {
     obs_register_source(&zoom_screenshare_info);
 
     feeds::RegisterChatPopupSource();
+    feeds::RegisterChatOverlaySource();
 
     // Eagerly load the fallback avatar so the popup source renders the
     // Feeds logo on its first frame (rather than the grey null-circle).
