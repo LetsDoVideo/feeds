@@ -147,9 +147,9 @@ static void RenderPopupToImage(FeedsChatPopupData* d,
     pillFont.setBold(true);
     pillFont.setPixelSize(24);
     p.setFont(pillFont);
-    QFontMetrics fm(pillFont);
-    int textWidth  = fm.horizontalAdvance(senderName);
-    int textHeight = fm.height();
+    QFontMetrics pillFm(pillFont);
+    int textWidth  = pillFm.horizontalAdvance(senderName);
+    int textHeight = pillFm.height();
     QRect pillRect(148, 20, textWidth + 20, textHeight + 12);
     p.setBrush(QColor("#FFA500"));
     p.setPen(Qt::NoPen);
