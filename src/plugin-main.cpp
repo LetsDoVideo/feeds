@@ -1154,7 +1154,7 @@ public:
 
     explicit FeedsChatDock(QWidget* parent = nullptr) : QWidget(parent) {
         m_list = new QListWidget(this);
-        m_list->addItem("Not connected to a meeting");
+        m_list->addItem(CurrentPlaceholderText());
 
         // Word wrap — without these three, long messages render on one
         // line with a horizontal scrollbar. setResizeMode(Adjust) makes
@@ -1239,11 +1239,20 @@ public:
         m_sendBtn->setEnabled(true);
     }
     void OnMeetingLeft() {
-        SetPlaceholder("Not connected to a meeting");
+        SetPlaceholder(CurrentPlaceholderText());
         m_input->setEnabled(false);
         m_sendBtn->setEnabled(false);
         // Hide any active popup so it doesn't carry into the next meeting.
         feeds::ClearChatPopup();
+    }
+
+    // Called from the IPC handlers when login state changes, so the
+    // placeholder reflects "click to login" vs "click to connect" as
+    // the user transitions between states without needing to leave a
+    // meeting first. No-op once chat history is showing.
+    void RefreshPlaceholder() {
+        if (m_messagesStarted) return;
+        SetPlaceholder(CurrentPlaceholderText());
     }
 
 private:
@@ -1259,11 +1268,20 @@ private:
     void OnMessageClicked(QListWidgetItem* item) {
         if (!item) return;
 
-        // Placeholder items ("Not connected to a meeting", etc.) carry no
-        // sender data — silently skip them so clicking a placeholder
-        // doesn't do anything weird.
+        // Placeholders carry no sender_id data. Use that as the signal to
+        // route the click through the same login / connect flows the menu
+        // and source properties already drive — gives the dock its own
+        // call-to-action entry point.
         QVariant idVar = item->data(RoleSenderId);
-        if (!idVar.isValid()) return;
+        if (!idVar.isValid()) {
+            if (m_messagesStarted) return;  // "Connected" placeholder
+            if (!g_isLoggedIn) {
+                OnLoginClick();
+            } else {
+                OnConnectClick();
+            }
+            return;
+        }
 
         unsigned int senderId = idVar.toUInt();
         QString      sender   = item->data(RoleSenderName).toString();
@@ -1272,6 +1290,12 @@ private:
         feeds::ToggleChatPopup(senderId,
                                sender.toStdString(),
                                content.toStdString());
+    }
+
+    QString CurrentPlaceholderText() const {
+        return g_isLoggedIn
+            ? "Logged in. Click to Connect to Zoom Meeting."
+            : "Not logged in to Zoom. Click to Login.";
     }
 
     void SendCurrentMessage() {
@@ -1395,7 +1419,7 @@ void SetupPluginMenu() {
     g_loginAction   = feedsMenu->addAction("Login to Zoom");
     g_logoutAction  = feedsMenu->addAction("Logout of Zoom");
     feedsMenu->addSeparator();
-    g_connectAction = feedsMenu->addAction("Connect to Zoom Meeting...");
+    g_connectAction = feedsMenu->addAction("Connect to Zoom Meeting");
     feedsMenu->addSeparator();
     QAction* aboutAction = feedsMenu->addAction("About / Tier Status");
 
@@ -1680,14 +1704,14 @@ static obs_properties_t* zp_properties(void* data) {
     if (!g_isInMeeting) {
         if (!g_isLoggedIn) {
             obs_properties_add_button(props, "login_btn",
-                "Not logged in to Zoom. Click to Login...",
+                "Not logged in to Zoom. Click to Login.",
                 [](obs_properties_t*, obs_property_t*, void*) -> bool {
                     OnLoginClick();
                     return true;
                 });
         } else {
             obs_properties_add_button(props, "connect_btn",
-                "Logged in. Click to Connect to Zoom Meeting...",
+                "Logged in. Click to Connect to Zoom Meeting.",
                 [](obs_properties_t*, obs_property_t*, void*) -> bool {
                     OnConnectClick();
                     return true;
@@ -2092,14 +2116,14 @@ static obs_properties_t* zs_properties(void* data) {
     if (!g_isInMeeting) {
         if (!g_isLoggedIn) {
             obs_properties_add_button(props, "login_btn",
-                "Not logged in to Zoom. Click to Login...",
+                "Not logged in to Zoom. Click to Login.",
                 [](obs_properties_t*, obs_property_t*, void*) -> bool {
                     OnLoginClick();
                     return true;
                 });
         } else {
             obs_properties_add_button(props, "connect_btn",
-                "Logged in. Click to Connect to Zoom Meeting...",
+                "Logged in. Click to Connect to Zoom Meeting.",
                 [](obs_properties_t*, obs_property_t*, void*) -> bool {
                     OnConnectClick();
                     return true;
@@ -2284,6 +2308,7 @@ static void RegisterEngineHandlers() {
             if (g_logoutAction)  g_logoutAction->setEnabled(true);
             if (g_connectAction) g_connectAction->setEnabled(true);
             RefreshAllSourceProperties();
+            if (g_chatDock) g_chatDock->RefreshPlaceholder();
 
             if (g_pendingMeetingJoin) {
                 g_pendingMeetingJoin = false;
@@ -2334,6 +2359,7 @@ static void RegisterEngineHandlers() {
             if (g_logoutAction)  g_logoutAction->setEnabled(false);
             if (g_connectAction) g_connectAction->setEnabled(false);
             RefreshAllSourceProperties();
+            if (g_chatDock) g_chatDock->RefreshPlaceholder();
 
             MessageBoxA(NULL, "You have been logged out of Zoom.",
                         "Feeds - Logout", MB_OK | MB_ICONINFORMATION);
@@ -2364,6 +2390,7 @@ static void RegisterEngineHandlers() {
             if (g_logoutAction)  g_logoutAction->setEnabled(false);
             if (g_connectAction) g_connectAction->setEnabled(false);
             RefreshAllSourceProperties();
+            if (g_chatDock) g_chatDock->RefreshPlaceholder();
 
             MessageBoxA(NULL,
                 "Your Zoom login has expired and could not be renewed.\n\n"
