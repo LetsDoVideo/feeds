@@ -22,4 +22,12 @@ void ToggleChatPopup(unsigned int senderId,
 // meeting-left so stale state doesn't carry into the next meeting.
 void ClearChatPopup();
 
+// Re-evaluate every popup source instance's tier_disabled flag against
+// the current g_currentTier (popup is a Streamer-tier feature, gated at
+// >= 2). Called from plugin-main's ReconcileSourcesToTier on
+// login_succeeded so a tier downgrade puts every popup into the
+// "show nothing, properties show upgrade message" state, and a re-upgrade
+// flips them back to normal rendering.
+void ReconcileChatPopupSources();
+
 }  // namespace feeds

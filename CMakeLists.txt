@@ -94,6 +94,7 @@ add_executable(FeedsEngine WIN32
     engine/engine-meeting.cpp
     engine/engine-video.cpp
     engine/engine-screenshare.cpp
+    engine/engine-frame-scaler.cpp
 )
 target_include_directories(FeedsEngine PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/zoom-sdk/h"

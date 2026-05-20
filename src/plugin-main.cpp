@@ -97,14 +97,18 @@ static QAction* g_connectAction = nullptr;
 // ---------------------------------------------------------------------------
 // Globals — cached state from engine
 // ---------------------------------------------------------------------------
-static bool g_isLoggedIn          = false;
+// Non-static so feeds-chat-popup-source.cpp and feeds-chat-overlay-source.cpp
+// can extern this for their tier-gating checks (mirrors the avatar-cache
+// linkage pattern lower in this file).
+bool g_isLoggedIn                 = false;
 static bool g_isInMeeting         = false;
 static bool g_rawLiveStreamGranted = false;
 static bool g_pendingMeetingJoin   = false;
 
 static std::string g_userDisplayName;
 static std::string g_userPMI;
-static int         g_currentTier = 0;
+// Non-static for the same reason as g_isLoggedIn above.
+int                g_currentTier = 0;
 static uint32_t    g_enginePid   = 0;   // Populated from engine_ready
 
 static unsigned long long g_currentMeetingNumber = 0;
@@ -1216,6 +1220,11 @@ public:
         // can pick it up without an IPC change.
         (void)timestamp;
 
+        // Defensive — the IPC handler already drops messages on tier < 1,
+        // but if SetTierDisabled fires after a message is queued for the
+        // UI thread we'd want to swallow it here too. Belt-and-braces.
+        if (m_tierDisabled) return;
+
         if (!m_messagesStarted) {
             // First real message — drop the placeholder. From here on the
             // dock shows only real chat history for the rest of the OBS
@@ -1258,6 +1267,29 @@ public:
         SetPlaceholder(CurrentPlaceholderText());
     }
 
+    // Toggle the dock between "normal" and "tier-locked" states.
+    // Called from ReconcileSourcesToTier on login_succeeded. Entering
+    // the locked state clears any accumulated chat history (so a Free
+    // user picking up a shared OBS doesn't see a paid user's history)
+    // and swaps the placeholder to the upgrade prompt. Exiting the
+    // locked state restores the normal placeholder; input stays
+    // disabled until OnMeetingJoined fires from a real connect.
+    void SetTierDisabled(bool disabled) {
+        if (m_tierDisabled == disabled) return;
+        m_tierDisabled = disabled;
+
+        if (disabled) {
+            m_messagesStarted = false;
+            m_list->clear();
+            m_input->clear();
+            m_input->setEnabled(false);
+            m_sendBtn->setEnabled(false);
+        }
+        SetPlaceholder(CurrentPlaceholderText());
+    }
+
+    bool IsTierDisabled() const { return m_tierDisabled; }
+
 private:
     void SetPlaceholder(const QString& text) {
         // Once real messages have arrived, the placeholder is permanently
@@ -1277,6 +1309,15 @@ private:
         // call-to-action entry point.
         QVariant idVar = item->data(RoleSenderId);
         if (!idVar.isValid()) {
+            // Tier-locked placeholder routes to the upgrade URL instead
+            // of the login/connect flows. Free users can't use the dock
+            // at all, so the only useful action is "go upgrade."
+            if (m_tierDisabled) {
+                QDesktopServices::openUrl(
+                    QUrl("https://letsdovideo.com/feeds-upgrade"));
+                return;
+            }
+
             // Bail on the "Connected" placeholder — already in a meeting,
             // the dock click shouldn't re-enter the connect flow (which
             // would hit the defensive Already-Connected MessageBox in
@@ -1304,6 +1345,9 @@ private:
     }
 
     QString CurrentPlaceholderText() const {
+        if (m_tierDisabled) {
+            return "Zoom Chat is a paid feature. Click to upgrade your plan.";
+        }
         return g_isLoggedIn
             ? "Logged in. Click to Connect to Zoom Meeting."
             : "Not logged in to Zoom. Click to Login.";
@@ -1335,6 +1379,10 @@ private:
     QLineEdit*   m_input            = nullptr;
     QPushButton* m_sendBtn          = nullptr;
     bool         m_messagesStarted  = false;
+    // True iff the current logged-in tier is Free (< 1). Dock starts
+    // false (pre-login state is identical to a normal Basic+ session)
+    // and toggles via SetTierDisabled from ReconcileSourcesToTier.
+    bool         m_tierDisabled     = false;
 };
 
 // Non-owning pointer to the registered dock instance. OBS owns the widget's
@@ -1478,7 +1526,9 @@ void SetupPluginMenu() {
 static std::atomic<uint64_t> g_lastTierPopupMs{0};
 static constexpr uint64_t TIER_POPUP_THROTTLE_MS = 3000;
 
-static bool ShouldShowTierPopup() {
+// Non-static so the chat popup and chat overlay sources can call it
+// during their own tier-gating create paths.
+bool ShouldShowTierPopup() {
     uint64_t now  = GetTickCount64();
     uint64_t last = g_lastTierPopupMs.load();
     if (now - last < TIER_POPUP_THROTTLE_MS) return false;
@@ -1492,7 +1542,9 @@ static bool ShouldShowTierPopup() {
 // QTimer::singleShot, matching the pattern used elsewhere in this file.
 // Uses show() + ApplicationModal + WA_DeleteOnClose rather than exec(),
 // since we're inside a queued lambda and don't want to nest event loops.
-static void ShowTierLimitDialog(const QString& title, const QString& html) {
+// Non-static so the chat popup and chat overlay sources can show their
+// own upgrade dialogs from their tier-gating create paths.
+void ShowTierLimitDialog(const QString& title, const QString& html) {
     QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
         [title, html]() {
             QMainWindow* mainWindow =
@@ -1527,6 +1579,22 @@ static void ShowTierLimitDialog(const QString& title, const QString& html) {
 
 static void* zp_create(obs_data_t* settings, obs_source_t* source) {
     (void)settings;
+
+    // Logged-out gating: refuse to create any Feeds source while the
+    // user has no Zoom session. Throttled-popup helper is reused so a
+    // saved scene loading several Feeds sources at once shows one
+    // login prompt rather than one per source. Order matters — this
+    // runs before the tier check so a logged-out user sees "log in"
+    // instead of a misleading "upgrade your plan".
+    if (!g_isLoggedIn) {
+        if (ShouldShowTierPopup()) {
+            ShowTierLimitDialog(
+                "Feeds - Login Required",
+                "Please log in to Zoom to use Feeds.<br><br>"
+                "Open the Feeds menu and click \"Login to Zoom\" to get started.");
+        }
+        return nullptr;
+    }
 
     // Tier gating: enforce max feeds per the current tier, but only if
     // logged in. On OBS startup, saved sources may be created before
@@ -2017,6 +2085,19 @@ static void CloseSharedMemoryForAllScreenshareSources() {
 static void* zs_create(obs_data_t* settings, obs_source_t* source) {
     (void)settings;
 
+    // Logged-out gating: same throttled-login-prompt pattern as
+    // zp_create / fcp_create / fcr_create. Runs before the tier check
+    // so a logged-out user sees "log in" rather than "upgrade".
+    if (!g_isLoggedIn) {
+        if (ShouldShowTierPopup()) {
+            ShowTierLimitDialog(
+                "Feeds - Login Required",
+                "Please log in to Zoom to use Feeds.<br><br>"
+                "Open the Feeds menu and click \"Login to Zoom\" to get started.");
+        }
+        return nullptr;
+    }
+
     // Tier gating: screenshare is a paid feature (Basic tier and up).
     // Same login-deferred logic as zp_create — if the user has a saved
     // scene with a screenshare source and login hasn't completed yet,
@@ -2267,6 +2348,21 @@ static void ReconcileSourcesToTier() {
             }
             s->tier_disabled = shouldDisable;
         }
+    }
+
+    // Chat popup sources — gated at Streamer (>= 2). Walks the source's
+    // own instance registry under its own mutex; no shared state with
+    // the participant/screenshare reconciliation above.
+    feeds::ReconcileChatPopupSources();
+
+    // Chat overlay sources — same threshold and pattern as the popup.
+    feeds::ReconcileChatOverlaySources();
+
+    // Chat dock — gated at Basic (>= 1). The dock object always exists
+    // (registered at module-load); SetTierDisabled flips it between
+    // normal and upgrade-prompt states.
+    if (g_chatDock) {
+        g_chatDock->SetTierDisabled(g_currentTier < 1);
     }
 
     RefreshAllSourceProperties();
@@ -2646,6 +2742,17 @@ static void RegisterEngineHandlers() {
         // so we just render whatever arrives. message_id is parsed for
         // logging only in Phase 1; future phases may use it for edit/
         // delete propagation or dedup.
+
+        // Tier gating at the IPC entry point. Sinks (dock, popup,
+        // overlay) gate themselves too, but cutting traffic here saves
+        // the avatar fetch + overlay history mutation for Free users
+        // and prevents stale messages from piling up in the overlay
+        // history during a tier-locked session.
+        //   Tier 0 (Free):       skip entirely
+        //   Tier 1 (Basic):      dock-only (skip overlay append)
+        //   Tier 2+ (Streamer+): full processing
+        if (g_currentTier < 1) return;
+
         std::string messageId  = ExtractJsonString(json, "message_id");
         unsigned int senderId  =
             (unsigned int)ExtractJsonNumber(json, "sender_id");
@@ -2657,15 +2764,18 @@ static void RegisterEngineHandlers() {
         blog(LOG_INFO, "[feeds] chat_message id=%s", messageId.c_str());
 
         // Populate the avatar cache up-front on the IPC thread so the
-        // chat popup source (coming in a later Phase 2 commit) can hit
-        // the cache synchronously. Return value unused in this commit.
+        // chat popup source can hit the cache synchronously when
+        // ToggleChatPopup runs. Return value unused here.
         (void)GetAvatarForSender(senderId, avatarPath);
 
-        // Push into the overlay's centralised history. Thread-safe; no
-        // need to marshal to the Qt main thread — the overlay source
-        // reads under its own mutex on the graphics thread.
-        feeds::AppendChatMessageToOverlay(senderId, senderName, content,
-                                          timestamp);
+        // Push into the overlay's centralised history (Streamer+ only).
+        // Thread-safe; no need to marshal to the Qt main thread — the
+        // overlay source reads under its own mutex on the graphics
+        // thread.
+        if (g_currentTier >= 2) {
+            feeds::AppendChatMessageToOverlay(senderId, senderName, content,
+                                              timestamp);
+        }
 
         QString qSender  = QString::fromStdString(senderName);
         QString qContent = QString::fromStdString(content);

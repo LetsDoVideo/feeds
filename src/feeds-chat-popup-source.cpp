@@ -13,16 +13,19 @@
 // a different one replaces the content. Animation lands in 3d.
 
 #include "feeds-chat-popup-source.h"
+#include "feeds-version.h"
 
 #include <obs-module.h>
 #include <graphics/graphics.h>
 
+#include <QDesktopServices>
+#include <QFont>
+#include <QFontMetrics>
 #include <QImage>
 #include <QPainter>
 #include <QPainterPath>
-#include <QFont>
-#include <QFontMetrics>
 #include <QString>
+#include <QUrl>
 
 #include <algorithm>
 #include <limits>
@@ -37,6 +40,19 @@
 extern std::mutex                       g_avatarCacheMutex;
 extern std::map<unsigned int, QImage>   g_avatarCache;
 extern QImage                           g_fallbackAvatar;
+
+// Tier state + helpers from plugin-main.cpp. Popup is gated at Streamer
+// (>= 2). The throttled dialog is reused from the participant/screenshare
+// create paths so a saved scene loading multiple over-tier sources at
+// once doesn't stack popups.
+extern bool g_isLoggedIn;
+extern int  g_currentTier;
+extern bool ShouldShowTierPopup();
+extern void ShowTierLimitDialog(const QString& title, const QString& html);
+
+// Tier threshold for the popup. Streamer (2) and Broadcaster (3) get it;
+// Free (0) and Basic (1) don't.
+static constexpr int POPUP_MIN_TIER = 2;
 
 namespace {
 
@@ -99,6 +115,13 @@ struct FeedsChatPopupData {
     // MIN_BUBBLE_HEIGHT + BOTTOM_MARGIN at scale=1.0 (60 + 130 + 15).
     uint32_t      width  = 1536;
     uint32_t      height = 205;
+
+    // True iff this instance is currently locked out by tier (logged in
+    // at < POPUP_MIN_TIER). Set by feeds::ReconcileChatPopupSources on
+    // login_succeeded. When true, fcp_video_render no-ops and
+    // fcp_get_properties returns an upgrade message instead of the
+    // normal (empty) properties panel.
+    bool          tier_disabled = false;
 
     bool          visible    = false;
     unsigned int  sender_id  = 0;
@@ -493,6 +516,38 @@ static const char* fcp_get_name(void*) {
 }
 
 static void* fcp_create(obs_data_t* /*settings*/, obs_source_t* source) {
+    // Logged-out gating: refuse creation outright when there's no Zoom
+    // session. Runs before the tier check so a logged-out user sees
+    // "log in" instead of an "upgrade your plan" message that doesn't
+    // apply yet. Throttled-popup helper deduplicates the prompt when a
+    // saved scene loads multiple Feeds sources at once.
+    if (!g_isLoggedIn) {
+        if (ShouldShowTierPopup()) {
+            ShowTierLimitDialog(
+                "Feeds - Login Required",
+                "Please log in to Zoom to use Feeds.<br><br>"
+                "Open the Feeds menu and click \"Login to Zoom\" to get started.");
+        }
+        return nullptr;
+    }
+
+    // Tier gating, mirroring zp_create / zs_create. Only fire the popup
+    // when we know the user's tier (post-login) — saved scenes that load
+    // before login_succeeded would otherwise block creation on the
+    // default tier=0. The plugin-main OnSourceCreated husk-sweep catches
+    // the NULL return and removes the placeholder source from any scene
+    // it landed in.
+    if (g_isLoggedIn && g_currentTier < POPUP_MIN_TIER) {
+        if (ShouldShowTierPopup()) {
+            ShowTierLimitDialog(
+                "Feeds - Upgrade Required",
+                "Zoom Chat Popup is a Streamer-tier feature.<br><br>"
+                "<a href=\"https://letsdovideo.com/feeds-upgrade\">"
+                "Upgrade your plan</a> to enable it.");
+        }
+        return nullptr;
+    }
+
     FeedsChatPopupData* d = new FeedsChatPopupData();
     d->source = source;
 
@@ -556,7 +611,34 @@ static uint32_t fcp_get_height(void* data) {
     return d ? d->height : 0;
 }
 
-static obs_properties_t* fcp_get_properties(void* /*data*/) {
+static obs_properties_t* fcp_get_properties(void* data) {
+    // Tier-locked branch: replace the (currently empty) normal properties
+    // panel with an upgrade message + button. Mirrors zp_properties /
+    // zs_properties when their sources are tier_disabled.
+    FeedsChatPopupData* d = static_cast<FeedsChatPopupData*>(data);
+    if (d && d->tier_disabled) {
+        obs_properties_t* props = obs_properties_create();
+        std::string verLabel = std::string("Feeds (v") +
+                               feeds_shared::VERSION + ")";
+        obs_properties_add_text(props, "ver_label", verLabel.c_str(),
+                                OBS_TEXT_INFO);
+
+        const char* tierName = (g_currentTier == 0) ? "Free" : "Basic";
+        std::string msg = std::string(
+            "Zoom Chat Popup is a Streamer-tier feature. ") +
+            "Your current tier is " + tierName + ".";
+        obs_properties_add_text(props, "tier_disabled_msg", msg.c_str(),
+                                OBS_TEXT_INFO);
+        obs_properties_add_button(props, "upgrade_btn",
+            "Upgrade your plan to enable Zoom Chat Popup",
+            [](obs_properties_t*, obs_property_t*, void*) -> bool {
+                QDesktopServices::openUrl(
+                    QUrl("https://letsdovideo.com/feeds-upgrade"));
+                return true;
+            });
+        return props;
+    }
+
     // No user-tunable settings yet — leave the properties panel empty
     // rather than inventing knobs we don't know we need.
     return obs_properties_create();
@@ -579,6 +661,10 @@ static void fcp_video_tick(void* data, float seconds) {
 static void fcp_video_render(void* data, gs_effect_t* /*effect*/) {
     FeedsChatPopupData* d = static_cast<FeedsChatPopupData*>(data);
     if (!d) return;
+
+    // Tier-locked: render nothing so the stream stays clean. Properties
+    // panel still tells the user why (see fcp_get_properties).
+    if (d->tier_disabled) return;
 
     // Snapshot per-instance state under lock so an in-flight
     // UpdateInstanceFromGlobal on the Qt main thread can't tear the
@@ -860,6 +946,22 @@ void ClearChatPopup() {
         g_popupAnimTo      = 1.0f;
         return;
     }
+    }
+}
+
+void ReconcileChatPopupSources() {
+    const bool shouldDisable = (g_currentTier < POPUP_MIN_TIER);
+    std::lock_guard<std::mutex> lock(g_instancesMutex);
+    for (FeedsChatPopupData* d : g_instances) {
+        if (!d) continue;
+        if (d->tier_disabled != shouldDisable) {
+            d->tier_disabled  = shouldDisable;
+            // Mark dirty so any cached texture for the now-disabled
+            // instance is recomputed (defensive — the render path will
+            // short-circuit on tier_disabled anyway, but a re-enabled
+            // instance needs to refresh whatever it was showing).
+            d->texture_dirty  = true;
+        }
     }
 }
 

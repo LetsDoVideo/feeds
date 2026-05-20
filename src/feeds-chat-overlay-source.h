@@ -31,4 +31,10 @@ void AppendChatMessageToOverlay(unsigned int       senderId,
 // so stale messages don't carry into the next meeting.
 void ClearChatOverlay();
 
+// Re-evaluate every overlay source instance's tier_disabled flag against
+// the current g_currentTier (overlay is a Streamer-tier feature, gated
+// at >= 2). Called from plugin-main's ReconcileSourcesToTier on
+// login_succeeded. Mirrors ReconcileChatPopupSources.
+void ReconcileChatOverlaySources();
+
 }  // namespace feeds

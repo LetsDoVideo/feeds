@@ -28,6 +28,7 @@
 #include "rawdata/zoom_rawdata_api.h"
 
 #include "shared-frame.h"
+#include "engine-frame-scaler.h"
 
 // Defined in engine-main.cpp
 extern void LogToFile(const char* msg);
@@ -161,8 +162,18 @@ public:
         m_slots  = nullptr;
     }
 
-    // Write one I420 frame. Called from the SDK's raw-data callback thread.
-    // The three Y/U/V buffers are copied into the next ring slot.
+    // Write one I420 frame. Called from the SDK's raw-data callback
+    // thread. The three Y/U/V buffers are copied into the next ring
+    // slot. m_writeMutex was added in v1.2.1 to support a planned
+    // scaler-worker path that hasn't shipped — current contention is
+    // only between this and WriteBlankSignal on the SDK status
+    // callback, both of which already serialise inside the SDK.
+    //
+    // TODO(stride): WriteFrame and the engine pipeline both assume
+    // tight-packed I420 (stride == width). The Zoom SDK consumer API
+    // (YUVRawDataI420) deliberately omits stride accessors that exist on
+    // its sibling YUVProcessDataI420; the assumption holds in practice
+    // today but is documented as fragile in research §12.1.
     void WriteFrame(const uint8_t* y, const uint8_t* u, const uint8_t* v,
                     uint32_t width, uint32_t height)
     {
@@ -176,6 +187,8 @@ public:
             width  == 0 || height == 0) {
             return;
         }
+
+        std::lock_guard<std::mutex> lock(m_writeMutex);
 
         // Pick the next slot. We write to slot (write_index % RING_SLOTS),
         // then bump write_index. A reader seeing write_index = N knows
@@ -215,9 +228,13 @@ public:
     // height==0) as "clear the OBS source" rather than render a frame.
     // Used when the SDK signals raw-data-off so the source goes
     // transparent instead of freezing on the last received frame.
+    // Same mutex as WriteFrame so concurrent worker output + blank
+    // signal can't end up writing to the same slot.
     void WriteBlankSignal()
     {
         if (!m_header || !m_slots) return;
+
+        std::lock_guard<std::mutex> lock(m_writeMutex);
 
         uint32_t slot = m_header->write_index % feeds_shared::RING_SLOTS;
         feeds_shared::FrameSlot* dest = &m_slots[slot];
@@ -243,6 +260,7 @@ private:
     void*  m_view = nullptr;
     feeds_shared::SharedFrameHeader* m_header = nullptr;
     feeds_shared::FrameSlot*         m_slots  = nullptr;
+    std::mutex                       m_writeMutex;
 };
 
 // ---------------------------------------------------------------------------
@@ -294,6 +312,12 @@ public:
         // allows 1080p for all feeds up to tier max. For now we just use
         // the tier resolution straight.
         m_renderer->setRawDataResolution(GetResolutionForCurrentTier());
+
+        // v1.2.1 ships without the engine-side frame scaler — the
+        // worker/scaler files (engine-frame-scaler.{h,cpp}) are still
+        // compiled but not wired up. onRawDataFrameReceived writes
+        // directly to m_writer, same as v1.2.0. Scaler resumes in
+        // v1.2.2 after the libyuv-vs-hand-rolled question lands.
 
         // Subscribe to the user's video, unless we're in follow-active-
         // speaker mode and no speaker has been designated yet.
@@ -443,6 +467,11 @@ private:
     bool         m_followActiveSpeaker = false;
     ZOOM_SDK_NAMESPACE::IZoomSDKRenderer* m_renderer = nullptr;
     SharedMemoryWriter m_writer;
+
+    // Frame-scaler worker placeholder. v1.2.1 ships unwired — left as a
+    // member so v1.2.2 can re-enable scaling without re-touching the
+    // struct layout. Always nullptr in this release.
+    std::unique_ptr<FrameScalerWorker> m_worker;
 };
 
 // ---------------------------------------------------------------------------

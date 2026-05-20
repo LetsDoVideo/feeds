@@ -17,15 +17,18 @@
 // and message-arrival animation (O4).
 
 #include "feeds-chat-overlay-source.h"
+#include "feeds-version.h"
 
 #include <obs-module.h>
 #include <graphics/graphics.h>
 
+#include <QDesktopServices>
 #include <QImage>
 #include <QPainter>
 #include <QPainterPath>
 #include <QString>
 #include <QTextDocument>
+#include <QUrl>
 
 #include <algorithm>
 #include <cstddef>
@@ -39,6 +42,18 @@
 extern std::mutex                       g_avatarCacheMutex;
 extern std::map<unsigned int, QImage>   g_avatarCache;
 extern QImage                           g_fallbackAvatar;
+
+// Tier state + helpers from plugin-main.cpp. Overlay is gated at
+// Streamer (>= 2). Same throttled dialog the participant/screenshare/
+// popup sources use, so stacked over-tier creations don't spam popups.
+extern bool g_isLoggedIn;
+extern int  g_currentTier;
+extern bool ShouldShowTierPopup();
+extern void ShowTierLimitDialog(const QString& title, const QString& html);
+
+// Tier threshold for the overlay. Streamer (2) and Broadcaster (3) get
+// it; Free (0) and Basic (1) don't.
+static constexpr int OVERLAY_MIN_TIER = 2;
 
 namespace {
 
@@ -117,6 +132,12 @@ struct FeedsChatOverlayData {
     gs_texture_t*   texture       = nullptr;
     bool            texture_dirty = true;
     gs_texrender_t* texrender     = nullptr;
+
+    // True iff this instance is currently locked out by tier (logged in
+    // at < OVERLAY_MIN_TIER). Set by feeds::ReconcileChatOverlaySources
+    // on login_succeeded. When true, fcr_video_render no-ops and
+    // fcr_get_properties returns an upgrade message.
+    bool            tier_disabled     = false;
 
     // Configured via source properties — fcr_update mirrors the settings
     // here, and RenderOverlayToImage uses them as the layout extents.
@@ -354,6 +375,34 @@ static void fcr_update(void* data, obs_data_t* settings) {
 }
 
 static void* fcr_create(obs_data_t* settings, obs_source_t* source) {
+    // Logged-out gating: refuse creation outright before any tier
+    // check, so a logged-out user gets "log in" rather than "upgrade".
+    // Throttled-popup helper deduplicates across simultaneous loads.
+    if (!g_isLoggedIn) {
+        if (ShouldShowTierPopup()) {
+            ShowTierLimitDialog(
+                "Feeds - Login Required",
+                "Please log in to Zoom to use Feeds.<br><br>"
+                "Open the Feeds menu and click \"Login to Zoom\" to get started.");
+        }
+        return nullptr;
+    }
+
+    // Tier gating, mirroring zp_create / zs_create / fcp_create. Skip
+    // the check pre-login so saved scenes loading before login_succeeded
+    // don't get blocked at default tier=0. The plugin-main
+    // OnSourceCreated husk-sweep handles the NULL-return case.
+    if (g_isLoggedIn && g_currentTier < OVERLAY_MIN_TIER) {
+        if (ShouldShowTierPopup()) {
+            ShowTierLimitDialog(
+                "Feeds - Upgrade Required",
+                "Zoom Chat Overlay is a Streamer-tier feature.<br><br>"
+                "<a href=\"https://letsdovideo.com/feeds-upgrade\">"
+                "Upgrade your plan</a> to enable it.");
+        }
+        return nullptr;
+    }
+
     FeedsChatOverlayData* d = new FeedsChatOverlayData();
     d->source = source;
 
@@ -409,7 +458,34 @@ static uint32_t fcr_get_height(void* data) {
     return d ? d->height : 0;
 }
 
-static obs_properties_t* fcr_get_properties(void* /*data*/) {
+static obs_properties_t* fcr_get_properties(void* data) {
+    // Tier-locked branch: replace the normal Width/Visible-Messages
+    // controls with an upgrade message + button. Same shape as
+    // fcp_get_properties' tier-locked branch.
+    FeedsChatOverlayData* d = static_cast<FeedsChatOverlayData*>(data);
+    if (d && d->tier_disabled) {
+        obs_properties_t* props = obs_properties_create();
+        std::string verLabel = std::string("Feeds (v") +
+                               feeds_shared::VERSION + ")";
+        obs_properties_add_text(props, "ver_label", verLabel.c_str(),
+                                OBS_TEXT_INFO);
+
+        const char* tierName = (g_currentTier == 0) ? "Free" : "Basic";
+        std::string msg = std::string(
+            "Zoom Chat Overlay is a Streamer-tier feature. ") +
+            "Your current tier is " + tierName + ".";
+        obs_properties_add_text(props, "tier_disabled_msg", msg.c_str(),
+                                OBS_TEXT_INFO);
+        obs_properties_add_button(props, "upgrade_btn",
+            "Upgrade your plan to enable Zoom Chat Overlay",
+            [](obs_properties_t*, obs_property_t*, void*) -> bool {
+                QDesktopServices::openUrl(
+                    QUrl("https://letsdovideo.com/feeds-upgrade"));
+                return true;
+            });
+        return props;
+    }
+
     obs_properties_t* props = obs_properties_create();
     obs_properties_add_int_slider(props, S_WIDTH,
                                   "Width",
@@ -423,6 +499,9 @@ static obs_properties_t* fcr_get_properties(void* /*data*/) {
 static void fcr_video_render(void* data, gs_effect_t* /*effect*/) {
     FeedsChatOverlayData* d = static_cast<FeedsChatOverlayData*>(data);
     if (!d) return;
+
+    // Tier-locked: render nothing. Properties panel surfaces the reason.
+    if (d->tier_disabled) return;
 
     // Clear dirty under the instances mutex so a concurrent
     // MarkAllOverlayInstancesDirty call from the IPC thread can't lose
@@ -558,6 +637,22 @@ void ClearChatOverlay() {
         g_overlayHistory.clear();
     }
     MarkAllOverlayInstancesDirty();
+}
+
+void ReconcileChatOverlaySources() {
+    const bool shouldDisable = (g_currentTier < OVERLAY_MIN_TIER);
+    std::lock_guard<std::mutex> lock(g_overlayInstancesMutex);
+    for (FeedsChatOverlayData* d : g_overlayInstances) {
+        if (!d) continue;
+        if (d->tier_disabled != shouldDisable) {
+            d->tier_disabled = shouldDisable;
+            // Mark dirty so a re-enabled instance refreshes its texture
+            // on the next render. The render path short-circuits on
+            // tier_disabled anyway, so the dirty bit only matters on
+            // the disable→enable transition.
+            d->texture_dirty = true;
+        }
+    }
 }
 
 }  // namespace feeds
