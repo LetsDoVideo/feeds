@@ -94,15 +94,19 @@ endif()
 # build target.
 #
 # GIT_TAG is pinned to upstream 94417b9d (2025-09-26, "Pass rgbconstants
-# via struct pointer"). libyuv doesn't publish semver tags. This pin is
-# the latest commit we've verified builds clean on MSVC 17.14 with /WX:
-#  - Predates the matrix-conversion refactor wave (RAW/RGB24 → matrix,
-#    ARGBToI4xx unification, RGBToYMatrix_AVX2) that introduces C4244
-#    truncation warnings in source/row_common.cc.
-#  - Predates upstream f2ac6db (2026-04-29, "RAWToNV21 using SME ..."),
-#    which adds `__attribute__((no_sanitize("cfi-icall")))` to
-#    source/row_win.cc — a Clang-only attribute MSVC rejects.
-# Re-verify on MSVC before advancing the pin.
+# via struct pointer"). libyuv doesn't publish semver tags. This pin
+# predates upstream f2ac6db (2026-04-29, "RAWToNV21 using SME ..."),
+# which adds `__attribute__((no_sanitize("cfi-icall")))` to
+# source/row_win.cc — a Clang-only attribute MSVC rejects with no
+# workaround short of patching libyuv.
+#
+# Warnings: even on this older pin, MSVC's C4244 trips on libyuv's
+# integer-truncation patterns under /WX. Rather than hunt further back
+# (older commits have other issues, and any new pin will likely
+# re-introduce something), we accept libyuv's warnings as upstream's
+# problem and disable warnings-as-errors on the libyuv target only.
+# Our own targets (FeedsEngine, the plugin) keep their strict warning
+# policies — the COMPILE_WARNING_AS_ERROR property is per-target.
 include(FetchContent)
 FetchContent_Declare(
     libyuv
@@ -111,6 +115,7 @@ FetchContent_Declare(
     EXCLUDE_FROM_ALL
 )
 FetchContent_MakeAvailable(libyuv)
+set_target_properties(yuv PROPERTIES COMPILE_WARNING_AS_ERROR OFF)
 
 add_executable(FeedsEngine WIN32
     engine/engine-main.cpp
