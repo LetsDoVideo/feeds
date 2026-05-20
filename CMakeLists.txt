@@ -104,9 +104,13 @@ endif()
 # integer-truncation patterns under /WX. Rather than hunt further back
 # (older commits have other issues, and any new pin will likely
 # re-introduce something), we accept libyuv's warnings as upstream's
-# problem and disable warnings-as-errors on the libyuv target only.
-# Our own targets (FeedsEngine, the plugin) keep their strict warning
-# policies — the COMPILE_WARNING_AS_ERROR property is per-target.
+# problem. libyuv defines several targets (yuv, yuv_common_objects,
+# possibly more depending on build options) so enumerating them with
+# set_target_properties is brittle — instead, save / clear /
+# CMAKE_COMPILE_WARNING_AS_ERROR around FetchContent_MakeAvailable so
+# every target libyuv creates inherits the OFF default. Our own targets
+# are defined below, after the restore, so they pick the original
+# strict value back up.
 include(FetchContent)
 FetchContent_Declare(
     libyuv
@@ -114,8 +118,10 @@ FetchContent_Declare(
     GIT_TAG        94417b9d213364905ce849c25719b819b8dbbaaa
     EXCLUDE_FROM_ALL
 )
+set(_FEEDS_SAVED_WAE ${CMAKE_COMPILE_WARNING_AS_ERROR})
+set(CMAKE_COMPILE_WARNING_AS_ERROR OFF)
 FetchContent_MakeAvailable(libyuv)
-set_target_properties(yuv PROPERTIES COMPILE_WARNING_AS_ERROR OFF)
+set(CMAKE_COMPILE_WARNING_AS_ERROR ${_FEEDS_SAVED_WAE})
 
 add_executable(FeedsEngine WIN32
     engine/engine-main.cpp
