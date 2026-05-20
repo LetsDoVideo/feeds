@@ -171,6 +171,14 @@ private:
     feeds_shared::FrameSlot*         m_slots  = nullptr;
 };
 
+// Singleton renderer pointer + subscribed-id state. Declared here (not
+// further down with the rest of the singleton state) because the
+// ShareRenderer class body below needs them in scope — its
+// onRendererBeDestroyed override nulls them out when the SDK destroys
+// the renderer.
+static ZOOM_SDK_NAMESPACE::IZoomSDKRenderer*  g_shareRenderer      = nullptr;
+static unsigned int                           g_currentSubscribeId = 0;  // what we're subscribed to (sharer or source id)
+
 // ---------------------------------------------------------------------------
 // Renderer delegate — receives I420 frames from the SDK and writes them
 // to the shared-memory region.
@@ -196,10 +204,13 @@ public:
     }
 
     virtual void onRendererBeDestroyed() override {
-        // SDK destroyed our renderer (meeting ended, etc.). Drop the
-        // pointer from our side so we don't try to use it. TearDown will
-        // skip the destroyRenderer call.
+        // SDK destroyed our renderer (meeting ended, etc.). Null the
+        // pointer from our side so TearDownScreenShare's destroyRenderer
+        // call doesn't dereference a dangling pointer. The participant-
+        // side delegate (engine-video.cpp:524) does the same.
         LogToFile("Share: SDK destroyed renderer");
+        g_shareRenderer      = nullptr;
+        g_currentSubscribeId = 0;
     }
 
 private:
@@ -209,11 +220,11 @@ private:
 // ---------------------------------------------------------------------------
 // Singleton state
 // ---------------------------------------------------------------------------
+// g_shareRenderer / g_currentSubscribeId are declared above the class so
+// the renderer-destroyed override can reference them.
 static std::mutex                             g_shareMutex;
 static ShareMemoryWriter                      g_shareWriter;
 static ShareRenderer                          g_shareDelegate;
-static ZOOM_SDK_NAMESPACE::IZoomSDKRenderer*  g_shareRenderer = nullptr;
-static unsigned int                           g_currentSubscribeId = 0;  // what we're subscribed to (sharer or source id)
 
 // ---------------------------------------------------------------------------
 // Lazily create renderer + writer the first time we need them. Caller

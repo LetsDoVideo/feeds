@@ -179,6 +179,19 @@ struct ZpSourceData {
     std::atomic<bool> pumpShouldExit{false};
     HANDLE            pumpWakeEvent = nullptr;
     uint32_t          lastReadIndex = 0;
+
+    // Serialises the pump-thread + shared-memory lifecycle for this source.
+    // Held across the full body of Open/CloseSharedMemory (which themselves
+    // call StartPumpThread / StopPumpThread). Without this, the graphics
+    // thread (zp_update) and PipeReaderThread (source_texture_released,
+    // meeting_left, etc.) could enter StopPumpThread concurrently and race
+    // on std::thread::join() — see v1.2.3 release notes.
+    //
+    // Lock ordering: g_sourcesMutex (outer) → ZpSourceData::lifecycleMutex
+    // (inner). Every caller that holds g_sourcesMutex and reaches into
+    // Open/CloseSharedMemory acquires them in that order; zp_destroy
+    // releases g_sourcesMutex before taking lifecycleMutex.
+    std::mutex        lifecycleMutex;
 };
 
 static std::mutex g_sourcesMutex;
@@ -563,6 +576,9 @@ static void PumpThreadFunc(ZpSourceData* data) {
          data->uuid.c_str());
 }
 
+// Caller MUST hold data->lifecycleMutex. Only called from OpenSharedMemory;
+// kept as a private helper so the lock is taken once at the Open/Close
+// boundary rather than re-entered here.
 static void StartPumpThread(ZpSourceData* data) {
     if (!data) return;
     if (data->pumpThread.joinable()) return;
@@ -574,6 +590,9 @@ static void StartPumpThread(ZpSourceData* data) {
     data->pumpThread = std::thread(PumpThreadFunc, data);
 }
 
+// Caller MUST hold data->lifecycleMutex. Only called from Open/CloseSharedMemory.
+// Without the lock, two threads could pass joinable() and call join() on the
+// same std::thread — UB, observed as std::system_error crashing the process.
 static void StopPumpThread(ZpSourceData* data) {
     if (!data) return;
 
@@ -592,6 +611,8 @@ static void StopPumpThread(ZpSourceData* data) {
 
 static void OpenSharedMemory(ZpSourceData* data) {
     if (!data || g_enginePid == 0) return;
+
+    std::lock_guard<std::mutex> lifecycleLock(data->lifecycleMutex);
 
     if (data->mapping) {
         StopPumpThread(data);
@@ -653,6 +674,9 @@ static void OpenSharedMemory(ZpSourceData* data) {
 // can crash — same bug class as STM v1.0.1).
 static void CloseSharedMemory(ZpSourceData* data, bool clearTexture = true) {
     if (!data) return;
+
+    std::lock_guard<std::mutex> lifecycleLock(data->lifecycleMutex);
+
     StopPumpThread(data);
 
     if (data->view)    { UnmapViewOfFile(data->view); data->view = nullptr; }
@@ -1580,6 +1604,10 @@ void ShowTierLimitDialog(const QString& title, const QString& html) {
 static void* zp_create(obs_data_t* settings, obs_source_t* source) {
     (void)settings;
 
+    // C++ exceptions must not escape into libobs C frames; the cost of
+    // returning nullptr (OBS treats the create as failed and keeps an
+    // invalid husk source) is far less than a process-wide crash.
+  try {
     // Logged-out gating: refuse to create any Feeds source while the
     // user has no Zoom session. Throttled-popup helper is reused so a
     // saved scene loading several Feeds sources at once shows one
@@ -1652,30 +1680,51 @@ static void* zp_create(obs_data_t* settings, obs_source_t* source) {
 
     g_activeParticipantSources++;
     return data;
+  } catch (const std::exception& e) {
+    blog(LOG_ERROR, "[feeds] zp_create exception: %s", e.what());
+    return nullptr;
+  } catch (...) {
+    blog(LOG_ERROR, "[feeds] zp_create unknown exception");
+    return nullptr;
+  }
 }
 
 static void zp_destroy(void* vdata) {
     if (!vdata) return;
     ZpSourceData* data = static_cast<ZpSourceData*>(vdata);
 
-    if (!data->uuid.empty()) {
-        std::string msg = "{\"type\":\"participant_source_unsubscribe\","
-                          "\"source_id\":\"" + data->uuid + "\"}";
-        feeds::SendToEngine(msg);
+    try {
+        if (!data->uuid.empty()) {
+            std::string msg = "{\"type\":\"participant_source_unsubscribe\","
+                              "\"source_id\":\"" + data->uuid + "\"}";
+            feeds::SendToEngine(msg);
+        }
+
+        // Erase from the global registry FIRST so any IPC handler arriving
+        // mid-destruction (source_texture_released, meeting_left, etc.)
+        // can't find this source via FindSourceByUuid and won't try to
+        // operate on it while we're tearing it down. CloseSharedMemory's
+        // per-source lifecycleMutex still protects against any handler
+        // that captured the pointer before this erase.
+        {
+            std::lock_guard<std::mutex> lock(g_sourcesMutex);
+            auto it = std::find(g_allParticipantSources.begin(),
+                                g_allParticipantSources.end(), data);
+            if (it != g_allParticipantSources.end())
+                g_allParticipantSources.erase(it);
+        }
+
+        // clearTexture=false: source is being destroyed, don't touch it.
+        // CloseSharedMemory takes data->lifecycleMutex internally, so any
+        // concurrent handler still inside it serialises here.
+        CloseSharedMemory(data, false);
+
+        g_activeParticipantSources--;
+    } catch (const std::exception& e) {
+        blog(LOG_ERROR, "[feeds] zp_destroy exception: %s", e.what());
+    } catch (...) {
+        blog(LOG_ERROR, "[feeds] zp_destroy unknown exception");
     }
-
-    // clearTexture=false: source is being destroyed, don't touch it.
-    CloseSharedMemory(data, false);
-
-    {
-        std::lock_guard<std::mutex> lock(g_sourcesMutex);
-        auto it = std::find(g_allParticipantSources.begin(),
-                            g_allParticipantSources.end(), data);
-        if (it != g_allParticipantSources.end())
-            g_allParticipantSources.erase(it);
-    }
-
-    g_activeParticipantSources--;
     delete data;
 }
 
@@ -1683,44 +1732,54 @@ static void zp_update(void* vdata, obs_data_t* settings) {
     if (!vdata) return;
     ZpSourceData* data = static_cast<ZpSourceData*>(vdata);
 
-    // Defensive: zp_properties replaces the dropdown with an upgrade
-    // message for tier-disabled sources, so a normal user flow can't
-    // reach here. Guards against unexpected paths (scripted update,
-    // scene-collection import) that would otherwise let a disabled
-    // source send subscribe IPC.
-    if (data->tier_disabled) return;
+    // OBS calls this from a C frame with no exception handler. Any C++
+    // exception that escapes here is unhandled (SEH 0xE06D7363) and
+    // terminates OBS. Swallow + log so the user sees a log message
+    // instead of a crash.
+    try {
+        // Defensive: zp_properties replaces the dropdown with an upgrade
+        // message for tier-disabled sources, so a normal user flow can't
+        // reach here. Guards against unexpected paths (scripted update,
+        // scene-collection import) that would otherwise let a disabled
+        // source send subscribe IPC.
+        if (data->tier_disabled) return;
 
-    unsigned int selected_id =
-        (unsigned int)obs_data_get_int(settings, "participant_id");
+        unsigned int selected_id =
+            (unsigned int)obs_data_get_int(settings, "participant_id");
 
-    if (selected_id == data->current_user_id) return;
+        if (selected_id == data->current_user_id) return;
 
-    // 0 is "--- Select Participant ---" — no subscription.
-    if (selected_id == 0) {
-        data->current_user_id = 0;
-        if (!data->uuid.empty()) {
-            std::string msg = "{\"type\":\"participant_source_unsubscribe\","
-                              "\"source_id\":\"" + data->uuid + "\"}";
+        // 0 is "--- Select Participant ---" — no subscription.
+        if (selected_id == 0) {
+            data->current_user_id = 0;
+            if (!data->uuid.empty()) {
+                std::string msg = "{\"type\":\"participant_source_unsubscribe\","
+                                  "\"source_id\":\"" + data->uuid + "\"}";
+                feeds::SendToEngine(msg);
+            }
+            CloseSharedMemory(data);
+            return;
+        }
+
+        // Tier enforcement lives in zp_create — by the time we get here the
+        // source already exists, so blocking subscription wouldn't prevent
+        // the user from creating over-tier sources. Create-time enforcement
+        // is the simpler and more honest gate.
+        data->current_user_id = selected_id;
+
+        // selected_id == 1 is [Active Speaker] sentinel. Engine handles the
+        // follow-speaker routing — we just pass the sentinel through.
+        // selected_id > 1 is a real Zoom SDK user ID.
+        if (!data->uuid.empty() && g_isInMeeting && g_rawLiveStreamGranted) {
+            std::string msg = "{\"type\":\"participant_source_subscribe\","
+                              "\"source_id\":\"" + data->uuid + "\","
+                              "\"participant_id\":" + std::to_string(selected_id) + "}";
             feeds::SendToEngine(msg);
         }
-        CloseSharedMemory(data);
-        return;
-    }
-
-    // Tier enforcement lives in zp_create — by the time we get here the
-    // source already exists, so blocking subscription wouldn't prevent
-    // the user from creating over-tier sources. Create-time enforcement
-    // is the simpler and more honest gate.
-    data->current_user_id = selected_id;
-
-    // selected_id == 1 is [Active Speaker] sentinel. Engine handles the
-    // follow-speaker routing — we just pass the sentinel through.
-    // selected_id > 1 is a real Zoom SDK user ID.
-    if (!data->uuid.empty() && g_isInMeeting && g_rawLiveStreamGranted) {
-        std::string msg = "{\"type\":\"participant_source_subscribe\","
-                          "\"source_id\":\"" + data->uuid + "\","
-                          "\"participant_id\":" + std::to_string(selected_id) + "}";
-        feeds::SendToEngine(msg);
+    } catch (const std::exception& e) {
+        blog(LOG_ERROR, "[feeds] zp_update exception: %s", e.what());
+    } catch (...) {
+        blog(LOG_ERROR, "[feeds] zp_update unknown exception");
     }
 }
 
@@ -1743,6 +1802,10 @@ static const char* OrdinalSuffix(int n) {
 }
 
 static obs_properties_t* zp_properties(void* data) {
+  // C++ exceptions must not escape into libobs C frames. On exception we
+  // return an empty properties object so the dialog still opens (instead
+  // of crashing OBS).
+  try {
     // data can be nullptr in some Qt code paths (e.g., properties
     // queried before source creation completes); null-guard the
     // tier_disabled access.
@@ -1862,6 +1925,13 @@ static obs_properties_t* zp_properties(void* data) {
         OBS_TEXT_INFO);
 
     return props;
+  } catch (const std::exception& e) {
+    blog(LOG_ERROR, "[feeds] zp_properties exception: %s", e.what());
+    return obs_properties_create();
+  } catch (...) {
+    blog(LOG_ERROR, "[feeds] zp_properties unknown exception");
+    return obs_properties_create();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1892,6 +1962,12 @@ struct ZsSourceData {
     std::atomic<bool> pumpShouldExit{false};
     HANDLE            pumpWakeEvent = nullptr;
     uint32_t          lastReadIndex = 0;
+
+    // Same role as ZpSourceData::lifecycleMutex. Held across Open/Close
+    // ShareSharedMemory bodies (which call ZsStart/ZsStopPumpThread).
+    // Lock ordering: g_screenshareSourcesMutex (outer) →
+    // ZsSourceData::lifecycleMutex (inner).
+    std::mutex        lifecycleMutex;
 };
 
 static std::mutex                 g_screenshareSourcesMutex;
@@ -1960,6 +2036,7 @@ static void ZsPumpThreadFunc(ZsSourceData* data) {
     blog(LOG_INFO, "[feeds] screenshare pump thread exiting");
 }
 
+// Caller MUST hold data->lifecycleMutex — see StartPumpThread comment.
 static void ZsStartPumpThread(ZsSourceData* data) {
     if (!data) return;
     if (data->pumpThread.joinable()) return;
@@ -1971,6 +2048,7 @@ static void ZsStartPumpThread(ZsSourceData* data) {
     data->pumpThread = std::thread(ZsPumpThreadFunc, data);
 }
 
+// Caller MUST hold data->lifecycleMutex — see StopPumpThread comment.
 static void ZsStopPumpThread(ZsSourceData* data) {
     if (!data) return;
 
@@ -1993,6 +2071,8 @@ static void ZsStopPumpThread(ZsSourceData* data) {
 // a later call succeeds).
 static void OpenShareSharedMemory(ZsSourceData* data) {
     if (!data || g_enginePid == 0) return;
+
+    std::lock_guard<std::mutex> lifecycleLock(data->lifecycleMutex);
 
     if (data->mapping) return;  // already open
 
@@ -2046,6 +2126,9 @@ static void OpenShareSharedMemory(ZsSourceData* data) {
 // destruction to avoid touching a half-torn-down source.
 static void CloseShareSharedMemory(ZsSourceData* data, bool clearTexture = true) {
     if (!data) return;
+
+    std::lock_guard<std::mutex> lifecycleLock(data->lifecycleMutex);
+
     ZsStopPumpThread(data);
 
     if (data->view)    { UnmapViewOfFile(data->view); data->view = nullptr; }
@@ -2085,6 +2168,8 @@ static void CloseSharedMemoryForAllScreenshareSources() {
 static void* zs_create(obs_data_t* settings, obs_source_t* source) {
     (void)settings;
 
+    // Same exception-boundary reasoning as zp_create.
+  try {
     // Logged-out gating: same throttled-login-prompt pattern as
     // zp_create / fcp_create / fcr_create. Runs before the tier check
     // so a logged-out user sees "log in" rather than "upgrade".
@@ -2156,28 +2241,47 @@ static void* zs_create(obs_data_t* settings, obs_source_t* source) {
     }
 
     return data;
+  } catch (const std::exception& e) {
+    blog(LOG_ERROR, "[feeds] zs_create exception: %s", e.what());
+    return nullptr;
+  } catch (...) {
+    blog(LOG_ERROR, "[feeds] zs_create unknown exception");
+    return nullptr;
+  }
 }
 
 static void zs_destroy(void* vdata) {
     if (!vdata) return;
     ZsSourceData* data = static_cast<ZsSourceData*>(vdata);
 
-    // clearTexture=false: source is being torn down, don't touch it.
-    // Same bug pattern that bit us on zp_destroy earlier.
-    CloseShareSharedMemory(data, false);
+    try {
+        // Erase from the global registry FIRST — same reasoning as
+        // zp_destroy. Prevents share_status_changed (and any other handler
+        // that iterates g_allScreenshareSources) from finding this source
+        // mid-destruction. Per-source lifecycleMutex inside
+        // CloseShareSharedMemory serialises any handler that already
+        // captured the pointer.
+        {
+            std::lock_guard<std::mutex> lock(g_screenshareSourcesMutex);
+            auto it = std::find(g_allScreenshareSources.begin(),
+                                g_allScreenshareSources.end(), data);
+            if (it != g_allScreenshareSources.end())
+                g_allScreenshareSources.erase(it);
+        }
 
-    {
-        std::lock_guard<std::mutex> lock(g_screenshareSourcesMutex);
-        auto it = std::find(g_allScreenshareSources.begin(),
-                            g_allScreenshareSources.end(), data);
-        if (it != g_allScreenshareSources.end())
-            g_allScreenshareSources.erase(it);
+        // clearTexture=false: source is being torn down, don't touch it.
+        CloseShareSharedMemory(data, false);
+    } catch (const std::exception& e) {
+        blog(LOG_ERROR, "[feeds] zs_destroy exception: %s", e.what());
+    } catch (...) {
+        blog(LOG_ERROR, "[feeds] zs_destroy unknown exception");
     }
-
     delete data;
 }
 
 static obs_properties_t* zs_properties(void* data) {
+  // Same exception-boundary reasoning as zp_properties.
+  try {
     // data can be nullptr in some Qt code paths; null-guard the
     // tier_disabled access.
     ZsSourceData* d = static_cast<ZsSourceData*>(data);
@@ -2244,6 +2348,13 @@ static obs_properties_t* zs_properties(void* data) {
     }
 
     return props;
+  } catch (const std::exception& e) {
+    blog(LOG_ERROR, "[feeds] zs_properties exception: %s", e.what());
+    return obs_properties_create();
+  } catch (...) {
+    blog(LOG_ERROR, "[feeds] zs_properties unknown exception");
+    return obs_properties_create();
+  }
 }
 
 // ---------------------------------------------------------------------------
