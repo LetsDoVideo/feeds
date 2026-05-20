@@ -7,63 +7,12 @@
 #include <cstring>
 #include <utility>
 
+#include <libyuv/scale.h>  // libyuv::I420Scale, libyuv::kFilterBilinear
+
 // Logging hook from engine-main.cpp.
 extern void LogToFile(const char* msg);
 
 namespace feeds_engine {
-
-namespace {
-
-// Bilinear-scale one tight-packed plane (src is srcW×srcH, stride == srcW)
-// into a subregion of dst (dst is dstStride-wide, subregion is dstW×dstH
-// at offset (dstX,dstY)). Caller is responsible for filling the rest of
-// the destination plane (the letterbox/pillarbox margin) with the
-// appropriate neutral value before calling — this function only writes
-// the content subregion.
-//
-// Standard half-pixel-aligned bilinear: output sample at integer (x,y)
-// maps to source coord (x+0.5)*srcW/dstW - 0.5, clamped to [0, srcW-1].
-// Soft on upscale, fine on small downscales; we're nearly always upscaling
-// since the SDK delivers below or at our target ceiling.
-static void BilinearScalePlane(const uint8_t* src, int srcW, int srcH,
-                               uint8_t*       dst, int dstStride,
-                               int dstX, int dstY, int dstW, int dstH)
-{
-    if (srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0) return;
-
-    const float xRatio = (float)srcW / (float)dstW;
-    const float yRatio = (float)srcH / (float)dstH;
-    const float srcMaxX = (float)(srcW - 1);
-    const float srcMaxY = (float)(srcH - 1);
-
-    for (int y = 0; y < dstH; ++y) {
-        float sy = (y + 0.5f) * yRatio - 0.5f;
-        if (sy < 0.0f)    sy = 0.0f;
-        if (sy > srcMaxY) sy = srcMaxY;
-        const int   sy0 = (int)sy;
-        const int   sy1 = std::min(sy0 + 1, srcH - 1);
-        const float wy  = sy - (float)sy0;
-
-        const uint8_t* row0 = src + (size_t)sy0 * srcW;
-        const uint8_t* row1 = src + (size_t)sy1 * srcW;
-        uint8_t*       out  = dst + (size_t)(dstY + y) * dstStride + dstX;
-
-        for (int x = 0; x < dstW; ++x) {
-            float sx = (x + 0.5f) * xRatio - 0.5f;
-            if (sx < 0.0f)    sx = 0.0f;
-            if (sx > srcMaxX) sx = srcMaxX;
-            const int   sx0 = (int)sx;
-            const int   sx1 = std::min(sx0 + 1, srcW - 1);
-            const float wx  = sx - (float)sx0;
-
-            const float a = (float)row0[sx0] * (1.0f - wx) + (float)row0[sx1] * wx;
-            const float b = (float)row1[sx0] * (1.0f - wx) + (float)row1[sx1] * wx;
-            out[x] = (uint8_t)(a * (1.0f - wy) + b * wy + 0.5f);
-        }
-    }
-}
-
-}  // namespace
 
 // ---------------------------------------------------------------------------
 // I420Scaler
@@ -90,7 +39,11 @@ void I420Scaler::Scale(const uint8_t* srcY, const uint8_t* srcU, const uint8_t* 
     if (srcWe <= 0 || srcHe <= 0) return;
 
     // Aspect-preserving fit: pick the smaller of width-fit / height-fit
-    // scale so the content lands wholly inside the target.
+    // scale so the content lands wholly inside the target. libyuv
+    // doesn't do letterbox/pillarbox itself — it scales source-aspect
+    // into whatever dst dimensions you give it — so we keep the content
+    // rect math here and ask libyuv to write only into the centered
+    // subregion of the larger target buffer.
     const float scale = std::min(
         (float)m_targetW / (float)srcWe,
         (float)m_targetH / (float)srcHe);
@@ -106,30 +59,40 @@ void I420Scaler::Scale(const uint8_t* srcY, const uint8_t* srcU, const uint8_t* 
     if (contentH > m_targetH) contentH = m_targetH;
 
     // Center offsets, rounded to even so the chroma subregion lines up.
-    int contentX = ((m_targetW - contentW) / 2) & ~1;
-    int contentY = ((m_targetH - contentH) / 2) & ~1;
+    const int contentX = ((m_targetW - contentW) / 2) & ~1;
+    const int contentY = ((m_targetH - contentH) / 2) & ~1;
 
-    // Fill the full target planes with video black. Y=0, U=V=128 (neutral
-    // chroma). The bilinear pass below overwrites only the content
-    // subregion, leaving the margin as the memset'd black.
+    // Fill the full target planes with video black (Y=0, U=V=128 neutral
+    // chroma). libyuv overwrites only the content subregion below; the
+    // margin keeps the memset'd black as pillarbox / letterbox.
     std::memset(dstY, 0,   (size_t)m_targetW * m_targetH);
     std::memset(dstU, 128, (size_t)(m_targetW / 2) * (m_targetH / 2));
     std::memset(dstV, 128, (size_t)(m_targetW / 2) * (m_targetH / 2));
 
-    // Y plane: full resolution.
-    BilinearScalePlane(srcY, srcWe, srcHe,
-                       dstY, m_targetW,
-                       contentX, contentY, contentW, contentH);
+    // Compute per-plane write offsets into the target buffers. libyuv
+    // writes (contentW × contentH) starting at the offset pointer,
+    // stepping by the target's stride — so we can write into a
+    // subregion of a larger buffer just by adjusting the start address
+    // and keeping the stride at the full target row width.
+    const int dstStrideY = m_targetW;
+    const int dstStrideU = m_targetW / 2;
+    const int dstStrideV = m_targetW / 2;
+    uint8_t*  dstYRegion = dstY + (size_t)contentY * dstStrideY + contentX;
+    uint8_t*  dstURegion = dstU + (size_t)(contentY / 2) * dstStrideU
+                                  + (contentX / 2);
+    uint8_t*  dstVRegion = dstV + (size_t)(contentY / 2) * dstStrideV
+                                  + (contentX / 2);
 
-    // U and V planes: half resolution in both dimensions.
-    BilinearScalePlane(srcU, srcWe / 2, srcHe / 2,
-                       dstU, m_targetW / 2,
-                       contentX / 2, contentY / 2,
-                       contentW / 2, contentH / 2);
-    BilinearScalePlane(srcV, srcWe / 2, srcHe / 2,
-                       dstV, m_targetW / 2,
-                       contentX / 2, contentY / 2,
-                       contentW / 2, contentH / 2);
+    libyuv::I420Scale(
+        srcY,       srcWe,
+        srcU,       srcWe / 2,
+        srcV,       srcWe / 2,
+        srcWe,      srcHe,
+        dstYRegion, dstStrideY,
+        dstURegion, dstStrideU,
+        dstVRegion, dstStrideV,
+        contentW,   contentH,
+        libyuv::kFilterBilinear);
 }
 
 // ---------------------------------------------------------------------------

@@ -86,6 +86,26 @@ if(MSVC)
     )
 endif()
 
+# libyuv for the engine's frame scaler. Pulled in via FetchContent rather
+# than vcpkg / git submodule so no new tooling lands on the CI runner —
+# the obsproject Windows runner already has network access for the
+# buildspec.json prebuilt downloads, and FetchContent piggy-backs on
+# that. EXCLUDE_FROM_ALL keeps libyuv's tests/tools out of the default
+# build target.
+#
+# GIT_TAG is pinned to a specific upstream commit (libyuv doesn't
+# publish semver tags). Bump deliberately when picking up upstream fixes;
+# CI builds against the pinned revision so the same Feeds tag always
+# rebuilds against the same libyuv.
+include(FetchContent)
+FetchContent_Declare(
+    libyuv
+    GIT_REPOSITORY https://chromium.googlesource.com/libyuv/libyuv.git
+    GIT_TAG        9d98aaefe7a5e2710aa6175d44da38892400b381
+    EXCLUDE_FROM_ALL
+)
+FetchContent_MakeAvailable(libyuv)
+
 add_executable(FeedsEngine WIN32
     engine/engine-main.cpp
     engine/engine-oauth.cpp
@@ -99,9 +119,13 @@ add_executable(FeedsEngine WIN32
 target_include_directories(FeedsEngine PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/zoom-sdk/h"
     "${CMAKE_CURRENT_SOURCE_DIR}/common"
+    # libyuv: belt-and-braces. Modern libyuv CMake propagates via
+    # target_link_libraries, but older or custom builds may not — this
+    # makes <libyuv/scale.h> resolve either way.
+    "${libyuv_SOURCE_DIR}/include"
 )
 target_link_directories(FeedsEngine PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/zoom-sdk/lib")
-target_link_libraries(FeedsEngine PRIVATE winhttp crypt32 advapi32 shell32 sdk)
+target_link_libraries(FeedsEngine PRIVATE winhttp crypt32 advapi32 shell32 sdk yuv)
 target_compile_definitions(FeedsEngine PRIVATE
     FEEDS_ZOOM_CLIENT_ID="${FEEDS_ZOOM_CLIENT_ID}"
 )

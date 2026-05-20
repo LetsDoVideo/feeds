@@ -55,6 +55,23 @@ static ZOOM_SDK_NAMESPACE::ZoomSDKResolution GetResolutionForCurrentTier() {
         : ZOOM_SDK_NAMESPACE::ZoomSDKResolution_720P;
 }
 
+// Output dimensions for the engine-side frame scaler. Matches the tier's
+// SDK resolution ceiling so the scaler is upsizing (or pass-through) in
+// the common case. Keeps OBS seeing a stable get_width / get_height
+// regardless of Zoom's bandwidth-driven resolution changes.
+static void GetScalerTargetForCurrentTier(int& w, int& h) {
+    if (GetCurrentTier() >= 1) { w = 1920; h = 1080; }
+    else                        { w = 1280; h = 720;  }
+}
+
+// Once-per-failure-type log bits for the SDK-callback validator. Held
+// per-subscription so a single misbehaving source doesn't spam the log
+// every frame.
+namespace validation_failures {
+    static constexpr unsigned int NULL_PLANE = 1u << 0;
+    static constexpr unsigned int ZERO_DIM   = 1u << 1;
+}
+
 // ---------------------------------------------------------------------------
 // JSON helpers (same primitives as elsewhere in the engine)
 // ---------------------------------------------------------------------------
@@ -162,12 +179,10 @@ public:
         m_slots  = nullptr;
     }
 
-    // Write one I420 frame. Called from the SDK's raw-data callback
-    // thread. The three Y/U/V buffers are copied into the next ring
-    // slot. m_writeMutex was added in v1.2.1 to support a planned
-    // scaler-worker path that hasn't shipped — current contention is
-    // only between this and WriteBlankSignal on the SDK status
-    // callback, both of which already serialise inside the SDK.
+    // Write one I420 frame. Called from the scaler worker thread for
+    // every scaled frame, and from the SDK status callbacks for the
+    // blank-signal path. m_writeMutex serialises the two callers so a
+    // status-change blank write can't trample an in-flight frame slot.
     //
     // TODO(stride): WriteFrame and the engine pipeline both assume
     // tight-packed I420 (stride == width). The Zoom SDK consumer API
@@ -313,11 +328,22 @@ public:
         // the tier resolution straight.
         m_renderer->setRawDataResolution(GetResolutionForCurrentTier());
 
-        // v1.2.1 ships without the engine-side frame scaler — the
-        // worker/scaler files (engine-frame-scaler.{h,cpp}) are still
-        // compiled but not wired up. onRawDataFrameReceived writes
-        // directly to m_writer, same as v1.2.0. Scaler resumes in
-        // v1.2.2 after the libyuv-vs-hand-rolled question lands.
+        // Spin up the scaler worker. SDK callbacks stage frames here; the
+        // worker libyuv-scales to the tier ceiling and hands the result
+        // to m_writer.WriteFrame, so OBS sees constant dimensions
+        // regardless of Zoom's bandwidth-driven resolution changes.
+        // Capturing `this` is safe — TearDown joins the worker before
+        // the subscription destructs.
+        int targetW, targetH;
+        GetScalerTargetForCurrentTier(targetW, targetH);
+        m_worker = std::make_unique<FrameScalerWorker>(
+            targetW, targetH,
+            [this](const uint8_t* y, const uint8_t* u, const uint8_t* v,
+                   int w, int h) {
+                m_writer.WriteFrame(y, u, v, (uint32_t)w, (uint32_t)h);
+            },
+            m_sourceUuid);
+        m_worker->Start();
 
         // Subscribe to the user's video, unless we're in follow-active-
         // speaker mode and no speaker has been designated yet.
@@ -391,9 +417,16 @@ public:
     }
 
     void TearDown() {
+        // Order matters:
+        //   1. SDK teardown first — after destroyRenderer returns, the
+        //      SDK can no longer fire onRawDataFrameReceived (and
+        //      therefore can't call m_worker->StageFrame after we
+        //      destroy it).
+        //   2. Worker stop+join — drains any in-flight scale + write.
+        //      Synchronous join means no risk of the worker touching
+        //      m_writer after Close.
+        //   3. Writer close — releases the file mapping.
         if (m_renderer) {
-            // unSubscribe before destroy — the SDK can be cranky if you
-            // destroy a subscribed renderer. v1.0.0 did this dance too.
             try {
                 m_renderer->unSubscribe();
                 ZOOM_SDK_NAMESPACE::destroyRenderer(m_renderer);
@@ -402,21 +435,73 @@ public:
             }
             m_renderer = nullptr;
         }
+        if (m_worker) {
+            m_worker->Stop();
+            m_worker.reset();
+        }
         m_writer.Close();
     }
 
-    // IZoomSDKRendererDelegate callbacks. Called by the SDK on its internal
-    // thread. We write the frame to shared memory; the plugin's render
-    // thread picks it up.
+    // IZoomSDKRendererDelegate callbacks. Called by the SDK on its
+    // internal thread. v1.2.2: the callback validates the frame, copies
+    // the planes into the worker's staging slot, and signals. The worker
+    // thread libyuv-scales to the tier ceiling and writes the result to
+    // shared memory. Keeping the SDK callback cheap is what stops
+    // Broadcaster-tier multi-renderer setups from serialising past one
+    // frame's budget (research §12.4).
     virtual void onRawDataFrameReceived(YUVRawDataI420* data) override {
-        if (!data) return;
+        if (!data || !m_worker) return;
 
-        m_writer.WriteFrame(
-            (const uint8_t*)data->GetYBuffer(),
-            (const uint8_t*)data->GetUBuffer(),
-            (const uint8_t*)data->GetVBuffer(),
-            data->GetStreamWidth(),
-            data->GetStreamHeight());
+        const uint8_t* y = (const uint8_t*)data->GetYBuffer();
+        const uint8_t* u = (const uint8_t*)data->GetUBuffer();
+        const uint8_t* v = (const uint8_t*)data->GetVBuffer();
+        const int      w = (int)data->GetStreamWidth();
+        const int      h = (int)data->GetStreamHeight();
+
+        // Defensive validation. Reject + log-once-per-type rather than
+        // forwarding a malformed frame and crashing the scaler.
+        if (w <= 0 || h <= 0) {
+            if (!(m_loggedFailures & validation_failures::ZERO_DIM)) {
+                char msg[256];
+                sprintf_s(msg,
+                    "Video: source='%s' received frame with zero dimension "
+                    "(%dx%d); dropping (logged once per subscription)",
+                    m_sourceUuid.c_str(), w, h);
+                LogToFile(msg);
+                m_loggedFailures |= validation_failures::ZERO_DIM;
+            }
+            return;
+        }
+        if (!y || !u || !v) {
+            if (!(m_loggedFailures & validation_failures::NULL_PLANE)) {
+                char msg[256];
+                sprintf_s(msg,
+                    "Video: source='%s' received frame with null plane "
+                    "buffer; dropping (logged once per subscription)",
+                    m_sourceUuid.c_str());
+                LogToFile(msg);
+                m_loggedFailures |= validation_failures::NULL_PLANE;
+            }
+            return;
+        }
+
+        // Dimension-change logging — helps diagnose future regressions
+        // around resolution shifts. Skip the first valid frame (no
+        // prior to compare against).
+        if (w != m_lastSrcW || h != m_lastSrcH) {
+            if (m_lastSrcW != 0 && m_lastSrcH != 0) {
+                char msg[256];
+                sprintf_s(msg,
+                    "Video: frame dimensions changed for source='%s': "
+                    "%dx%d -> %dx%d",
+                    m_sourceUuid.c_str(), m_lastSrcW, m_lastSrcH, w, h);
+                LogToFile(msg);
+            }
+            m_lastSrcW = w;
+            m_lastSrcH = h;
+        }
+
+        m_worker->StageFrame(y, u, v, w, h);
     }
 
     virtual void onRawDataStatusChanged(RawDataStatus status) override {
@@ -468,10 +553,15 @@ private:
     ZOOM_SDK_NAMESPACE::IZoomSDKRenderer* m_renderer = nullptr;
     SharedMemoryWriter m_writer;
 
-    // Frame-scaler worker placeholder. v1.2.1 ships unwired — left as a
-    // member so v1.2.2 can re-enable scaling without re-touching the
-    // struct layout. Always nullptr in this release.
+    // Frame-scaler worker. Owns its own thread; SDK callback stages
+    // frames here. Lives only while the subscription is active.
     std::unique_ptr<FrameScalerWorker> m_worker;
+
+    // SDK-callback-only state; never read from outside that thread, so
+    // no synchronisation needed.
+    int           m_lastSrcW       = 0;  // last frame's width (0 = none yet)
+    int           m_lastSrcH       = 0;
+    unsigned int  m_loggedFailures = 0;  // bitfield from validation_failures
 };
 
 // ---------------------------------------------------------------------------
