@@ -93,15 +93,21 @@ endif()
 # that. EXCLUDE_FROM_ALL keeps libyuv's tests/tools out of the default
 # build target.
 #
-# GIT_TAG is pinned to a specific upstream commit (libyuv doesn't
-# publish semver tags). Bump deliberately when picking up upstream fixes;
-# CI builds against the pinned revision so the same Feeds tag always
-# rebuilds against the same libyuv.
+# GIT_TAG is pinned to upstream 94417b9d (2025-09-26, "Pass rgbconstants
+# via struct pointer"). libyuv doesn't publish semver tags. This pin is
+# the latest commit we've verified builds clean on MSVC 17.14 with /WX:
+#  - Predates the matrix-conversion refactor wave (RAW/RGB24 → matrix,
+#    ARGBToI4xx unification, RGBToYMatrix_AVX2) that introduces C4244
+#    truncation warnings in source/row_common.cc.
+#  - Predates upstream f2ac6db (2026-04-29, "RAWToNV21 using SME ..."),
+#    which adds `__attribute__((no_sanitize("cfi-icall")))` to
+#    source/row_win.cc — a Clang-only attribute MSVC rejects.
+# Re-verify on MSVC before advancing the pin.
 include(FetchContent)
 FetchContent_Declare(
     libyuv
     GIT_REPOSITORY https://chromium.googlesource.com/libyuv/libyuv.git
-    GIT_TAG        9d98aaefe7a5e2710aa6175d44da38892400b381
+    GIT_TAG        94417b9d213364905ce849c25719b819b8dbbaaa
     EXCLUDE_FROM_ALL
 )
 FetchContent_MakeAvailable(libyuv)
