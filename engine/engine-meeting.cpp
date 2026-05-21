@@ -71,6 +71,13 @@ static uint64_t     g_rawLiveStreamRequestMs = 0;
 // the request lifecycle. Reset to 0 when a new request is made or
 // after the smoking-gun log fires.
 static uint64_t     g_priorChangedFalseMs = 0;
+
+// Forward declarations — the Phase B diagnostic helpers are defined
+// further down (just before ZoomLiveStreamListener) but used earlier
+// by the participants listener's in-flight correlation logs.
+static bool IsRawLiveStreamRequestInFlight();
+static void FormatRawLiveStreamElapsed(char* buf, size_t bufSz);
+
 static unsigned int g_activeSpeakerUserId  = 0;
 static unsigned int g_activeSharerUserId   = 0;
 static unsigned int g_activeShareSourceId  = 0;
