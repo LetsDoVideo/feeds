@@ -46,6 +46,7 @@ extern QImage                           g_fallbackAvatar;
 // create paths so a saved scene loading multiple over-tier sources at
 // once doesn't stack popups.
 extern bool g_isLoggedIn;
+extern bool g_loginAttemptCompleted;
 extern int  g_currentTier;
 extern bool ShouldShowTierPopup();
 extern void ShowTierLimitDialog(const QString& title, const QString& html);
@@ -520,8 +521,10 @@ static void* fcp_create(obs_data_t* /*settings*/, obs_source_t* source) {
     // session. Runs before the tier check so a logged-out user sees
     // "log in" instead of an "upgrade your plan" message that doesn't
     // apply yet. Throttled-popup helper deduplicates the prompt when a
-    // saved scene loads multiple Feeds sources at once.
-    if (!g_isLoggedIn) {
+    // saved scene loads multiple Feeds sources at once. Deferred until
+    // login_succeeded / login_failed has come back from the engine —
+    // see g_loginAttemptCompleted in plugin-main.cpp.
+    if (g_loginAttemptCompleted && !g_isLoggedIn) {
         if (ShouldShowTierPopup()) {
             ShowTierLimitDialog(
                 "Feeds - Login Required",

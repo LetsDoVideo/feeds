@@ -180,6 +180,14 @@ bool InitializeSDK() {
         AuthenticateSDK();
     } else {
         LogToFile("SDK: no access token stored, waiting for user login");
+        // Tell the plugin we tried and there's nothing to try with. This
+        // is not a "failure" in the usual sense — the user simply hasn't
+        // logged in yet — but the plugin needs the signal to flip
+        // g_loginAttemptCompleted so its source-creation callbacks can
+        // surface the "Please log in" prompt instead of silently
+        // blocking. The plugin special-cases this error code to skip
+        // its error dialog.
+        SendToPlugin("{\"type\":\"login_failed\",\"error\":\"no_stored_token\"}");
     }
 
     return true;

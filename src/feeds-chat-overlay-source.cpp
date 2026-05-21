@@ -47,6 +47,7 @@ extern QImage                           g_fallbackAvatar;
 // Streamer (>= 2). Same throttled dialog the participant/screenshare/
 // popup sources use, so stacked over-tier creations don't spam popups.
 extern bool g_isLoggedIn;
+extern bool g_loginAttemptCompleted;
 extern int  g_currentTier;
 extern bool ShouldShowTierPopup();
 extern void ShowTierLimitDialog(const QString& title, const QString& html);
@@ -378,7 +379,9 @@ static void* fcr_create(obs_data_t* settings, obs_source_t* source) {
     // Logged-out gating: refuse creation outright before any tier
     // check, so a logged-out user gets "log in" rather than "upgrade".
     // Throttled-popup helper deduplicates across simultaneous loads.
-    if (!g_isLoggedIn) {
+    // Deferred until login_succeeded / login_failed has come back from
+    // the engine — see g_loginAttemptCompleted in plugin-main.cpp.
+    if (g_loginAttemptCompleted && !g_isLoggedIn) {
         if (ShouldShowTierPopup()) {
             ShowTierLimitDialog(
                 "Feeds - Login Required",

@@ -101,6 +101,21 @@ static QAction* g_connectAction = nullptr;
 // can extern this for their tier-gating checks (mirrors the avatar-cache
 // linkage pattern lower in this file).
 bool g_isLoggedIn                 = false;
+// True once we've heard back from the engine on a login attempt — either
+// login_succeeded (stored token valid, or user just completed OAuth) or
+// login_failed (user cancelled, token exchange broke). The create
+// callbacks use this to defer the logged-out popup until we have a
+// confirmed answer, otherwise a saved scene loading Feeds sources at
+// OBS startup will pop "Please log in to Zoom" before the engine
+// finishes authenticating an already-logged-in user.
+//
+// Caveat: on a fresh install with no stored token, the engine doesn't
+// send anything at startup, so this stays false until the user clicks
+// Login from the Feeds menu. That means the first source-creation
+// attempt by a never-logged-in user silently fails instead of prompting
+// — they have to discover the menu. Same behaviour as the existing
+// tier check, which also requires g_isLoggedIn.
+bool g_loginAttemptCompleted      = false;
 static bool g_isInMeeting         = false;
 static bool g_rawLiveStreamGranted = false;
 static bool g_pendingMeetingJoin   = false;
@@ -1614,7 +1629,13 @@ static void* zp_create(obs_data_t* settings, obs_source_t* source) {
     // login prompt rather than one per source. Order matters — this
     // runs before the tier check so a logged-out user sees "log in"
     // instead of a misleading "upgrade your plan".
-    if (!g_isLoggedIn) {
+    //
+    // Deferred until login_succeeded / login_failed has come back from
+    // the engine — otherwise saved scenes loading at OBS startup race
+    // the engine's authentication of a stored token and pop a
+    // misleading "Please log in" dialog at an already-logged-in user.
+    // Same shape as the tier check below (g_isLoggedIn && tier < N).
+    if (g_loginAttemptCompleted && !g_isLoggedIn) {
         if (ShouldShowTierPopup()) {
             ShowTierLimitDialog(
                 "Feeds - Login Required",
@@ -2172,8 +2193,10 @@ static void* zs_create(obs_data_t* settings, obs_source_t* source) {
   try {
     // Logged-out gating: same throttled-login-prompt pattern as
     // zp_create / fcp_create / fcr_create. Runs before the tier check
-    // so a logged-out user sees "log in" rather than "upgrade".
-    if (!g_isLoggedIn) {
+    // so a logged-out user sees "log in" rather than "upgrade". Deferred
+    // until login_succeeded / login_failed has come back from the engine
+    // — see g_loginAttemptCompleted in plugin-main.cpp.
+    if (g_loginAttemptCompleted && !g_isLoggedIn) {
         if (ShouldShowTierPopup()) {
             ShowTierLimitDialog(
                 "Feeds - Login Required",
@@ -2494,6 +2517,7 @@ static void RegisterEngineHandlers() {
         g_userDisplayName = ExtractJsonString(json, "display_name");
         g_userPMI         = ExtractJsonString(json, "pmi");
         g_currentTier     = (int)ExtractJsonNumber(json, "tier");
+        g_loginAttemptCompleted = true;
         blog(LOG_INFO, "[feeds] login_succeeded: name='%s', pmi='%s', tier=%d",
              g_userDisplayName.c_str(), g_userPMI.c_str(), g_currentTier);
 
@@ -2508,6 +2532,20 @@ static void RegisterEngineHandlers() {
     feeds::RegisterMessageHandler("login_failed", [](const std::string& json) {
         std::string error = ExtractJsonString(json, "error");
         if (error.empty()) error = "unknown";
+        g_loginAttemptCompleted = true;
+
+        // "no_stored_token" is the engine's startup signal that there's
+        // no saved credential to authenticate with — not an actual
+        // failure. We still want g_loginAttemptCompleted=true (already
+        // set above) so source-creation callbacks pop the "Please log
+        // in" prompt, but suppress the error MessageBox and don't
+        // re-enable the login menu item (it's already enabled in this
+        // state). Logged as INFO rather than ERROR for the same reason.
+        if (error == "no_stored_token") {
+            blog(LOG_INFO, "[feeds] login_failed: no_stored_token (expected on first run / after logout)");
+            return;
+        }
+
         blog(LOG_ERROR, "[feeds] login_failed: %s", error.c_str());
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
             [error]() {
