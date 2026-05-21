@@ -1462,41 +1462,6 @@ void HandleGetParticipants(const std::string& /*json*/) {
 }
 
 // ---------------------------------------------------------------------------
-// IPC handler: request_raw_livestream_privilege
-// User clicked "Ask Host Again" in the source properties panel after the
-// host declined or let the request time out. Re-fires the SDK request;
-// onRawLiveStreamPrivilegeChanged / onRawLiveStreamPrivilegeRequestTimeout
-// will drive the plugin state forward as the host responds (or doesn't).
-//
-// Open question — whether calling RequestRawLiveStreaming a second time
-// actually re-pops the host dialog or is silently ignored by the SDK
-// when there's an outstanding request. We won't know until we test
-// two-account; if it's a no-op the plugin-side messaging will need to
-// tell users to leave and rejoin instead.
-// ---------------------------------------------------------------------------
-void HandleRequestRawLiveStreamPrivilege(const std::string& /*json*/) {
-    LogToFile("Meeting: HandleRequestRawLiveStreamPrivilege called");
-    if (!g_meetingService) {
-        LogToFile("Meeting: request_raw_livestream_privilege ignored — "
-                  "no meeting service");
-        return;
-    }
-    ZOOM_SDK_NAMESPACE::IMeetingLiveStreamController* lsc =
-        g_meetingService->GetMeetingLiveStreamController();
-    if (!lsc) {
-        LogToFile("Meeting: request_raw_livestream_privilege ignored — "
-                  "no livestream controller");
-        return;
-    }
-    ZOOM_SDK_NAMESPACE::SDKError err = lsc->RequestRawLiveStreaming(
-        L"https://letsdovideo.com/feeds-support/", L"Feeds");
-    char buf[128];
-    sprintf_s(buf, "Meeting: re-requested raw livestream privilege "
-                   "(SDKError=%d)", (int)err);
-    LogToFile(buf);
-}
-
-// ---------------------------------------------------------------------------
 // IPC handler: send_chat_message
 // Sends a public ("to all") chat message via the SDK and replies with a
 // chat_send_result. Failure reasons are written as short, user-facing

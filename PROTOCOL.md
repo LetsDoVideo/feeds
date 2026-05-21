@@ -164,7 +164,7 @@ Engine has observed the SDK reporting `MEETING_STATUS_ENDED` or `MEETING_STATUS_
 ```
 
 #### `raw_livestream_pending` (E→P)
-Engine has just called `IMeetingLiveStreamController::RequestRawLiveStreaming` on the non-host join path — the host now has a "Request to livestream" popup on screen and we're waiting. Plugin flips `g_rawPrivilegeState` to `Pending` and source properties panels render a "Waiting for host..." message instead of the participant dropdown. Skipped on the host path, where privilege is granted automatically and `raw_livestream_granted` fires directly.
+Engine has just called `IMeetingLiveStreamController::RequestRawLiveStreaming` on the non-host join path — the host now has a "Request to livestream" popup on screen and we're waiting. Plugin flips `g_rawPrivilegeState` to `Pending`; the participant dropdown shows "Waiting for permission" and the source status text reflects the wait. Skipped on the host path, where privilege is granted automatically and `raw_livestream_granted` fires directly.
 
 ```json
 {"type": "raw_livestream_pending"}
@@ -178,24 +178,17 @@ Engine has just called `IMeetingLiveStreamController::RequestRawLiveStreaming` o
 ```
 
 #### `raw_livestream_denied` (E→P)
-`IMeetingLiveStreamCtrlEvent::onRawLiveStreamPrivilegeChanged(false)` fired — the host declined, closed the popup, or revoked an already-granted privilege mid-meeting. Plugin flips `g_rawPrivilegeState` to `Denied`; source properties panels show "Host hasn't granted..." plus an "Ask Host Again" button that sends `request_raw_livestream_privilege` back to the engine.
+`IMeetingLiveStreamCtrlEvent::onRawLiveStreamPrivilegeChanged(false)` fired — the host declined, closed the popup, or revoked an already-granted privilege mid-meeting. Plugin flips `g_rawPrivilegeState` to `Denied`; source properties panels show "Host denied use of Feeds..." with instructions to leave and rejoin. There is no retry IPC: `RequestRawLiveStreaming` is a no-op on a second call (empirically confirmed in v1.2.4), so the only SDK-supported recovery is a fresh meeting join.
 
 ```json
 {"type": "raw_livestream_denied"}
 ```
 
 #### `raw_livestream_timeout` (E→P)
-The SDK timed out waiting for the host to approve the raw-livestream request. Plugin flips `g_rawPrivilegeState` to `TimedOut`, which surfaces the same "Ask Host Again" affordance as `raw_livestream_denied`.
+The SDK timed out waiting for the host to approve the raw-livestream request. Plugin flips `g_rawPrivilegeState` to `TimedOut`, which surfaces the same leave-and-rejoin messaging as `raw_livestream_denied`. Plugin and engine both suppress this signal when state is already `Granted` — the SDK has been observed firing the timeout callback 10–25 s after a successful grant, which would otherwise overwrite the correct state.
 
 ```json
 {"type": "raw_livestream_timeout"}
-```
-
-#### `request_raw_livestream_privilege` (P→E)
-Plugin asks the engine to re-fire `RequestRawLiveStreaming` after a Denied or TimedOut state. Triggered by the user clicking "Ask Host Again" in the source properties panel; throttled plugin-side to one request per 10s. Engine logs the SDKError and lets the existing privilege/timeout callbacks drive the next state transition. **Open question:** whether the SDK actually re-shows the host popup on a second request, or silently ignores it — to be confirmed by two-account testing.
-
-```json
-{"type": "request_raw_livestream_privilege"}
 ```
 
 ### Participants

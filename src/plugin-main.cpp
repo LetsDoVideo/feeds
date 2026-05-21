@@ -1607,22 +1607,6 @@ bool ShouldShowTierPopup() {
     return true;
 }
 
-// Throttle for the "Ask Host Again" button. A user mashing the button
-// would have us spam the host with privilege-request popups; SDK may
-// rate-limit too. 10s is loose enough to feel responsive but tight
-// enough to discourage spam. Same compare-and-store shape as
-// ShouldShowTierPopup.
-static std::atomic<uint64_t> g_lastAskHostMs{0};
-static constexpr uint64_t ASK_HOST_THROTTLE_MS = 10000;
-
-static bool ShouldAskHostAgain() {
-    uint64_t now  = GetTickCount64();
-    uint64_t last = g_lastAskHostMs.load();
-    if (now - last < ASK_HOST_THROTTLE_MS) return false;
-    g_lastAskHostMs.store(now);
-    return true;
-}
-
 // Modal popup with a clickable hyperlink, parented to the OBS main window
 // so it inherits OBS title-bar chrome. Called from zp_create / zs_create,
 // which may run on non-UI threads — dispatch to the main thread via
@@ -1870,72 +1854,49 @@ static const char* OrdinalSuffix(int n) {
     }
 }
 
-// Adds the privilege-state UI to a source properties panel when we're in
-// a meeting but the host hasn't granted raw livestream privilege. Caller
-// passes the props panel (with version label already added) and returns
-// early if this function returns true, so the panel renders only the
-// privilege state instead of the usual participant dropdown /
-// screenshare status. Shared by zp_properties and zs_properties.
+// Returns the privilege-aware status-label text for an in-meeting source
+// properties panel, or an empty string when state == Granted (caller
+// uses its own normal status text in that case). Shared by zp_properties
+// and zs_properties so wording stays in lockstep.
 //
 // State mapping:
-//   Granted        → returns false, normal panel renders
-//   Pending        → "Waiting for host..." info text, no button
+//   Granted        → "" (caller uses normal "Connected to Meeting X" text)
+//   Pending        → "Waiting for host..." message
 //   NotRequested   → same as Pending (covers the brief gap between
 //                    meeting_joined and raw_livestream_pending/granted;
 //                    no actionable state for the user yet)
-//   Denied/TimedOut→ "Host hasn't granted..." info text + "Ask Host
-//                    Again" button (throttled to one request per 10s)
-static bool MaybePrivilegeStateUI(obs_properties_t* props) {
-    blog(LOG_INFO, "[feeds] MaybePrivilegeStateUI: entered, "
+//   Denied         → "Host denied..." with leave-and-rejoin instructions
+//   TimedOut       → same as Denied. RequestRawLiveStreaming is a no-op
+//                    on re-request (empirically confirmed v1.2.4), so
+//                    the only recovery path the SDK gives us is a fresh
+//                    meeting join.
+static std::string PrivilegeStatusText() {
+    // v1.2.4 diagnostic: kept for Phase B's investigation of the
+    // Denied-doesn't-refresh issue. Strip once that's resolved.
+    blog(LOG_INFO, "[feeds] PrivilegeStatusText: called, "
                    "isInMeeting=%d, privilege_state=%d",
          (int)g_isInMeeting, (int)g_rawPrivilegeState);
-    if (!g_isInMeeting ||
-        g_rawPrivilegeState == RawPrivilegeState::Granted) {
-        blog(LOG_INFO, "[feeds] MaybePrivilegeStateUI: returning false "
-                       "(normal panel renders)");
-        return false;
+    if (g_rawPrivilegeState == RawPrivilegeState::Granted) {
+        blog(LOG_INFO, "[feeds] PrivilegeStatusText: returning empty "
+                       "(Granted, caller renders normal status)");
+        return std::string();
     }
-
-    const bool actionable =
-        g_rawPrivilegeState == RawPrivilegeState::Denied ||
-        g_rawPrivilegeState == RawPrivilegeState::TimedOut;
-    blog(LOG_INFO, "[feeds] MaybePrivilegeStateUI: rendering %s UI",
-         actionable ? "Denied/TimedOut (with Ask Host Again button)"
-                    : "Pending/NotRequested (info-only)");
-
-    if (actionable) {
-        obs_properties_add_text(props, "privilege_state_msg",
-            "Host hasn't granted Feeds permission yet. They may have "
-            "closed the popup before clicking allow.",
-            OBS_TEXT_INFO);
-        obs_properties_add_button(props, "ask_host_btn",
-            "Ask Host Again",
-            [](obs_properties_t*, obs_property_t*, void*) -> bool {
-                if (!ShouldAskHostAgain()) {
-                    blog(LOG_INFO,
-                        "[feeds] Ask Host Again throttled (10s window)");
-                    return true;
-                }
-                // Optimistic UI: flip to Pending immediately so the
-                // panel re-renders the "Waiting..." text without round-
-                // tripping through the engine. If the SDK call is a
-                // no-op (the open question per the spec), the engine's
-                // grant/deny/timeout callback eventually flips state
-                // back; if it does re-fire the host popup, the next
-                // grant/deny callback drives the next transition.
-                g_rawPrivilegeState = RawPrivilegeState::Pending;
-                feeds::SendToEngine(
-                    "{\"type\":\"request_raw_livestream_privilege\"}");
-                RefreshAllSourceProperties();
-                return true;
-            });
-    } else {
-        obs_properties_add_text(props, "privilege_state_msg",
-            "Waiting for host to grant Feeds permission. A popup is "
-            "visible on the host's screen.",
-            OBS_TEXT_INFO);
+    switch (g_rawPrivilegeState) {
+        case RawPrivilegeState::Denied:
+        case RawPrivilegeState::TimedOut:
+            blog(LOG_INFO, "[feeds] PrivilegeStatusText: returning "
+                           "Denied/TimedOut wording");
+            return "Status: Host denied use of Feeds. Please leave the "
+                   "meeting, rejoin, and have the host click 'Grant "
+                   "Permission' on the Request to Livestream popup.";
+        case RawPrivilegeState::Pending:
+        case RawPrivilegeState::NotRequested:
+        default:
+            blog(LOG_INFO, "[feeds] PrivilegeStatusText: returning "
+                           "Pending/NotRequested wording");
+            return "Status: Waiting for host to grant Feeds permission. "
+                   "A popup is visible on the host's screen.";
     }
-    return true;
 }
 
 static obs_properties_t* zp_properties(void* data) {
@@ -1978,20 +1939,14 @@ static obs_properties_t* zp_properties(void* data) {
         return props;
     }
 
-    if (g_isInMeeting)
+    // Skip the participant-list request when privilege isn't granted —
+    // the engine can't deliver one, and there's no dropdown to populate.
+    if (g_isInMeeting && g_rawPrivilegeState == RawPrivilegeState::Granted)
         feeds::SendToEngine("{\"type\":\"get_participants\"}");
 
     obs_properties_t* props = obs_properties_create();
     std::string verLabel = std::string("Feeds (v") + feeds_shared::VERSION + ")";
     obs_properties_add_text(props, "ver_label", verLabel.c_str(), OBS_TEXT_INFO);
-
-    // In-meeting + privilege-not-granted: render the waiting/denied UI
-    // instead of the participant dropdown. Returns early so the rest of
-    // the panel (status, refresh, dropdown, tips) is suppressed —
-    // matches the tier-disabled return-early structure above.
-    if (MaybePrivilegeStateUI(props)) {
-        return props;
-    }
 
     if (!g_isInMeeting) {
         if (!g_isLoggedIn) {
@@ -2010,19 +1965,29 @@ static obs_properties_t* zp_properties(void* data) {
                 });
         }
     } else {
-        std::string status_text = "Status: Connected";
-        if (g_currentMeetingNumber != 0)
-            status_text = "Status: Connected to Meeting " +
-                          std::to_string(g_currentMeetingNumber);
+        // Privilege state takes precedence over the connected-to-meeting
+        // text. PrivilegeStatusText returns empty when Granted so the
+        // normal "Connected to Meeting X" line renders.
+        std::string status_text = PrivilegeStatusText();
+        if (status_text.empty()) {
+            status_text = "Status: Connected";
+            if (g_currentMeetingNumber != 0)
+                status_text = "Status: Connected to Meeting " +
+                              std::to_string(g_currentMeetingNumber);
+        }
         obs_properties_add_text(props, "status_label", status_text.c_str(),
                                 OBS_TEXT_INFO);
 
-        obs_properties_add_button(props, "refresh_btn",
-            "Refresh Participant List",
-            [](obs_properties_t*, obs_property_t*, void*) -> bool {
-                feeds::SendToEngine("{\"type\":\"get_participants\"}");
-                return true;
-            });
+        // Refresh button only makes sense when there's a list to refresh
+        // — skip it during the privilege-pending/denied states.
+        if (g_rawPrivilegeState == RawPrivilegeState::Granted) {
+            obs_properties_add_button(props, "refresh_btn",
+                "Refresh Participant List",
+                [](obs_properties_t*, obs_property_t*, void*) -> bool {
+                    feeds::SendToEngine("{\"type\":\"get_participants\"}");
+                    return true;
+                });
+        }
     }
 
     obs_property_t* list = obs_properties_add_list(
@@ -2034,13 +1999,17 @@ static obs_properties_t* zp_properties(void* data) {
     // state we replace the list with a single contextual placeholder and
     // grey the control out so users can't open it before login/meeting.
     // RefreshAllSourceProperties() is already called on login_success,
-    // meeting_joined, meeting_ended, logout, and participant_list_changed,
-    // so this re-evaluates live without a properties-dialog reopen.
+    // meeting_joined, meeting_ended, logout, participant_list_changed,
+    // and every raw_livestream_* state transition, so this re-evaluates
+    // live without a properties-dialog reopen.
     if (!g_isLoggedIn) {
         obs_property_list_add_int(list, "Login to Zoom first", 0);
         obs_property_set_enabled(list, false);
     } else if (!g_isInMeeting) {
         obs_property_list_add_int(list, "Join a meeting first", 0);
+        obs_property_set_enabled(list, false);
+    } else if (g_rawPrivilegeState != RawPrivilegeState::Granted) {
+        obs_property_list_add_int(list, "Waiting for permission", 0);
         obs_property_set_enabled(list, false);
     } else {
         std::lock_guard<std::mutex> lock(g_participantsMutex);
@@ -2465,11 +2434,6 @@ static obs_properties_t* zs_properties(void* data) {
     std::string verLabel = std::string("Feeds - Screenshare (v") + feeds_shared::VERSION + ")";
     obs_properties_add_text(props, "ver_label", verLabel.c_str(), OBS_TEXT_INFO);
 
-    // See zp_properties for the rationale.
-    if (MaybePrivilegeStateUI(props)) {
-        return props;
-    }
-
     if (!g_isInMeeting) {
         if (!g_isLoggedIn) {
             obs_properties_add_button(props, "login_btn",
@@ -2487,22 +2451,27 @@ static obs_properties_t* zs_properties(void* data) {
                 });
         }
     } else {
-        std::string status_text;
-        if (g_activeSharerUserId == 0) {
-            status_text = "Status: Connected - waiting for screenshare";
-        } else if (g_cachedMyUserId != 0 &&
-                   g_activeSharerUserId == g_cachedMyUserId) {
-            // The Feeds user is sharing their own screen. Not blocked —
-            // it works fine and is sometimes useful (different encoder
-            // path than OBS display capture, testing workflow, etc.) —
-            // but we flag it because OBS's own Display Capture source
-            // is usually lower-latency for one's own screen.
-            status_text =
-                "Status: Receiving screenshare (your own)\n"
-                "Tip: OBS Display Capture may give lower latency for "
-                "your own screen.";
-        } else {
-            status_text = "Status: Receiving screenshare";
+        // Privilege state takes precedence over the share-status text.
+        // PrivilegeStatusText returns empty when Granted so the normal
+        // share-status text renders.
+        std::string status_text = PrivilegeStatusText();
+        if (status_text.empty()) {
+            if (g_activeSharerUserId == 0) {
+                status_text = "Status: Connected - waiting for screenshare";
+            } else if (g_cachedMyUserId != 0 &&
+                       g_activeSharerUserId == g_cachedMyUserId) {
+                // The Feeds user is sharing their own screen. Not blocked —
+                // it works fine and is sometimes useful (different encoder
+                // path than OBS display capture, testing workflow, etc.) —
+                // but we flag it because OBS's own Display Capture source
+                // is usually lower-latency for one's own screen.
+                status_text =
+                    "Status: Receiving screenshare (your own)\n"
+                    "Tip: OBS Display Capture may give lower latency for "
+                    "your own screen.";
+            } else {
+                status_text = "Status: Receiving screenshare";
+            }
         }
         obs_properties_add_text(props, "status_label", status_text.c_str(),
                                 OBS_TEXT_INFO);

@@ -218,7 +218,6 @@ namespace feeds_engine {
     void HandleCreateInstantMeeting(const std::string&);
     void HandleLeaveMeeting(const std::string&);
     void HandleGetParticipants(const std::string&);
-    void HandleRequestRawLiveStreamPrivilege(const std::string&);
     void HandleLogout(const std::string&);
 }
 // Forward decls — defined in engine-video.cpp
@@ -309,8 +308,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     RegisterHandler("create_instant_meeting",         feeds_engine::HandleCreateInstantMeeting);
     RegisterHandler("leave_meeting",                  feeds_engine::HandleLeaveMeeting);
     RegisterHandler("get_participants",               feeds_engine::HandleGetParticipants);
-    RegisterHandler("request_raw_livestream_privilege",
-                                                      feeds_engine::HandleRequestRawLiveStreamPrivilege);
     RegisterHandler("send_chat_message",              feeds_engine::HandleSendChatMessage);
     RegisterHandler("participant_source_subscribe",   feeds_engine::HandleParticipantSourceSubscribe);
     RegisterHandler("participant_source_unsubscribe", feeds_engine::HandleParticipantSourceUnsubscribe);
