@@ -2990,23 +2990,27 @@ static void RegisterEngineHandlers() {
     feeds::RegisterMessageHandler("raw_livestream_timeout", [](const std::string&) {
         blog(LOG_WARNING, "[feeds] raw_livestream_timeout: handler entered, "
                           "prev_state=%d", (int)g_rawPrivilegeState);
-        // v1.2.4 Issue 2: the SDK fires onRawLiveStreamPrivilegeRequestTimeout
-        // ~10-25s after a successful grant — engine logs confirm. Engine-side
-        // is the primary guard (see onRawLiveStreamPrivilegeRequestTimeout
-        // in engine-meeting.cpp); this plugin-side check is defence in
-        // depth in case the engine ever emits raw_livestream_timeout from a
-        // different path.
+        // v1.2.4 Phase B finding: the SDK's
+        // onRawLiveStreamPrivilegeRequestTimeout fires reliably at ~30s
+        // after RequestRawLiveStreaming regardless of host action. The
+        // host's popup stays visible and Grant can still arrive after
+        // this fires (Test E confirmed). So this signal has no
+        // UI-actionable meaning — we stay in Pending until a real
+        // Changed(true) -> Granted or Changed(false) -> Denied arrives.
+        //
+        // The Granted-state check below stays for defence in depth
+        // against the v1.2.4 first-cut spurious-timeout-after-grant
+        // scenario (timer not cancelled when the host approves before
+        // 30s). Engine-side has the primary guard; this is a backstop.
         if (g_rawPrivilegeState == RawPrivilegeState::Granted) {
             blog(LOG_INFO, "[feeds] ignoring raw_livestream_timeout — already "
                            "Granted (spurious SDK callback)");
             return;
         }
-        g_rawPrivilegeState = RawPrivilegeState::TimedOut;
-        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
-            blog(LOG_INFO, "[feeds] raw_livestream_timeout: QTimer lambda fired "
-                           "on UI thread, calling RefreshAllSourceProperties");
-            RefreshAllSourceProperties();
-        });
+        blog(LOG_INFO, "[feeds] raw_livestream_timeout: leaving state at "
+                       "Pending — SDK timeout is informational only");
+        // No state change. No RefreshAllSourceProperties — nothing changed
+        // for the UI to reflect.
     });
 
     feeds::RegisterMessageHandler("participant_list_changed",

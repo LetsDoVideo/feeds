@@ -185,7 +185,7 @@ Engine has just called `IMeetingLiveStreamController::RequestRawLiveStreaming` o
 ```
 
 #### `raw_livestream_timeout` (E→P)
-The SDK timed out waiting for the host to approve the raw-livestream request. Plugin flips `g_rawPrivilegeState` to `TimedOut`, which surfaces the same leave-and-rejoin messaging as `raw_livestream_denied`. Plugin and engine both suppress this signal when state is already `Granted` — the SDK has been observed firing the timeout callback 10–25 s after a successful grant, which would otherwise overwrite the correct state.
+Engine forwards `IMeetingLiveStreamCtrlEvent::onRawLiveStreamPrivilegeRequestTimeout`. Phase B diagnostic testing established this fires reliably at ~30 s after `RequestRawLiveStreaming` regardless of host action — the host's popup stays visible and Grant can still arrive after this fires. The plugin treats this signal as informational only: it does **not** transition `g_rawPrivilegeState` and leaves the UI showing the pending message. State transitions out of Pending only on a real `Changed(true)` (→ Granted) or `Changed(false)` (→ Denied). The engine still forwards this IPC so the chain stays observable in logs. Engine and plugin both also suppress the signal when state is already `Granted` — defence-in-depth against the v1.2.4 first-cut case where the timer fires 10–25 s after a successful grant.
 
 ```json
 {"type": "raw_livestream_timeout"}
