@@ -1861,18 +1861,24 @@ static const char* OrdinalSuffix(int n) {
 //
 // State mapping:
 //   Granted        → "" (caller uses normal "Connected to Meeting X" text)
-//   Pending        → "Waiting for host..." message
+//   Pending        → "Waiting for host..." message (popup definitely up)
 //   NotRequested   → same as Pending (covers the brief gap between
 //                    meeting_joined and raw_livestream_pending/granted;
 //                    no actionable state for the user yet)
-//   Denied         → "Host denied..." with leave-and-rejoin instructions
-//   TimedOut       → same as Denied. RequestRawLiveStreaming is a no-op
-//                    on re-request (empirically confirmed v1.2.4), so
-//                    the only recovery path the SDK gives us is a fresh
-//                    meeting join.
+//   Denied         → "Host denied..." with leave-and-rejoin instructions.
+//                    Only set on a real onRawLiveStreamPrivilegeChanged
+//                    (false) callback — pre-timeout user action, or
+//                    post-grant revoke. Both unambiguously mean rejoin
+//                    is required.
+//   TimedOut       → "Still waiting... please check with the host" — the
+//                    SDK has stopped reporting host actions on the popup
+//                    (Phase B-Extended diagnostics confirmed: zero
+//                    callbacks or query-state changes for post-timeout
+//                    Deny). We honestly don't know what the host did,
+//                    so the wording is honest about that uncertainty.
 static std::string PrivilegeStatusText() {
-    // v1.2.4 diagnostic: kept for Phase B's investigation of the
-    // Denied-doesn't-refresh issue. Strip once that's resolved.
+    // v1.2.4 diagnostic: kept for any follow-up investigation. Strip
+    // once v1.2.4 ships and is stable.
     blog(LOG_INFO, "[feeds] PrivilegeStatusText: called, "
                    "isInMeeting=%d, privilege_state=%d",
          (int)g_isInMeeting, (int)g_rawPrivilegeState);
@@ -1883,12 +1889,17 @@ static std::string PrivilegeStatusText() {
     }
     switch (g_rawPrivilegeState) {
         case RawPrivilegeState::Denied:
-        case RawPrivilegeState::TimedOut:
             blog(LOG_INFO, "[feeds] PrivilegeStatusText: returning "
-                           "Denied/TimedOut wording");
+                           "Denied wording");
             return "Status: Host denied use of Feeds. Please leave the "
                    "meeting, rejoin, and have the host click 'Grant "
                    "Permission' on the Request to Livestream popup.";
+        case RawPrivilegeState::TimedOut:
+            blog(LOG_INFO, "[feeds] PrivilegeStatusText: returning "
+                           "TimedOut wording");
+            return "Status: Still waiting for permission. Please check "
+                   "with the host. If they closed the popup, rejoin the "
+                   "meeting.";
         case RawPrivilegeState::Pending:
         case RawPrivilegeState::NotRequested:
         default:
@@ -2990,27 +3001,31 @@ static void RegisterEngineHandlers() {
     feeds::RegisterMessageHandler("raw_livestream_timeout", [](const std::string&) {
         blog(LOG_WARNING, "[feeds] raw_livestream_timeout: handler entered, "
                           "prev_state=%d", (int)g_rawPrivilegeState);
-        // v1.2.4 Phase B finding: the SDK's
-        // onRawLiveStreamPrivilegeRequestTimeout fires reliably at ~30s
-        // after RequestRawLiveStreaming regardless of host action. The
-        // host's popup stays visible and Grant can still arrive after
-        // this fires (Test E confirmed). So this signal has no
-        // UI-actionable meaning — we stay in Pending until a real
-        // Changed(true) -> Granted or Changed(false) -> Denied arrives.
-        //
-        // The Granted-state check below stays for defence in depth
-        // against the v1.2.4 first-cut spurious-timeout-after-grant
-        // scenario (timer not cancelled when the host approves before
-        // 30s). Engine-side has the primary guard; this is a backstop.
+        // Defence in depth — engine-side already suppresses the timeout
+        // when g_rawLiveStreamGranted is true (the v1.2.4 first-cut case
+        // where the SDK fires the timeout 10–25 s after a successful
+        // grant). This check is the backstop.
         if (g_rawPrivilegeState == RawPrivilegeState::Granted) {
             blog(LOG_INFO, "[feeds] ignoring raw_livestream_timeout — already "
                            "Granted (spurious SDK callback)");
             return;
         }
-        blog(LOG_INFO, "[feeds] raw_livestream_timeout: leaving state at "
-                       "Pending — SDK timeout is informational only");
-        // No state change. No RefreshAllSourceProperties — nothing changed
-        // for the UI to reflect.
+        // v1.2.4 Phase B-Extended finding: post-timeout, the SDK fires
+        // no callbacks for host actions on the popup. Grant still works
+        // via the existing Changed(true) callback. Deny and X-button-
+        // close are invisible to us — 155 polling snapshots across
+        // Tests G/H/I revealed zero state change. So at 30 s we can no
+        // longer trust the Pending state to be accurate, and we
+        // transition to TimedOut. The PrivilegeStatusText for TimedOut
+        // is intentionally honest ("Still waiting... please check with
+        // the host") rather than asserting a denial.
+        g_rawPrivilegeState = RawPrivilegeState::TimedOut;
+        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
+            blog(LOG_INFO, "[feeds] raw_livestream_timeout: QTimer lambda "
+                           "fired on UI thread, calling "
+                           "RefreshAllSourceProperties");
+            RefreshAllSourceProperties();
+        });
     });
 
     feeds::RegisterMessageHandler("participant_list_changed",
