@@ -11,8 +11,10 @@
 #include <wincred.h>
 #include <string>
 #include <sstream>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <thread>
 
 #include "zoom_sdk.h"
 #include "zoom_sdk_def.h"
@@ -74,9 +76,20 @@ static uint64_t     g_priorChangedFalseMs = 0;
 
 // Forward declarations — the Phase B diagnostic helpers are defined
 // further down (just before ZoomLiveStreamListener) but used earlier
-// by the participants listener's in-flight correlation logs.
+// by the participants listener's in-flight correlation logs and by
+// the polling loop, which sits before LiveStreamStatusName's
+// definition.
 static bool IsRawLiveStreamRequestInFlight();
 static void FormatRawLiveStreamElapsed(char* buf, size_t bufSz);
+static const char* LiveStreamStatusName(
+    ZOOM_SDK_NAMESPACE::LiveStreamStatus s);
+// v1.2.4 Phase B-Extended: catch-all logger for SDK callbacks that we
+// otherwise have empty bodies for. Logs "<name> fired (t+ms)" only
+// while a livestream request is in flight, so normal-meeting noise
+// stays out of the log. Goal is to surface ANY callback that fires
+// during the post-timeout-deny window so we can identify a hook for
+// detecting that scenario.
+static void LogInFlightCallback(const char* name);
 
 static unsigned int g_activeSpeakerUserId  = 0;
 static unsigned int g_activeSharerUserId   = 0;
@@ -432,35 +445,84 @@ public:
         SendParticipantList();
     }
 
-    // Other IMeetingParticipantsCtrlEvent callbacks — required by the
-    // pure-virtual interface but not currently used by Feeds.
-    virtual void onHostChangeNotification(unsigned int) override {}
-    virtual void onLowOrRaiseHandStatusChanged(bool, unsigned int) override {}
-    virtual void onCoHostChangeNotification(unsigned int, bool) override {}
-    virtual void onInvalidReclaimHostkey() override {}
-    virtual void onAllHandsLowered() override {}
+    // v1.2.4 Phase B-Extended: in-flight catch-all logging on every
+    // otherwise-empty IMeetingParticipantsCtrlEvent override. If the
+    // SDK fires anything in this category during the post-timeout-deny
+    // test we'll see it. Logs are silent outside the request window.
+    virtual void onHostChangeNotification(unsigned int) override {
+        LogInFlightCallback("onHostChangeNotification");
+    }
+    virtual void onLowOrRaiseHandStatusChanged(bool, unsigned int) override {
+        LogInFlightCallback("onLowOrRaiseHandStatusChanged");
+    }
+    virtual void onCoHostChangeNotification(unsigned int, bool) override {
+        LogInFlightCallback("onCoHostChangeNotification");
+    }
+    virtual void onInvalidReclaimHostkey() override {
+        LogInFlightCallback("onInvalidReclaimHostkey");
+    }
+    virtual void onAllHandsLowered() override {
+        LogInFlightCallback("onAllHandsLowered");
+    }
     virtual void onLocalRecordingStatusChanged(
-        unsigned int, ZOOM_SDK_NAMESPACE::RecordingStatus) override {}
-    virtual void onAllowParticipantsRenameNotification(bool) override {}
-    virtual void onAllowParticipantsUnmuteSelfNotification(bool) override {}
-    virtual void onAllowParticipantsStartVideoNotification(bool) override {}
-    virtual void onAllowParticipantsShareWhiteBoardNotification(bool) override {}
+        unsigned int, ZOOM_SDK_NAMESPACE::RecordingStatus) override {
+        LogInFlightCallback("onLocalRecordingStatusChanged");
+    }
+    virtual void onAllowParticipantsRenameNotification(bool) override {
+        LogInFlightCallback("onAllowParticipantsRenameNotification");
+    }
+    virtual void onAllowParticipantsUnmuteSelfNotification(bool) override {
+        LogInFlightCallback("onAllowParticipantsUnmuteSelfNotification");
+    }
+    virtual void onAllowParticipantsStartVideoNotification(bool) override {
+        LogInFlightCallback("onAllowParticipantsStartVideoNotification");
+    }
+    virtual void onAllowParticipantsShareWhiteBoardNotification(bool) override {
+        LogInFlightCallback("onAllowParticipantsShareWhiteBoardNotification");
+    }
     virtual void onRequestLocalRecordingPrivilegeChanged(
-        ZOOM_SDK_NAMESPACE::LocalRecordingRequestPrivilegeStatus) override {}
-    virtual void onAllowParticipantsRequestCloudRecording(bool) override {}
-    virtual void onInMeetingUserAvatarPathUpdated(unsigned int) override {}
-    virtual void onParticipantProfilePictureStatusChange(bool) override {}
-    virtual void onFocusModeStateChanged(bool) override {}
+        ZOOM_SDK_NAMESPACE::LocalRecordingRequestPrivilegeStatus) override {
+        // High interest: parallel-shaped privilege flow to the raw-live-
+        // stream one we're investigating. If this fires post-timeout when
+        // the host clicks a different popup, it tells us a lot.
+        LogInFlightCallback("onRequestLocalRecordingPrivilegeChanged");
+    }
+    virtual void onAllowParticipantsRequestCloudRecording(bool) override {
+        LogInFlightCallback("onAllowParticipantsRequestCloudRecording");
+    }
+    virtual void onInMeetingUserAvatarPathUpdated(unsigned int) override {
+        LogInFlightCallback("onInMeetingUserAvatarPathUpdated");
+    }
+    virtual void onParticipantProfilePictureStatusChange(bool) override {
+        LogInFlightCallback("onParticipantProfilePictureStatusChange");
+    }
+    virtual void onFocusModeStateChanged(bool) override {
+        LogInFlightCallback("onFocusModeStateChanged");
+    }
     virtual void onFocusModeShareTypeChanged(
-        ZOOM_SDK_NAMESPACE::FocusModeShareType) override {}
-    virtual void onBotAuthorizerRelationChanged(unsigned int) override {}
-    virtual void onVirtualNameTagStatusChanged(bool, unsigned int) override {}
-    virtual void onVirtualNameTagRosterInfoUpdated(unsigned int) override {}
+        ZOOM_SDK_NAMESPACE::FocusModeShareType) override {
+        LogInFlightCallback("onFocusModeShareTypeChanged");
+    }
+    virtual void onBotAuthorizerRelationChanged(unsigned int) override {
+        LogInFlightCallback("onBotAuthorizerRelationChanged");
+    }
+    virtual void onVirtualNameTagStatusChanged(bool, unsigned int) override {
+        LogInFlightCallback("onVirtualNameTagStatusChanged");
+    }
+    virtual void onVirtualNameTagRosterInfoUpdated(unsigned int) override {
+        LogInFlightCallback("onVirtualNameTagRosterInfoUpdated");
+    }
 #if defined(WIN32)
-    virtual void onCreateCompanionRelation(unsigned int, unsigned int) override {}
-    virtual void onRemoveCompanionRelation(unsigned int) override {}
+    virtual void onCreateCompanionRelation(unsigned int, unsigned int) override {
+        LogInFlightCallback("onCreateCompanionRelation");
+    }
+    virtual void onRemoveCompanionRelation(unsigned int) override {
+        LogInFlightCallback("onRemoveCompanionRelation");
+    }
 #endif
-    virtual void onGrantCoOwnerPrivilegeChanged(bool) override {}
+    virtual void onGrantCoOwnerPrivilegeChanged(bool) override {
+        LogInFlightCallback("onGrantCoOwnerPrivilegeChanged");
+    }
 };
 static ZoomParticipantsListener g_participantsListener;
 
@@ -592,6 +654,143 @@ static ZoomChatListener g_chatListener;
 // the window are normal operation and don't need the annotation.
 static bool IsRawLiveStreamRequestInFlight() {
     return g_rawLiveStreamRequestMs > 0 && !g_rawLiveStreamGranted;
+}
+
+// v1.2.4 Phase B-Extended: one-line in-flight callback log. Used by
+// otherwise-empty SDK callback overrides to surface any signal that
+// fires during the post-timeout-deny window. Parameter details are
+// intentionally omitted — if a callback fires we'll see the name and
+// can drill into its parameters in a follow-up build.
+static void LogInFlightCallback(const char* name) {
+    if (!IsRawLiveStreamRequestInFlight()) return;
+    char elapsed[32];
+    FormatRawLiveStreamElapsed(elapsed, sizeof(elapsed));
+    char buf[128];
+    sprintf_s(buf, "Meeting: %s fired (%s)", name, elapsed);
+    LogToFile(buf);
+}
+
+// v1.2.4 Phase B-Extended: periodic state-polling thread.
+//
+// Some SDK callbacks (notably post-timeout host Deny clicks) appear to
+// not fire any onRawLiveStreamPrivilegeChanged callback at all. If SDK
+// query methods reveal a state change at that moment — even without a
+// callback — that change becomes our signal. The polling thread queries
+// the livestream controller's full state every 3 s while a request is
+// in flight and logs both a per-tick snapshot and a delta line when
+// any field changes.
+//
+// Lifecycle: started right after RequestRawLiveStreaming returns,
+// stops when IsRawLiveStreamRequestInFlight() goes false (granted,
+// or meeting ended). Detached so we don't have to wire join() into
+// the meeting-leave path; the guard flag prevents concurrent threads
+// across re-joins.
+
+static std::atomic<bool> g_pollingThreadRunning{false};
+
+struct LiveStreamPollSnapshot {
+    int canStart  = -2;  // SDKError as int; -2 = uninitialized
+    int supported = -2;  // 0/1 ; -2 = uninitialized
+    int lsStatus  = -2;
+    int privCount = -2;  // -1 = SDK returned null list
+    int infoCount = -2;
+};
+
+static void RawLiveStreamPollingLoop() {
+    LogToFile("Meeting: POLL thread started");
+    LiveStreamPollSnapshot prev;
+    int tickNumber = 0;
+
+    while (IsRawLiveStreamRequestInFlight()) {
+        // Sleep in 100ms chunks so we react quickly to state change /
+        // process exit. 30 chunks = ~3s tick cadence.
+        for (int i = 0; i < 30 && IsRawLiveStreamRequestInFlight(); ++i) {
+            Sleep(100);
+        }
+        if (!IsRawLiveStreamRequestInFlight()) break;
+
+        ++tickNumber;
+        char elapsed[32];
+        FormatRawLiveStreamElapsed(elapsed, sizeof(elapsed));
+
+        if (!g_meetingService) {
+            char buf[128];
+            sprintf_s(buf, "Meeting: POLL tick=%d — meetingService=null (%s)",
+                      tickNumber, elapsed);
+            LogToFile(buf);
+            continue;
+        }
+        ZOOM_SDK_NAMESPACE::IMeetingLiveStreamController* lsc =
+            g_meetingService->GetMeetingLiveStreamController();
+        if (!lsc) {
+            char buf[128];
+            sprintf_s(buf, "Meeting: POLL tick=%d — lsc=null (%s)",
+                      tickNumber, elapsed);
+            LogToFile(buf);
+            continue;
+        }
+
+        LiveStreamPollSnapshot now;
+        now.canStart  = (int)lsc->CanStartRawLiveStream();
+        now.supported = lsc->IsRawLiveStreamSupported() ? 1 : 0;
+        ZOOM_SDK_NAMESPACE::LiveStreamStatus lsStatus =
+            lsc->GetCurrentLiveStreamStatus();
+        now.lsStatus  = (int)lsStatus;
+        ZOOM_SDK_NAMESPACE::IList<unsigned int>* pl =
+            lsc->GetRawLiveStreamPrivilegeUserList();
+        now.privCount = pl ? pl->GetCount() : -1;
+        ZOOM_SDK_NAMESPACE::IList<ZOOM_SDK_NAMESPACE::RawLiveStreamInfo>* il =
+            lsc->GetRawLiveStreamingInfoList();
+        now.infoCount = il ? il->GetCount() : -1;
+
+        {
+            char buf[384];
+            sprintf_s(buf,
+                "Meeting: POLL tick=%d canStart=%d supported=%d "
+                "lsStatus=%d(%s) privCount=%d infoCount=%d (%s)",
+                tickNumber, now.canStart, now.supported,
+                now.lsStatus, LiveStreamStatusName(lsStatus),
+                now.privCount, now.infoCount, elapsed);
+            LogToFile(buf);
+        }
+
+        // Delta line: only printed when something changed since the
+        // previous tick. This is the high-signal log — if a host Deny
+        // post-timeout doesn't fire a callback but DOES move one of
+        // these values, the delta line is what we're looking for.
+        if (tickNumber > 1 &&
+            (now.canStart  != prev.canStart  ||
+             now.supported != prev.supported ||
+             now.lsStatus  != prev.lsStatus  ||
+             now.privCount != prev.privCount ||
+             now.infoCount != prev.infoCount)) {
+            char buf[512];
+            sprintf_s(buf,
+                "Meeting: POLL CHANGED tick=%d — "
+                "canStart %d->%d, supported %d->%d, lsStatus %d->%d, "
+                "privCount %d->%d, infoCount %d->%d (%s)",
+                tickNumber,
+                prev.canStart,  now.canStart,
+                prev.supported, now.supported,
+                prev.lsStatus,  now.lsStatus,
+                prev.privCount, now.privCount,
+                prev.infoCount, now.infoCount,
+                elapsed);
+            LogToFile(buf);
+        }
+        prev = now;
+    }
+
+    LogToFile("Meeting: POLL thread exiting");
+    g_pollingThreadRunning = false;
+}
+
+static void StartRawLiveStreamPolling() {
+    // Guard against concurrent threads across re-joins. exchange returns
+    // the prior value; if it was already true, another thread is alive
+    // and we just no-op.
+    if (g_pollingThreadRunning.exchange(true)) return;
+    std::thread(RawLiveStreamPollingLoop).detach();
 }
 
 // Writes "t+12345ms" or "t+N/A" into the caller-supplied buffer. Caller
@@ -875,8 +1074,6 @@ public:
             bHasPrivilege ? 1 : 0, elapsed);
         LogToFile(buf);
     }
-    virtual void onRawLiveStreamPrivilegeRequested(
-        ZOOM_SDK_NAMESPACE::IRequestRawLiveStreamPrivilegeHandler*) override {}
     // v1.2.4 Phase B: was empty. Fires when raw livestreaming starts /
     // stops anywhere in the meeting. Logged so we can correlate with
     // privilege transitions — e.g. if a stream-stop on someone else's
@@ -903,9 +1100,53 @@ public:
             }
         }
     }
-    virtual void onLiveStreamReminderStatusChanged(bool) override {}
-    virtual void onLiveStreamReminderStatusChangeFailed() override {}
-    virtual void onUserThresholdReachedForLiveStream(int) override {}
+    // v1.2.4 Phase B-Extended: was empty. Host-side callback that fires
+    // when WE are the host receiving a request from someone else. Logged
+    // for completeness in case it fires unexpectedly during the
+    // post-timeout-deny test window.
+    virtual void onRawLiveStreamPrivilegeRequested(
+        ZOOM_SDK_NAMESPACE::IRequestRawLiveStreamPrivilegeHandler* handler) override {
+        char elapsed[32];
+        FormatRawLiveStreamElapsed(elapsed, sizeof(elapsed));
+        unsigned int requesterId = 0;
+        if (handler) {
+            requesterId = handler->GetRequesterId();
+        }
+        char buf[160];
+        sprintf_s(buf,
+            "Meeting: onRawLiveStreamPrivilegeRequested requesterId=%u "
+            "(host-side callback — we should NOT be the host) (%s)",
+            requesterId, elapsed);
+        LogToFile(buf);
+    }
+    // v1.2.4 Phase B-Extended: was empty. Logged so we catch any
+    // unexpected signal during the post-timeout-deny window.
+    virtual void onLiveStreamReminderStatusChanged(bool enable) override {
+        char elapsed[32];
+        FormatRawLiveStreamElapsed(elapsed, sizeof(elapsed));
+        char buf[128];
+        sprintf_s(buf,
+            "Meeting: onLiveStreamReminderStatusChanged enable=%d (%s)",
+            enable ? 1 : 0, elapsed);
+        LogToFile(buf);
+    }
+    virtual void onLiveStreamReminderStatusChangeFailed() override {
+        char elapsed[32];
+        FormatRawLiveStreamElapsed(elapsed, sizeof(elapsed));
+        char buf[96];
+        sprintf_s(buf,
+            "Meeting: onLiveStreamReminderStatusChangeFailed (%s)", elapsed);
+        LogToFile(buf);
+    }
+    virtual void onUserThresholdReachedForLiveStream(int percent) override {
+        char elapsed[32];
+        FormatRawLiveStreamElapsed(elapsed, sizeof(elapsed));
+        char buf[128];
+        sprintf_s(buf,
+            "Meeting: onUserThresholdReachedForLiveStream percent=%d (%s)",
+            percent, elapsed);
+        LogToFile(buf);
+    }
 };
 static ZoomLiveStreamListener g_liveStreamListener;
 
@@ -1185,6 +1426,12 @@ public:
                         (unsigned long long)g_rawLiveStreamRequestMs);
                     LogToFile(buf);
                 }
+                // v1.2.4 Phase B-Extended: kick off the periodic state-
+                // polling thread to capture SDK-state changes that
+                // happen without firing callbacks (suspected for the
+                // post-timeout host-Deny case). Exits on its own when
+                // IsRawLiveStreamRequestInFlight() goes false.
+                StartRawLiveStreamPolling();
                 // Tell the plugin we're waiting on the host so the
                 // source properties panel can show "Waiting for host"
                 // instead of the participant dropdown. The host path
@@ -1334,21 +1581,39 @@ public:
             }
         }
     }
+    // v1.2.4 Phase B-Extended: in-flight catch-all logging on every
+    // otherwise-empty IMeetingServiceEvent override.
     virtual void onMeetingStatisticsWarningNotification(
-        ZOOM_SDK_NAMESPACE::StatisticsWarningType) override {}
+        ZOOM_SDK_NAMESPACE::StatisticsWarningType) override {
+        LogInFlightCallback("onMeetingStatisticsWarningNotification");
+    }
     virtual void onMeetingParameterNotification(
-        const ZOOM_SDK_NAMESPACE::MeetingParameter*) override {}
-    virtual void onSuspendParticipantsActivities() override {}
-    virtual void onAICompanionActiveChangeNotice(bool) override {}
-    virtual void onMeetingTopicChanged(const zchar_t*) override {}
-    virtual void onMeetingFullToWatchLiveStream(const zchar_t*) override {}
+        const ZOOM_SDK_NAMESPACE::MeetingParameter*) override {
+        LogInFlightCallback("onMeetingParameterNotification");
+    }
+    virtual void onSuspendParticipantsActivities() override {
+        LogInFlightCallback("onSuspendParticipantsActivities");
+    }
+    virtual void onAICompanionActiveChangeNotice(bool) override {
+        LogInFlightCallback("onAICompanionActiveChangeNotice");
+    }
+    virtual void onMeetingTopicChanged(const zchar_t*) override {
+        LogInFlightCallback("onMeetingTopicChanged");
+    }
+    virtual void onMeetingFullToWatchLiveStream(const zchar_t*) override {
+        LogInFlightCallback("onMeetingFullToWatchLiveStream");
+    }
     virtual void onUserNetworkStatusChanged(
         ZOOM_SDK_NAMESPACE::MeetingComponentType,
         ZOOM_SDK_NAMESPACE::ConnectionQuality,
-        unsigned int, bool) override {}
+        unsigned int, bool) override {
+        LogInFlightCallback("onUserNetworkStatusChanged");
+    }
 #if defined(WIN32)
     virtual void onAppSignalPanelUpdated(
-        ZOOM_SDK_NAMESPACE::IMeetingAppSignalHandler*) override {}
+        ZOOM_SDK_NAMESPACE::IMeetingAppSignalHandler*) override {
+        LogInFlightCallback("onAppSignalPanelUpdated");
+    }
 #endif
 };
 static ZoomMeetingListener g_meetingListener;
