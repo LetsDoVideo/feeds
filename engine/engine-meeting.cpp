@@ -625,6 +625,19 @@ public:
     virtual void onLiveStreamStatusChange(
         ZOOM_SDK_NAMESPACE::LiveStreamStatus) override {}
     virtual void onRawLiveStreamPrivilegeRequestTimeout() override {
+        // v1.2.4 Issue 2: the SDK fires this ~10-25s after a successful
+        // grant, evidently because its internal request-timeout timer
+        // doesn't get cancelled when the host approves. If we already
+        // have privilege, the timeout is spurious — forwarding it to
+        // the plugin would overwrite the Granted state with TimedOut
+        // and surface a wrong "Ask Host Again" UI on next properties
+        // open. Suppress here; plugin-side has a matching defensive
+        // check.
+        if (g_rawLiveStreamGranted) {
+            LogToFile("Meeting: ignoring raw livestream timeout — "
+                      "privilege already granted (spurious SDK callback)");
+            return;
+        }
         LogToFile("Meeting: raw livestream request TIMED OUT");
         SendToPlugin(
             "{\"type\":\"raw_livestream_timeout\"}");
