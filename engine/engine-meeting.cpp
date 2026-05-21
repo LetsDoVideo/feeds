@@ -544,7 +544,19 @@ public:
             ? "Meeting: raw livestream privilege GRANTED"
             : "Meeting: raw livestream privilege DENIED");
 
-        if (!bHasPrivilege) return;
+        if (!bHasPrivilege) {
+            // Tell the plugin the host declined (or revoked) so the
+            // source properties panel can swap from "waiting" to
+            // "denied + Ask Host Again" UI. Without this signal the
+            // user has no way to tell the difference between "host
+            // still deciding" and "host closed the popup without
+            // approving." Also fires if the host removes our
+            // already-granted privilege mid-meeting — acceptable
+            // side-effect coverage per the spec.
+            g_rawLiveStreamGranted = false;
+            SendToPlugin("{\"type\":\"raw_livestream_denied\"}");
+            return;
+        }
         g_rawLiveStreamGranted = true;
 
         if (!g_meetingService) return;
@@ -878,6 +890,12 @@ public:
                 LogToFile("Meeting: requesting raw livestream privilege from host");
                 lsc->RequestRawLiveStreaming(
                     L"https://letsdovideo.com/feeds-support/", L"Feeds");
+                // Tell the plugin we're waiting on the host so the
+                // source properties panel can show "Waiting for host"
+                // instead of the participant dropdown. The host path
+                // below skips this — they get privilege automatically
+                // and the granted/denied callback drives the UI.
+                SendToPlugin("{\"type\":\"raw_livestream_pending\"}");
             }
             // Otherwise: we're the host, privilege is already available.
             // The SDK will fire onRawLiveStreamPrivilegeChanged(true) on
@@ -1428,6 +1446,41 @@ void HandleLeaveMeeting(const std::string& /*json*/) {
 void HandleGetParticipants(const std::string& /*json*/) {
     LogToFile("Meeting: HandleGetParticipants called");
     SendParticipantList();
+}
+
+// ---------------------------------------------------------------------------
+// IPC handler: request_raw_livestream_privilege
+// User clicked "Ask Host Again" in the source properties panel after the
+// host declined or let the request time out. Re-fires the SDK request;
+// onRawLiveStreamPrivilegeChanged / onRawLiveStreamPrivilegeRequestTimeout
+// will drive the plugin state forward as the host responds (or doesn't).
+//
+// Open question — whether calling RequestRawLiveStreaming a second time
+// actually re-pops the host dialog or is silently ignored by the SDK
+// when there's an outstanding request. We won't know until we test
+// two-account; if it's a no-op the plugin-side messaging will need to
+// tell users to leave and rejoin instead.
+// ---------------------------------------------------------------------------
+void HandleRequestRawLiveStreamPrivilege(const std::string& /*json*/) {
+    LogToFile("Meeting: HandleRequestRawLiveStreamPrivilege called");
+    if (!g_meetingService) {
+        LogToFile("Meeting: request_raw_livestream_privilege ignored — "
+                  "no meeting service");
+        return;
+    }
+    ZOOM_SDK_NAMESPACE::IMeetingLiveStreamController* lsc =
+        g_meetingService->GetMeetingLiveStreamController();
+    if (!lsc) {
+        LogToFile("Meeting: request_raw_livestream_privilege ignored — "
+                  "no livestream controller");
+        return;
+    }
+    ZOOM_SDK_NAMESPACE::SDKError err = lsc->RequestRawLiveStreaming(
+        L"https://letsdovideo.com/feeds-support/", L"Feeds");
+    char buf[128];
+    sprintf_s(buf, "Meeting: re-requested raw livestream privilege "
+                   "(SDKError=%d)", (int)err);
+    LogToFile(buf);
 }
 
 // ---------------------------------------------------------------------------

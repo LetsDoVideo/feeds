@@ -120,6 +120,27 @@ static bool g_isInMeeting         = false;
 static bool g_rawLiveStreamGranted = false;
 static bool g_pendingMeetingJoin   = false;
 
+// Raw livestream privilege state. Mirrors g_rawLiveStreamGranted but with
+// the extra states the properties panel needs to render the
+// "waiting / denied / timed out" UI. g_rawLiveStreamGranted stays for
+// subscribe gating to keep the diff minimal — kept in sync with this
+// enum in every transition. Non-static for parity with g_isLoggedIn /
+// g_currentTier, though no other TU references it today.
+//
+//   NotRequested  before joining, or after leaving — initial state
+//   Pending       engine sent RequestRawLiveStreaming, awaiting host
+//   Granted       host approved (g_rawLiveStreamGranted also true)
+//   Denied        host declined, or revoked mid-meeting
+//   TimedOut      no host response within the SDK's request window
+enum class RawPrivilegeState {
+    NotRequested,
+    Pending,
+    Granted,
+    Denied,
+    TimedOut,
+};
+RawPrivilegeState g_rawPrivilegeState = RawPrivilegeState::NotRequested;
+
 static std::string g_userDisplayName;
 static std::string g_userPMI;
 // Non-static for the same reason as g_isLoggedIn above.
@@ -1575,6 +1596,22 @@ bool ShouldShowTierPopup() {
     return true;
 }
 
+// Throttle for the "Ask Host Again" button. A user mashing the button
+// would have us spam the host with privilege-request popups; SDK may
+// rate-limit too. 10s is loose enough to feel responsive but tight
+// enough to discourage spam. Same compare-and-store shape as
+// ShouldShowTierPopup.
+static std::atomic<uint64_t> g_lastAskHostMs{0};
+static constexpr uint64_t ASK_HOST_THROTTLE_MS = 10000;
+
+static bool ShouldAskHostAgain() {
+    uint64_t now  = GetTickCount64();
+    uint64_t last = g_lastAskHostMs.load();
+    if (now - last < ASK_HOST_THROTTLE_MS) return false;
+    g_lastAskHostMs.store(now);
+    return true;
+}
+
 // Modal popup with a clickable hyperlink, parented to the OBS main window
 // so it inherits OBS title-bar chrome. Called from zp_create / zs_create,
 // which may run on non-UI threads — dispatch to the main thread via
@@ -1822,6 +1859,66 @@ static const char* OrdinalSuffix(int n) {
     }
 }
 
+// Adds the privilege-state UI to a source properties panel when we're in
+// a meeting but the host hasn't granted raw livestream privilege. Caller
+// passes the props panel (with version label already added) and returns
+// early if this function returns true, so the panel renders only the
+// privilege state instead of the usual participant dropdown /
+// screenshare status. Shared by zp_properties and zs_properties.
+//
+// State mapping:
+//   Granted        → returns false, normal panel renders
+//   Pending        → "Waiting for host..." info text, no button
+//   NotRequested   → same as Pending (covers the brief gap between
+//                    meeting_joined and raw_livestream_pending/granted;
+//                    no actionable state for the user yet)
+//   Denied/TimedOut→ "Host hasn't granted..." info text + "Ask Host
+//                    Again" button (throttled to one request per 10s)
+static bool MaybePrivilegeStateUI(obs_properties_t* props) {
+    if (!g_isInMeeting ||
+        g_rawPrivilegeState == RawPrivilegeState::Granted) {
+        return false;
+    }
+
+    const bool actionable =
+        g_rawPrivilegeState == RawPrivilegeState::Denied ||
+        g_rawPrivilegeState == RawPrivilegeState::TimedOut;
+
+    if (actionable) {
+        obs_properties_add_text(props, "privilege_state_msg",
+            "Host hasn't granted Feeds permission yet. They may have "
+            "closed the popup before clicking allow.",
+            OBS_TEXT_INFO);
+        obs_properties_add_button(props, "ask_host_btn",
+            "Ask Host Again",
+            [](obs_properties_t*, obs_property_t*, void*) -> bool {
+                if (!ShouldAskHostAgain()) {
+                    blog(LOG_INFO,
+                        "[feeds] Ask Host Again throttled (10s window)");
+                    return true;
+                }
+                // Optimistic UI: flip to Pending immediately so the
+                // panel re-renders the "Waiting..." text without round-
+                // tripping through the engine. If the SDK call is a
+                // no-op (the open question per the spec), the engine's
+                // grant/deny/timeout callback eventually flips state
+                // back; if it does re-fire the host popup, the next
+                // grant/deny callback drives the next transition.
+                g_rawPrivilegeState = RawPrivilegeState::Pending;
+                feeds::SendToEngine(
+                    "{\"type\":\"request_raw_livestream_privilege\"}");
+                RefreshAllSourceProperties();
+                return true;
+            });
+    } else {
+        obs_properties_add_text(props, "privilege_state_msg",
+            "Waiting for host to grant Feeds permission. A popup is "
+            "visible on the host's screen.",
+            OBS_TEXT_INFO);
+    }
+    return true;
+}
+
 static obs_properties_t* zp_properties(void* data) {
   // C++ exceptions must not escape into libobs C frames. On exception we
   // return an empty properties object so the dialog still opens (instead
@@ -1863,6 +1960,14 @@ static obs_properties_t* zp_properties(void* data) {
     obs_properties_t* props = obs_properties_create();
     std::string verLabel = std::string("Feeds (v") + feeds_shared::VERSION + ")";
     obs_properties_add_text(props, "ver_label", verLabel.c_str(), OBS_TEXT_INFO);
+
+    // In-meeting + privilege-not-granted: render the waiting/denied UI
+    // instead of the participant dropdown. Returns early so the rest of
+    // the panel (status, refresh, dropdown, tips) is suppressed —
+    // matches the tier-disabled return-early structure above.
+    if (MaybePrivilegeStateUI(props)) {
+        return props;
+    }
 
     if (!g_isInMeeting) {
         if (!g_isLoggedIn) {
@@ -2332,6 +2437,11 @@ static obs_properties_t* zs_properties(void* data) {
     std::string verLabel = std::string("Feeds - Screenshare (v") + feeds_shared::VERSION + ")";
     obs_properties_add_text(props, "ver_label", verLabel.c_str(), OBS_TEXT_INFO);
 
+    // See zp_properties for the rationale.
+    if (MaybePrivilegeStateUI(props)) {
+        return props;
+    }
+
     if (!g_isInMeeting) {
         if (!g_isLoggedIn) {
             obs_properties_add_button(props, "login_btn",
@@ -2599,6 +2709,7 @@ static void RegisterEngineHandlers() {
             g_isLoggedIn           = false;
             g_isInMeeting          = false;
             g_rawLiveStreamGranted = false;
+            g_rawPrivilegeState    = RawPrivilegeState::NotRequested;
             g_currentMeetingNumber = 0;
             g_activeSharerUserId   = 0;
             g_activeSpeakerUserId  = 0;
@@ -2635,6 +2746,7 @@ static void RegisterEngineHandlers() {
             g_isLoggedIn = false;
             g_isInMeeting = false;
             g_rawLiveStreamGranted = false;
+            g_rawPrivilegeState    = RawPrivilegeState::NotRequested;
             g_userDisplayName.clear();
             g_userPMI.clear();
             g_currentTier = 0;
@@ -2784,6 +2896,7 @@ static void RegisterEngineHandlers() {
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
             g_isInMeeting          = false;
             g_rawLiveStreamGranted = false;
+            g_rawPrivilegeState    = RawPrivilegeState::NotRequested;
             g_currentMeetingNumber = 0;
             g_activeSharerUserId   = 0;
             g_activeSpeakerUserId  = 0;
@@ -2802,26 +2915,54 @@ static void RegisterEngineHandlers() {
     feeds::RegisterMessageHandler("raw_livestream_granted", [](const std::string&) {
         blog(LOG_INFO, "[feeds] raw_livestream_granted");
         g_rawLiveStreamGranted = true;
+        g_rawPrivilegeState    = RawPrivilegeState::Granted;
 
         // Auto-subscribe any sources that had a participant (including
         // [Active Speaker], sentinel 1) picked before the meeting was
         // joined / privilege was granted.
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
-            std::lock_guard<std::mutex> lock(g_sourcesMutex);
-            for (ZpSourceData* s : g_allParticipantSources) {
-                if (s && s->current_user_id >= 1 && !s->uuid.empty()) {
-                    std::string msg = "{\"type\":\"participant_source_subscribe\","
-                                      "\"source_id\":\"" + s->uuid + "\","
-                                      "\"participant_id\":" +
-                                      std::to_string(s->current_user_id) + "}";
-                    feeds::SendToEngine(msg);
+            {
+                std::lock_guard<std::mutex> lock(g_sourcesMutex);
+                for (ZpSourceData* s : g_allParticipantSources) {
+                    if (s && s->current_user_id >= 1 && !s->uuid.empty()) {
+                        std::string msg = "{\"type\":\"participant_source_subscribe\","
+                                          "\"source_id\":\"" + s->uuid + "\","
+                                          "\"participant_id\":" +
+                                          std::to_string(s->current_user_id) + "}";
+                        feeds::SendToEngine(msg);
+                    }
                 }
             }
+            // Flip the properties panels from the privilege-pending UI
+            // to the normal participant dropdown / screenshare status.
+            RefreshAllSourceProperties();
+        });
+    });
+
+    feeds::RegisterMessageHandler("raw_livestream_pending", [](const std::string&) {
+        blog(LOG_INFO, "[feeds] raw_livestream_pending");
+        g_rawPrivilegeState = RawPrivilegeState::Pending;
+        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
+            RefreshAllSourceProperties();
+        });
+    });
+
+    feeds::RegisterMessageHandler("raw_livestream_denied", [](const std::string&) {
+        blog(LOG_WARNING, "[feeds] raw_livestream_denied - host declined "
+                          "(or revoked) Feeds permission");
+        g_rawLiveStreamGranted = false;
+        g_rawPrivilegeState    = RawPrivilegeState::Denied;
+        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
+            RefreshAllSourceProperties();
         });
     });
 
     feeds::RegisterMessageHandler("raw_livestream_timeout", [](const std::string&) {
         blog(LOG_WARNING, "[feeds] raw_livestream_timeout - host did not approve");
+        g_rawPrivilegeState = RawPrivilegeState::TimedOut;
+        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
+            RefreshAllSourceProperties();
+        });
     });
 
     feeds::RegisterMessageHandler("participant_list_changed",

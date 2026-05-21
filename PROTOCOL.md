@@ -163,6 +163,13 @@ Engine has observed the SDK reporting `MEETING_STATUS_ENDED` or `MEETING_STATUS_
 {"type": "meeting_left"}
 ```
 
+#### `raw_livestream_pending` (E→P)
+Engine has just called `IMeetingLiveStreamController::RequestRawLiveStreaming` on the non-host join path — the host now has a "Request to livestream" popup on screen and we're waiting. Plugin flips `g_rawPrivilegeState` to `Pending` and source properties panels render a "Waiting for host..." message instead of the participant dropdown. Skipped on the host path, where privilege is granted automatically and `raw_livestream_granted` fires directly.
+
+```json
+{"type": "raw_livestream_pending"}
+```
+
 #### `raw_livestream_granted` (E→P)
 `IMeetingLiveStreamCtrlEvent::onRawLiveStreamPrivilegeChanged(true)` fired. This is the critical moment where the plugin can actually render participant video. If the user is the host (e.g. joining their own PMI), this fires almost immediately after `meeting_joined`. Otherwise it fires only after the host clicks "Allow" on the "Request to livestream" popup in the Zoom client.
 
@@ -170,11 +177,25 @@ Engine has observed the SDK reporting `MEETING_STATUS_ENDED` or `MEETING_STATUS_
 {"type": "raw_livestream_granted"}
 ```
 
+#### `raw_livestream_denied` (E→P)
+`IMeetingLiveStreamCtrlEvent::onRawLiveStreamPrivilegeChanged(false)` fired — the host declined, closed the popup, or revoked an already-granted privilege mid-meeting. Plugin flips `g_rawPrivilegeState` to `Denied`; source properties panels show "Host hasn't granted..." plus an "Ask Host Again" button that sends `request_raw_livestream_privilege` back to the engine.
+
+```json
+{"type": "raw_livestream_denied"}
+```
+
 #### `raw_livestream_timeout` (E→P)
-The SDK timed out waiting for the host to approve the raw-livestream request. Plugin logs but does not currently show a user-visible notification (future enhancement).
+The SDK timed out waiting for the host to approve the raw-livestream request. Plugin flips `g_rawPrivilegeState` to `TimedOut`, which surfaces the same "Ask Host Again" affordance as `raw_livestream_denied`.
 
 ```json
 {"type": "raw_livestream_timeout"}
+```
+
+#### `request_raw_livestream_privilege` (P→E)
+Plugin asks the engine to re-fire `RequestRawLiveStreaming` after a Denied or TimedOut state. Triggered by the user clicking "Ask Host Again" in the source properties panel; throttled plugin-side to one request per 10s. Engine logs the SDKError and lets the existing privilege/timeout callbacks drive the next state transition. **Open question:** whether the SDK actually re-shows the host popup on a second request, or silently ignores it — to be confirmed by two-account testing.
+
+```json
+{"type": "request_raw_livestream_privilege"}
 ```
 
 ### Participants
