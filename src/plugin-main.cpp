@@ -512,25 +512,14 @@ static void CheckForUpdateAsync() {
 }
 
 static void RefreshAllSourceProperties() {
-    // v1.2.4 diagnostic for Issue 1.
-    blog(LOG_INFO, "[feeds] RefreshAllSourceProperties: entered, "
-                   "privilege_state=%d", (int)g_rawPrivilegeState);
-    int feeds_source_count = 0;
-    obs_enum_sources([](void* count, obs_source_t* src) -> bool {
+    obs_enum_sources([](void*, obs_source_t* src) -> bool {
         const char* id = obs_source_get_id(src);
         if (id && (strcmp(id, "zoom_participant_source") == 0 ||
                    strcmp(id, "zoom_screenshare_source") == 0)) {
-            const char* name = obs_source_get_name(src);
-            blog(LOG_INFO, "[feeds] RefreshAllSourceProperties: calling "
-                           "obs_source_update_properties on '%s' (id=%s)",
-                 name ? name : "<null>", id);
             obs_source_update_properties(src);
-            ++(*static_cast<int*>(count));
         }
         return true;
-    }, &feeds_source_count);
-    blog(LOG_INFO, "[feeds] RefreshAllSourceProperties: refreshed %d source(s)",
-         feeds_source_count);
+    }, nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -1877,34 +1866,21 @@ static const char* OrdinalSuffix(int n) {
 //                    Deny). We honestly don't know what the host did,
 //                    so the wording is honest about that uncertainty.
 static std::string PrivilegeStatusText() {
-    // v1.2.4 diagnostic: kept for any follow-up investigation. Strip
-    // once v1.2.4 ships and is stable.
-    blog(LOG_INFO, "[feeds] PrivilegeStatusText: called, "
-                   "isInMeeting=%d, privilege_state=%d",
-         (int)g_isInMeeting, (int)g_rawPrivilegeState);
     if (g_rawPrivilegeState == RawPrivilegeState::Granted) {
-        blog(LOG_INFO, "[feeds] PrivilegeStatusText: returning empty "
-                       "(Granted, caller renders normal status)");
         return std::string();
     }
     switch (g_rawPrivilegeState) {
         case RawPrivilegeState::Denied:
-            blog(LOG_INFO, "[feeds] PrivilegeStatusText: returning "
-                           "Denied wording");
             return "Status: Host denied use of Feeds. Please leave the "
                    "meeting, rejoin, and have the host click 'Grant "
                    "Permission' on the Request to Livestream popup.";
         case RawPrivilegeState::TimedOut:
-            blog(LOG_INFO, "[feeds] PrivilegeStatusText: returning "
-                           "TimedOut wording");
             return "Status: Still waiting for permission. Please check "
                    "with the host. If they closed the popup, rejoin the "
                    "meeting.";
         case RawPrivilegeState::Pending:
         case RawPrivilegeState::NotRequested:
         default:
-            blog(LOG_INFO, "[feeds] PrivilegeStatusText: returning "
-                           "Pending/NotRequested wording");
             return "Status: Waiting for host to grant Feeds permission. "
                    "A popup is visible on the host's screen.";
     }
@@ -1915,11 +1891,6 @@ static obs_properties_t* zp_properties(void* data) {
   // return an empty properties object so the dialog still opens (instead
   // of crashing OBS).
   try {
-    // v1.2.4 diagnostic: confirms the dialog is actually re-invoking our
-    // get_properties when obs_source_update_properties fires.
-    blog(LOG_INFO, "[feeds] zp_properties: entered, isInMeeting=%d, "
-                   "privilege_state=%d, isLoggedIn=%d",
-         (int)g_isInMeeting, (int)g_rawPrivilegeState, (int)g_isLoggedIn);
     // data can be nullptr in some Qt code paths (e.g., properties
     // queried before source creation completes); null-guard the
     // tier_disabled access.
@@ -2414,10 +2385,6 @@ static void zs_destroy(void* vdata) {
 static obs_properties_t* zs_properties(void* data) {
   // Same exception-boundary reasoning as zp_properties.
   try {
-    // v1.2.4 diagnostic: paired with zp_properties entry log.
-    blog(LOG_INFO, "[feeds] zs_properties: entered, isInMeeting=%d, "
-                   "privilege_state=%d, isLoggedIn=%d",
-         (int)g_isInMeeting, (int)g_rawPrivilegeState, (int)g_isLoggedIn);
     // data can be nullptr in some Qt code paths; null-guard the
     // tier_disabled access.
     ZsSourceData* d = static_cast<ZsSourceData*>(data);
@@ -2921,22 +2888,15 @@ static void RegisterEngineHandlers() {
     });
 
     feeds::RegisterMessageHandler("raw_livestream_granted", [](const std::string&) {
-        // v1.2.4 diagnostic: trace the refresh chain end-to-end so we can
-        // compare the (working) Granted path against the (broken) Denied
-        // path in the OBS log. Strip back once Issue 1 is diagnosed.
-        blog(LOG_INFO, "[feeds] raw_livestream_granted: handler entered, "
-                       "prev_state=%d", (int)g_rawPrivilegeState);
+        blog(LOG_INFO, "[feeds] raw_livestream_granted");
         g_rawLiveStreamGranted = true;
         g_rawPrivilegeState    = RawPrivilegeState::Granted;
-        blog(LOG_INFO, "[feeds] raw_livestream_granted: state set to Granted (%d)",
-             (int)g_rawPrivilegeState);
 
         // Auto-subscribe any sources that had a participant (including
         // [Active Speaker], sentinel 1) picked before the meeting was
-        // joined / privilege was granted.
+        // joined / privilege was granted, then refresh the properties
+        // panels from the privilege-pending UI to the normal layout.
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
-            blog(LOG_INFO, "[feeds] raw_livestream_granted: QTimer lambda fired "
-                           "on UI thread");
             {
                 std::lock_guard<std::mutex> lock(g_sourcesMutex);
                 for (ZpSourceData* s : g_allParticipantSources) {
@@ -2949,81 +2909,47 @@ static void RegisterEngineHandlers() {
                     }
                 }
             }
-            // Flip the properties panels from the privilege-pending UI
-            // to the normal participant dropdown / screenshare status.
-            blog(LOG_INFO, "[feeds] raw_livestream_granted: calling "
-                           "RefreshAllSourceProperties");
             RefreshAllSourceProperties();
         });
     });
 
     feeds::RegisterMessageHandler("raw_livestream_pending", [](const std::string&) {
-        blog(LOG_INFO, "[feeds] raw_livestream_pending: handler entered, "
-                       "prev_state=%d", (int)g_rawPrivilegeState);
+        blog(LOG_INFO, "[feeds] raw_livestream_pending");
         g_rawPrivilegeState = RawPrivilegeState::Pending;
-        blog(LOG_INFO, "[feeds] raw_livestream_pending: state set to Pending (%d)",
-             (int)g_rawPrivilegeState);
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
-            blog(LOG_INFO, "[feeds] raw_livestream_pending: QTimer lambda fired "
-                           "on UI thread, calling RefreshAllSourceProperties");
             RefreshAllSourceProperties();
         });
     });
 
     feeds::RegisterMessageHandler("raw_livestream_denied", [](const std::string&) {
-        blog(LOG_WARNING, "[feeds] raw_livestream_denied: handler entered, "
-                          "prev_state=%d", (int)g_rawPrivilegeState);
-        // v1.2.4 defense in depth: a Denied callback arriving when we're
-        // already Granted is either a stale SDK callback or a real
-        // mid-meeting revocation. We can't distinguish, so we log and
-        // continue (assume revocation) — the engine has already cleared
-        // g_rawLiveStreamGranted in its own onRawLiveStreamPrivilegeChanged
-        // path, so frame delivery will stop either way. If this turns out
-        // to be the spurious-callback case, the visible symptom is the
-        // user being shown the Denied UI until the next state transition
-        // — annoying but not crash-prone.
-        if (g_rawPrivilegeState == RawPrivilegeState::Granted) {
-            blog(LOG_WARNING, "[feeds] raw_livestream_denied while in Granted "
-                              "state — possible stale callback, or host "
-                              "revoked privilege; continuing as revocation");
-        }
+        // A Denied callback arriving when we're already Granted is a
+        // mid-meeting host revoke. Continue processing — frame delivery
+        // needs to stop either way and the engine has already cleared
+        // its g_rawLiveStreamGranted flag.
+        blog(LOG_WARNING, "[feeds] raw_livestream_denied");
         g_rawLiveStreamGranted = false;
         g_rawPrivilegeState    = RawPrivilegeState::Denied;
-        blog(LOG_WARNING, "[feeds] raw_livestream_denied: state set to Denied (%d)",
-             (int)g_rawPrivilegeState);
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
-            blog(LOG_INFO, "[feeds] raw_livestream_denied: QTimer lambda fired "
-                           "on UI thread, calling RefreshAllSourceProperties");
             RefreshAllSourceProperties();
         });
     });
 
     feeds::RegisterMessageHandler("raw_livestream_timeout", [](const std::string&) {
-        blog(LOG_WARNING, "[feeds] raw_livestream_timeout: handler entered, "
-                          "prev_state=%d", (int)g_rawPrivilegeState);
-        // Defence in depth — engine-side already suppresses the timeout
-        // when g_rawLiveStreamGranted is true (the v1.2.4 first-cut case
-        // where the SDK fires the timeout 10–25 s after a successful
-        // grant). This check is the backstop.
+        // Defence in depth — engine already suppresses the timeout when
+        // g_rawLiveStreamGranted is true (the SDK has been observed
+        // firing the timeout 10–25 s after a successful grant). Backstop.
         if (g_rawPrivilegeState == RawPrivilegeState::Granted) {
-            blog(LOG_INFO, "[feeds] ignoring raw_livestream_timeout — already "
-                           "Granted (spurious SDK callback)");
+            blog(LOG_INFO, "[feeds] ignoring raw_livestream_timeout — already Granted");
             return;
         }
-        // v1.2.4 Phase B-Extended finding: post-timeout, the SDK fires
-        // no callbacks for host actions on the popup. Grant still works
-        // via the existing Changed(true) callback. Deny and X-button-
-        // close are invisible to us — 155 polling snapshots across
-        // Tests G/H/I revealed zero state change. So at 30 s we can no
-        // longer trust the Pending state to be accurate, and we
-        // transition to TimedOut. The PrivilegeStatusText for TimedOut
-        // is intentionally honest ("Still waiting... please check with
-        // the host") rather than asserting a denial.
+        // Post-timeout, the SDK fires no callbacks for host actions on
+        // the popup — Grant still works via Changed(true), but Deny and
+        // popup-close are invisible. Transition to TimedOut so the UI
+        // ("Still waiting... please check with the host") is honest
+        // about the uncertainty.
+        blog(LOG_WARNING, "[feeds] raw_livestream_timeout");
         g_rawPrivilegeState = RawPrivilegeState::TimedOut;
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
-            blog(LOG_INFO, "[feeds] raw_livestream_timeout: QTimer lambda "
-                           "fired on UI thread, calling "
-                           "RefreshAllSourceProperties");
             RefreshAllSourceProperties();
         });
     });
