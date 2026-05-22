@@ -26,6 +26,8 @@
 #include "meeting_service_components/meeting_sharing_interface.h"
 #include "setting_service_interface.h"
 
+#include "engine-shared.h"
+
 // Defined elsewhere in the engine
 extern void LogToFile(const char* msg);
 extern bool SendToPlugin(const std::string& json);
@@ -1554,29 +1556,85 @@ void HandleGetParticipants(const std::string& /*json*/) {
 // chat_send_result. Failure reasons are written as short, user-facing
 // strings — the plugin shows them verbatim in a MessageBox.
 // ---------------------------------------------------------------------------
+// Shared reply helper used by both the pipe-thread error paths and the
+// main-thread send. Posting an empty `error` with success=true is the
+// success reply.
+static void ReplyChatSendResult(bool success, const std::string& error) {
+    std::string out;
+    if (success) {
+        out = "{\"type\":\"chat_send_result\",\"success\":true}";
+    } else {
+        out = "{\"type\":\"chat_send_result\",\"success\":false,"
+              "\"error\":\"" + JsonEscape(error) + "\"}";
+    }
+    SendToPlugin(out);
+}
+
+// IPC handler — runs on the pipe-reader thread. Does the lightweight
+// JSON parse and posts the content to the main thread via the anchor
+// window. The actual SDK send happens in SendChatMessageOnMainThread.
+//
+// Why: the Zoom Meeting SDK requires chat sends to run on the thread
+// that owns the SDK window and pumps Windows messages. Sending from
+// this background thread returns SDKERR_SUCCESS and echoes locally,
+// but the message never propagates to other participants. Confirmed
+// empirically v1.2.4 across multiple test sessions; matches the
+// pattern documented on the Zoom dev forum and by Recall.ai.
 void HandleSendChatMessage(const std::string& json) {
     std::string content = JsonExtractStringEscaped(json, "content");
+    {
+        char buf[160];
+        sprintf_s(buf, "Chat: HandleSendChatMessage (pipe thread id=%lu) "
+                       "marshalling to main thread",
+                  (unsigned long)GetCurrentThreadId());
+        LogToFile(buf);
+    }
 
-    auto reply = [](bool success, const std::string& error) {
-        std::string out;
-        if (success) {
-            out = "{\"type\":\"chat_send_result\",\"success\":true}";
-        } else {
-            out = "{\"type\":\"chat_send_result\",\"success\":false,"
-                  "\"error\":\"" + JsonEscape(error) + "\"}";
-        }
-        SendToPlugin(out);
-    };
+    if (!g_anchorWnd) {
+        LogToFile("Chat: send_chat_message — no anchor window to marshal to");
+        ReplyChatSendResult(false, "Internal error (no main thread)");
+        return;
+    }
+
+    // Heap-allocate; window proc takes ownership and frees. PostMessage
+    // returns immediately; the actual send + chat_send_result reply
+    // happen on the main thread.
+    std::string* heapContent = new std::string(content);
+    if (!PostMessageW(g_anchorWnd, WM_FEEDS_SEND_CHAT, 0,
+                      reinterpret_cast<LPARAM>(heapContent))) {
+        DWORD lastErr = GetLastError();
+        char buf[128];
+        sprintf_s(buf, "Chat: send_chat_message — PostMessage failed err=%lu",
+                  lastErr);
+        LogToFile(buf);
+        delete heapContent;
+        ReplyChatSendResult(false, "Internal error (post failed)");
+        return;
+    }
+}
+
+// Main-thread send — invoked by EngineWndProc on receipt of
+// WM_FEEDS_SEND_CHAT. Contains everything that touches the SDK.
+// Sends the chat_send_result reply directly so the plugin gets a
+// single reply regardless of which thread did the work.
+void SendChatMessageOnMainThread(const std::string& content) {
+    {
+        char buf[128];
+        sprintf_s(buf, "Chat: SendChatMessageOnMainThread "
+                       "(main thread id=%lu)",
+                  (unsigned long)GetCurrentThreadId());
+        LogToFile(buf);
+    }
 
     if (!g_meetingService) {
         LogToFile("Chat: send_chat_message — no meeting service");
-        reply(false, "Not in a meeting");
+        ReplyChatSendResult(false, "Not in a meeting");
         return;
     }
     if (g_meetingService->GetMeetingStatus() !=
         ZOOM_SDK_NAMESPACE::MEETING_STATUS_INMEETING) {
         LogToFile("Chat: send_chat_message — not in meeting");
-        reply(false, "Not in a meeting");
+        ReplyChatSendResult(false, "Not in a meeting");
         return;
     }
 
@@ -1584,14 +1642,16 @@ void HandleSendChatMessage(const std::string& json) {
         g_meetingService->GetMeetingChatController();
     if (!cc) {
         LogToFile("Chat: send_chat_message — chat controller unavailable");
-        reply(false, "Chat is unavailable in this meeting");
+        ReplyChatSendResult(false, "Chat is unavailable in this meeting");
         return;
     }
 
     // Phase C chat diagnostic: pre-send ChatStatus + myself snapshot.
     // The ChatStatus snapshot tells us whether the SDK thinks we have
     // permission to send to all at this moment. The myself snapshot
-    // tells us what session-role the SDK believes we have.
+    // tells us what session-role the SDK believes we have. Both
+    // retained for this build to confirm the main-thread fix lands
+    // cleanly; will be stripped in a follow-up cleanup commit.
     {
         char buf[160];
         sprintf_s(buf,
@@ -1632,7 +1692,7 @@ void HandleSendChatMessage(const std::string& json) {
         cc->GetChatMessageBuilder();
     if (!builder) {
         LogToFile("Chat: send_chat_message — chat builder unavailable");
-        reply(false, "Chat is unavailable in this meeting");
+        ReplyChatSendResult(false, "Chat is unavailable in this meeting");
         return;
     }
     {
@@ -1646,8 +1706,10 @@ void HandleSendChatMessage(const std::string& json) {
     LogToFile("Chat DIAG send step 2: after SetContent");
     // Required for To_All — per Zoom SDK docs and dev forum, the message
     // is sent to all participants only when receiver is explicitly set
-    // to 0. Without this, FDC-sent messages appear locally (FDC + the
-    // Feeds user's own Zoom client) but never reach other participants.
+    // to 0. The thread-bug fix in this commit was the actual cause of
+    // FDC messages not propagating, but SetReceiver(0) is still
+    // necessary per spec and removing it now would be an untested
+    // change.
     builder->SetReceiver(0);
     LogToFile("Chat DIAG send step 3: after SetReceiver(0)");
     builder->SetMessageType(ZOOM_SDK_NAMESPACE::SDKChatMessageType_To_All);
@@ -1655,12 +1717,9 @@ void HandleSendChatMessage(const std::string& json) {
     ZOOM_SDK_NAMESPACE::IChatMsgInfo* msg = builder->Build();
     if (!msg) {
         LogToFile("Chat: send_chat_message — Build returned null");
-        reply(false, "Failed to build chat message");
+        ReplyChatSendResult(false, "Failed to build chat message");
         return;
     }
-    // Step 5: introspect the built message. If IsChatToAll=0 or
-    // chatMessageType != SDKChatMessageType_To_All, the builder isn't
-    // applying our settings — smoking gun.
     {
         char buf[384];
         sprintf_s(buf,
@@ -1677,9 +1736,6 @@ void HandleSendChatMessage(const std::string& json) {
         LogToFile(buf);
     }
 
-    // Step 6/7: capture send time + result. g_chatSendStartMs is read
-    // by onChatMsgNotification to annotate the matching echo with the
-    // round-trip delay.
     g_chatSendStartMs = GetTickCount64();
     {
         char buf[128];
@@ -1700,12 +1756,12 @@ void HandleSendChatMessage(const std::string& json) {
     if (err != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
         char errBuf[96];
         sprintf_s(errBuf, "Failed to send (SDK error %d)", (int)err);
-        reply(false, errBuf);
+        ReplyChatSendResult(false, errBuf);
         return;
     }
 
     LogToFile("Chat: send_chat_message sent successfully");
-    reply(true, "");
+    ReplyChatSendResult(true, "");
 }
 
 // ---------------------------------------------------------------------------

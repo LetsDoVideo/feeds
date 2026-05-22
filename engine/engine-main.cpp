@@ -12,7 +12,12 @@
 #include <atomic>
 
 #include "feeds-version.h"
+#include "engine-shared.h"
 
+// Defined here, declared extern in engine-shared.h so engine-meeting.cpp
+// can post WM_FEEDS_SEND_CHAT to it from the pipe thread. Set inside
+// WinMain right after CreateWindowExW succeeds.
+HWND g_anchorWnd = nullptr;
 
 static const wchar_t* P2E_PIPE_NAME = L"\\\\.\\pipe\\FeedsEngine_P2E";
 static const wchar_t* E2P_PIPE_NAME = L"\\\\.\\pipe\\FeedsEngine_E2P";
@@ -258,8 +263,21 @@ static void HandleShutdown(const std::string& json)
 // ---------------------------------------------------------------------------
 
 static std::atomic<bool> g_engineShuttingDown{false};
-// Dummy window proc for the message-only window
+// Window proc for the anchor window. Mostly a passthrough, but handles
+// WM_FEEDS_SEND_CHAT — our cross-thread marshalling vehicle for SDK
+// chat sends, which must run on the main thread (this thread). See
+// engine-shared.h for the protocol.
 static LRESULT CALLBACK EngineWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_FEEDS_SEND_CHAT) {
+        // lp is a heap-allocated std::string* the pipe handler created.
+        // Take ownership and free unconditionally.
+        std::string* content = reinterpret_cast<std::string*>(lp);
+        if (content) {
+            feeds_engine::SendChatMessageOnMainThread(*content);
+            delete content;
+        }
+        return 0;
+    }
     return DefWindowProc(hwnd, msg, wp, lp);
 }
 
@@ -295,6 +313,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     }
     // Note: intentionally do NOT call ShowWindow. The window stays hidden.
     LogToFile("Created anchor window");
+    // Publish the anchor handle so engine-meeting.cpp's chat send path
+    // can post WM_FEEDS_SEND_CHAT to it from the pipe-reader thread.
+    g_anchorWnd = hwnd;
+    {
+        char buf[96];
+        sprintf_s(buf, "Engine: main thread id = %lu",
+                  (unsigned long)GetCurrentThreadId());
+        LogToFile(buf);
+    }
 
     if (!ConnectToPipes()) {
         LogToFile("Could not connect to pipes, exiting");
