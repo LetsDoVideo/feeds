@@ -11,7 +11,6 @@
 #include <wincred.h>
 #include <string>
 #include <sstream>
-#include <cstdint>
 #include <cstdio>
 
 #include "zoom_sdk.h"
@@ -417,41 +416,6 @@ public:
 };
 static ZoomParticipantsListener g_participantsListener;
 
-// Phase C chat diagnostic — timestamp of the most recent SendChatMsgTo
-// call, used by the receive-side log to compute echo-delay (time from
-// our SendChatMsgTo to the matching onChatMsgNotification echo).
-// Cleared on echo so only the matching echo gets the annotation.
-static uint64_t g_chatSendStartMs = 0;
-
-// Phase C chat diagnostic — dump a ChatStatus to the log. Used at
-// meeting-join time and right before each send so we can correlate
-// send-success against the SDK's view of our chat permissions.
-static void LogChatStatusSnapshot(
-    const ZOOM_SDK_NAMESPACE::ChatStatus* s, const char* label) {
-    if (!s) {
-        char buf[160];
-        sprintf_s(buf, "Chat DIAG ChatStatus snapshot [%s]: NULL", label);
-        LogToFile(buf);
-        return;
-    }
-    char buf[768];
-    sprintf_s(buf,
-        "Chat DIAG ChatStatus snapshot [%s]: "
-        "is_chat_off=%d is_webinar_meeting=%d is_webinar_attendee=%d "
-        "normal.can_chat=%d normal.can_chat_to_all=%d "
-        "normal.can_chat_to_individual=%d "
-        "normal.is_only_can_chat_to_host=%d",
-        label,
-        s->is_chat_off ? 1 : 0,
-        s->is_webinar_meeting ? 1 : 0,
-        s->is_webinar_attendee ? 1 : 0,
-        s->ut.normal_meeting_status.can_chat ? 1 : 0,
-        s->ut.normal_meeting_status.can_chat_to_all ? 1 : 0,
-        s->ut.normal_meeting_status.can_chat_to_individual ? 1 : 0,
-        s->ut.normal_meeting_status.is_only_can_chat_to_host ? 1 : 0);
-    LogToFile(buf);
-}
-
 // ---------------------------------------------------------------------------
 // Chat listener — receives messages from the SDK's chat controller and
 // forwards public ("to everyone") messages to the plugin via the
@@ -469,48 +433,6 @@ public:
         if (!chatMsg) {
             LogToFile("Chat: onChatMsgNotification with null chatMsg");
             return;
-        }
-
-        // Phase C chat diagnostic: dump every queryable field BEFORE
-        // the privacy filter so we capture metadata for messages we'd
-        // otherwise drop. No content is logged — the privacy guarantee
-        // (engine logs cannot leak non-public message bodies) holds.
-        {
-            const zchar_t* msgIdRaw    = chatMsg->GetMessageID();
-            const zchar_t* senderRaw   = chatMsg->GetSenderDisplayName();
-            const zchar_t* receiverRaw = chatMsg->GetReceiverDisplayName();
-            const zchar_t* threadRaw   = chatMsg->GetThreadID();
-            std::string msgIdS    = msgIdRaw    ? WideToUtf8(msgIdRaw)    : "<null>";
-            std::string senderS   = senderRaw   ? WideToUtf8(senderRaw)   : "<null>";
-            std::string receiverS = receiverRaw ? WideToUtf8(receiverRaw) : "<null>";
-            std::string threadS   = threadRaw   ? WideToUtf8(threadRaw)   : "<null>";
-            uint64_t echoDelayMs = 0;
-            if (g_chatSendStartMs != 0) {
-                echoDelayMs = GetTickCount64() - g_chatSendStartMs;
-                g_chatSendStartMs = 0;  // only the matching echo gets the annotation
-            }
-            char buf[1024];
-            sprintf_s(buf,
-                "Chat DIAG receive: msgId='%s' senderId=%u senderName='%s' "
-                "isChatToAll=%d isChatToAllPanelist=%d isChatToWaitingroom=%d "
-                "chatMessageType=%d receiverUserId=%u receiverName='%s' "
-                "isComment=%d isThread=%d threadId='%s' timestamp=%lld "
-                "echoDelayMs=%llu",
-                msgIdS.c_str(),
-                chatMsg->GetSenderUserId(),
-                senderS.c_str(),
-                chatMsg->IsChatToAll() ? 1 : 0,
-                chatMsg->IsChatToAllPanelist() ? 1 : 0,
-                chatMsg->IsChatToWaitingroom() ? 1 : 0,
-                (int)chatMsg->GetChatMessageType(),
-                chatMsg->GetReceiverUserId(),
-                receiverS.c_str(),
-                chatMsg->IsComment() ? 1 : 0,
-                chatMsg->IsThread() ? 1 : 0,
-                threadS.c_str(),
-                (long long)chatMsg->GetTimeStamp(),
-                (unsigned long long)echoDelayMs);
-            LogToFile(buf);
         }
 
         if (!chatMsg->IsChatToAll()) {
@@ -568,9 +490,8 @@ public:
     }
 
     virtual void onChatStatusChangedNotification(
-        ZOOM_SDK_NAMESPACE::ChatStatus* status) override {
-        // Phase C chat diagnostic: full status dump (was just "fired").
-        LogChatStatusSnapshot(status, "onChatStatusChangedNotification");
+        ZOOM_SDK_NAMESPACE::ChatStatus*) override {
+        LogToFile("Chat: onChatStatusChangedNotification fired");
     }
 
     virtual void onChatMsgDeleteNotification(
@@ -592,27 +513,13 @@ public:
         LogToFile(buf);
     }
 
-    virtual void onShareMeetingChatStatusChanged(bool isStart) override {
-        char buf[128];
-        sprintf_s(buf, "Chat DIAG: onShareMeetingChatStatusChanged isStart=%d",
-                  isStart ? 1 : 0);
-        LogToFile(buf);
-    }
-
+    virtual void onShareMeetingChatStatusChanged(bool) override {}
     virtual void onFileSendStart(
-        ZOOM_SDK_NAMESPACE::ISDKFileSender*) override {
-        LogToFile("Chat DIAG: onFileSendStart fired");
-    }
-
+        ZOOM_SDK_NAMESPACE::ISDKFileSender*) override {}
     virtual void onFileReceived(
-        ZOOM_SDK_NAMESPACE::ISDKFileReceiver*) override {
-        LogToFile("Chat DIAG: onFileReceived fired");
-    }
-
+        ZOOM_SDK_NAMESPACE::ISDKFileReceiver*) override {}
     virtual void onFileTransferProgress(
-        ZOOM_SDK_NAMESPACE::SDKFileTransferInfo*) override {
-        LogToFile("Chat DIAG: onFileTransferProgress fired");
-    }
+        ZOOM_SDK_NAMESPACE::SDKFileTransferInfo*) override {}
 };
 static ZoomChatListener g_chatListener;
 
@@ -955,19 +862,8 @@ public:
             ZOOM_SDK_NAMESPACE::IMeetingChatController* cc =
                 g_meetingService->GetMeetingChatController();
             if (cc) {
-                // Phase C chat diagnostic: capture the SetEvent SDKError
-                // and a baseline ChatStatus snapshot at join-time, for
-                // comparison against the at-send-time snapshot.
-                ZOOM_SDK_NAMESPACE::SDKError chatEvtErr =
-                    cc->SetEvent(&g_chatListener);
-                char buf[128];
-                sprintf_s(buf, "Meeting: chat listener attach result = %d "
-                               "(cc_ptr=%p IsFileTransferEnabled=%d)",
-                          (int)chatEvtErr, (void*)cc,
-                          cc->IsFileTransferEnabled() ? 1 : 0);
-                LogToFile(buf);
-                LogChatStatusSnapshot(cc->GetChatStatus(),
-                                      "post-join baseline");
+                cc->SetEvent(&g_chatListener);
+                LogToFile("Meeting: chat controller listener attached");
             } else {
                 LogToFile("Meeting: chat controller unavailable at join");
             }
@@ -1582,13 +1478,6 @@ static void ReplyChatSendResult(bool success, const std::string& error) {
 // pattern documented on the Zoom dev forum and by Recall.ai.
 void HandleSendChatMessage(const std::string& json) {
     std::string content = JsonExtractStringEscaped(json, "content");
-    {
-        char buf[160];
-        sprintf_s(buf, "Chat: HandleSendChatMessage (pipe thread id=%lu) "
-                       "marshalling to main thread",
-                  (unsigned long)GetCurrentThreadId());
-        LogToFile(buf);
-    }
 
     if (!g_anchorWnd) {
         LogToFile("Chat: send_chat_message — no anchor window to marshal to");
@@ -1618,14 +1507,6 @@ void HandleSendChatMessage(const std::string& json) {
 // Sends the chat_send_result reply directly so the plugin gets a
 // single reply regardless of which thread did the work.
 void SendChatMessageOnMainThread(const std::string& content) {
-    {
-        char buf[128];
-        sprintf_s(buf, "Chat: SendChatMessageOnMainThread "
-                       "(main thread id=%lu)",
-                  (unsigned long)GetCurrentThreadId());
-        LogToFile(buf);
-    }
-
     if (!g_meetingService) {
         LogToFile("Chat: send_chat_message — no meeting service");
         ReplyChatSendResult(false, "Not in a meeting");
@@ -1646,48 +1527,6 @@ void SendChatMessageOnMainThread(const std::string& content) {
         return;
     }
 
-    // Phase C chat diagnostic: pre-send ChatStatus + myself snapshot.
-    // The ChatStatus snapshot tells us whether the SDK thinks we have
-    // permission to send to all at this moment. The myself snapshot
-    // tells us what session-role the SDK believes we have. Both
-    // retained for this build to confirm the main-thread fix lands
-    // cleanly; will be stripped in a follow-up cleanup commit.
-    {
-        char buf[160];
-        sprintf_s(buf,
-            "Chat DIAG pre-send: cc_ptr=%p IsFileTransferEnabled=%d",
-            (void*)cc, cc->IsFileTransferEnabled() ? 1 : 0);
-        LogToFile(buf);
-    }
-    LogChatStatusSnapshot(cc->GetChatStatus(), "pre-send");
-    {
-        ZOOM_SDK_NAMESPACE::IMeetingParticipantsController* pc =
-            g_meetingService->GetMeetingParticipantsController();
-        if (pc) {
-            ZOOM_SDK_NAMESPACE::IUserInfo* me = pc->GetMySelfUser();
-            if (me) {
-                const zchar_t* name = me->GetUserName();
-                std::string nameS = name ? WideToUtf8(name) : "<null>";
-                char buf[512];
-                sprintf_s(buf,
-                    "Chat DIAG pre-send myself: userId=%u name='%s' "
-                    "role=%d isHost=%d isInWaitingRoom=%d isMySelf=%d "
-                    "isPurePhoneUser=%d",
-                    me->GetUserID(), nameS.c_str(),
-                    (int)me->GetUserRole(),
-                    me->IsHost() ? 1 : 0,
-                    me->IsInWaitingRoom() ? 1 : 0,
-                    me->IsMySelf() ? 1 : 0,
-                    me->IsPurePhoneUser() ? 1 : 0);
-                LogToFile(buf);
-            } else {
-                LogToFile("Chat DIAG pre-send: GetMySelfUser returned null");
-            }
-        } else {
-            LogToFile("Chat DIAG pre-send: GetMeetingParticipantsController returned null");
-        }
-    }
-
     ZOOM_SDK_NAMESPACE::IChatMsgInfoBuilder* builder =
         cc->GetChatMessageBuilder();
     if (!builder) {
@@ -1695,65 +1534,29 @@ void SendChatMessageOnMainThread(const std::string& content) {
         ReplyChatSendResult(false, "Chat is unavailable in this meeting");
         return;
     }
-    {
-        char buf[96];
-        sprintf_s(buf, "Chat DIAG send step 1: builder_ptr=%p", (void*)builder);
-        LogToFile(buf);
-    }
 
     std::wstring wContent = Utf8ToWide(content);
     builder->SetContent(wContent.c_str());
-    LogToFile("Chat DIAG send step 2: after SetContent");
     // Required for To_All — per Zoom SDK docs and dev forum, the message
     // is sent to all participants only when receiver is explicitly set
-    // to 0. The thread-bug fix in this commit was the actual cause of
-    // FDC messages not propagating, but SetReceiver(0) is still
-    // necessary per spec and removing it now would be an untested
-    // change.
+    // to 0. The actual cause of v1.2.4's "FDC messages don't propagate"
+    // bug was the threading (this function now runs on the main thread
+    // via WM_FEEDS_SEND_CHAT marshalling), but SetReceiver(0) is still
+    // required per spec.
     builder->SetReceiver(0);
-    LogToFile("Chat DIAG send step 3: after SetReceiver(0)");
     builder->SetMessageType(ZOOM_SDK_NAMESPACE::SDKChatMessageType_To_All);
-    LogToFile("Chat DIAG send step 4: after SetMessageType(To_All)");
     ZOOM_SDK_NAMESPACE::IChatMsgInfo* msg = builder->Build();
     if (!msg) {
         LogToFile("Chat: send_chat_message — Build returned null");
         ReplyChatSendResult(false, "Failed to build chat message");
         return;
     }
-    {
-        char buf[384];
-        sprintf_s(buf,
-            "Chat DIAG send step 5: built msg — msg_ptr=%p "
-            "msgType=%d receiverUserId=%u isChatToAll=%d "
-            "isChatToAllPanelist=%d isComment=%d isThread=%d",
-            (void*)msg,
-            (int)msg->GetChatMessageType(),
-            msg->GetReceiverUserId(),
-            msg->IsChatToAll() ? 1 : 0,
-            msg->IsChatToAllPanelist() ? 1 : 0,
-            msg->IsComment() ? 1 : 0,
-            msg->IsThread() ? 1 : 0);
-        LogToFile(buf);
-    }
 
-    g_chatSendStartMs = GetTickCount64();
-    {
-        char buf[128];
-        sprintf_s(buf, "Chat DIAG send step 6: calling SendChatMsgTo at t=%llu",
-                  (unsigned long long)g_chatSendStartMs);
-        LogToFile(buf);
-    }
     ZOOM_SDK_NAMESPACE::SDKError err = cc->SendChatMsgTo(msg);
-    {
-        uint64_t sendEndMs = GetTickCount64();
-        char buf[160];
-        sprintf_s(buf, "Chat DIAG send step 7: SendChatMsgTo returned err=%d "
-                       "elapsed=%llums",
-                  (int)err,
-                  (unsigned long long)(sendEndMs - g_chatSendStartMs));
-        LogToFile(buf);
-    }
     if (err != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
+        char buf[128];
+        sprintf_s(buf, "Chat: SendChatMsgTo returned %d", (int)err);
+        LogToFile(buf);
         char errBuf[96];
         sprintf_s(errBuf, "Failed to send (SDK error %d)", (int)err);
         ReplyChatSendResult(false, errBuf);
