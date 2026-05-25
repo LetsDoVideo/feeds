@@ -2708,7 +2708,16 @@ static void RegisterEngineHandlers() {
             if (g_logoutAction)  g_logoutAction->setEnabled(false);
             if (g_connectAction) g_connectAction->setEnabled(false);
             RefreshAllSourceProperties();
-            if (g_chatDock) g_chatDock->RefreshPlaceholder();
+            // Clear any stale tier-disabled state from the prior login.
+            // Without this, logging out from a Free account leaves
+            // m_tierDisabled == true and the dock shows the "paid
+            // feature" upgrade prompt instead of the logged-out
+            // placeholder (CurrentPlaceholderText checks tierDisabled
+            // before login state).
+            if (g_chatDock) {
+                g_chatDock->SetTierDisabled(false);
+                g_chatDock->RefreshPlaceholder();
+            }
 
             MessageBoxA(NULL, "You have been logged out of Zoom.",
                         "Feeds - Logout", MB_OK | MB_ICONINFORMATION);
@@ -2740,7 +2749,13 @@ static void RegisterEngineHandlers() {
             if (g_logoutAction)  g_logoutAction->setEnabled(false);
             if (g_connectAction) g_connectAction->setEnabled(false);
             RefreshAllSourceProperties();
-            if (g_chatDock) g_chatDock->RefreshPlaceholder();
+            // Clear stale tier-disabled state — same gap as
+            // logout_complete: a Free-tier session expiry would
+            // otherwise leave the dock stuck on the upgrade prompt.
+            if (g_chatDock) {
+                g_chatDock->SetTierDisabled(false);
+                g_chatDock->RefreshPlaceholder();
+            }
 
             MessageBoxA(NULL,
                 "Your Zoom login has expired and could not be renewed.\n\n"
