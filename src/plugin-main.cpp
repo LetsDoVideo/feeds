@@ -1304,6 +1304,13 @@ public:
     }
 
     void OnMeetingJoined() {
+        // Free tier: the dock stays locked even after a meeting connects.
+        // Leave the upgrade-prompt placeholder in place and keep the input
+        // disabled. Without this guard a Free user gets a working send box
+        // and a "Connected" message on join.
+        if (m_tierDisabled) {
+            return;
+        }
         SetPlaceholder("Connected");
         m_input->setEnabled(true);
         m_sendBtn->setEnabled(true);
