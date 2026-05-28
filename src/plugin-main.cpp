@@ -92,8 +92,7 @@ namespace feeds {
 // ---------------------------------------------------------------------------
 // Globals — menu actions
 // ---------------------------------------------------------------------------
-static QAction* g_loginAction        = nullptr;
-static QAction* g_logoutAction       = nullptr;
+static QAction* g_loginLogoutAction  = nullptr;
 static QAction* g_connectAction      = nullptr;
 static QAction* g_isoRecordingAction = nullptr;
 
@@ -125,6 +124,11 @@ bool g_isLoggedIn                 = false;
 // — they have to discover the menu. Same behaviour as the existing
 // tier check, which also requires g_isLoggedIn.
 bool g_loginAttemptCompleted      = false;
+// Set when an auth round-trip (login or logout) is in flight; cleared at
+// every termination handler. Drives the Login/Logout menu item's
+// "Logging in..." / "Logging out..." disabled states so a double-click
+// during the in-progress window can't double-fire the request.
+static bool g_authInProgress      = false;
 static bool g_isInMeeting         = false;
 static bool g_rawLiveStreamGranted = false;
 static bool g_pendingMeetingJoin   = false;
@@ -196,6 +200,7 @@ static int GetMaxFeedsForTier() {
 void OnLoginClick();
 void OnLogoutClick();
 void OnConnectClick();
+static void UpdateLoginLogoutMenuItem();
 
 // ---------------------------------------------------------------------------
 // Per-source data
@@ -752,7 +757,8 @@ void OnLoginClick() {
                     "Feeds - Login", MB_OK | MB_ICONINFORMATION);
         return;
     }
-    if (g_loginAction) g_loginAction->setEnabled(false);
+    g_authInProgress = true;
+    UpdateLoginLogoutMenuItem();
     feeds::SendToEngine("{\"type\":\"login_start\"}");
 }
 
@@ -762,6 +768,8 @@ void OnLogoutClick() {
                     "Feeds - Logout", MB_OK | MB_ICONINFORMATION);
         return;
     }
+    g_authInProgress = true;
+    UpdateLoginLogoutMenuItem();
     feeds::SendToEngine("{\"type\":\"logout\"}");
 }
 
@@ -1563,15 +1571,31 @@ static void ApplyIsoRecordingStateToAllSources() {
 }
 
 // Sync the menu item's enabled state and label to the current tier. Free /
-// logged-out shows greyed with a "Basic plan required" hint; paid shows
-// enabled with the plain label.
+// logged-out shows greyed with the "paid feature" wording (matches the
+// Chat Dock); paid shows enabled with the plain label.
 static void UpdateIsoMenuItemForTier() {
     if (!g_isoRecordingAction) return;
     bool paid = g_currentTier >= 1;
     g_isoRecordingAction->setEnabled(paid);
     g_isoRecordingAction->setText(paid
-        ? "Record ISO for all participants"
-        : "Record ISO for all participants (Basic plan required)");
+        ? "ISO Recording (All Participants)"
+        : "ISO Recording is a Paid Feature");
+}
+
+// Sync the collapsed Login/Logout item's label and enabled state. Three
+// settled labels follow g_isLoggedIn; while an auth round-trip is in
+// flight (g_authInProgress) the item shows "Logging in..." / "Logging
+// out..." disabled, so a double-click during the in-progress window
+// can't double-fire the request.
+static void UpdateLoginLogoutMenuItem() {
+    if (!g_loginLogoutAction) return;
+    if (g_authInProgress) {
+        g_loginLogoutAction->setText(g_isLoggedIn ? "Logging out..." : "Logging in...");
+        g_loginLogoutAction->setEnabled(false);
+        return;
+    }
+    g_loginLogoutAction->setText(g_isLoggedIn ? "Logout of Zoom" : "Login to Zoom");
+    g_loginLogoutAction->setEnabled(true);
 }
 
 void SetupPluginMenu() {
@@ -1580,16 +1604,14 @@ void SetupPluginMenu() {
     QMenu*       feedsMenu  = new QMenu("Feeds", menuBar);
     menuBar->addMenu(feedsMenu);
 
-    g_loginAction   = feedsMenu->addAction("Login to Zoom");
-    g_logoutAction  = feedsMenu->addAction("Logout of Zoom");
+    g_loginLogoutAction  = feedsMenu->addAction("Login to Zoom");
+    g_connectAction      = feedsMenu->addAction("Connect to Zoom Meeting");
     feedsMenu->addSeparator();
-    g_connectAction = feedsMenu->addAction("Connect to Zoom Meeting");
-    feedsMenu->addSeparator();
-    QAction* aboutAction = feedsMenu->addAction("About / Tier Status");
-    feedsMenu->addSeparator();
-    g_isoRecordingAction = feedsMenu->addAction("Record ISO for all participants");
+    g_isoRecordingAction = feedsMenu->addAction("ISO Recording (All Participants)");
     g_isoRecordingAction->setCheckable(true);
     g_isoRecordingAction->setChecked(g_isoRecordingEnabled);
+    feedsMenu->addSeparator();
+    QAction* aboutAction = feedsMenu->addAction("About / Tier Status");
 
     // Sync menu action states to the current plugin state. If the engine
     // has already finished authenticating (common on startup when a valid
@@ -1597,18 +1619,14 @@ void SetupPluginMenu() {
     // handler fired before this menu existed — its setEnabled() calls
     // silently no-op'd against the then-null action pointers. We re-apply
     // the correct state here now that the actions exist.
-    if (g_isLoggedIn) {
-        g_loginAction->setEnabled(false);
-        g_logoutAction->setEnabled(true);
-        g_connectAction->setEnabled(!g_isInMeeting);
-    } else {
-        g_logoutAction->setEnabled(false);
-        g_connectAction->setEnabled(false);
-    }
+    g_connectAction->setEnabled(g_isLoggedIn && !g_isInMeeting);
+    UpdateLoginLogoutMenuItem();
     UpdateIsoMenuItemForTier();
 
-    QObject::connect(g_loginAction,   &QAction::triggered, []() { OnLoginClick(); });
-    QObject::connect(g_logoutAction,  &QAction::triggered, []() { OnLogoutClick(); });
+    QObject::connect(g_loginLogoutAction, &QAction::triggered, []() {
+        if (g_isLoggedIn) OnLogoutClick();
+        else              OnLoginClick();
+    });
     QObject::connect(g_connectAction, &QAction::triggered, []() { OnConnectClick(); });
     QObject::connect(g_isoRecordingAction, &QAction::toggled, [](bool checked) {
         g_isoRecordingEnabled = checked;
@@ -2719,6 +2737,14 @@ static void RegisterEngineHandlers() {
         // state). Logged as INFO rather than ERROR for the same reason.
         if (error == "no_stored_token") {
             blog(LOG_INFO, "[feeds] login_failed: no_stored_token (expected on first run / after logout)");
+            // Defensive: this branch fires at engine startup before any
+            // user click, so the flag should already be false. Clear it
+            // anyway so a future code path that routes a user-initiated
+            // login through this branch can't wedge the menu.
+            QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
+                g_authInProgress = false;
+                UpdateLoginLogoutMenuItem();
+            });
             return;
         }
 
@@ -2727,7 +2753,8 @@ static void RegisterEngineHandlers() {
             [error]() {
                 std::string msg = "Login failed: " + error;
                 MessageBoxA(NULL, msg.c_str(), "Feeds - Login", MB_OK | MB_ICONERROR);
-                if (g_loginAction) g_loginAction->setEnabled(true);
+                g_authInProgress = false;
+                UpdateLoginLogoutMenuItem();
                 g_pendingMeetingJoin = false;
             });
     });
@@ -2736,8 +2763,8 @@ static void RegisterEngineHandlers() {
         blog(LOG_INFO, "[feeds] sdk_authenticated");
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
             g_isLoggedIn = true;
-            if (g_loginAction)   g_loginAction->setEnabled(false);
-            if (g_logoutAction)  g_logoutAction->setEnabled(true);
+            g_authInProgress = false;
+            UpdateLoginLogoutMenuItem();
             if (g_connectAction) g_connectAction->setEnabled(true);
             RefreshAllSourceProperties();
             if (g_chatDock) g_chatDock->RefreshPlaceholder();
@@ -2755,7 +2782,8 @@ static void RegisterEngineHandlers() {
             MessageBoxA(NULL,
                 "Zoom authentication failed. Please try logging in again.",
                 "Feeds - Auth Failed", MB_OK | MB_ICONERROR);
-            if (g_loginAction) g_loginAction->setEnabled(true);
+            g_authInProgress = false;
+            UpdateLoginLogoutMenuItem();
             g_pendingMeetingJoin = false;
         });
     });
@@ -2788,8 +2816,8 @@ static void RegisterEngineHandlers() {
                 g_cachedParticipants.clear();
             }
 
-            if (g_loginAction)   g_loginAction->setEnabled(true);
-            if (g_logoutAction)  g_logoutAction->setEnabled(false);
+            g_authInProgress = false;
+            UpdateLoginLogoutMenuItem();
             if (g_connectAction) g_connectAction->setEnabled(false);
 
             // Reset the global ISO toggle so the next login starts in a
@@ -2841,8 +2869,8 @@ static void RegisterEngineHandlers() {
                 std::lock_guard<std::mutex> lock(g_participantsMutex);
                 g_cachedParticipants.clear();
             }
-            if (g_loginAction)   g_loginAction->setEnabled(true);
-            if (g_logoutAction)  g_logoutAction->setEnabled(false);
+            g_authInProgress = false;
+            UpdateLoginLogoutMenuItem();
             if (g_connectAction) g_connectAction->setEnabled(false);
 
             // Same reset as logout_complete: clear the global ISO toggle
