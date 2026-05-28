@@ -1996,9 +1996,12 @@ static obs_properties_t* zp_properties(void* data) {
         feeds::SendToEngine("{\"type\":\"get_participants\"}");
 
     obs_properties_t* props = obs_properties_create();
-    std::string verLabel = std::string("Feeds (v") + feeds_shared::VERSION + ")";
-    obs_properties_add_text(props, "ver_label", verLabel.c_str(), OBS_TEXT_INFO);
 
+    // One state-driven slot at the top: a button when not in a meeting, a
+    // dropdown (greyed or live) when in a meeting. RefreshAllSourceProperties()
+    // fires on login_success, meeting_joined, meeting_ended, logout,
+    // participant_list_changed, and every raw_livestream_* transition, so
+    // this re-evaluates without a properties-dialog reopen.
     if (!g_isInMeeting) {
         if (!g_isLoggedIn) {
             obs_properties_add_button(props, "login_btn",
@@ -2016,70 +2019,47 @@ static obs_properties_t* zp_properties(void* data) {
                 });
         }
     } else {
-        // Privilege state takes precedence over the connected-to-meeting
-        // text. PrivilegeStatusText returns empty when Granted so the
-        // normal "Connected to Meeting X" line renders.
-        std::string status_text = PrivilegeStatusText();
-        if (status_text.empty()) {
-            status_text = "Status: Connected";
-            if (g_currentMeetingNumber != 0)
-                status_text = "Status: Connected to Meeting " +
-                              std::to_string(g_currentMeetingNumber);
-        }
-        obs_properties_add_text(props, "status_label", status_text.c_str(),
-                                OBS_TEXT_INFO);
+        obs_property_t* list = obs_properties_add_list(
+            props, "participant_id", "Select Participant",
+            OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
 
-        // Refresh button only makes sense when there's a list to refresh
-        // — skip it during the privilege-pending/denied states.
-        if (g_rawPrivilegeState == RawPrivilegeState::Granted) {
-            obs_properties_add_button(props, "refresh_btn",
-                "Refresh Participant List",
-                [](obs_properties_t*, obs_property_t*, void*) -> bool {
-                    feeds::SendToEngine("{\"type\":\"get_participants\"}");
-                    return true;
-                });
+        if (g_rawPrivilegeState != RawPrivilegeState::Granted) {
+            std::string msg = PrivilegeStatusText();
+            if (msg.empty()) msg = "Waiting for permission";
+            obs_property_list_add_int(list, msg.c_str(), 0);
+            obs_property_set_enabled(list, false);
+        } else {
+            std::lock_guard<std::mutex> lock(g_participantsMutex);
+            size_t selectable = 0;
+            for (const auto& p : g_cachedParticipants) {
+                if (g_cachedMyUserId != 0 && p.id == g_cachedMyUserId) continue;
+                ++selectable;
+            }
+            if (selectable == 0) {
+                obs_property_list_add_int(list, "Waiting for participants...", 0);
+                obs_property_set_enabled(list, false);
+            } else {
+                obs_property_list_add_int(list, "--- Select Participant ---", 0);
+                obs_property_list_add_int(list, "[Active Speaker]", 1);
+                for (const auto& p : g_cachedParticipants) {
+                    if (g_cachedMyUserId != 0 && p.id == g_cachedMyUserId) continue;
+                    obs_property_list_add_int(list, p.name.c_str(), (long long)p.id);
+                }
+            }
         }
     }
 
-    obs_property_t* list = obs_properties_add_list(
-        props, "participant_id", "Select Participant",
-        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-
-    // Mirror the login/join button's state machine: the dropdown is only
-    // enabled when there's actually someone selectable. In every other
-    // state we replace the list with a single contextual placeholder and
-    // grey the control out so users can't open it before login/meeting.
-    // RefreshAllSourceProperties() is already called on login_success,
-    // meeting_joined, meeting_ended, logout, participant_list_changed,
-    // and every raw_livestream_* state transition, so this re-evaluates
-    // live without a properties-dialog reopen.
-    if (!g_isLoggedIn) {
-        obs_property_list_add_int(list, "Login to Zoom first", 0);
-        obs_property_set_enabled(list, false);
-    } else if (!g_isInMeeting) {
-        obs_property_list_add_int(list, "Join a meeting first", 0);
-        obs_property_set_enabled(list, false);
-    } else if (g_rawPrivilegeState != RawPrivilegeState::Granted) {
-        obs_property_list_add_int(list, "Waiting for permission", 0);
-        obs_property_set_enabled(list, false);
-    } else {
-        std::lock_guard<std::mutex> lock(g_participantsMutex);
-        size_t selectable = 0;
-        for (const auto& p : g_cachedParticipants) {
-            if (g_cachedMyUserId != 0 && p.id == g_cachedMyUserId) continue;
-            ++selectable;
-        }
-        if (selectable == 0) {
-            obs_property_list_add_int(list, "Waiting for participants...", 0);
-            obs_property_set_enabled(list, false);
-        } else {
-            obs_property_list_add_int(list, "--- Select Participant ---", 0);
-            obs_property_list_add_int(list, "[Active Speaker]", 1);
-            for (const auto& p : g_cachedParticipants) {
-                if (g_cachedMyUserId != 0 && p.id == g_cachedMyUserId) continue;
-                obs_property_list_add_int(list, p.name.c_str(), (long long)p.id);
-            }
-        }
+    // ISO recording: one checkbox, everything else inherited from OBS's main
+    // recording config. Basic tier and above (>= 1); Free sees it greyed out
+    // with an explanatory line below.
+    obs_property_t* iso = obs_properties_add_bool(
+        props, "feeds_iso_recording_enabled",
+        "Enable ISO recording. Starts with main OBS recording.");
+    if (g_currentTier < 1) {
+        obs_property_set_enabled(iso, false);
+        obs_properties_add_text(props, "iso_tier_info",
+            "ISO recording is a paid feature.",
+            OBS_TEXT_INFO);
     }
 
     // Contextual hints for users who skipped the tutorial video. Plain
@@ -2093,20 +2073,6 @@ static obs_properties_t* zp_properties(void* data) {
         "RETURN VIDEO: Use OBS Virtual Camera to send the show video "
         "back to Zoom.",
         OBS_TEXT_INFO);
-
-    // ISO recording: one checkbox, everything else inherited from OBS's main
-    // recording config. Basic tier and above (>= 1); Free sees it greyed out
-    // with an explanatory line below.
-    obs_property_t* iso = obs_properties_add_bool(
-        props, "feeds_iso_recording_enabled",
-        "Enable ISO recording for this source "
-        "\xE2\x80\x94 starts when OBS recording starts");
-    if (g_currentTier < 1) {
-        obs_property_set_enabled(iso, false);
-        obs_properties_add_text(props, "iso_tier_info",
-            "ISO recording is available on Basic plans and above.",
-            OBS_TEXT_INFO);
-    }
 
     return props;
   } catch (const std::exception& e) {
