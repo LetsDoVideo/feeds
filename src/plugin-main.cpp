@@ -1634,14 +1634,17 @@ void SetupPluginMenu() {
 
     QObject::connect(g_loginLogoutAction, &QAction::triggered, []() {
         if (g_authInProgress && !g_isLoggedIn) {
-            // User clicked "Cancel login". Clear local state and refresh
-            // the menu. No engine message: the engine's in-flight OAuth
-            // state either times out or gets superseded by the next
-            // login attempt, which is harmless. g_pendingMeetingJoin
-            // mirrors what login_failed clears.
+            // User clicked "Cancel login". Tell the engine first so it
+            // can unblock its OAuth pipe-reader thread and discard PKCE
+            // state — without this the engine's reader stays parked on
+            // \\.\pipe\FeedsAuth, the pipe name stays bound, and the
+            // next login_start fails on CreateNamedPipe + a stray
+            // browser callback later surfaces as token_exchange_failed.
+            // Then clear local state.
             blog(LOG_INFO, "[feeds] login cancelled by user");
+            feeds::SendToEngine("{\"type\":\"login_cancel\"}");
             g_authInProgress = false;
-            g_pendingMeetingJoin = false;
+            g_pendingMeetingJoin = false;  // matches what login_failed clears
             UpdateLoginLogoutMenuItem();
             return;
         }

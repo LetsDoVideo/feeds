@@ -208,13 +208,22 @@ static void PipeReaderLoop()
 // Message handlers (stubs for now — will be filled in as phases progress)
 // ---------------------------------------------------------------------------
 
-// Forward declaration — implemented in engine-oauth.cpp
-namespace feeds_engine { bool StartLoginFlow(); }
+// Forward declarations — implemented in engine-oauth.cpp
+namespace feeds_engine {
+    bool StartLoginFlow();
+    void CancelLoginFlow();
+}
 
 static void HandleLoginStart(const std::string& json)
 {
     LogToFile("HandleLoginStart: starting OAuth flow");
     feeds_engine::StartLoginFlow();
+}
+
+static void HandleLoginCancel(const std::string& json)
+{
+    LogToFile("HandleLoginCancel: cancelling in-flight OAuth flow");
+    feeds_engine::CancelLoginFlow();
 }
 // Forward decls — defined in engine-meeting.cpp
 namespace feeds_engine {
@@ -330,6 +339,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
 
     // Register handlers for messages we expect from the plugin
     RegisterHandler("login_start",                    HandleLoginStart);
+    RegisterHandler("login_cancel",                   HandleLoginCancel);
     RegisterHandler("logout",                         feeds_engine::HandleLogout);
     RegisterHandler("join_meeting",                   feeds_engine::HandleJoinMeeting);
     RegisterHandler("create_instant_meeting",         feeds_engine::HandleCreateInstantMeeting);
