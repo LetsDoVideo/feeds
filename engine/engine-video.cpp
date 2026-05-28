@@ -664,22 +664,6 @@ void HandleParticipantSourceSubscribe(const std::string& json) {
 
     auto it = g_subs.find(sourceId);
     if (it != g_subs.end()) {
-        // [asdiag] Existing subscription path. Resubscribe() re-points the
-        // user but does NOT touch m_followActiveSpeaker — so if the request
-        // is asking for a different follow-mode than what the existing sub
-        // was created with, the flag is now stale (candidate 1). Logging
-        // both lets us spot the mismatch in the next test run.
-        {
-            char dmsg[256];
-            sprintf_s(dmsg,
-                "Video: [asdiag] subscribe EXISTING sub='%s' reqUserId=%u "
-                "reqFollow=%s actualUserId=%u existingFollow=%s",
-                sourceId.c_str(), userId,
-                followActiveSpeaker ? "true" : "false",
-                actualUserId,
-                it->second->FollowsActiveSpeaker() ? "true" : "false");
-            LogToFile(dmsg);
-        }
         // Carry the follow-mode flag through. Resubscribe() re-points the
         // user but deliberately leaves m_followActiveSpeaker alone (it's
         // also called from NotifyActiveSpeakerChanged's retarget loop,
@@ -707,18 +691,6 @@ void HandleParticipantSourceSubscribe(const std::string& json) {
             feeds_shared::MAX_FRAME_HEIGHT);
         SendToPlugin(resp);
         return;
-    }
-
-    // [asdiag] New subscription path — log the flag and userId we're about
-    // to construct with so the next test run shows the request shape clearly.
-    {
-        char dmsg[256];
-        sprintf_s(dmsg,
-            "Video: [asdiag] subscribe NEW sub='%s' reqUserId=%u "
-            "follow=%s actualUserId=%u",
-            sourceId.c_str(), userId,
-            followActiveSpeaker ? "true" : "false", actualUserId);
-        LogToFile(dmsg);
     }
 
     // New subscription.
@@ -753,24 +725,6 @@ void HandleParticipantSourceSubscribe(const std::string& json) {
 void NotifyActiveSpeakerChanged(unsigned int newSpeakerId) {
     std::lock_guard<std::mutex> lock(g_subsMutex);
 
-    // [asdiag] Entry trace. Shows how many subscriptions exist and how many
-    // are flagged to follow the active speaker. If followers==0 here while a
-    // source IS set to [Active Speaker], the follow flag isn't being set —
-    // candidate 1 (Resubscribe doesn't carry m_followActiveSpeaker, so a
-    // source switched into Active Speaker mode on an existing renderer keeps
-    // FollowsActiveSpeaker()==false and gets skipped by the loop below).
-    {
-        int followers = 0;
-        for (auto& kv : g_subs)
-            if (kv.second && kv.second->FollowsActiveSpeaker()) followers++;
-        char dmsg[192];
-        sprintf_s(dmsg,
-            "Video: [asdiag] NotifyActiveSpeakerChanged newSpeaker=%u "
-            "g_currentActiveSpeaker=%u subs=%zu followers=%d",
-            newSpeakerId, g_currentActiveSpeaker, g_subs.size(), followers);
-        LogToFile(dmsg);
-    }
-
     if (newSpeakerId == 0) return;
 
     // Filter 1: Never subscribe to the Feeds user themselves. They're
@@ -790,28 +744,6 @@ void NotifyActiveSpeakerChanged(unsigned int newSpeakerId) {
         auto* participantCtrl = ms->GetMeetingParticipantsController();
         if (participantCtrl) {
             auto* userInfo = participantCtrl->GetUserByUserID(newSpeakerId);
-            // [asdiag] Report exactly what the SDK says about the new
-            // speaker's video at the instant the AUDIO event fired. Logging
-            // the lookup result and the raw IsVideoOn() value (not just the
-            // "off" path) lets us distinguish a genuine camera-off speaker
-            // from a timing window where the camera is on but the SDK hasn't
-            // updated state yet — candidate 2. Note: if userInfo is null the
-            // filter does NOT fire and we fall through to retarget.
-            {
-                char dmsg[192];
-                if (!userInfo) {
-                    sprintf_s(dmsg,
-                        "Video: [asdiag] GetUserByUserID(%u) returned null "
-                        "(filter 2 skipped, proceeding to retarget)",
-                        newSpeakerId);
-                } else {
-                    sprintf_s(dmsg,
-                        "Video: [asdiag] speaker userId=%u IsVideoOn=%s",
-                        newSpeakerId,
-                        userInfo->IsVideoOn() ? "true" : "false");
-                }
-                LogToFile(dmsg);
-            }
             if (userInfo && !userInfo->IsVideoOn()) {
                 char msg[128];
                 sprintf_s(msg,
@@ -824,32 +756,11 @@ void NotifyActiveSpeakerChanged(unsigned int newSpeakerId) {
     }
 
     // Speaker passes both filters. Update state and retarget.
-    if (g_currentActiveSpeaker == newSpeakerId) {
-        // [asdiag] Already pointed here — no retarget. If a source is still
-        // black/stuck while this fires, the bug is upstream: g_currentActive-
-        // Speaker is stale relative to the meeting-side g_activeSpeakerUserId
-        // (candidate 3 — state desync caused by an earlier filter-2 return
-        // that updated the meeting variable but not this one).
-        LogToFile(
-            "Video: [asdiag] g_currentActiveSpeaker == newSpeaker, dedup return "
-            "(no retarget)");
-        return;
-    }
+    if (g_currentActiveSpeaker == newSpeakerId) return;
     g_currentActiveSpeaker = newSpeakerId;
 
     int retargeted = 0;
     for (auto& kv : g_subs) {
-        // [asdiag] Per-sub trace so we can see exactly which subscriptions
-        // are eligible to follow and which are skipped.
-        {
-            char dmsg[256];
-            sprintf_s(dmsg,
-                "Video: [asdiag]   sub='%s' follows=%s currentUserId=%u",
-                kv.first.c_str(),
-                kv.second->FollowsActiveSpeaker() ? "true" : "false",
-                kv.second->UserId());
-            LogToFile(dmsg);
-        }
         if (kv.second->FollowsActiveSpeaker()) {
             kv.second->Resubscribe(newSpeakerId);
             retargeted++;
