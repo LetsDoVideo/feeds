@@ -202,6 +202,16 @@ static const char *format_output_id(const char *format)
 	return "ffmpeg_muxer";
 }
 
+// Writable mix target passed to the composite-source summing pass. We can't
+// reuse obs_source_audio for this — its data[] is `const uint8_t *` (it's an
+// input-audio struct), so it can't carry the writable float mix buffers.
+struct composite_mix {
+	float *out[MAX_AUDIO_CHANNELS];  // points into the callback's mix-0 buffers
+	uint64_t timestamp;
+	uint32_t speakers;
+	uint32_t samples_per_sec;
+};
+
 // ---------------------------------------------------------------------------
 // Audio callback (Bug 1). Routes the parent source's audio into the private
 // audio_output. The parent is held directly, so only the no-weak-source
@@ -254,13 +264,12 @@ static bool audio_input_callback(void *param, uint64_t start_ts_in, uint64_t end
 			return true;
 		}
 
-		struct obs_source_audio mixed = {};
+		composite_mix mixed = {};
 		for (size_t i = 0; i < MAX_AUDIO_CHANNELS; i++)
-			mixed.data[i] = reinterpret_cast<uint8_t *>(mixes->data[i]);
+			mixed.out[i] = mixes->data[i];  // float* -> float*, no cast
 		mixed.timestamp = min_ts;
-		mixed.speakers = static_cast<enum speaker_layout>(rec->audio_channels);
+		mixed.speakers = rec->audio_channels;
 		mixed.samples_per_sec = rec->audio_sample_rate;
-		mixed.format = AUDIO_FORMAT_FLOAT_PLANAR;
 
 		obs_source_enum_active_tree(
 			audio_source,
@@ -270,7 +279,7 @@ static bool audio_input_callback(void *param, uint64_t start_ts_in, uint64_t end
 				const uint64_t ts = obs_source_get_audio_timestamp(child);
 				if (!ts)
 					return;
-				auto *m = static_cast<struct obs_source_audio *>(p);
+				auto *m = static_cast<composite_mix *>(p);
 				const size_t pos =
 					static_cast<size_t>(ns_to_audio_frames(m->samples_per_sec, ts - m->timestamp));
 				if (pos > AUDIO_OUTPUT_FRAMES)
@@ -278,8 +287,8 @@ static bool audio_input_callback(void *param, uint64_t start_ts_in, uint64_t end
 				const size_t count = AUDIO_OUTPUT_FRAMES - pos;
 				struct obs_source_audio_mix child_audio;
 				obs_source_get_audio_mix(child, &child_audio);
-				for (size_t ch = 0; ch < static_cast<size_t>(m->speakers); ch++) {
-					float *o = reinterpret_cast<float *>(m->data[ch]) + pos;
+				for (uint32_t ch = 0; ch < m->speakers; ch++) {
+					float *o = m->out[ch] + pos;  // writable float buffer
 					float *in = child_audio.output[0].data[ch];
 					if (!in)
 						continue;
@@ -292,7 +301,7 @@ static bool audio_input_callback(void *param, uint64_t start_ts_in, uint64_t end
 		for (size_t mix_idx = 0; mix_idx < MAX_AUDIO_MIXES; mix_idx++) {
 			if ((mixers & (1 << mix_idx)) == 0)
 				continue;
-			for (size_t ch = 0; ch < static_cast<size_t>(mixed.speakers); ch++) {
+			for (uint32_t ch = 0; ch < mixed.speakers; ch++) {
 				float *d = mixes[mix_idx].data[ch];
 				float *end = &d[AUDIO_OUTPUT_FRAMES];
 				while (d < end) {
@@ -362,7 +371,8 @@ static void ensure_audio_output(feeds_iso_recorder *rec)
 		rec->audio_output = nullptr;
 		return;
 	}
-	rec->audio_channels = audio_output_get_channels(rec->audio_output);
+	// Channel count is tiny (<= MAX_AUDIO_CHANNELS); narrow explicitly.
+	rec->audio_channels = static_cast<uint32_t>(audio_output_get_channels(rec->audio_output));
 	rec->audio_sample_rate = audio_output_get_sample_rate(rec->audio_output);
 }
 
