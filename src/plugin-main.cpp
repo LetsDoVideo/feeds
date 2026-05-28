@@ -1582,16 +1582,25 @@ static void UpdateIsoMenuItemForTier() {
         : "ISO Recording is a Paid Feature");
 }
 
-// Sync the collapsed Login/Logout item's label and enabled state. Three
-// settled labels follow g_isLoggedIn; while an auth round-trip is in
-// flight (g_authInProgress) the item shows "Logging in..." / "Logging
-// out..." disabled, so a double-click during the in-progress window
-// can't double-fire the request.
+// Sync the collapsed Login/Logout item's label and enabled state.
+// Settled labels follow g_isLoggedIn. While an auth round-trip is in
+// flight (g_authInProgress):
+//   - Logout shows "Logging out..." disabled (logout is fast; no cancel
+//     affordance needed; disabled blocks the double-click double-fire).
+//   - Login shows "Cancel login" enabled, so the user can escape the
+//     in-progress state if they close the OAuth browser tab — the
+//     engine never sends a termination message in that case, so without
+//     this the menu would be stuck on "Logging in..." until OBS restart.
 static void UpdateLoginLogoutMenuItem() {
     if (!g_loginLogoutAction) return;
     if (g_authInProgress) {
-        g_loginLogoutAction->setText(g_isLoggedIn ? "Logging out..." : "Logging in...");
-        g_loginLogoutAction->setEnabled(false);
+        if (g_isLoggedIn) {
+            g_loginLogoutAction->setText("Logging out...");
+            g_loginLogoutAction->setEnabled(false);
+        } else {
+            g_loginLogoutAction->setText("Cancel login");
+            g_loginLogoutAction->setEnabled(true);
+        }
         return;
     }
     g_loginLogoutAction->setText(g_isLoggedIn ? "Logout of Zoom" : "Login to Zoom");
@@ -1624,6 +1633,18 @@ void SetupPluginMenu() {
     UpdateIsoMenuItemForTier();
 
     QObject::connect(g_loginLogoutAction, &QAction::triggered, []() {
+        if (g_authInProgress && !g_isLoggedIn) {
+            // User clicked "Cancel login". Clear local state and refresh
+            // the menu. No engine message: the engine's in-flight OAuth
+            // state either times out or gets superseded by the next
+            // login attempt, which is harmless. g_pendingMeetingJoin
+            // mirrors what login_failed clears.
+            blog(LOG_INFO, "[feeds] login cancelled by user");
+            g_authInProgress = false;
+            g_pendingMeetingJoin = false;
+            UpdateLoginLogoutMenuItem();
+            return;
+        }
         if (g_isLoggedIn) OnLogoutClick();
         else              OnLoginClick();
     });
