@@ -32,11 +32,22 @@ bool AuthenticateSDK();  // defined in engine-sdk.cpp
 //   - the OAuth thread (LoginThreadFunc / WaitForAuthCode)
 //   - the IPC pipe-reader thread (StartLoginFlow / CancelLoginFlow)
 //
-// g_loginPipe is published by WaitForAuthCode after CreateNamedPipe so a
-// concurrent cancel can take ownership and CloseHandle it, which unblocks
-// ConnectNamedPipe/ReadFile on the OAuth thread. Whichever side wins the
-// ownership-transfer race (g_loginPipe -> nullptr) is responsible for the
-// CloseHandle — the other side must not double-close.
+// g_loginThreadHandle is a duplicated HANDLE to the OAuth thread, captured
+// before std::thread::detach() releases the original. CancelLoginFlow uses
+// it to call CancelSynchronousIo, which is the only mechanism that actually
+// unblocks the OAuth thread's synchronous ConnectNamedPipe / ReadFile on
+// the FeedsAuth pipe. (CloseHandle on the pipe handle does NOT interrupt a
+// synchronous wait on Windows — the pipe was created without
+// FILE_FLAG_OVERLAPPED. Verified empirically: prior to this, cancel set the
+// flags and closed the pipe but the OAuth thread stayed parked, so the next
+// StartLoginFlow was silently rejected and the user could not log in
+// without restarting OBS.)
+//
+// g_loginPipe is published by WaitForAuthCode after CreateNamedPipe; cancel
+// still closes it as belt-and-suspenders, but CancelSynchronousIo is the
+// operative call. Whichever side wins the ownership-transfer race
+// (g_loginPipe -> nullptr) is responsible for the CloseHandle — the other
+// side must not double-close. Same ownership model for g_loginThreadHandle.
 //
 // g_loginCancelled tells the OAuth thread that its unblock was a user cancel
 // rather than a real auth code, so it exits silently instead of sending
@@ -44,9 +55,10 @@ bool AuthenticateSDK();  // defined in engine-sdk.cpp
 // user-initiated cancel).
 // ---------------------------------------------------------------------------
 static std::mutex g_loginMutex;
-static bool       g_loginInProgress = false;
-static bool       g_loginCancelled  = false;
-static HANDLE     g_loginPipe       = nullptr;
+static bool       g_loginInProgress   = false;
+static bool       g_loginCancelled    = false;
+static HANDLE     g_loginPipe         = nullptr;
+static HANDLE     g_loginThreadHandle = nullptr;
 
 // ---------------------------------------------------------------------------
 // Crypto, encoding, and JSON helpers
@@ -297,16 +309,26 @@ static std::string WaitForAuthCode(bool& outCancelled)
 // RAII clear of in-flight state on thread exit. Guarantees every return path
 // resets the flags so the next StartLoginFlow isn't rejected, even if a
 // future edit adds a new early-return.
+//
+// Also closes our duplicated thread handle if cancel didn't already take it.
+// The handle has to be closed exactly once — whichever of LoginGuard or
+// CancelLoginFlow nulls g_loginThreadHandle first owns the CloseHandle.
 namespace {
 struct LoginGuard {
     ~LoginGuard() {
-        std::lock_guard<std::mutex> lock(g_loginMutex);
-        g_loginInProgress = false;
-        g_loginCancelled  = false;
-        // g_loginPipe is cleared by WaitForAuthCode in both branches; if
-        // we somehow got here with it still set, the handle is still ours
-        // and we leak it rather than risk a double-close vs. a racing
-        // CancelLoginFlow that may have already started.
+        HANDLE handleToClose = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(g_loginMutex);
+            g_loginInProgress = false;
+            g_loginCancelled  = false;
+            handleToClose       = g_loginThreadHandle;
+            g_loginThreadHandle = nullptr;
+            // g_loginPipe is cleared by WaitForAuthCode in both branches;
+            // if we somehow got here with it still set, the handle is
+            // still ours and we leak it rather than risk a double-close
+            // vs. a racing CancelLoginFlow that may have already started.
+        }
+        if (handleToClose) CloseHandle(handleToClose);
     }
 };
 }
@@ -391,11 +413,37 @@ bool StartLoginFlow()
             LogToFile("OAuth: StartLoginFlow rejected — login already in progress");
             return false;
         }
-        g_loginInProgress = true;
-        g_loginCancelled  = false;
-        g_loginPipe       = nullptr;
+        g_loginInProgress   = true;
+        g_loginCancelled    = false;
+        g_loginPipe         = nullptr;
+        g_loginThreadHandle = nullptr;
     }
+
     std::thread t(LoginThreadFunc);
+
+    // Duplicate the thread handle so CancelLoginFlow can call
+    // CancelSynchronousIo on it after t.detach() releases the original.
+    // THREAD_TERMINATE is the access right MSDN requires for
+    // CancelSynchronousIo. If the duplicate fails the OAuth thread still
+    // runs to completion normally; only cancel is degraded (back to the
+    // pipe-close-only path, which empirically does not interrupt the
+    // synchronous ConnectNamedPipe wait — so cancel becomes effectively
+    // a no-op until the SDK side times out).
+    HANDLE threadDup = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), t.native_handle(),
+                         GetCurrentProcess(), &threadDup,
+                         THREAD_TERMINATE, FALSE, 0)) {
+        char buf[128];
+        sprintf_s(buf, "OAuth: DuplicateHandle for OAuth thread failed: %lu",
+                  GetLastError());
+        LogToFile(buf);
+        threadDup = nullptr;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_loginMutex);
+        g_loginThreadHandle = threadDup;
+    }
+
     t.detach();
     return true;
 }
@@ -403,7 +451,8 @@ bool StartLoginFlow()
 void CancelLoginFlow()
 {
     LogToFile("OAuth: CancelLoginFlow called");
-    HANDLE pipeToClose = nullptr;
+    HANDLE pipeToClose   = nullptr;
+    HANDLE threadToCancel = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_loginMutex);
         if (!g_loginInProgress) {
@@ -415,16 +464,40 @@ void CancelLoginFlow()
             LogToFile("OAuth: cancel ignored — no login in progress");
             return;
         }
-        g_loginCancelled = true;
-        pipeToClose      = g_loginPipe;
-        g_loginPipe      = nullptr;
+        g_loginCancelled    = true;
+        pipeToClose         = g_loginPipe;
+        g_loginPipe         = nullptr;
+        threadToCancel      = g_loginThreadHandle;
+        g_loginThreadHandle = nullptr;  // take ownership; LoginGuard will skip close
     }
-    if (pipeToClose) {
-        // Closing the pipe handle while the OAuth thread is blocked in
-        // ConnectNamedPipe or ReadFile causes those calls to return with
-        // an error. The thread then sees g_loginCancelled and exits via
-        // LoginGuard without sending login_failed.
-        CloseHandle(pipeToClose);
+
+    // Belt: closes the pipe handle. On its own this does NOT unblock a
+    // synchronous ConnectNamedPipe — kept anyway because it does reliably
+    // unblock a synchronous ReadFile (the later phase) on some Windows
+    // versions, and costs nothing if the thread is already past it.
+    if (pipeToClose) CloseHandle(pipeToClose);
+
+    // Suspenders: the operative call. CancelSynchronousIo aborts whatever
+    // synchronous syscall the OAuth thread is currently parked on
+    // (ConnectNamedPipe or ReadFile), which returns ERROR_OPERATION_ABORTED.
+    // WaitForAuthCode's takeover block then sees g_loginCancelled and the
+    // thread exits via LoginGuard without sending login_failed.
+    //
+    // ERROR_NOT_FOUND means the thread isn't currently in a cancellable
+    // synchronous op (e.g. cancel arrived during token exchange, which
+    // uses async WinHTTP and can't be cancelled this way). That's fine —
+    // we accept that a late-stage cancel may complete the login anyway
+    // per the design contract.
+    if (threadToCancel) {
+        if (!CancelSynchronousIo(threadToCancel)) {
+            DWORD err = GetLastError();
+            if (err != ERROR_NOT_FOUND) {
+                char buf[128];
+                sprintf_s(buf, "OAuth: CancelSynchronousIo failed: %lu", err);
+                LogToFile(buf);
+            }
+        }
+        CloseHandle(threadToCancel);
     }
     // PKCE verifier lives on LoginThreadFunc's stack and dies with the
     // thread, so there's nothing additional to drop here. Same for the
