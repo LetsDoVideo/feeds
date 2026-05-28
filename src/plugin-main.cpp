@@ -33,6 +33,7 @@
 #include <QMenuBar>
 #include <QMenu>
 #include <QAction>
+#include <QSignalBlocker>
 #include <QDateTime>
 #include <QInputDialog>
 #include <QLineEdit>
@@ -91,9 +92,16 @@ namespace feeds {
 // ---------------------------------------------------------------------------
 // Globals — menu actions
 // ---------------------------------------------------------------------------
-static QAction* g_loginAction   = nullptr;
-static QAction* g_logoutAction  = nullptr;
-static QAction* g_connectAction = nullptr;
+static QAction* g_loginAction        = nullptr;
+static QAction* g_logoutAction       = nullptr;
+static QAction* g_connectAction      = nullptr;
+static QAction* g_isoRecordingAction = nullptr;
+
+// Global ISO recording toggle. When true (and tier >= 1), every participant
+// source's recorder is enabled — they all start writing when OBS main
+// recording starts. Driven by the Feeds menu item; replaces the old
+// per-source checkbox.
+static bool g_isoRecordingEnabled = false;
 
 // ---------------------------------------------------------------------------
 // Globals — cached state from engine
@@ -1541,6 +1549,31 @@ static void SetupChatDock() {
     blog(LOG_INFO, "[feeds] chat dock registered");
 }
 
+// Push the global ISO-recording state to every active participant source's
+// recorder. The recorder itself also gates internally on tier >= 1, but
+// gating here keeps the menu state and observable behavior consistent.
+// MUST NOT be called while holding g_sourcesMutex (it acquires it here).
+static void ApplyIsoRecordingStateToAllSources() {
+    bool enabled = g_isoRecordingEnabled && g_currentTier >= 1;
+    std::lock_guard<std::mutex> lock(g_sourcesMutex);
+    for (ZpSourceData* s : g_allParticipantSources) {
+        if (s && s->iso)
+            feeds::feeds_iso_recorder_set_enabled(s->iso, enabled);
+    }
+}
+
+// Sync the menu item's enabled state and label to the current tier. Free /
+// logged-out shows greyed with a "Basic plan required" hint; paid shows
+// enabled with the plain label.
+static void UpdateIsoMenuItemForTier() {
+    if (!g_isoRecordingAction) return;
+    bool paid = g_currentTier >= 1;
+    g_isoRecordingAction->setEnabled(paid);
+    g_isoRecordingAction->setText(paid
+        ? "Record ISO for all participants"
+        : "Record ISO for all participants (Basic plan required)");
+}
+
 void SetupPluginMenu() {
     QMainWindow* mainWindow = (QMainWindow*)obs_frontend_get_main_window();
     QMenuBar*    menuBar    = mainWindow->menuBar();
@@ -1553,6 +1586,10 @@ void SetupPluginMenu() {
     g_connectAction = feedsMenu->addAction("Connect to Zoom Meeting");
     feedsMenu->addSeparator();
     QAction* aboutAction = feedsMenu->addAction("About / Tier Status");
+    feedsMenu->addSeparator();
+    g_isoRecordingAction = feedsMenu->addAction("Record ISO for all participants");
+    g_isoRecordingAction->setCheckable(true);
+    g_isoRecordingAction->setChecked(g_isoRecordingEnabled);
 
     // Sync menu action states to the current plugin state. If the engine
     // has already finished authenticating (common on startup when a valid
@@ -1568,10 +1605,15 @@ void SetupPluginMenu() {
         g_logoutAction->setEnabled(false);
         g_connectAction->setEnabled(false);
     }
+    UpdateIsoMenuItemForTier();
 
     QObject::connect(g_loginAction,   &QAction::triggered, []() { OnLoginClick(); });
     QObject::connect(g_logoutAction,  &QAction::triggered, []() { OnLogoutClick(); });
     QObject::connect(g_connectAction, &QAction::triggered, []() { OnConnectClick(); });
+    QObject::connect(g_isoRecordingAction, &QAction::toggled, [](bool checked) {
+        g_isoRecordingEnabled = checked;
+        ApplyIsoRecordingStateToAllSources();
+    });
     QObject::connect(aboutAction, &QAction::triggered, []() {
         std::string tierName;
         switch (g_currentTier) {
@@ -1760,8 +1802,12 @@ static void* zp_create(obs_data_t* settings, obs_source_t* source) {
 
     // Per-source ISO recorder. The name hook reads this source's selected
     // participant; the tier seed gates recording until the user is Basic+.
+    // Seed the enabled state from the global toggle so a source created
+    // while the menu toggle is already on starts in the right state.
     data->iso = feeds::feeds_iso_recorder_create(source, ResolveParticipantName, data);
     feeds::feeds_iso_recorder_set_tier(data->iso, g_currentTier);
+    feeds::feeds_iso_recorder_set_enabled(
+        data->iso, g_isoRecordingEnabled && g_currentTier >= 1);
 
     g_activeParticipantSources++;
     return data;
@@ -1827,12 +1873,10 @@ static void zp_update(void* vdata, obs_data_t* settings) {
     // terminates OBS. Swallow + log so the user sees a log message
     // instead of a crash.
     try {
-        // ISO recording enable toggle. Read before the tier_disabled gate so
-        // the recorder always tracks the checkbox; the recorder itself gates
-        // actual recording on tier >= 1 (a safety net for state persisted
-        // from a higher tier).
-        feeds::feeds_iso_recorder_set_enabled(
-            data->iso, obs_data_get_bool(settings, "feeds_iso_recording_enabled"));
+        // ISO recording enable state is driven by the global Feeds menu
+        // toggle, not per-source settings — applied via
+        // ApplyIsoRecordingStateToAllSources() when the toggle or tier
+        // changes, and seeded in zp_create for newly created sources.
 
         // Defensive: zp_properties replaces the dropdown with an upgrade
         // message for tier-disabled sources, so a normal user flow can't
@@ -2047,19 +2091,6 @@ static obs_properties_t* zp_properties(void* data) {
                 }
             }
         }
-    }
-
-    // ISO recording: one checkbox, everything else inherited from OBS's main
-    // recording config. Basic tier and above (>= 1); Free sees it greyed out
-    // with an explanatory line below.
-    obs_property_t* iso = obs_properties_add_bool(
-        props, "feeds_iso_recording_enabled",
-        "Enable ISO recording. Starts with main OBS recording.");
-    if (g_currentTier < 1) {
-        obs_property_set_enabled(iso, false);
-        obs_properties_add_text(props, "iso_tier_info",
-            "ISO recording is a paid feature.",
-            OBS_TEXT_INFO);
     }
 
     // Contextual hints for users who skipped the tutorial video. Plain
@@ -2637,6 +2668,13 @@ static void ReconcileSourcesToTier() {
         g_chatDock->SetTierDisabled(g_currentTier < 1);
     }
 
+    // ISO recording menu + recorder state follow the tier: an upgrade
+    // re-enables the menu and resumes the user's chosen toggle; a downgrade
+    // greys the menu and stops any active recording (also enforced inside
+    // the recorder via set_tier above, but we mirror it here for clarity).
+    UpdateIsoMenuItemForTier();
+    ApplyIsoRecordingStateToAllSources();
+
     RefreshAllSourceProperties();
 }
 
@@ -2753,6 +2791,18 @@ static void RegisterEngineHandlers() {
             if (g_loginAction)   g_loginAction->setEnabled(true);
             if (g_logoutAction)  g_logoutAction->setEnabled(false);
             if (g_connectAction) g_connectAction->setEnabled(false);
+
+            // Reset the global ISO toggle so the next login starts in a
+            // known state (the menu item also greys out via the tier
+            // update, but we clear the checked state to match).
+            g_isoRecordingEnabled = false;
+            if (g_isoRecordingAction) {
+                QSignalBlocker blocker(g_isoRecordingAction);
+                g_isoRecordingAction->setChecked(false);
+            }
+            UpdateIsoMenuItemForTier();
+            ApplyIsoRecordingStateToAllSources();
+
             RefreshAllSourceProperties();
             // Clear any stale tier-disabled state from the prior login.
             // Without this, logging out from a Free account leaves
@@ -2794,6 +2844,17 @@ static void RegisterEngineHandlers() {
             if (g_loginAction)   g_loginAction->setEnabled(true);
             if (g_logoutAction)  g_logoutAction->setEnabled(false);
             if (g_connectAction) g_connectAction->setEnabled(false);
+
+            // Same reset as logout_complete: clear the global ISO toggle
+            // and refresh the menu so the user starts fresh on next login.
+            g_isoRecordingEnabled = false;
+            if (g_isoRecordingAction) {
+                QSignalBlocker blocker(g_isoRecordingAction);
+                g_isoRecordingAction->setChecked(false);
+            }
+            UpdateIsoMenuItemForTier();
+            ApplyIsoRecordingStateToAllSources();
+
             RefreshAllSourceProperties();
             // Clear stale tier-disabled state — same gap as
             // logout_complete: a Free-tier session expiry would
