@@ -753,8 +753,10 @@ static void CloseSharedMemory(ZpSourceData* data, bool clearTexture = true) {
 // ---------------------------------------------------------------------------
 void OnLoginClick() {
     if (g_isLoggedIn) {
-        MessageBoxA(NULL, "You are already logged in to Zoom.",
-                    "Feeds - Login", MB_OK | MB_ICONINFORMATION);
+        QMessageBox::information(
+            static_cast<QWidget*>(obs_frontend_get_main_window()),
+            QString::fromUtf8("Feeds - Login"),
+            QString::fromUtf8("You are already logged in to Zoom."));
         return;
     }
     g_authInProgress = true;
@@ -764,8 +766,10 @@ void OnLoginClick() {
 
 void OnLogoutClick() {
     if (!g_isLoggedIn) {
-        MessageBoxA(NULL, "You are not currently logged in to Zoom.",
-                    "Feeds - Logout", MB_OK | MB_ICONINFORMATION);
+        QMessageBox::information(
+            static_cast<QWidget*>(obs_frontend_get_main_window()),
+            QString::fromUtf8("Feeds - Logout"),
+            QString::fromUtf8("You are not currently logged in to Zoom."));
         return;
     }
     g_authInProgress = true;
@@ -776,19 +780,23 @@ void OnLogoutClick() {
 void OnConnectClick() {
     if (!g_isLoggedIn) {
         g_pendingMeetingJoin = true;
-        MessageBoxA(NULL,
-            "You need to log in to Zoom first.\n\n"
-            "Please log in and then try Connect to Zoom Meeting again.",
-            "Feeds - Login Required", MB_OK | MB_ICONINFORMATION);
+        QMessageBox::information(
+            static_cast<QWidget*>(obs_frontend_get_main_window()),
+            QString::fromUtf8("Feeds - Login Required"),
+            QString::fromUtf8(
+                "You need to log in to Zoom first.\n\n"
+                "Please log in and then try Connect to Zoom Meeting again."));
         OnLoginClick();
         return;
     }
 
     if (g_isInMeeting) {
-        MessageBoxA(NULL,
-            "You are already connected to a Zoom meeting.\n\n"
-            "Use the Leave button in the Zoom window to disconnect.",
-            "Feeds - Already Connected", MB_OK | MB_ICONINFORMATION);
+        QMessageBox::information(
+            static_cast<QWidget*>(obs_frontend_get_main_window()),
+            QString::fromUtf8("Feeds - Already Connected"),
+            QString::fromUtf8(
+                "You are already connected to a Zoom meeting.\n\n"
+                "Use the Leave button in the Zoom window to disconnect."));
         return;
     }
 
@@ -990,10 +998,12 @@ void OnConnectClick() {
 
     if (choice == 2) {
         if (g_userPMI.empty()) {
-            MessageBoxA(NULL,
-                "Could not retrieve your Personal Meeting Room ID.\n"
-                "Please use Join by Meeting Number instead.",
-                "Feeds", MB_OK | MB_ICONWARNING);
+            QMessageBox::warning(
+                static_cast<QWidget*>(obs_frontend_get_main_window()),
+                QString::fromUtf8("Feeds"),
+                QString::fromUtf8(
+                    "Could not retrieve your Personal Meeting Room ID.\n"
+                    "Please use Join by Meeting Number instead."));
             return;
         }
         input = QString::fromStdString(g_userPMI);
@@ -1668,7 +1678,10 @@ void SetupPluginMenu() {
         if (!g_userDisplayName.empty())
             aboutText += "Logged in as: " + g_userDisplayName + "\n";
         aboutText += "Tier: " + tierName;
-        MessageBoxA(NULL, aboutText.c_str(), "About Feeds", MB_OK);
+        QMessageBox::information(
+            static_cast<QWidget*>(obs_frontend_get_main_window()),
+            QString::fromUtf8("About Feeds"),
+            QString::fromUtf8(aboutText.c_str()));
     });
 }
 
@@ -2776,7 +2789,10 @@ static void RegisterEngineHandlers() {
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
             [error]() {
                 std::string msg = "Login failed: " + error;
-                MessageBoxA(NULL, msg.c_str(), "Feeds - Login", MB_OK | MB_ICONERROR);
+                QMessageBox::critical(
+                    static_cast<QWidget*>(obs_frontend_get_main_window()),
+                    QString::fromUtf8("Feeds - Login"),
+                    QString::fromUtf8(msg.c_str()));
                 g_authInProgress = false;
                 UpdateLoginLogoutMenuItem();
                 g_pendingMeetingJoin = false;
@@ -2803,9 +2819,11 @@ static void RegisterEngineHandlers() {
     feeds::RegisterMessageHandler("sdk_auth_failed", [](const std::string& json) {
         blog(LOG_ERROR, "[feeds] sdk_auth_failed: %s", json.c_str());
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
-            MessageBoxA(NULL,
-                "Zoom authentication failed. Please try logging in again.",
-                "Feeds - Auth Failed", MB_OK | MB_ICONERROR);
+            QMessageBox::critical(
+                static_cast<QWidget*>(obs_frontend_get_main_window()),
+                QString::fromUtf8("Feeds - Auth Failed"),
+                QString::fromUtf8(
+                    "Zoom authentication failed. Please try logging in again."));
             g_authInProgress = false;
             UpdateLoginLogoutMenuItem();
             g_pendingMeetingJoin = false;
@@ -2867,8 +2885,10 @@ static void RegisterEngineHandlers() {
                 g_chatDock->RefreshPlaceholder();
             }
 
-            MessageBoxA(NULL, "You have been logged out of Zoom.",
-                        "Feeds - Logout", MB_OK | MB_ICONINFORMATION);
+            QMessageBox::information(
+                static_cast<QWidget*>(obs_frontend_get_main_window()),
+                QString::fromUtf8("Feeds - Logout"),
+                QString::fromUtf8("You have been logged out of Zoom."));
         });
     });
 
@@ -2916,10 +2936,12 @@ static void RegisterEngineHandlers() {
                 g_chatDock->RefreshPlaceholder();
             }
 
-            MessageBoxA(NULL,
-                "Your Zoom login has expired and could not be renewed.\n\n"
-                "Please log in again.",
-                "Feeds - Session Expired", MB_OK | MB_ICONWARNING);
+            QMessageBox::warning(
+                static_cast<QWidget*>(obs_frontend_get_main_window()),
+                QString::fromUtf8("Feeds - Session Expired"),
+                QString::fromUtf8(
+                    "Your Zoom login has expired and could not be renewed.\n\n"
+                    "Please log in again."));
         });
     });
 
@@ -3029,8 +3051,10 @@ static void RegisterEngineHandlers() {
             [msg]() {
                 if (g_connectAction && g_isLoggedIn)
                     g_connectAction->setEnabled(true);
-                MessageBoxA(NULL, msg.c_str(), "Feeds - Join Failed",
-                            MB_OK | MB_ICONERROR);
+                QMessageBox::critical(
+                    static_cast<QWidget*>(obs_frontend_get_main_window()),
+                    QString::fromUtf8("Feeds - Join Failed"),
+                    QString::fromUtf8(msg.c_str()));
             });
     });
 
