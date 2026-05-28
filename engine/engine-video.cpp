@@ -376,6 +376,15 @@ public:
 
     bool FollowsActiveSpeaker() const { return m_followActiveSpeaker; }
 
+    // Update the follow-mode flag without touching the renderer. Used by
+    // HandleParticipantSourceSubscribe when the plugin switches an existing
+    // source's dropdown into or out of [Active Speaker]. Resubscribe()
+    // deliberately leaves the flag alone — it's also called from the
+    // NotifyActiveSpeakerChanged retarget loop, where the flag must not
+    // change (the source is staying in follow mode, we're just pointing
+    // it at a new user). So the handler, not Resubscribe, owns mode flips.
+    void SetFollowsActiveSpeaker(bool v) { m_followActiveSpeaker = v; }
+
     // Re-point this subscription at a different user without tearing down
     // the renderer or shared memory. Used when the plugin changes the
     // dropdown selection.
@@ -671,6 +680,17 @@ void HandleParticipantSourceSubscribe(const std::string& json) {
                 it->second->FollowsActiveSpeaker() ? "true" : "false");
             LogToFile(dmsg);
         }
+        // Carry the follow-mode flag through. Resubscribe() re-points the
+        // user but deliberately leaves m_followActiveSpeaker alone (it's
+        // also called from NotifyActiveSpeakerChanged's retarget loop,
+        // where the flag must not change). So if the plugin's dropdown
+        // was switched into [Active Speaker] on an existing subscription,
+        // this is where the follow flag flips on; switching to a specific
+        // user flips it off. Without this line the source would stay
+        // pointed at its initial user forever (the retarget loop checks
+        // FollowsActiveSpeaker() and skips subs whose flag is stale).
+        it->second->SetFollowsActiveSpeaker(followActiveSpeaker);
+
         // Existing subscription — just switch the user.
         it->second->Resubscribe(actualUserId);
 
