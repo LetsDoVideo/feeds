@@ -255,6 +255,23 @@ public:
         ZOOM_SDK_NAMESPACE::IList<unsigned int>* plstActiveAudio) override {
         if (!plstActiveAudio || plstActiveAudio->GetCount() == 0) return;
         unsigned int newSpeaker = plstActiveAudio->GetItem(0);
+
+        // [asdiag] Trace the raw active-audio list and the dedup decision.
+        // Same-speaker re-fires get early-returned below, so a speaker who
+        // was suppressed once by engine-video.cpp's filter 2 (video off)
+        // can stay stuck because the meeting variable was updated even
+        // though g_currentActiveSpeaker was not — candidate 3.
+        {
+            int cnt = plstActiveAudio->GetCount();
+            char dmsg[256];
+            sprintf_s(dmsg,
+                "Meeting: [asdiag] onUserActiveAudioChange count=%d item0=%u "
+                "prevActiveSpeaker=%u dedup=%s",
+                cnt, newSpeaker, g_activeSpeakerUserId,
+                (newSpeaker == g_activeSpeakerUserId) ? "WILL_RETURN" : "proceed");
+            LogToFile(dmsg);
+        }
+
         if (newSpeaker == g_activeSpeakerUserId) return;
         g_activeSpeakerUserId = newSpeaker;
 
