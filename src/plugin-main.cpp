@@ -60,6 +60,7 @@
 
 #include "feeds-chat-popup-source.h"
 #include "feeds-chat-overlay-source.h"
+#include "feeds-iso-recorder.h"
 
 // Qt defines `slots` and `signals` as preprocessor macros (expanding to
 // empty or to annotations for the Meta-Object Compiler). Any non-Qt code
@@ -195,6 +196,10 @@ struct ZpSourceData {
     obs_source_t* source          = nullptr;
     std::string   uuid;
     unsigned int  current_user_id = 0;
+    // Per-source ISO recorder (feeds-iso-recorder). Created in zp_create,
+    // torn down in zp_destroy. Records this source to its own MP4 alongside
+    // OBS's main recording when the properties checkbox is enabled.
+    feeds::feeds_iso_recorder* iso = nullptr;
     // In-memory only; recomputed on every login_succeeded by
     // ReconcileSourcesToTier. Not persisted in scene-collection data
     // because the same scene can be tier-legal for one Feeds user and
@@ -1644,6 +1649,32 @@ void ShowTierLimitDialog(const QString& title, const QString& html) {
         });
 }
 
+// Name hook for the ISO recorder — resolves the filename's "<participant
+// name>" once, at record start. Called from the recorder (graphics thread).
+// Fallback chain: selected participant's Zoom name -> OBS source name (the
+// recorder applies the final "Feeds ISO" guard if even that is empty). Never
+// blocks beyond a brief mutex, never throws.
+static std::string ResolveParticipantName(void* userdata) {
+    ZpSourceData* d = static_cast<ZpSourceData*>(userdata);
+    if (!d) return "";
+
+    // current_user_id 0 = no selection, 1 = [Active Speaker] sentinel — both
+    // lack a stable participant name, so fall through to the source name.
+    if (d->current_user_id > 1) {
+        std::lock_guard<std::mutex> lock(g_participantsMutex);
+        for (const auto& p : g_cachedParticipants) {
+            if (p.id == d->current_user_id) {
+                if (!p.name.empty() && p.name != "Unknown")
+                    return p.name;
+                break;
+            }
+        }
+    }
+
+    const char* sn = obs_source_get_name(d->source);
+    return sn ? std::string(sn) : std::string();
+}
+
 static void* zp_create(obs_data_t* settings, obs_source_t* source) {
     (void)settings;
 
@@ -1727,6 +1758,11 @@ static void* zp_create(obs_data_t* settings, obs_source_t* source) {
         g_allParticipantSources.push_back(data);
     }
 
+    // Per-source ISO recorder. The name hook reads this source's selected
+    // participant; the tier seed gates recording until the user is Basic+.
+    data->iso = feeds::feeds_iso_recorder_create(source, ResolveParticipantName, data);
+    feeds::feeds_iso_recorder_set_tier(data->iso, g_currentTier);
+
     g_activeParticipantSources++;
     return data;
   } catch (const std::exception& e) {
@@ -1763,6 +1799,11 @@ static void zp_destroy(void* vdata) {
                 g_allParticipantSources.erase(it);
         }
 
+        // Tear down the ISO recorder while the source is still valid (it
+        // borrows the source pointer). Synchronous, drain-aware, bounded.
+        feeds::feeds_iso_recorder_destroy(data->iso);
+        data->iso = nullptr;
+
         // clearTexture=false: source is being destroyed, don't touch it.
         // CloseSharedMemory takes data->lifecycleMutex internally, so any
         // concurrent handler still inside it serialises here.
@@ -1786,6 +1827,13 @@ static void zp_update(void* vdata, obs_data_t* settings) {
     // terminates OBS. Swallow + log so the user sees a log message
     // instead of a crash.
     try {
+        // ISO recording enable toggle. Read before the tier_disabled gate so
+        // the recorder always tracks the checkbox; the recorder itself gates
+        // actual recording on tier >= 1 (a safety net for state persisted
+        // from a higher tier).
+        feeds::feeds_iso_recorder_set_enabled(
+            data->iso, obs_data_get_bool(settings, "feeds_iso_recording_enabled"));
+
         // Defensive: zp_properties replaces the dropdown with an upgrade
         // message for tier-disabled sources, so a normal user flow can't
         // reach here. Guards against unexpected paths (scripted update,
@@ -1829,6 +1877,20 @@ static void zp_update(void* vdata, obs_data_t* settings) {
         blog(LOG_ERROR, "[feeds] zp_update exception: %s", e.what());
     } catch (...) {
         blog(LOG_ERROR, "[feeds] zp_update unknown exception");
+    }
+}
+
+// Drives the ISO recorder's per-frame state machine (lazy view creation,
+// start/stop, pause). Exception-guarded like the other libobs C callbacks.
+static void zp_video_tick(void* vdata, float seconds) {
+    if (!vdata) return;
+    ZpSourceData* data = static_cast<ZpSourceData*>(vdata);
+    try {
+        feeds::feeds_iso_recorder_tick(data->iso, seconds);
+    } catch (const std::exception& e) {
+        blog(LOG_ERROR, "[feeds] zp_video_tick exception: %s", e.what());
+    } catch (...) {
+        blog(LOG_ERROR, "[feeds] zp_video_tick unknown exception");
     }
 }
 
@@ -2031,6 +2093,20 @@ static obs_properties_t* zp_properties(void* data) {
         "RETURN VIDEO: Use OBS Virtual Camera to send the show video "
         "back to Zoom.",
         OBS_TEXT_INFO);
+
+    // ISO recording: one checkbox, everything else inherited from OBS's main
+    // recording config. Basic tier and above (>= 1); Free sees it greyed out
+    // with an explanatory line below.
+    obs_property_t* iso = obs_properties_add_bool(
+        props, "feeds_iso_recording_enabled",
+        "Enable ISO recording for this source "
+        "\xE2\x80\x94 starts when OBS recording starts");
+    if (g_currentTier < 1) {
+        obs_property_set_enabled(iso, false);
+        obs_properties_add_text(props, "iso_tier_info",
+            "ISO recording is available on Basic plans and above.",
+            OBS_TEXT_INFO);
+    }
 
     return props;
   } catch (const std::exception& e) {
@@ -2558,6 +2634,10 @@ static void ReconcileSourcesToTier() {
             }
             s->tier_disabled   = shouldDisable;
             s->source_position = idx;
+
+            // Forward the new tier to the ISO recorder; it stops any active
+            // recording if the tier drops below Basic.
+            feeds::feeds_iso_recorder_set_tier(s->iso, g_currentTier);
         }
     }
 
@@ -3434,6 +3514,7 @@ bool obs_module_load(void) {
     zoom_participant_info.destroy        = zp_destroy;
     zoom_participant_info.get_properties = zp_properties;
     zoom_participant_info.update         = zp_update;
+    zoom_participant_info.video_tick     = zp_video_tick;
     zoom_participant_info.icon_type      = OBS_ICON_TYPE_CAMERA;
     obs_register_source(&zoom_participant_info);
 
@@ -3449,6 +3530,10 @@ bool obs_module_load(void) {
 
     feeds::RegisterChatPopupSource();
     feeds::RegisterChatOverlaySource();
+
+    // ISO recorder: registers the single frontend-event callback that fans
+    // recording start/stop/pause out to every per-source recorder.
+    feeds::feeds_iso_recorder_module_load();
 
     // Eagerly load the fallback avatar so the popup source renders the
     // Feeds logo on its first frame (rather than the grey null-circle).
@@ -3494,6 +3579,11 @@ void obs_module_unload(void) {
         signal_handler_disconnect(sh, "source_create", OnSourceCreated, nullptr);
     }
     if (g_updateCheckThread.joinable()) g_updateCheckThread.join();
+
+    // Remove the ISO recorder's frontend callback and drain any leftovers
+    // before the engine + Qt teardown below.
+    feeds::feeds_iso_recorder_module_unload();
+
     feeds::StopEngine();
 
     {

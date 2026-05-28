@@ -62,6 +62,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     src/engine-client.cpp
     src/feeds-chat-popup-source.cpp
     src/feeds-chat-overlay-source.cpp
+    src/feeds-iso-recorder.cpp
 )
 
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
