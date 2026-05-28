@@ -273,6 +273,13 @@ static std::string WaitForAuthCode(bool& outCancelled)
     BOOL  connected = ConnectNamedPipe(pipe, nullptr);
     DWORD connectErr = GetLastError();
 
+    {
+        char dbg[160];
+        sprintf_s(dbg, "OAuth: [diag] ConnectNamedPipe returned connected=%d err=%lu",
+                  (int)connected, connectErr);
+        LogToFile(dbg);
+    }
+
     char  buf[512]    = {};
     DWORD bytesRead   = 0;
     if (connected || connectErr == ERROR_PIPE_CONNECTED) {
@@ -430,7 +437,8 @@ bool StartLoginFlow()
     // synchronous ConnectNamedPipe wait — so cancel becomes effectively
     // a no-op until the SDK side times out).
     HANDLE threadDup = nullptr;
-    if (!DuplicateHandle(GetCurrentProcess(), t.native_handle(),
+    HANDLE nativeHandle = t.native_handle();
+    if (!DuplicateHandle(GetCurrentProcess(), nativeHandle,
                          GetCurrentProcess(), &threadDup,
                          THREAD_TERMINATE, FALSE, 0)) {
         char buf[128];
@@ -438,6 +446,12 @@ bool StartLoginFlow()
                   GetLastError());
         LogToFile(buf);
         threadDup = nullptr;
+    }
+    {
+        char dbg[160];
+        sprintf_s(dbg, "OAuth: [diag] native_handle=%p threadDup=%p",
+                  nativeHandle, threadDup);
+        LogToFile(dbg);
     }
     {
         std::lock_guard<std::mutex> lock(g_loginMutex);
@@ -471,11 +485,20 @@ void CancelLoginFlow()
         g_loginThreadHandle = nullptr;  // take ownership; LoginGuard will skip close
     }
 
+    {
+        char dbg[160];
+        sprintf_s(dbg, "OAuth: [diag] cancel: pipeToClose=%p threadToCancel=%p",
+                  pipeToClose, threadToCancel);
+        LogToFile(dbg);
+    }
+
     // Belt: closes the pipe handle. On its own this does NOT unblock a
     // synchronous ConnectNamedPipe — kept anyway because it does reliably
     // unblock a synchronous ReadFile (the later phase) on some Windows
     // versions, and costs nothing if the thread is already past it.
+    LogToFile("OAuth: [diag] cancel: about to CloseHandle(pipe)");
     if (pipeToClose) CloseHandle(pipeToClose);
+    LogToFile("OAuth: [diag] cancel: pipe CloseHandle returned");
 
     // Suspenders: the operative call. CancelSynchronousIo aborts whatever
     // synchronous syscall the OAuth thread is currently parked on
@@ -489,16 +512,24 @@ void CancelLoginFlow()
     // we accept that a late-stage cancel may complete the login anyway
     // per the design contract.
     if (threadToCancel) {
-        if (!CancelSynchronousIo(threadToCancel)) {
-            DWORD err = GetLastError();
-            if (err != ERROR_NOT_FOUND) {
-                char buf[128];
-                sprintf_s(buf, "OAuth: CancelSynchronousIo failed: %lu", err);
-                LogToFile(buf);
-            }
+        BOOL  ok  = CancelSynchronousIo(threadToCancel);
+        DWORD err = GetLastError();
+        {
+            char dbg[160];
+            sprintf_s(dbg, "OAuth: [diag] CancelSynchronousIo=%s lastError=%lu",
+                      ok ? "TRUE" : "FALSE", err);
+            LogToFile(dbg);
         }
+        if (!ok && err != ERROR_NOT_FOUND) {
+            char buf[128];
+            sprintf_s(buf, "OAuth: CancelSynchronousIo failed: %lu", err);
+            LogToFile(buf);
+        }
+        LogToFile("OAuth: [diag] cancel: about to CloseHandle(thread)");
         CloseHandle(threadToCancel);
+        LogToFile("OAuth: [diag] cancel: thread CloseHandle returned");
     }
+    LogToFile("OAuth: [diag] cancel: returning");
     // PKCE verifier lives on LoginThreadFunc's stack and dies with the
     // thread, so there's nothing additional to drop here. Same for the
     // refresh/access tokens (never reach this side on cancel).
