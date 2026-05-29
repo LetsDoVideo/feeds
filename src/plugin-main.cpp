@@ -1699,15 +1699,48 @@ static void ShowAboutDialog() {
 
     QObject::connect(closeBtn, &QPushButton::clicked, &dlg, &QDialog::accept);
     QObject::connect(openLogsBtn, &QPushButton::clicked, []() {
-        // os_get_config_path_ptr resolves the right location for both
-        // standard installs (%APPDATA%\obs-studio\logs) and portable
-        // installs (config\obs-studio\logs next to the OBS executable).
-        char* logsPath = os_get_config_path_ptr("obs-studio/logs");
-        if (logsPath) {
-            QDesktopServices::openUrl(
-                QUrl::fromLocalFile(QString::fromUtf8(logsPath)));
-            bfree(logsPath);
+        // os_get_config_path_ptr always returns the AppData config path and
+        // does NOT honor OBS's portable-mode detection, so portable installs
+        // (where that folder doesn't exist) open nothing. Replicate OBS's own
+        // logic: a portable_mode[.txt] marker file in the OBS root (two dirs
+        // above the executable) means logs live under
+        // <root>\config\obs-studio\logs. Otherwise fall back to AppData.
+        QString logsDir;
+
+        wchar_t exePathW[MAX_PATH] = {};
+        DWORD len = GetModuleFileNameW(nullptr, exePathW, MAX_PATH);
+        if (len > 0 && len < MAX_PATH) {
+            // <root>\bin\64bit\obs64.exe → strip the filename and the two
+            // directory levels to reach <root>.
+            std::wstring p(exePathW, len);
+            bool ok = true;
+            for (int i = 0; i < 3; ++i) {
+                size_t slash = p.find_last_of(L"\\/");
+                if (slash == std::wstring::npos) { ok = false; break; }
+                p.resize(slash);
+            }
+            if (ok && !p.empty()) {
+                QString root = QString::fromStdWString(p);
+                QString marker1 = root + "\\portable_mode";
+                QString marker2 = root + "\\portable_mode.txt";
+                if (os_file_exists(marker1.toUtf8().constData()) ||
+                    os_file_exists(marker2.toUtf8().constData())) {
+                    logsDir = root + "\\config\\obs-studio\\logs";
+                }
+            }
         }
+
+        if (logsDir.isEmpty()) {
+            // Not portable (or detection failed): fall back to AppData.
+            char* logsPath = os_get_config_path_ptr("obs-studio/logs");
+            if (logsPath) {
+                logsDir = QString::fromUtf8(logsPath);
+                bfree(logsPath);
+            }
+        }
+
+        if (!logsDir.isEmpty())
+            QDesktopServices::openUrl(QUrl::fromLocalFile(logsDir));
     });
 
     dlg.exec();
