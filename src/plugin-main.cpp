@@ -1672,7 +1672,7 @@ static void ShowAboutDialog() {
     // clicks through QDesktopServices automatically.
     QLabel* links = new QLabel(
         QString::fromUtf8(
-            "<a href=\"https://marketplace.zoom.us/apps/JlP6KfRqTt6r0t67FcDuqQ\">"
+            "<a href=\"https://marketplace.zoom.us/apps/9ZWYWHNdRCSuI-9pFTuPJw\">"
             "View on Zoom Marketplace</a>"
             "&nbsp;&nbsp;·&nbsp;&nbsp;"
             "<a href=\"https://letsdovideo.com/feeds\">letsdovideo.com/feeds</a>"),
