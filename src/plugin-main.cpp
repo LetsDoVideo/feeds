@@ -52,6 +52,7 @@
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QImage>
+#include <QPixmap>
 #include <QUrl>
 #include <QUrlQuery>
 #include <QVariant>
@@ -1617,6 +1618,122 @@ static void UpdateLoginLogoutMenuItem() {
     g_loginLogoutAction->setEnabled(true);
 }
 
+// Build and exec the About dialog. Stack-allocated; exec() blocks until the
+// user closes it, so the dialog and its child widgets are torn down before
+// we return — no WA_DeleteOnClose dance needed. Parent is the OBS main
+// window so the dialog picks up OBS's stylesheet, stays modal-ish (no system
+// alert sound, unlike QMessageBox), and dies with OBS rather than outliving
+// it.
+static void ShowAboutDialog() {
+    std::string tierName;
+    switch (g_currentTier) {
+        case 1:  tierName = "Basic";       break;
+        case 2:  tierName = "Streamer";    break;
+        case 3:  tierName = "Broadcaster"; break;
+        default: tierName = "Free";        break;
+    }
+
+    QDialog dlg(static_cast<QWidget*>(obs_frontend_get_main_window()));
+    dlg.setWindowTitle(QString::fromUtf8("About Feeds"));
+    dlg.setMinimumWidth(360);
+
+    QVBoxLayout* layout = new QVBoxLayout(&dlg);
+    layout->setSpacing(12);
+
+    // Logo — reuse the same asset the chat dock uses for fallback avatars
+    // (EnsureFallbackAvatarLoaded). bfree the path on every branch; the
+    // pixmap then owns its own pixel data.
+    QLabel* logo = new QLabel(&dlg);
+    char* logoPath = obs_module_file("feeds-logo.png");
+    if (logoPath) {
+        QPixmap pixmap;
+        if (pixmap.load(QString::fromUtf8(logoPath))) {
+            logo->setPixmap(pixmap.scaledToHeight(96, Qt::SmoothTransformation));
+        }
+        bfree(logoPath);
+    }
+    logo->setAlignment(Qt::AlignCenter);
+    layout->addWidget(logo);
+
+    QString infoText = QString::fromUtf8("Feeds v") +
+                       QString::fromUtf8(feeds_shared::VERSION);
+    if (!g_userDisplayName.empty()) {
+        infoText += "\n" + QString::fromUtf8("Logged in as: ") +
+                    QString::fromUtf8(g_userDisplayName.c_str());
+    }
+    infoText += "\n" + QString::fromUtf8("Tier: ") +
+                QString::fromUtf8(tierName.c_str());
+    QLabel* info = new QLabel(infoText, &dlg);
+    info->setAlignment(Qt::AlignCenter);
+    layout->addWidget(info);
+
+    // Link row — rich-text hyperlinks on a single label so they sit on one
+    // line and inherit OBS's link color. setOpenExternalLinks routes the
+    // clicks through QDesktopServices automatically.
+    QLabel* links = new QLabel(
+        QString::fromUtf8(
+            "<a href=\"https://marketplace.zoom.us/apps/JlP6KfRqTt6r0t67FcDuqQ\">"
+            "View on Zoom Marketplace</a>"
+            "&nbsp;&nbsp;·&nbsp;&nbsp;"
+            "<a href=\"https://letsdovideo.com/feeds\">letsdovideo.com/feeds</a>"),
+        &dlg);
+    links->setAlignment(Qt::AlignCenter);
+    links->setTextFormat(Qt::RichText);
+    links->setOpenExternalLinks(true);
+    layout->addWidget(links);
+
+    QHBoxLayout* buttonRow = new QHBoxLayout();
+    QPushButton* copyBtn  = new QPushButton(
+        QString::fromUtf8("Copy diagnostic info"), &dlg);
+    QPushButton* closeBtn = new QPushButton(QString::fromUtf8("Close"), &dlg);
+    closeBtn->setDefault(true);
+    buttonRow->addWidget(copyBtn);
+    buttonRow->addWidget(closeBtn);
+    layout->addLayout(buttonRow);
+
+    QLabel* footer = new QLabel(
+        QString::fromUtf8("Made by Let's Do Video · 2026"), &dlg);
+    footer->setAlignment(Qt::AlignCenter);
+    footer->setStyleSheet("color: #888; font-size: 10px;");
+    layout->addWidget(footer);
+
+    QObject::connect(closeBtn, &QPushButton::clicked, &dlg, &QDialog::accept);
+    QObject::connect(copyBtn, &QPushButton::clicked, [copyBtn, tierName]() {
+        QString diag = QString::fromUtf8("Feeds v") +
+                       QString::fromUtf8(feeds_shared::VERSION) + "\n" +
+                       QString::fromUtf8("Tier: ") +
+                       QString::fromUtf8(tierName.c_str()) + " (" +
+                       QString::number(g_currentTier) + ")\n" +
+                       QString::fromUtf8("Logged in: ");
+        if (!g_userDisplayName.empty()) {
+            diag += QString::fromUtf8(g_userDisplayName.c_str());
+            if (!g_userPMI.empty()) {
+                diag += QString::fromUtf8(" (PMI ") +
+                        QString::fromUtf8(g_userPMI.c_str()) + ")";
+            }
+        } else {
+            diag += QString::fromUtf8("Not logged in");
+        }
+        char* logsPath = os_get_config_path_ptr("obs-studio/logs");
+        if (logsPath) {
+            diag += "\n" + QString::fromUtf8("OBS log folder: ") +
+                    QString::fromUtf8(logsPath);
+            bfree(logsPath);
+        }
+        QApplication::clipboard()->setText(diag);
+        copyBtn->setText(QString::fromUtf8("Copied!"));
+        copyBtn->setEnabled(false);
+        // Context object is copyBtn so the timer auto-cancels if the user
+        // closes the dialog before the revert fires.
+        QTimer::singleShot(1500, copyBtn, [copyBtn]() {
+            copyBtn->setText(QString::fromUtf8("Copy diagnostic info"));
+            copyBtn->setEnabled(true);
+        });
+    });
+
+    dlg.exec();
+}
+
 void SetupPluginMenu() {
     QMainWindow* mainWindow = (QMainWindow*)obs_frontend_get_main_window();
     QMenuBar*    menuBar    = mainWindow->menuBar();
@@ -1667,21 +1784,7 @@ void SetupPluginMenu() {
         ApplyIsoRecordingStateToAllSources();
     });
     QObject::connect(aboutAction, &QAction::triggered, []() {
-        std::string tierName;
-        switch (g_currentTier) {
-            case 1:  tierName = "Basic";       break;
-            case 2:  tierName = "Streamer";    break;
-            case 3:  tierName = "Broadcaster"; break;
-            default: tierName = "Free";        break;
-        }
-        std::string aboutText = std::string("Feeds v") + feeds_shared::VERSION + "\n";
-        if (!g_userDisplayName.empty())
-            aboutText += "Logged in as: " + g_userDisplayName + "\n";
-        aboutText += "Tier: " + tierName;
-        QMessageBox::information(
-            static_cast<QWidget*>(obs_frontend_get_main_window()),
-            QString::fromUtf8("About Feeds"),
-            QString::fromUtf8(aboutText.c_str()));
+        ShowAboutDialog();
     });
 }
 
