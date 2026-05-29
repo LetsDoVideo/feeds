@@ -3,14 +3,15 @@
 // C:\Dev\iso-recording-investigation.md for the full design rationale.
 //
 // This adopts Exeldro's Source Record patterns (C:\Dev\obs-source-record\
-// source-record.c) — obs_view + audio_output + obs_output — used DIRECTLY
-// inside the participant source rather than as an OBS filter, with the six
-// known Source Record bugs fixed:
+// source-record.c) — a private obs_view for video and an obs_output muxer,
+// with audio taken from OBS's program mix (obs_get_audio(), per Source
+// Record's program-audio path) — used DIRECTLY inside the participant source
+// rather than as an OBS filter, with the six known Source Record bugs fixed:
 //
-//   Bug 1: use-after-release in the audio callback. We always route the
-//          parent source (held directly), never a weak source, so the
-//          buggy branch is unreachable — but the callback is written with
-//          the correct two-branch ownership so re-adding it can't regress.
+//   Bug 1: use-after-release in Source Record's audio callback. Not
+//          applicable to Feeds: the audio encoder binds directly to OBS's
+//          program mix (obs_get_audio()), so there is no per-source audio
+//          callback here and the buggy code path doesn't exist.
 //   Bug 2: unprotected global filter DARRAY. Our recorder registry is
 //          mutex-protected.
 //   Bug 3: encoder release racing the output release. Our teardown runs the
@@ -27,18 +28,17 @@
 //
 // Threading: source lifecycle + frontend events arrive on the OBS UI thread;
 // tick runs on the graphics thread. Both mutate the recorder, so the state
-// machine is guarded by feeds_iso_recorder::lock. The audio callback runs on
-// libobs's dedicated audio thread and deliberately takes no lock — it only
-// reads the stable parent pointer, the atomic `closing` flag, and audio
-// constants cached at open time. The output's "stop" signal fires on an
-// internal OBS thread and only sets an atomic flag + notifies a CV; the actual
-// release happens on a core thread (tick, or destroy after a bounded wait).
+// machine is guarded by feeds_iso_recorder::lock. Audio needs no per-source
+// callback and no lock: the audio encoder is bound directly to OBS's program
+// mix (obs_get_audio()), so libobs's own audio plumbing routes the samples
+// into the recording. The output's "stop" signal fires on an internal OBS
+// thread and only sets an atomic flag + notifies a CV; the actual release
+// happens on a core thread (tick, or destroy after a bounded wait).
 
 #include "feeds-iso-recorder.h"
 
 #include <obs-module.h>
 #include <obs-frontend-api.h>
-#include <media-io/audio-io.h>
 #include <util/config-file.h>
 #include <util/platform.h>
 
@@ -63,8 +63,8 @@ constexpr int TEARDOWN_TIMEOUT_MS = 5000;
 // Ultimate filename fallback when no usable name is available.
 constexpr const char *NAME_FALLBACK = "Feeds ISO";
 
-// Default audio bitrate (kbps) for the AAC track. Phase 1 records a silent
-// track, so the exact value is immaterial.
+// Audio bitrate (kbps) for the AAC track. The track carries OBS's full program
+// mix (Phase 1.1), so this is a real, audible bitrate.
 constexpr int AUDIO_BITRATE_KBPS = 160;
 
 }  // namespace
@@ -89,12 +89,6 @@ struct feeds_iso_recorder {
 	video_t *video_output = nullptr;
 	uint32_t width = 0;
 	uint32_t height = 0;
-
-	// Private audio output. Persists across recordings; closed at destroy.
-	// Phase 1: the parent source emits no audio, so this yields silence.
-	audio_t *audio_output = nullptr;
-	uint32_t audio_channels = 0;     // cached at open; read by the audio thread
-	uint32_t audio_sample_rate = 0;  // cached at open; read by the audio thread
 
 	// Per-recording output + encoders, created at start. On stop the output
 	// is told to drain gracefully (Bug 4) and released — by the next tick once
@@ -200,180 +194,6 @@ static const char *format_output_id(const char *format)
 	if (format && strcmp(format, "hybrid_mov") == 0)
 		return "mov_output";
 	return "ffmpeg_muxer";
-}
-
-// Writable mix target passed to the composite-source summing pass. We can't
-// reuse obs_source_audio for this — its data[] is `const uint8_t *` (it's an
-// input-audio struct), so it can't carry the writable float mix buffers.
-struct composite_mix {
-	float *out[MAX_AUDIO_CHANNELS];  // points into the callback's mix-0 buffers
-	uint64_t timestamp;
-	uint32_t speakers;
-	uint32_t samples_per_sec;
-};
-
-// ---------------------------------------------------------------------------
-// Audio callback (Bug 1). Routes the parent source's audio into the private
-// audio_output. The parent is held directly, so only the no-weak-source
-// branch below is reachable; the weak-source branch is written with the
-// correct "release at the end" ownership purely so re-adding Different Audio
-// later can't reintroduce the use-after-release. Runs on the audio thread:
-// no recorder lock, only stable/atomic reads.
-// ---------------------------------------------------------------------------
-static bool audio_input_callback(void *param, uint64_t start_ts_in, uint64_t end_ts_in, uint64_t *out_ts,
-				 uint32_t mixers, struct audio_output_data *mixes)
-{
-	UNUSED_PARAMETER(end_ts_in);
-	auto *rec = static_cast<feeds_iso_recorder *>(param);
-
-	if (rec->closing.load() || obs_source_removed(rec->parent)) {
-		*out_ts = start_ts_in;
-		return true;
-	}
-
-	// Direct-parent branch: no ref was taken, so we must NOT release. (A
-	// hypothetical weak-source branch would take a strong ref here and
-	// release it at the END of the function — see Bug 1 in the header.)
-	obs_source_t *audio_source = rec->parent;
-	if (!audio_source || obs_source_removed(audio_source)) {
-		*out_ts = start_ts_in;
-		return true;
-	}
-
-	const uint32_t flags = obs_source_get_output_flags(audio_source);
-
-	// Composite source: sum its active audio tree. (Feeds sources aren't
-	// composite today, but a scene/group parent could be in the future.)
-	if ((flags & OBS_SOURCE_COMPOSITE) != 0) {
-		uint64_t min_ts = 0;
-		obs_source_enum_active_tree(
-			audio_source,
-			[](obs_source_t *, obs_source_t *child, void *p) {
-				if (!child || obs_source_audio_pending(child))
-					return;
-				const uint64_t ts = obs_source_get_audio_timestamp(child);
-				if (!ts)
-					return;
-				uint64_t *m = static_cast<uint64_t *>(p);
-				if (!*m || ts < *m)
-					*m = ts;
-			},
-			&min_ts);
-		if (!min_ts) {
-			*out_ts = start_ts_in;
-			return true;
-		}
-
-		composite_mix mixed = {};
-		for (size_t i = 0; i < MAX_AUDIO_CHANNELS; i++)
-			mixed.out[i] = mixes->data[i];  // float* -> float*, no cast
-		mixed.timestamp = min_ts;
-		mixed.speakers = rec->audio_channels;
-		mixed.samples_per_sec = rec->audio_sample_rate;
-
-		obs_source_enum_active_tree(
-			audio_source,
-			[](obs_source_t *, obs_source_t *child, void *p) {
-				if (!child || obs_source_audio_pending(child))
-					return;
-				const uint64_t ts = obs_source_get_audio_timestamp(child);
-				if (!ts)
-					return;
-				auto *m = static_cast<composite_mix *>(p);
-				const size_t pos =
-					static_cast<size_t>(ns_to_audio_frames(m->samples_per_sec, ts - m->timestamp));
-				if (pos > AUDIO_OUTPUT_FRAMES)
-					return;
-				const size_t count = AUDIO_OUTPUT_FRAMES - pos;
-				struct obs_source_audio_mix child_audio;
-				obs_source_get_audio_mix(child, &child_audio);
-				for (uint32_t ch = 0; ch < m->speakers; ch++) {
-					float *o = m->out[ch] + pos;  // writable float buffer
-					float *in = child_audio.output[0].data[ch];
-					if (!in)
-						continue;
-					for (size_t i = 0; i < count; i++)
-						o[i] += in[i];
-				}
-			},
-			&mixed);
-
-		for (size_t mix_idx = 0; mix_idx < MAX_AUDIO_MIXES; mix_idx++) {
-			if ((mixers & (1 << mix_idx)) == 0)
-				continue;
-			for (uint32_t ch = 0; ch < mixed.speakers; ch++) {
-				float *d = mixes[mix_idx].data[ch];
-				float *end = &d[AUDIO_OUTPUT_FRAMES];
-				while (d < end) {
-					float v = *d;
-					v = v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v);
-					*(d++) = v;
-				}
-			}
-		}
-		*out_ts = min_ts;
-		return true;
-	}
-
-	// Plain source with no audio (the Phase 1 case for Feeds participant
-	// sources): produce no samples -> silent track.
-	if ((flags & OBS_SOURCE_AUDIO) == 0) {
-		*out_ts = start_ts_in;
-		return true;
-	}
-
-	const uint64_t source_ts = obs_source_get_audio_timestamp(audio_source);
-	if (!source_ts) {
-		*out_ts = start_ts_in;
-		return true;
-	}
-	if (obs_source_audio_pending(audio_source))
-		return false;
-
-	struct obs_source_audio_mix audio;
-	obs_source_get_audio_mix(audio_source, &audio);
-	const size_t channels = rec->audio_channels;
-	for (size_t mix_idx = 0; mix_idx < MAX_AUDIO_MIXES; mix_idx++) {
-		if ((mixers & (1 << mix_idx)) == 0)
-			continue;
-		for (size_t ch = 0; ch < channels; ch++) {
-			float *o = mixes[mix_idx].data[ch];
-			float *in = audio.output[0].data[ch];
-			if (!in)
-				continue;
-			for (size_t i = 0; i < AUDIO_OUTPUT_FRAMES; i++) {
-				o[i] += in[i];
-				if (o[i] > 1.0f)
-					o[i] = 1.0f;
-				if (o[i] < -1.0f)
-					o[i] = -1.0f;
-			}
-		}
-	}
-	*out_ts = source_ts;
-	return true;
-}
-
-// Open the persistent private audio_output if not already open. Caller holds
-// rec->lock. Caches channels/sample-rate for the audio thread.
-static void ensure_audio_output(feeds_iso_recorder *rec)
-{
-	if (rec->audio_output)
-		return;
-	struct audio_output_info oi = {};
-	oi.name = "feeds_iso_audio";
-	oi.speakers = SPEAKERS_STEREO;
-	oi.samples_per_sec = audio_output_get_sample_rate(obs_get_audio());
-	oi.format = AUDIO_FORMAT_FLOAT_PLANAR;
-	oi.input_param = rec;
-	oi.input_callback = audio_input_callback;
-	if (audio_output_open(&rec->audio_output, &oi) != 0) {
-		rec->audio_output = nullptr;
-		return;
-	}
-	// Channel count is tiny (<= MAX_AUDIO_CHANNELS); narrow explicitly.
-	rec->audio_channels = static_cast<uint32_t>(audio_output_get_channels(rec->audio_output));
-	rec->audio_sample_rate = audio_output_get_sample_rate(rec->audio_output);
 }
 
 // ---------------------------------------------------------------------------
@@ -642,15 +462,19 @@ static void start_output(feeds_iso_recorder *rec)
 	}
 	obs_encoder_set_video(rec->venc, rec->video_output);
 
-	// Audio encoder — AAC at a default bitrate against the private (silent)
-	// audio_output.
-	ensure_audio_output(rec);
+	// Audio encoder — AAC bound to OBS's program audio mix. obs_get_audio()
+	// is libobs's global program audio handle (the same one feeding the main
+	// recording); mix index 0 = OBS recording track 1. Binding the encoder to
+	// it lets libobs's own audio plumbing route the full program mix into the
+	// ISO file, so it carries the same audio as the main recording. This
+	// handle is owned by libobs core and must NOT be closed by us (see
+	// destroy) — we no longer open a private per-source audio_output.
 	obs_data_t *aenc_settings = obs_data_create();
 	obs_data_set_int(aenc_settings, "bitrate", AUDIO_BITRATE_KBPS);
 	rec->aenc = obs_audio_encoder_create("ffmpeg_aac", aenc_name.c_str(), aenc_settings, 0, nullptr);
 	obs_data_release(aenc_settings);
-	if (rec->aenc && rec->audio_output)
-		obs_encoder_set_audio(rec->aenc, rec->audio_output);
+	if (rec->aenc)
+		obs_encoder_set_audio(rec->aenc, obs_get_audio());
 
 	// Build the output and its settings (path).
 	std::string path = build_filepath(rec, dir.c_str(), ext);
@@ -730,9 +554,10 @@ static void detach_view_source(feeds_iso_recorder *rec)
 //                   wait. Never a busy-loop.
 //
 // Only one output drains at a time; tick blocks new starts and view
-// recreation while draining, so a draining output never has its mix or audio
-// freed underneath it. The persistent view + audio_output are torn down only
-// at destroy, after the final drain has been released.
+// recreation while draining, so a draining output never has its mix freed
+// underneath it. The persistent view is torn down only at destroy, after the
+// final drain has been released. (Audio comes from OBS's shared program mix,
+// obs_get_audio(), which we never own and never free.)
 // ---------------------------------------------------------------------------
 
 // "stop" signal handler: marks the drain complete and wakes destroy's waiter.
@@ -1093,12 +918,10 @@ void feeds_iso_recorder_destroy(feeds_iso_recorder *rec)
 		finish_drain(rec);  // disconnect "stop", release output + encoders (Bug 3)
 	}
 
-	// Release the persistent resources: audio (joins the audio thread, so no
-	// further callback touches the parent) then the view.
-	if (rec->audio_output) {
-		audio_output_close(rec->audio_output);
-		rec->audio_output = nullptr;
-	}
+	// Release the persistent render view. The recording's audio came from
+	// OBS's shared program mix (obs_get_audio()), which libobs core owns — we
+	// never opened a private audio_output, so there is nothing of ours to
+	// close here.
 	if (rec->view) {
 		obs_view_set_source(rec->view, 0, nullptr);
 		obs_view_remove(rec->view);
