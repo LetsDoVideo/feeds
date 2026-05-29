@@ -1683,11 +1683,11 @@ static void ShowAboutDialog() {
     layout->addWidget(links);
 
     QHBoxLayout* buttonRow = new QHBoxLayout();
-    QPushButton* copyBtn  = new QPushButton(
-        QString::fromUtf8("Copy diagnostic info"), &dlg);
-    QPushButton* closeBtn = new QPushButton(QString::fromUtf8("Close"), &dlg);
+    QPushButton* openLogsBtn = new QPushButton(
+        QString::fromUtf8("Open log folder"), &dlg);
+    QPushButton* closeBtn    = new QPushButton(QString::fromUtf8("Close"), &dlg);
     closeBtn->setDefault(true);
-    buttonRow->addWidget(copyBtn);
+    buttonRow->addWidget(openLogsBtn);
     buttonRow->addWidget(closeBtn);
     layout->addLayout(buttonRow);
 
@@ -1698,37 +1698,16 @@ static void ShowAboutDialog() {
     layout->addWidget(footer);
 
     QObject::connect(closeBtn, &QPushButton::clicked, &dlg, &QDialog::accept);
-    QObject::connect(copyBtn, &QPushButton::clicked, [copyBtn, tierName]() {
-        QString diag = QString::fromUtf8("Feeds v") +
-                       QString::fromUtf8(feeds_shared::VERSION) + "\n" +
-                       QString::fromUtf8("Tier: ") +
-                       QString::fromUtf8(tierName.c_str()) + " (" +
-                       QString::number(g_currentTier) + ")\n" +
-                       QString::fromUtf8("Logged in: ");
-        if (!g_userDisplayName.empty()) {
-            diag += QString::fromUtf8(g_userDisplayName.c_str());
-            if (!g_userPMI.empty()) {
-                diag += QString::fromUtf8(" (PMI ") +
-                        QString::fromUtf8(g_userPMI.c_str()) + ")";
-            }
-        } else {
-            diag += QString::fromUtf8("Not logged in");
-        }
+    QObject::connect(openLogsBtn, &QPushButton::clicked, []() {
+        // os_get_config_path_ptr resolves the right location for both
+        // standard installs (%APPDATA%\obs-studio\logs) and portable
+        // installs (config\obs-studio\logs next to the OBS executable).
         char* logsPath = os_get_config_path_ptr("obs-studio/logs");
         if (logsPath) {
-            diag += "\n" + QString::fromUtf8("OBS log folder: ") +
-                    QString::fromUtf8(logsPath);
+            QDesktopServices::openUrl(
+                QUrl::fromLocalFile(QString::fromUtf8(logsPath)));
             bfree(logsPath);
         }
-        QApplication::clipboard()->setText(diag);
-        copyBtn->setText(QString::fromUtf8("Copied!"));
-        copyBtn->setEnabled(false);
-        // Context object is copyBtn so the timer auto-cancels if the user
-        // closes the dialog before the revert fires.
-        QTimer::singleShot(1500, copyBtn, [copyBtn]() {
-            copyBtn->setText(QString::fromUtf8("Copy diagnostic info"));
-            copyBtn->setEnabled(true);
-        });
     });
 
     dlg.exec();
