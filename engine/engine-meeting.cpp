@@ -1171,6 +1171,24 @@ void HandleJoinMeeting(const std::string& json) {
         return;
     }
 
+    // Zoom Events Hub webinars can't be joined via the Meeting SDK — the
+    // event-join token in the URL path can't be carried by JoinParam, so a
+    // pasted event link would otherwise get digit-scraped into a garbage
+    // meeting number and fail with a misleading "Meeting not found". Reject
+    // it up front (lowercase a copy since the parser's find calls below are
+    // case-sensitive and this needs to match the link as typed).
+    std::string inputLower = input;
+    for (char& c : inputLower) if (c >= 'A' && c <= 'Z') c += 32;
+    if (inputLower.find("events.zoom.us") != std::string::npos) {
+        LogToFile("Meeting: rejected Zoom Events link, not supported by Meeting SDK");
+        SendToPlugin("{\"type\":\"meeting_failed\",\"code\":-4,"
+                     "\"message\":\"This is a Zoom Events link, which can't be joined "
+                     "from Feeds as it is not yet supported by the Zoom SDK. Schedule "
+                     "the webinar directly in Zoom (not in an Events Hub) and use that "
+                     "link instead.\"}");
+        return;
+    }
+
     // Fresh ZAK, and verify display name is cached (should be, from post-auth
     // prefetch, but defensive).
     std::string zak = FetchZak();
