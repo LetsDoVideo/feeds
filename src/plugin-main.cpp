@@ -2814,7 +2814,11 @@ static void RegisterEngineHandlers() {
         g_userDisplayName = ExtractJsonString(json, "display_name");
         g_userPMI         = ExtractJsonString(json, "pmi");
         g_currentTier     = (int)ExtractJsonNumber(json, "tier");
-        g_loginAttemptCompleted = true;
+        // NOTE: g_loginAttemptCompleted is intentionally NOT armed here.
+        // It is set together with g_isLoggedIn in the sdk_authenticated
+        // handler so the popup gate (g_loginAttemptCompleted && !g_isLoggedIn)
+        // never sees a window where the gate is armed but g_isLoggedIn is
+        // still false. See sdk_authenticated below.
         blog(LOG_INFO, "[feeds] login_succeeded: name='%s', pmi='%s', tier=%d",
              g_userDisplayName.c_str(), g_userPMI.c_str(), g_currentTier);
 
@@ -2868,6 +2872,11 @@ static void RegisterEngineHandlers() {
     feeds::RegisterMessageHandler("sdk_authenticated", [](const std::string&) {
         blog(LOG_INFO, "[feeds] sdk_authenticated");
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
+            // Arm the popup gate together with g_isLoggedIn, on the same
+            // thread in the same step, so a source-creation popup check can
+            // never observe g_loginAttemptCompleted=true while g_isLoggedIn
+            // is still false (the false "Please log in" race).
+            g_loginAttemptCompleted = true;
             g_isLoggedIn = true;
             g_authInProgress = false;
             UpdateLoginLogoutMenuItem();
