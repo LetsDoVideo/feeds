@@ -40,26 +40,20 @@ SetCompressor /SOLID lzma
 !insertmacro MUI_LANGUAGE "English"
 
 ; ---------------------------------------------------------------------------
-; VC++ 2015-2022 REDISTRIBUTABLE CHECK
-; Silently installs the MSVC runtime if not already present.
+; VC++ REDISTRIBUTABLE INSTALL
+; Always runs the bundled MSVC runtime installer. We do NOT skip on a
+; registry-presence check: the old check only confirmed *some* v14 runtime
+; was present, which could leave a machine below the 14.50 floor that
+; v145-built binaries require. The bundled redist is 14.50, and Microsoft's
+; bootstrapper no-ops when an equal-or-newer runtime is already installed,
+; so unconditional execution is safe.
 ; The redist installer is bundled in the installer package.
 ; ---------------------------------------------------------------------------
 Section "-VCRedist" SecVCRedist
-    ; Check if VC++ 2015-2022 x64 redist is already installed by looking
-    ; for the registry key it writes on install
-    ReadRegDWORD $0 HKLM "SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64" "Installed"
-    ${If} $0 == 1
-        ; Already installed — skip
-        Goto VCRedistDone
-    ${EndIf}
-
-    ; Not found — install silently
     SetOutPath "$TEMP"
     File "${ROOT_DIR}\installer\VC_redist.x64.exe"
     ExecWait '"$TEMP\VC_redist.x64.exe" /install /quiet /norestart'
     Delete "$TEMP\VC_redist.x64.exe"
-
-    VCRedistDone:
 SectionEnd
 
 ; ---------------------------------------------------------------------------
