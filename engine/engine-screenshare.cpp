@@ -35,7 +35,10 @@
 #include "shared-frame.h"
 
 // Defined in engine-main.cpp
-extern void LogToFile(const char* msg);
+extern void LogToFile(const char* msg);  // forwards at DEBUG
+extern void LogInfo(const char* msg);
+extern void LogWarn(const char* msg);
+extern void LogError(const char* msg);
 extern bool SendToPlugin(const std::string& json);
 
 namespace feeds_engine {
@@ -82,7 +85,7 @@ public:
             char msg[256];
             sprintf_s(msg, "Share: CreateFileMapping failed for '%s', err=%lu",
                       regionName.c_str(), GetLastError());
-            LogToFile(msg);
+            LogError(msg);
             return false;
         }
 
@@ -92,7 +95,7 @@ public:
             char msg[256];
             sprintf_s(msg, "Share: MapViewOfFile failed for '%s', err=%lu",
                       regionName.c_str(), GetLastError());
-            LogToFile(msg);
+            LogError(msg);
             CloseHandle(m_mapping);
             m_mapping = nullptr;
             return false;
@@ -234,7 +237,7 @@ static bool EnsureShareInfrastructure() {
     if (g_shareRenderer) return true;
 
     if (!g_shareWriter.Open()) {
-        LogToFile("Share: failed to open shared memory region");
+        LogError("Share: failed to open shared memory region");
         return false;
     }
     g_shareDelegate.SetWriter(&g_shareWriter);
@@ -244,7 +247,7 @@ static bool EnsureShareInfrastructure() {
     if (err != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS || !g_shareRenderer) {
         char msg[128];
         sprintf_s(msg, "Share: createRenderer failed: %d", (int)err);
-        LogToFile(msg);
+        LogError(msg);
         g_shareWriter.Close();
         g_shareRenderer = nullptr;
         return false;
@@ -316,7 +319,7 @@ void UpdateShareSubscription() {
         char msg[128];
         sprintf_s(msg, "Share: subscribe(id=%u) failed: %d",
                   targetId, (int)err);
-        LogToFile(msg);
+        LogError(msg);
     }
 }
 

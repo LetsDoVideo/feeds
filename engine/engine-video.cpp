@@ -31,7 +31,10 @@
 #include "engine-frame-scaler.h"
 
 // Defined in engine-main.cpp
-extern void LogToFile(const char* msg);
+extern void LogToFile(const char* msg);  // forwards at DEBUG
+extern void LogInfo(const char* msg);
+extern void LogWarn(const char* msg);
+extern void LogError(const char* msg);
 extern bool SendToPlugin(const std::string& json);
 
 namespace feeds_engine {
@@ -127,7 +130,7 @@ public:
             char msg[256];
             sprintf_s(msg, "Video: CreateFileMapping failed for '%s', err=%lu",
                       regionName.c_str(), GetLastError());
-            LogToFile(msg);
+            LogError(msg);
             return false;
         }
 
@@ -141,7 +144,7 @@ public:
             char msg[256];
             sprintf_s(msg, "Video: MapViewOfFile failed for '%s', err=%lu",
                       regionName.c_str(), GetLastError());
-            LogToFile(msg);
+            LogError(msg);
             CloseHandle(m_mapping);
             m_mapping = nullptr;
             return false;
@@ -305,7 +308,7 @@ public:
         uint32_t pid = GetCurrentProcessId();
         std::string name = feeds_shared::MakeFrameRegionName(pid, m_sourceUuid);
         if (!m_writer.Open(name)) {
-            LogToFile("Video: failed to open shared memory, aborting subscription");
+            LogError("Video: failed to open shared memory, aborting subscription");
             return false;
         }
 
@@ -315,7 +318,7 @@ public:
         if (err != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS || !m_renderer) {
             char msg[128];
             sprintf_s(msg, "Video: createRenderer failed: %d", (int)err);
-            LogToFile(msg);
+            LogError(msg);
             m_writer.Close();
             return false;
         }
@@ -354,7 +357,7 @@ public:
                 char msg[128];
                 sprintf_s(msg, "Video: subscribe(userId=%u) failed: %d",
                           m_userId, (int)err);
-                LogToFile(msg);
+                LogError(msg);
                 // Continue anyway — renderer exists, shared memory exists,
                 // we'll just never get frames. Not fatal.
             } else {
@@ -362,7 +365,7 @@ public:
                 sprintf_s(msg, "Video: subscribed source='%s' to userId=%u%s",
                           m_sourceUuid.c_str(), m_userId,
                           m_followActiveSpeaker ? " [follow-speaker]" : "");
-                LogToFile(msg);
+                LogInfo(msg);
             }
         } else {
             char msg[128];
@@ -476,7 +479,7 @@ public:
                     "Video: source='%s' received frame with zero dimension "
                     "(%dx%d); dropping (logged once per subscription)",
                     m_sourceUuid.c_str(), w, h);
-                LogToFile(msg);
+                LogWarn(msg);
                 m_loggedFailures |= validation_failures::ZERO_DIM;
             }
             return;
@@ -488,7 +491,7 @@ public:
                     "Video: source='%s' received frame with null plane "
                     "buffer; dropping (logged once per subscription)",
                     m_sourceUuid.c_str());
-                LogToFile(msg);
+                LogWarn(msg);
                 m_loggedFailures |= validation_failures::NULL_PLANE;
             }
             return;
@@ -697,7 +700,7 @@ void HandleParticipantSourceSubscribe(const std::string& json) {
     auto sub = std::make_unique<ParticipantSubscription>(
         sourceId, actualUserId, followActiveSpeaker);
     if (!sub->Start()) {
-        LogToFile("Video: subscription Start failed");
+        LogError("Video: subscription Start failed");
         return;
     }
 
@@ -790,7 +793,7 @@ void HandleParticipantSourceUnsubscribe(const std::string& json) {
 
     char msg[256];
     sprintf_s(msg, "Video: unsubscribed source='%s'", sourceId.c_str());
-    LogToFile(msg);
+    LogInfo(msg);
 
     char resp[256];
     sprintf_s(resp,

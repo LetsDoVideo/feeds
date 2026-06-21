@@ -8,7 +8,10 @@
 #include <thread>
 #include <cstdio>
 
-extern void LogToFile(const char* msg);
+extern void LogToFile(const char* msg);  // forwards at DEBUG
+extern void LogInfo(const char* msg);
+extern void LogWarn(const char* msg);
+extern void LogError(const char* msg);
 extern bool SendToPlugin(const std::string& json);
 
 namespace feeds_engine {
@@ -44,14 +47,14 @@ public:
         if (ret != ZOOM_SDK_NAMESPACE::AUTHRET_SUCCESS) {
             char msg[256];
             sprintf_s(msg, "SDK: onAuthenticationReturn FAILED: %d", (int)ret);
-            LogToFile(msg);
+            LogError(msg);
             char resp[256];
             sprintf_s(resp, "{\"type\":\"sdk_auth_failed\",\"code\":%d}", (int)ret);
             SendToPlugin(resp);
             return;
         }
 
-        LogToFile("SDK: onAuthenticationReturn SUCCESS");
+        LogInfo("SDK: onAuthenticationReturn SUCCESS");
 
         // Create the meeting service now so it's ready when the user
         // clicks Connect. Singleton — only created once per process.
@@ -64,7 +67,7 @@ public:
             FetchAndApplyEntitlement();
 
             if (!gotUser) {
-                LogToFile("SDK: post-auth user-info fetch failed");
+                LogWarn("SDK: post-auth user-info fetch failed");
             }
 
             // Build the login_succeeded message with everything the plugin
@@ -119,7 +122,7 @@ static EngineAuthListener g_authListener;
 
 bool AuthenticateSDK() {
     if (!g_sdkInitialized) {
-        LogToFile("SDK: AuthenticateSDK called but SDK not initialized");
+        LogError("SDK: AuthenticateSDK called but SDK not initialized");
         return false;
     }
 
@@ -129,7 +132,7 @@ bool AuthenticateSDK() {
         if (err != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS || !g_authService) {
             char msg[256];
             sprintf_s(msg, "SDK: CreateAuthService failed: %d", (int)err);
-            LogToFile(msg);
+            LogError(msg);
             return false;
         }
         g_authService->SetEvent(&g_authListener);
@@ -149,7 +152,7 @@ bool AuthenticateSDK() {
     if (err != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
         char msg[256];
         sprintf_s(msg, "SDK: SDKAuth call failed: %d", (int)err);
-        LogToFile(msg);
+        LogError(msg);
         return false;
     }
 
@@ -167,7 +170,7 @@ bool InitializeSDK() {
     if (err != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
         char msg[256];
         sprintf_s(msg, "SDK: InitSDK FAILED: %d", (int)err);
-        LogToFile(msg);
+        LogError(msg);
         return false;
     }
 

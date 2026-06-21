@@ -28,7 +28,10 @@
 #include "engine-shared.h"
 
 // Defined elsewhere in the engine
-extern void LogToFile(const char* msg);
+extern void LogToFile(const char* msg);  // forwards at DEBUG
+extern void LogInfo(const char* msg);
+extern void LogWarn(const char* msg);
+extern void LogError(const char* msg);
 extern bool SendToPlugin(const std::string& json);
 
 namespace feeds_engine {
@@ -829,7 +832,7 @@ public:
                 char buf[128];
                 sprintf_s(buf, "Meeting: type=%d (1=normal, 2=webinar, 3=breakout)",
                           (int)info->GetMeetingType());
-                LogToFile(buf);
+                LogInfo(buf);
             }
 
             // Send the initial participant list and wire up the
@@ -846,7 +849,7 @@ public:
                     sprintf_s(buf, "Meeting: local user role=%d "
                                    "(1=host, 2=cohost, 3=panelist, 5=attendee)",
                               (int)me->GetUserRole());
-                    LogToFile(buf);
+                    LogInfo(buf);
                 }
                 SendParticipantList();
                 pc->SetEvent(&g_participantsListener);
@@ -1000,7 +1003,7 @@ public:
         }
 
         if (status == ZOOM_SDK_NAMESPACE::MEETING_STATUS_WEBINAR_PROMOTE) {
-            LogToFile("Meeting: WEBINAR_PROMOTE — local user promoted to panelist");
+            LogInfo("Meeting: WEBINAR_PROMOTE — local user promoted to panelist");
             if (g_meetingService) {
                 ZOOM_SDK_NAMESPACE::IMeetingParticipantsController* pc =
                     g_meetingService->GetMeetingParticipantsController();
@@ -1018,7 +1021,7 @@ public:
         }
 
         if (status == ZOOM_SDK_NAMESPACE::MEETING_STATUS_WEBINAR_DEPROMOTE) {
-            LogToFile("Meeting: WEBINAR_DEPROMOTE — local user demoted to attendee");
+            LogInfo("Meeting: WEBINAR_DEPROMOTE — local user demoted to attendee");
             if (g_meetingService) {
                 ZOOM_SDK_NAMESPACE::IMeetingParticipantsController* pc =
                     g_meetingService->GetMeetingParticipantsController();
@@ -1062,7 +1065,7 @@ static void ApplyDefaultSettings() {
     if (err != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS || !settingService) {
         char buf[128];
         sprintf_s(buf, "Settings: CreateSettingService failed: %d", (int)err);
-        LogToFile(buf);
+        LogError(buf);
         return;
     }
 
@@ -1101,7 +1104,7 @@ bool InitializeMeetingSession() {
     if (err != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS || !g_meetingService) {
         char buf[128];
         sprintf_s(buf, "Meeting: CreateMeetingService failed: %d", (int)err);
-        LogToFile(buf);
+        LogError(buf);
         return false;
     }
 
@@ -1117,7 +1120,7 @@ bool InitializeMeetingSession() {
         config->RedirectMeetingInputUserInfoDialog(true);
         LogToFile("Meeting: configuration listener attached, webinar redirects enabled");
     } else {
-        LogToFile("Meeting: GetMeetingConfiguration returned null — webinar joins may fail");
+        LogWarn("Meeting: GetMeetingConfiguration returned null — webinar joins may fail");
     }
 
     ApplyDefaultSettings();
@@ -1195,7 +1198,7 @@ void HandleJoinMeeting(const std::string& json) {
     const std::string& displayName = GetUserDisplayName();
 
     if (zak.empty() || displayName.empty()) {
-        LogToFile("Meeting: could not retrieve ZAK or display name");
+        LogWarn("Meeting: could not retrieve ZAK or display name");
         SendToPlugin("{\"type\":\"meeting_failed\",\"code\":-3,"
                      "\"message\":\"Could not retrieve your Zoom account details. "
                      "Please log out and log in again.\"}");
@@ -1313,7 +1316,7 @@ void HandleJoinMeeting(const std::string& json) {
     if (joinErr != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
         char buf[256];
         sprintf_s(buf, "Meeting: Join() call failed immediately: %d", (int)joinErr);
-        LogToFile(buf);
+        LogError(buf);
         sprintf_s(buf,
             "{\"type\":\"meeting_failed\",\"code\":%d,"
             "\"message\":\"Could not start meeting join. SDK error: %d\"}",
@@ -1322,7 +1325,7 @@ void HandleJoinMeeting(const std::string& json) {
         return;
     }
 
-    LogToFile("Meeting: Join() call returned SUCCESS, waiting for status events");
+    LogInfo("Meeting: Join() call returned SUCCESS, waiting for status events");
 }
 
 // ---------------------------------------------------------------------------
@@ -1362,7 +1365,7 @@ void HandleCreateInstantMeeting(const std::string& json) {
     const std::string& displayName = GetUserDisplayName();
 
     if (zak.empty() || displayName.empty()) {
-        LogToFile("Meeting: could not retrieve ZAK or display name");
+        LogWarn("Meeting: could not retrieve ZAK or display name");
         SendToPlugin("{\"type\":\"meeting_failed\",\"code\":-3,"
                      "\"message\":\"Could not retrieve your Zoom account details. "
                      "Please log out and log in again.\"}");
@@ -1375,7 +1378,7 @@ void HandleCreateInstantMeeting(const std::string& json) {
     std::string joinUrl;
     if (!CreateInstantMeeting("Feeds Instant Meeting",
                               meetingId, meetingPassword, joinUrl)) {
-        LogToFile("Meeting: CreateInstantMeeting REST call failed");
+        LogError("Meeting: CreateInstantMeeting REST call failed");
         SendToPlugin("{\"type\":\"meeting_failed\",\"code\":-4,"
                      "\"message\":\"Could not create instant meeting. "
                      "Check the engine log for details.\"}");
@@ -1422,7 +1425,7 @@ void HandleCreateInstantMeeting(const std::string& json) {
 
         char buf[256];
         sprintf_s(buf, "Meeting: Start() failed: %d", (int)startErr);
-        LogToFile(buf);
+        LogError(buf);
         sprintf_s(buf,
             "{\"type\":\"meeting_failed\",\"code\":%d,"
             "\"message\":\"Could not start instant meeting. SDK error: %d\"}",
@@ -1438,7 +1441,7 @@ void HandleCreateInstantMeeting(const std::string& json) {
 // IPC handler: leave_meeting
 // ---------------------------------------------------------------------------
 void HandleLeaveMeeting(const std::string& /*json*/) {
-    LogToFile("Meeting: HandleLeaveMeeting called");
+    LogInfo("Meeting: HandleLeaveMeeting called");
     if (!g_meetingService) return;
 
     ZOOM_SDK_NAMESPACE::MeetingStatus status = g_meetingService->GetMeetingStatus();
@@ -1599,7 +1602,7 @@ void HandleLogout(const std::string& /*json*/);  // fwd, defined below
 void ClearUserInfo();  // from engine-api.cpp
 
 void HandleLogout(const std::string& /*json*/) {
-    LogToFile("Meeting: HandleLogout called");
+    LogInfo("Meeting: HandleLogout called");
 
     // Leave meeting first if we're in one
     if (g_meetingService) {

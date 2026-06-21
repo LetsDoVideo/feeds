@@ -12,7 +12,10 @@
 #include <cstdlib>
 
 // Defined in engine-main.cpp
-extern void LogToFile(const char* msg);
+extern void LogToFile(const char* msg);  // forwards at DEBUG
+extern void LogInfo(const char* msg);
+extern void LogWarn(const char* msg);
+extern void LogError(const char* msg);
 extern bool SendToPlugin(const std::string& json);
 
 namespace feeds_engine {
@@ -162,7 +165,7 @@ static bool RefreshAccessToken() {
     std::string newRefresh = JsonExtractString(response, "refresh_token");
 
     if (newAccess.empty()) {
-        LogToFile("API: RefreshAccessToken failed (no access_token in response)");
+        LogWarn("API: RefreshAccessToken failed (no access_token in response)");
         return false;
     }
 
@@ -240,7 +243,7 @@ std::string ZoomApiGet(const std::wstring& path) {
             sep = result.find('|');
             body = (sep == std::string::npos) ? "" : result.substr(sep + 1);
         } else {
-            LogToFile("API: refresh failed, session expired");
+            LogWarn("API: refresh failed, session expired");
             SendToPlugin("{\"type\":\"session_expired\"}");
             return "";
         }
@@ -320,7 +323,7 @@ std::string ZoomApiPost(const std::wstring& path, const std::string& jsonBody) {
             sep = result.find('|');
             body = (sep == std::string::npos) ? "" : result.substr(sep + 1);
         } else {
-            LogToFile("API: refresh failed, session expired");
+            LogWarn("API: refresh failed, session expired");
             SendToPlugin("{\"type\":\"session_expired\"}");
             return "";
         }
@@ -382,14 +385,14 @@ bool CreateInstantMeeting(const std::string& topic,
     LogToFile("API: CreateInstantMeeting POST /v2/users/me/meetings");
     std::string response = ZoomApiPost(L"/v2/users/me/meetings", body);
     if (response.empty()) {
-        LogToFile("API: CreateInstantMeeting got empty response "
-                  "(session expired or network error)");
+        LogError("API: CreateInstantMeeting got empty response "
+                 "(session expired or network error)");
         return false;
     }
 
     std::string idStr = JsonExtractNumber(response, "id");
     if (idStr.empty()) {
-        LogToFile("API: CreateInstantMeeting response missing 'id' field");
+        LogError("API: CreateInstantMeeting response missing 'id' field");
         // First 200 chars of response to help diagnose what came back
         // (likely a 403 error body with a missing-scope message).
         std::string snippet = response.substr(0, 200);
@@ -400,10 +403,11 @@ bool CreateInstantMeeting(const std::string& topic,
     outPassword = JsonExtractString(response, "password");
     outJoinUrl  = JsonExtractString(response, "join_url");
 
+    // Log the id only — never the password (not even present/empty) in the
+    // shared OBS log.
     char log[256];
-    sprintf_s(log, "API: CreateInstantMeeting got id=%llu (pwd=%s)",
-              outId, outPassword.empty() ? "empty" : "present");
-    LogToFile(log);
+    sprintf_s(log, "API: CreateInstantMeeting got id=%llu", outId);
+    LogInfo(log);
     return true;
 }
 
@@ -442,7 +446,7 @@ std::string FetchZak() {
     std::string response = ZoomApiGet(L"/v2/users/me/zak");
     std::string zak = JsonExtractString(response, "token");
     if (zak.empty())
-        LogToFile("API: FetchZak got empty ZAK");
+        LogWarn("API: FetchZak got empty ZAK");
     else
         LogToFile("API: FetchZak succeeded");
     return zak;
@@ -477,7 +481,7 @@ void FetchAndApplyEntitlement() {
                                       WINHTTP_NO_PROXY_NAME,
                                       WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) {
-        LogToFile("API: tier query failed (WinHttpOpen) — applying tier=0");
+        LogWarn("API: tier query failed (WinHttpOpen) — applying tier=0");
         return;
     }
     HINTERNET hConnect = WinHttpConnect(hSession,
@@ -485,7 +489,7 @@ void FetchAndApplyEntitlement() {
         INTERNET_DEFAULT_HTTPS_PORT, 0);
     if (!hConnect) {
         WinHttpCloseHandle(hSession);
-        LogToFile("API: tier query failed (WinHttpConnect) — applying tier=0");
+        LogWarn("API: tier query failed (WinHttpConnect) — applying tier=0");
         return;
     }
     HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", L"/tier",
@@ -495,7 +499,7 @@ void FetchAndApplyEntitlement() {
     if (!hRequest) {
         WinHttpCloseHandle(hConnect);
         WinHttpCloseHandle(hSession);
-        LogToFile("API: tier query failed (WinHttpOpenRequest) — applying tier=0");
+        LogWarn("API: tier query failed (WinHttpOpenRequest) — applying tier=0");
         return;
     }
 
@@ -510,7 +514,7 @@ void FetchAndApplyEntitlement() {
         WinHttpCloseHandle(hRequest);
         WinHttpCloseHandle(hConnect);
         WinHttpCloseHandle(hSession);
-        LogToFile("API: tier query failed (network error) — applying tier=0");
+        LogWarn("API: tier query failed (network error) — applying tier=0");
         return;
     }
 
@@ -544,7 +548,7 @@ void FetchAndApplyEntitlement() {
     }
 
     if (statusCode == 401) {
-        LogToFile("API: tier query auth failed — applying tier=0");
+        LogWarn("API: tier query auth failed — applying tier=0");
         return;
     }
 
@@ -552,13 +556,13 @@ void FetchAndApplyEntitlement() {
         char msg[128];
         sprintf_s(msg, "API: tier query failed (HTTP %lu) — applying tier=0",
                   statusCode);
-        LogToFile(msg);
+        LogWarn(msg);
         return;
     }
 
     std::string tierStr = JsonExtractNumber(response, "tier");
     if (tierStr.empty()) {
-        LogToFile("API: tier query response missing tier field — applying tier=0");
+        LogWarn("API: tier query response missing tier field — applying tier=0");
         return;
     }
 
@@ -567,7 +571,7 @@ void FetchAndApplyEntitlement() {
     char msg[128];
     sprintf_s(msg, "API: entitlement applied, tier=%d (from backend)",
               g_currentTier);
-    LogToFile(msg);
+    LogInfo(msg);
 }
 
 } // namespace feeds_engine

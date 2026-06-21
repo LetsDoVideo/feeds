@@ -71,27 +71,40 @@ static std::string JsonEscapeLog(const char* s)
     return out;
 }
 
-// Phase 1: the engine no longer keeps its own FeedsEngine.log. Each log line
-// is forwarded to the plugin over the E2P pipe as a discrete
-// {"type":"log","level":"info","message":"..."} message; the plugin writes it
-// into the OBS log via blog(). Everything is sent at "info" this phase — a
-// later phase assigns per-line levels.
+// The engine forwards every log line to the plugin over the E2P pipe as a
+// {"type":"log","level":"...","message":"..."} message; the plugin re-emits it
+// into the OBS log via blog() at the matching level.
+//
+// Phase 2 assigns levels. The legacy LogToFile forwards at "debug" — so every
+// call site left untouched becomes a DEBUG trace — while LogInfo / LogWarn /
+// LogError forward their respective levels. Only the specific lines that belong
+// in the default OBS log (the session narrative, degraded-but-handled
+// warnings, and hard failures) were switched to those helpers.
 //
 // Lines emitted before the E2P pipe is connected (engine start, pipe-connect
 // attempts) are dropped on purpose — we deliberately do NOT buffer. The plugin
 // tracks engine connection state from its own side, so a not-yet-connected
-// engine is not a total blind spot. Name kept as LogToFile so the many
-// existing call sites (and their extern decls) need no change.
-void LogToFile(const char* msg)
+// engine is not a total blind spot.
+static void ForwardLog(const char* level, const char* msg)
 {
     if (g_writePipe == INVALID_HANDLE_VALUE)
         return;  // pipe not up yet — drop, no buffer.
 
-    std::string out = "{\"type\":\"log\",\"level\":\"info\",\"message\":\"";
+    std::string out = "{\"type\":\"log\",\"level\":\"";
+    out += level;
+    out += "\",\"message\":\"";
     out += JsonEscapeLog(msg);
     out += "\"}";
     WriteToPipeRaw(out, nullptr);
 }
+
+// LogToFile keeps its name so the many existing call sites (and their extern
+// decls in the other TUs) need no change; it now forwards at DEBUG. Use
+// LogInfo / LogWarn / LogError for lines that belong in the default OBS log.
+void LogToFile(const char* msg) { ForwardLog("debug",   msg); }
+void LogInfo  (const char* msg) { ForwardLog("info",    msg); }
+void LogWarn  (const char* msg) { ForwardLog("warning", msg); }
+void LogError (const char* msg) { ForwardLog("error",   msg); }
 
 // ---------------------------------------------------------------------------
 // Pipe send/receive

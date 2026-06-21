@@ -20,7 +20,10 @@
 #include <cstdio>
 
 // Defined in engine-main.cpp
-extern void LogToFile(const char* msg);
+extern void LogToFile(const char* msg);  // forwards at DEBUG
+extern void LogInfo(const char* msg);
+extern void LogWarn(const char* msg);
+extern void LogError(const char* msg);
 extern bool SendToPlugin(const std::string& json);
 
 namespace feeds_engine {
@@ -424,7 +427,7 @@ static void LoginThreadFunc()
     std::string refreshToken = JsonExtractString(response, "refresh_token");
 
     if (accessToken.empty()) {
-        LogToFile("OAuth: token exchange failed, no access_token in response");
+        LogError("OAuth: token exchange failed, no access_token in response");
         SendToPlugin("{\"type\":\"login_failed\",\"error\":\"token_exchange_failed\"}");
         return;
     }
