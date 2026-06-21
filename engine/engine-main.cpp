@@ -10,6 +10,7 @@
 #include <functional>
 #include <thread>
 #include <atomic>
+#include <mutex>
 
 #include "feeds-version.h"
 #include "engine-shared.h"
@@ -35,28 +36,93 @@ namespace feeds_engine {
 // Logging
 // ---------------------------------------------------------------------------
 
+// Forward decls — defined further down in this file.
+static std::string ExtractJsonStringField(const std::string& json,
+                                          const std::string& field);
+static bool WriteToPipeRaw(const std::string& json, DWORD* outErr);
+
+// Minimal JSON string-escape so log text containing quotes, backslashes, or
+// control characters round-trips intact inside the IPC message. Mirrors the
+// JsonEscape in engine-meeting.cpp and the plugin so the plugin's
+// escape-aware extractor (ExtractJsonStringEscaped) can decode it.
+static std::string JsonEscapeLog(const char* s)
+{
+    std::string out;
+    for (const char* p = s ? s : ""; *p; ++p) {
+        unsigned char c = (unsigned char)*p;
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (c < 0x20) {
+                    char buf[8];
+                    sprintf_s(buf, "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += (char)c;
+                }
+        }
+    }
+    return out;
+}
+
+// Phase 1: the engine no longer keeps its own FeedsEngine.log. Each log line
+// is forwarded to the plugin over the E2P pipe as a discrete
+// {"type":"log","level":"info","message":"..."} message; the plugin writes it
+// into the OBS log via blog(). Everything is sent at "info" this phase — a
+// later phase assigns per-line levels.
+//
+// Lines emitted before the E2P pipe is connected (engine start, pipe-connect
+// attempts) are dropped on purpose — we deliberately do NOT buffer. The plugin
+// tracks engine connection state from its own side, so a not-yet-connected
+// engine is not a total blind spot. Name kept as LogToFile so the many
+// existing call sites (and their extern decls) need no change.
 void LogToFile(const char* msg)
 {
-    wchar_t logPath[MAX_PATH];
-    GetModuleFileNameW(NULL, logPath, MAX_PATH);
-    wchar_t* lastSlash = wcsrchr(logPath, L'\\');
-    if (lastSlash) *(lastSlash + 1) = L'\0';
-    wcscat_s(logPath, L"FeedsEngine.log");
+    if (g_writePipe == INVALID_HANDLE_VALUE)
+        return;  // pipe not up yet — drop, no buffer.
 
-    FILE* f = nullptr;
-    _wfopen_s(&f, logPath, L"a");
-    if (f) {
-        SYSTEMTIME st;
-        GetLocalTime(&st);
-        fprintf(f, "[%02d:%02d:%02d.%03d] %s\n",
-                st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, msg);
-        fclose(f);
-    }
+    std::string out = "{\"type\":\"log\",\"level\":\"info\",\"message\":\"";
+    out += JsonEscapeLog(msg);
+    out += "\"}";
+    WriteToPipeRaw(out, nullptr);
 }
 
 // ---------------------------------------------------------------------------
 // Pipe send/receive
 // ---------------------------------------------------------------------------
+
+// Serializes all writes to the E2P pipe. The engine sends — and now logs —
+// from multiple threads (pipe-reader, main message pump, video/scaler
+// callbacks). Every log line is also an E2P write, so without this lock
+// concurrent writes could interleave and corrupt messages on the pipe. This
+// is the main correctness risk of routing logs through the pipe.
+static std::mutex g_writePipeMutex;
+
+// Low-level serialized write to the E2P pipe. Returns false if the pipe isn't
+// connected or WriteFile fails; on WriteFile failure the OS error is reported
+// via outErr (when non-null), captured while the lock is still held. Holds
+// g_writePipeMutex only around the WriteFile so callers can log before/after
+// without re-entering the (non-recursive) lock. Deliberately does NOT call
+// LogToFile — LogToFile calls this, and recursion would self-deadlock.
+static bool WriteToPipeRaw(const std::string& json, DWORD* outErr)
+{
+    if (g_writePipe == INVALID_HANDLE_VALUE) {
+        if (outErr) *outErr = ERROR_PIPE_NOT_CONNECTED;
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(g_writePipeMutex);
+    DWORD written = 0;
+    BOOL ok = WriteFile(g_writePipe, json.c_str(), (DWORD)json.size(), &written, NULL);
+    if (!ok && outErr) *outErr = GetLastError();
+    return ok != FALSE;
+}
 
 static bool ConnectToPipes()
 {
@@ -113,18 +179,20 @@ static bool ConnectToPipes()
 
 bool SendToPlugin(const std::string& json)
 {
-    DWORD written = 0;
-    BOOL ok = WriteFile(g_writePipe, json.c_str(), (DWORD)json.size(), &written, NULL);
-    if (!ok) {
+    DWORD err = 0;
+    if (!WriteToPipeRaw(json, &err)) {
         char msg[256];
-        sprintf_s(msg, "WriteFile failed: %lu", GetLastError());
+        sprintf_s(msg, "WriteFile failed: %lu", err);
         LogToFile(msg);
         return false;
     }
 
-    char msg[4200];
-    sprintf_s(msg, "Sent: %s", json.c_str());
-    LogToFile(msg);
+    // Redaction: log only the message type, never the payload. Outgoing
+    // messages can carry meeting password, webinar_token, ZAK, and join_token
+    // — none of which may reach the shared OBS log.
+    std::string type = ExtractJsonStringField(json, "type");
+    if (type.empty()) type = "(unknown)";
+    LogToFile(("Sent: " + type).c_str());
     return true;
 }
 
@@ -160,9 +228,9 @@ static void DispatchIpcMessage(const std::string& json)
 {
     std::string type = ExtractJsonStringField(json, "type");
     if (type.empty()) {
-        char msg[4200];
-        sprintf_s(msg, "Could not extract type from: %s", json.c_str());
-        LogToFile(msg);
+        // Redaction: never log the raw payload — incoming messages can carry
+        // secrets (join_meeting: password, ZAK, join_token, webinar_token).
+        LogToFile("Could not extract type from incoming message");
         return;
     }
 
@@ -170,9 +238,8 @@ static void DispatchIpcMessage(const std::string& json)
     if (it != g_messageHandlers.end()) {
         it->second(json);
     } else {
-        char msg[4200];
-        sprintf_s(msg, "No handler for type '%s' (message: %s)", type.c_str(), json.c_str());
-        LogToFile(msg);
+        // Redaction: log only the type, never the payload.
+        LogToFile(("No handler for type '" + type + "'").c_str());
     }
 }
 
@@ -195,9 +262,12 @@ static void PipeReaderLoop()
             buffer[bytesRead] = '\0';
             std::string json(buffer, bytesRead);
 
-            char msg[4200];
-            sprintf_s(msg, "Received: %s", json.c_str());
-            LogToFile(msg);
+            // Redaction: log only the message type, never the payload.
+            // Incoming join_meeting carries password, ZAK, join_token, and
+            // webinar_token — none of which may reach the shared OBS log.
+            std::string type = ExtractJsonStringField(json, "type");
+            if (type.empty()) type = "(unknown)";
+            LogToFile(("Received: " + type).c_str());
 
             DispatchIpcMessage(json);
         }
@@ -292,6 +362,22 @@ static LRESULT CALLBACK EngineWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
 {
+    // --- TEMPORARY MIGRATION (remove in a few releases) --------------------
+    // Older versions wrote engine logs to FeedsEngine.log next to the exe.
+    // Engine logs now go to the OBS log via the plugin, so delete any stale
+    // file left over from a previous install. New installs never create one.
+    {
+        wchar_t oldLog[MAX_PATH];
+        GetModuleFileNameW(NULL, oldLog, MAX_PATH);
+        wchar_t* slash = wcsrchr(oldLog, L'\\');
+        if (slash) *(slash + 1) = L'\0';
+        wcscat_s(oldLog, L"FeedsEngine.log");
+        DeleteFileW(oldLog);  // ignore result — an absent file is the norm
+    }
+    // --- END TEMPORARY MIGRATION -------------------------------------------
+
+    // NOTE: these two lines run before the E2P pipe is connected, so they are
+    // dropped (LogToFile no longer buffers). Kept for symmetry once connected.
     LogToFile("========================================");
     LogToFile("FeedsEngine.exe starting");
 

@@ -2810,6 +2810,25 @@ static void RegisterEngineHandlers() {
              version.c_str(), g_enginePid);
     });
 
+    // Engine log forwarding (Phase 1). The engine no longer writes its own
+    // file — it sends each line as {"type":"log","level":"...","message":"..."}
+    // and we re-emit it into the OBS log via blog(). The "[feeds-engine]"
+    // prefix keeps these distinguishable from the plugin's own "[feeds]" lines.
+    // message is escape-decoded; level maps to the matching OBS log level
+    // (everything is "info" this phase — per-line levels come in a later one).
+    feeds::RegisterMessageHandler("log", [](const std::string& json) {
+        std::string level   = ExtractJsonString(json, "level");
+        std::string message = ExtractJsonStringEscaped(json, "message");
+
+        int obsLevel = LOG_INFO;
+        if      (level == "debug")   obsLevel = LOG_DEBUG;
+        else if (level == "warning") obsLevel = LOG_WARNING;
+        else if (level == "error")   obsLevel = LOG_ERROR;
+        // "info" (and anything unrecognized) falls through to LOG_INFO.
+
+        blog(obsLevel, "[feeds-engine] %s", message.c_str());
+    });
+
     feeds::RegisterMessageHandler("login_succeeded", [](const std::string& json) {
         g_userDisplayName = ExtractJsonString(json, "display_name");
         g_userPMI         = ExtractJsonString(json, "pmi");
@@ -3425,17 +3444,6 @@ static void RegisterEngineHandlers() {
         std::lock_guard<std::mutex> lock(g_sourcesMutex);
         ZpSourceData* s = FindSourceByUuid(sourceId);
         if (s) CloseSharedMemory(s);
-    });
-
-    feeds::RegisterMessageHandler("engine_log", [](const std::string& json) {
-        std::string message = ExtractJsonString(json, "message");
-        blog(LOG_INFO, "[engine] %s", message.c_str());
-    });
-
-    feeds::RegisterMessageHandler("engine_error", [](const std::string& json) {
-        std::string code    = ExtractJsonString(json, "code");
-        std::string message = ExtractJsonString(json, "message");
-        blog(LOG_ERROR, "[engine] %s: %s", code.c_str(), message.c_str());
     });
 }
 

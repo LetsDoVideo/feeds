@@ -426,11 +426,9 @@ bool FetchUserInfo() {
     g_userPMI         = JsonExtractNumber(response, "pmi");
     g_userEmail       = JsonExtractString(response, "email");
 
-    char msg[512];
-    sprintf_s(msg, "API: FetchUserInfo got name='%s', pmi='%s', email_present=%d",
-              g_userDisplayName.c_str(), g_userPMI.c_str(),
-              g_userEmail.empty() ? 0 : 1);
-    LogToFile(msg);
+    // Redaction: never log the user's name, PMI, or email — these must not
+    // reach the shared OBS log. Log success only.
+    LogToFile("API: FetchUserInfo succeeded");
 
     return !g_userDisplayName.empty();
 }
