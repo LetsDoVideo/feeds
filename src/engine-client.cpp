@@ -165,7 +165,12 @@ bool SendToEngine(const std::string& jsonMessage)
         return false;
     }
 
-    blog(LOG_INFO, "[feeds] SendToEngine: sent %s", jsonMessage.c_str());
+    // Redaction: log only the message type, never the payload. Outbound
+    // join_meeting carries the meeting password and webinar_token. At DEBUG
+    // so the normal OBS log isn't flooded with per-message traces.
+    std::string type = ExtractJsonStringField(jsonMessage, "type");
+    if (type.empty()) type = "(unknown)";
+    blog(LOG_DEBUG, "[feeds] SendToEngine: sent %s", type.c_str());
     return true;
 }
 
@@ -335,7 +340,9 @@ static void DispatchMessage(const std::string& json)
 {
     std::string type = ExtractJsonStringField(json, "type");
     if (type.empty()) {
-        blog(LOG_WARNING, "[feeds] DispatchMessage: could not extract type from: %s", json.c_str());
+        // Redaction: never log the raw payload — a malformed message can
+        // still carry secrets.
+        blog(LOG_WARNING, "[feeds] DispatchMessage: could not extract type from message");
         return;
     }
 
@@ -351,8 +358,9 @@ static void DispatchMessage(const std::string& json)
     if (handler) {
         handler(json);
     } else {
-        blog(LOG_INFO, "[feeds] DispatchMessage: no handler for type '%s' (message: %s)",
-             type.c_str(), json.c_str());
+        // Redaction: log only the type, never the payload.
+        blog(LOG_INFO, "[feeds] DispatchMessage: no handler for type '%s'",
+             type.c_str());
     }
 }
 
@@ -381,7 +389,14 @@ static void PipeReaderThread()
         if (bytesRead > 0) {
             buffer[bytesRead] = '\0';
             std::string json(buffer, bytesRead);
-            blog(LOG_INFO, "[feeds] PipeReaderThread: received: %s", json.c_str());
+            // Redaction: log only the message type, never the payload.
+            // Inbound login_succeeded carries the user's name and PMI, and
+            // forwarded engine "log" messages are re-emitted by their own
+            // handler — so this raw line would both leak and duplicate. At
+            // DEBUG so the normal OBS log isn't flooded.
+            std::string rtype = ExtractJsonStringField(json, "type");
+            if (rtype.empty()) rtype = "(unknown)";
+            blog(LOG_DEBUG, "[feeds] PipeReaderThread: received: %s", rtype.c_str());
             DispatchMessage(json);
         }
     }

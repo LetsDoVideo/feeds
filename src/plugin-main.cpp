@@ -2838,8 +2838,11 @@ static void RegisterEngineHandlers() {
         // handler so the popup gate (g_loginAttemptCompleted && !g_isLoggedIn)
         // never sees a window where the gate is armed but g_isLoggedIn is
         // still false. See sdk_authenticated below.
-        blog(LOG_INFO, "[feeds] login_succeeded: name='%s', pmi='%s', tier=%d",
-             g_userDisplayName.c_str(), g_userPMI.c_str(), g_currentTier);
+        // Redaction: never log the user's name or PMI. The assignments above
+        // stay — the UI still needs them — only the log text is sign-in
+        // completion plus the non-sensitive tier.
+        blog(LOG_INFO, "[feeds] login_succeeded: sign-in completed, tier=%d",
+             g_currentTier);
 
         // Reconcile on the UI thread — ReconcileSourcesToTier touches
         // OBS source state and refreshes properties, both of which
@@ -3041,7 +3044,9 @@ static void RegisterEngineHandlers() {
 
     feeds::RegisterMessageHandler("meeting_joined", [](const std::string& json) {
         std::string mn = ExtractJsonString(json, "meeting_number");
-        blog(LOG_INFO, "[feeds] meeting_joined: %s", mn.c_str());
+        // Redaction: the meeting number is the user's PMI for a PMI join, so
+        // keep it out of the normal log — DEBUG only.
+        blog(LOG_DEBUG, "[feeds] meeting_joined: %s", mn.c_str());
         try { g_currentMeetingNumber = std::stoull(mn); }
         catch (...) { g_currentMeetingNumber = 0; }
 
