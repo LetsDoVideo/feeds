@@ -2,7 +2,7 @@
 ; NSIS Installer Script
 
 !define PRODUCT_NAME "Feeds - Isolated Feeds for OBS"
-!define PRODUCT_VERSION "1.0"
+!define PRODUCT_VERSION "1.3.1"
 !define PRODUCT_PUBLISHER "LetsDoVideo"
 !define PRODUCT_WEB_SITE "https://letsdovideo.com/feeds"
 !define PRODUCT_UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\Feeds-OBS"
