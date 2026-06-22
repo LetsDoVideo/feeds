@@ -16,6 +16,7 @@
 #include <obs-module.h>
 #include <obs-frontend-api.h>
 #include <util/platform.h>
+#include <util/config-file.h>
 #include <media-io/video-frame.h>
 #include <string>
 #include <vector>
@@ -93,15 +94,25 @@ namespace feeds {
 // ---------------------------------------------------------------------------
 // Globals — menu actions
 // ---------------------------------------------------------------------------
-static QAction* g_loginLogoutAction  = nullptr;
-static QAction* g_connectAction      = nullptr;
-static QAction* g_isoRecordingAction = nullptr;
+static QAction* g_loginLogoutAction     = nullptr;
+static QAction* g_connectAction         = nullptr;
+static QAction* g_isoRecordingAction    = nullptr;
+static QAction* g_connectOnStartupAction = nullptr;
 
 // Global ISO recording toggle. When true (and tier >= 1), every participant
 // source's recorder is enabled — they all start writing when OBS main
 // recording starts. Driven by the Feeds menu item; replaces the old
 // per-source checkbox.
 static bool g_isoRecordingEnabled = false;
+
+// "Connect to Zoom on Startup" toggle. Unlike the ISO toggle (runtime-only),
+// this persists across OBS sessions in the user-level frontend config (see
+// LoadConnectOnStartupSetting / SaveConnectOnStartupSetting). When enabled,
+// the join dialog is auto-opened once per session after login completes.
+static bool g_connectOnStartupEnabled = false;
+// One-shot guard so the startup auto-open fires at most once per OBS session
+// — a mid-session logout/login must not re-pop the dialog.
+static bool g_startupConnectDone = false;
 
 // ---------------------------------------------------------------------------
 // Globals — cached state from engine
@@ -1697,6 +1708,31 @@ static void ShowAboutDialog() {
     dlg.exec();
 }
 
+// ---------------------------------------------------------------------------
+// Persistent global preferences
+// ---------------------------------------------------------------------------
+// Stored in OBS's user-level (global) frontend config, NOT the per-profile
+// config — "Connect to Zoom on Startup" is a global preference. OBS 30+
+// renamed the accessor from obs_frontend_get_global_config (now deprecated)
+// to obs_frontend_get_user_config; Feeds builds against OBS 31, so we use the
+// new one. This is Feeds' first persisted non-source preference.
+static const char* kFeedsConfigSection      = "Feeds";
+static const char* kCfgConnectOnStartup      = "ConnectOnStartup";
+
+static bool LoadConnectOnStartupSetting() {
+    config_t* cfg = obs_frontend_get_user_config();
+    if (!cfg) return false;
+    // config_get_bool returns false for an absent key, which is our default.
+    return config_get_bool(cfg, kFeedsConfigSection, kCfgConnectOnStartup);
+}
+
+static void SaveConnectOnStartupSetting(bool enabled) {
+    config_t* cfg = obs_frontend_get_user_config();
+    if (!cfg) return;
+    config_set_bool(cfg, kFeedsConfigSection, kCfgConnectOnStartup, enabled);
+    config_save(cfg);
+}
+
 void SetupPluginMenu() {
     QMainWindow* mainWindow = (QMainWindow*)obs_frontend_get_main_window();
     QMenuBar*    menuBar    = mainWindow->menuBar();
@@ -1709,6 +1745,10 @@ void SetupPluginMenu() {
     g_isoRecordingAction = feedsMenu->addAction("ISO Recording (All Participants)");
     g_isoRecordingAction->setCheckable(true);
     g_isoRecordingAction->setChecked(g_isoRecordingEnabled);
+    g_connectOnStartupAction = feedsMenu->addAction("Connect to Zoom on Startup");
+    g_connectOnStartupAction->setCheckable(true);
+    g_connectOnStartupEnabled = LoadConnectOnStartupSetting();
+    g_connectOnStartupAction->setChecked(g_connectOnStartupEnabled);
     feedsMenu->addSeparator();
     QAction* aboutAction = feedsMenu->addAction("About / Tier Status");
 
@@ -1745,6 +1785,10 @@ void SetupPluginMenu() {
     QObject::connect(g_isoRecordingAction, &QAction::toggled, [](bool checked) {
         g_isoRecordingEnabled = checked;
         ApplyIsoRecordingStateToAllSources();
+    });
+    QObject::connect(g_connectOnStartupAction, &QAction::toggled, [](bool checked) {
+        g_connectOnStartupEnabled = checked;
+        SaveConnectOnStartupSetting(checked);
     });
     QObject::connect(aboutAction, &QAction::triggered, []() {
         ShowAboutDialog();
@@ -2905,6 +2949,22 @@ static void RegisterEngineHandlers() {
             if (g_connectAction) g_connectAction->setEnabled(true);
             RefreshAllSourceProperties();
             if (g_chatDock) g_chatDock->RefreshPlaceholder();
+
+            // "Connect to Zoom on Startup": the first time we reach an
+            // authenticated state this OBS session, auto-open the join dialog
+            // if the user enabled the setting. This point — g_isLoggedIn just
+            // set true on the UI thread — implies the engine is connected and
+            // login succeeded. The one-shot guard ensures a mid-session
+            // logout/login can't re-pop it. Skipped when a user-initiated join
+            // is already pending (handled just below). Deferred with
+            // singleShot(0) so the dialog opens cleanly after this handler
+            // returns rather than reentrantly inside it.
+            if (!g_startupConnectDone) {
+                g_startupConnectDone = true;
+                if (g_connectOnStartupEnabled && !g_pendingMeetingJoin) {
+                    QTimer::singleShot(0, []() { OnConnectClick(); });
+                }
+            }
 
             if (g_pendingMeetingJoin) {
                 g_pendingMeetingJoin = false;
