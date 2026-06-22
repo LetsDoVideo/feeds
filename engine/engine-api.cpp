@@ -8,6 +8,7 @@
 #include <winhttp.h>
 #include <wincred.h>
 #include <string>
+#include <vector>
 #include <cstdio>
 #include <cstdlib>
 
@@ -184,10 +185,15 @@ static bool RefreshAccessToken() {
 
 // ---------------------------------------------------------------------------
 // Authenticated GET to api.zoom.us with transparent 401-retry via refresh.
-// Returns the response body on success, or empty on session-expired.
+// ZoomApiGetWithStatus additionally reports the final HTTP status, so callers
+// like the Zoom Events flow can tell a missing-scope 401/403 apart from a real
+// empty result. ZoomApiGet keeps its original body-only contract: returns the
+// response body on success, or empty on session-expired.
 // ---------------------------------------------------------------------------
-std::string ZoomApiGet(const std::wstring& path) {
-    auto doRequest = [&]() -> std::string {
+std::string ZoomApiGetWithStatus(const std::wstring& path, int& outStatus) {
+    outStatus = 0;
+    auto doRequest = [&](int& st) -> std::string {
+        st = 0;
         HINTERNET hSession = WinHttpOpen(L"Feeds/1.0",
                                           WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                           WINHTTP_NO_PROXY_NAME,
@@ -227,29 +233,32 @@ std::string ZoomApiGet(const std::wstring& path) {
         WinHttpCloseHandle(hConnect);
         WinHttpCloseHandle(hSession);
 
-        return std::to_string(statusCode) + "|" + response;
+        st = (int)statusCode;
+        return response;
     };
 
-    std::string result = doRequest();
-    size_t sep = result.find('|');
-    if (sep == std::string::npos) return "";
-    std::string status = result.substr(0, sep);
-    std::string body   = result.substr(sep + 1);
+    int st = 0;
+    std::string body = doRequest(st);
 
-    if (status == "401") {
+    if (st == 401) {
         LogToFile("API: got 401, attempting refresh");
         if (RefreshAccessToken()) {
-            result = doRequest();
-            sep = result.find('|');
-            body = (sep == std::string::npos) ? "" : result.substr(sep + 1);
+            body = doRequest(st);
         } else {
             LogWarn("API: refresh failed, session expired");
             SendToPlugin("{\"type\":\"session_expired\"}");
+            outStatus = 401;
             return "";
         }
     }
 
+    outStatus = st;
     return body;
+}
+
+std::string ZoomApiGet(const std::wstring& path) {
+    int status = 0;
+    return ZoomApiGetWithStatus(path, status);
 }
 
 // ---------------------------------------------------------------------------
@@ -450,6 +459,185 @@ std::string FetchZak() {
     else
         LogToFile("API: FetchZak succeeded");
     return zak;
+}
+
+// ---------------------------------------------------------------------------
+// Zoom Events API (GET /v2/zoom_events/...). All three calls and their parsing
+// live here; the plugin only renders the normalized arrays we emit and drives
+// selection over IPC.
+// ---------------------------------------------------------------------------
+
+// JSON string escaper for the event/session names we re-emit (they can contain
+// quotes, backslashes, or non-ASCII). Same shape as the engine's other escapers.
+static std::string JsonEscape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 2);
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (c < 0x20) { char b[8]; sprintf_s(b, "\\u%04x", c); out += b; }
+                else out += (char)c;
+        }
+    }
+    return out;
+}
+
+// Return the text of the array value for `key` (from its '[' to the matching
+// ']'), string- and bracket-aware so nested arrays/objects don't confuse it.
+static std::string JsonExtractArrayBody(const std::string& json,
+                                        const std::string& key) {
+    std::string search = "\"" + key + "\"";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return "";
+    pos = json.find('[', pos + search.size());
+    if (pos == std::string::npos) return "";
+
+    int depth = 0; bool inStr = false; bool esc = false;
+    for (size_t i = pos; i < json.size(); ++i) {
+        char c = json[i];
+        if (inStr) {
+            if (esc) esc = false;
+            else if (c == '\\') esc = true;
+            else if (c == '"') inStr = false;
+            continue;
+        }
+        if (c == '"') inStr = true;
+        else if (c == '[') depth++;
+        else if (c == ']') { if (--depth == 0) return json.substr(pos, i - pos + 1); }
+    }
+    return "";
+}
+
+// Split a JSON array body into its top-level object substrings ("{...}"),
+// skipping nested braces and brace characters inside strings.
+static std::vector<std::string> JsonSplitObjects(const std::string& arr) {
+    std::vector<std::string> out;
+    int depth = 0; bool inStr = false; bool esc = false; size_t start = 0;
+    for (size_t i = 0; i < arr.size(); ++i) {
+        char c = arr[i];
+        if (inStr) {
+            if (esc) esc = false;
+            else if (c == '\\') esc = true;
+            else if (c == '"') inStr = false;
+            continue;
+        }
+        if (c == '"') inStr = true;
+        else if (c == '{') { if (depth++ == 0) start = i; }
+        else if (c == '}') { if (--depth == 0) out.push_back(arr.substr(start, i - start + 1)); }
+    }
+    return out;
+}
+
+// Fetch one role_type's upcoming events, appending normalized objects to `out`.
+// Follows next_page_token. Sets authFailed on a 401/403 — the user authorized
+// before the Events scopes existed and must log out / back in to re-consent.
+static void FetchEventsForRole(const std::string& roleType, std::string& out,
+                               bool& authFailed) {
+    std::string nextToken;
+    for (int page = 0; page < 20; ++page) {  // page cap is defensive
+        std::wstring path =
+            L"/v2/zoom_events/events?event_status_type=upcoming&role_type=" +
+            std::wstring(roleType.begin(), roleType.end());
+        if (!nextToken.empty())
+            path += L"&next_page_token=" +
+                    std::wstring(nextToken.begin(), nextToken.end());
+
+        int status = 0;
+        std::string resp = ZoomApiGetWithStatus(path, status);
+        if (status == 401 || status == 403) { authFailed = true; return; }
+        if (resp.empty()) return;
+
+        std::string body = JsonExtractArrayBody(resp, "events");
+        for (const std::string& obj : JsonSplitObjects(body)) {
+            std::string id = JsonExtractString(obj, "event_id");
+            if (id.empty()) continue;
+            std::string name  = JsonExtractString(obj, "name");
+            std::string etype = JsonExtractString(obj, "event_type");
+            if (!out.empty()) out += ",";
+            out += "{\"event_id\":\""  + JsonEscape(id)    + "\","
+                    "\"name\":\""       + JsonEscape(name)  + "\","
+                    "\"event_type\":\"" + JsonEscape(etype) + "\","
+                    "\"role\":\""       + roleType          + "\"}";
+        }
+
+        nextToken = JsonExtractString(resp, "next_page_token");
+        if (nextToken.empty()) return;
+    }
+}
+
+// Returns a JSON array string of normalized events across both role types
+// (attendee + host). On a 401/403 from either call, authFailed is set and ""
+// is returned so the handler can prompt the user to re-consent.
+std::string FetchEventsArray(bool& authFailed) {
+    authFailed = false;
+    LogToFile("API: FetchEventsArray starting");
+    std::string out;
+    FetchEventsForRole("attendee", out, authFailed);
+    if (authFailed) return "";
+    FetchEventsForRole("host", out, authFailed);
+    if (authFailed) return "";
+    return "[" + out + "]";
+}
+
+// Returns a JSON array string of normalized sessions for an event.
+//   type: 0 = meeting, 2 = webinar, 4 = neither. meeting_id/webinar_id are
+//   present in the response but informational — we never join by them.
+std::string FetchEventSessionsArray(const std::string& eventId) {
+    LogToFile("API: FetchEventSessionsArray starting");
+    std::wstring path = L"/v2/zoom_events/events/" +
+        std::wstring(eventId.begin(), eventId.end()) + L"/sessions";
+    std::string resp = ZoomApiGet(path);
+    if (resp.empty()) return "[]";
+
+    std::string out;
+    std::string body = JsonExtractArrayBody(resp, "sessions");
+    for (const std::string& obj : JsonSplitObjects(body)) {
+        std::string id = JsonExtractString(obj, "session_id");
+        if (id.empty()) continue;
+        std::string name  = JsonExtractString(obj, "name");
+        std::string start = JsonExtractString(obj, "start_time");
+        std::string type  = JsonExtractNumber(obj, "type");
+        if (type.empty()) type = "4";  // 4 = neither meeting nor webinar
+        if (!out.empty()) out += ",";
+        out += "{\"session_id\":\"" + JsonEscape(id)    + "\","
+                "\"name\":\""        + JsonEscape(name)  + "\","
+                "\"start_time\":\""  + JsonEscape(start) + "\","
+                "\"type\":"          + type              + "}";
+    }
+    return "[" + out + "]";
+}
+
+// Fetch the just-in-time join token for a session. The token has no documented
+// TTL, so callers must fetch it immediately before joining and never cache it.
+// Returns true only when code == 0 and a token came back; otherwise code and
+// errorMessage carry the failure (1130 = no valid ticket, 1150 = revoked).
+bool FetchEventJoinToken(const std::string& eventId, const std::string& sessionId,
+                         int& code, std::string& joinToken,
+                         std::string& errorMessage) {
+    LogToFile("API: FetchEventJoinToken starting");
+    code = -1; joinToken.clear(); errorMessage.clear();
+
+    std::wstring path = L"/v2/zoom_events/events/" +
+        std::wstring(eventId.begin(), eventId.end()) + L"/sessions/" +
+        std::wstring(sessionId.begin(), sessionId.end()) + L"/join_token";
+    std::string resp = ZoomApiGet(path);
+    if (resp.empty()) {
+        errorMessage = "No response from Zoom Events.";
+        return false;
+    }
+
+    std::string codeStr = JsonExtractNumber(resp, "code");
+    code         = codeStr.empty() ? -1 : atoi(codeStr.c_str());
+    joinToken    = JsonExtractString(resp, "join_token");
+    errorMessage = JsonExtractString(resp, "error_message");
+    return code == 0 && !joinToken.empty();
 }
 
 // ---------------------------------------------------------------------------

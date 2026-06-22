@@ -316,6 +316,9 @@ namespace feeds_engine {
     void HandleLeaveMeeting(const std::string&);
     void HandleGetParticipants(const std::string&);
     void HandleLogout(const std::string&);
+    void HandleRequestEvents(const std::string&);
+    void HandleRequestSessions(const std::string&);
+    void HandleJoinEventSession(const std::string&);
 }
 // Forward decls — defined in engine-video.cpp
 namespace feeds_engine {
@@ -445,6 +448,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     RegisterHandler("leave_meeting",                  feeds_engine::HandleLeaveMeeting);
     RegisterHandler("get_participants",               feeds_engine::HandleGetParticipants);
     RegisterHandler("send_chat_message",              feeds_engine::HandleSendChatMessage);
+    RegisterHandler("request_events",                 feeds_engine::HandleRequestEvents);
+    RegisterHandler("request_sessions",               feeds_engine::HandleRequestSessions);
+    RegisterHandler("join_event_session",             feeds_engine::HandleJoinEventSession);
     RegisterHandler("participant_source_subscribe",   feeds_engine::HandleParticipantSourceSubscribe);
     RegisterHandler("participant_source_unsubscribe", feeds_engine::HandleParticipantSourceUnsubscribe);
     RegisterHandler("shutdown",                       HandleShutdown);

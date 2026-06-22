@@ -191,6 +191,52 @@ Engine forwards `IMeetingLiveStreamCtrlEvent::onRawLiveStreamPrivilegeRequestTim
 {"type": "raw_livestream_timeout"}
 ```
 
+### Zoom Events
+
+Additive flow for joining a Zoom Events session. The engine makes three authenticated `GET /v2/zoom_events/...` calls (reusing `ZoomApiGet`) and joins via the SDK's join-by-token path. A joined session is a normal meeting or webinar from the SDK's side, so all meeting messages above apply afterward (`meeting_joined`, `raw_livestream_*`, etc.). Join failures (including the just-in-time join-token errors `1130` no-valid-ticket and `1150` ticket-revoked) are surfaced via the existing `meeting_failed`.
+
+#### `request_events` (P→E)
+User clicked "Zoom Events" in the connect dialog. Engine lists the user's upcoming events for both `role_type=attendee` and `role_type=host` (following `next_page_token`), parses them, and replies with `events_list` — or `events_auth_required` on a 401/403.
+
+```json
+{"type": "request_events"}
+```
+
+#### `events_list` (E→P)
+Normalized upcoming events. `role` is `"attendee"` or `"host"`. Plugin shows a picker; choosing an event sends `request_sessions`.
+
+```json
+{"type": "events_list", "events": [{"event_id": "...", "name": "...", "event_type": "...", "role": "attendee"}]}
+```
+
+#### `events_auth_required` (E→P)
+The events list returned 401/403 — the user authorized before the Zoom Events scopes existed. Plugin prompts them to log out and back in to re-consent (no raw error shown).
+
+```json
+{"type": "events_auth_required"}
+```
+
+#### `request_sessions` (P→E)
+User picked an event. Engine lists that event's sessions and replies with `sessions_list`.
+
+```json
+{"type": "request_sessions", "event_id": "..."}
+```
+
+#### `sessions_list` (E→P)
+Normalized sessions for the event. `type`: `0` = meeting, `2` = webinar, `4` = neither. `meeting_id`/`webinar_id` are informational only and are not emitted — Events join is token-only.
+
+```json
+{"type": "sessions_list", "event_id": "...", "sessions": [{"session_id": "...", "name": "...", "start_time": "...", "type": 2}]}
+```
+
+#### `join_event_session` (P→E)
+User picked a session. Engine fetches the just-in-time join token (`GET .../join_token`, never cached) and, on `code == 0`, joins via `JoinParam4WithoutLogin` with `join_token` set and `meetingNumber`/`password` empty (the eventId/sessionId are a separate ID space). Result arrives via `meeting_joined` / `meeting_failed`.
+
+```json
+{"type": "join_event_session", "event_id": "...", "session_id": "...", "display_name": "..."}
+```
+
 ### Participants
 
 #### `get_participants` (P→E)

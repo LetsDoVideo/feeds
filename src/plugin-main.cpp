@@ -180,6 +180,13 @@ static unsigned long long g_currentMeetingNumber = 0;
 // consumer is wired in commit 4; commit 3 only sets this so the protocol
 // shape is in place when commit 4 lands.
 static std::atomic<bool> g_pendingInstantMeeting{false};
+
+// Zoom Events connect flow (async, driven over IPC). These pending flags gate
+// the events_list / sessions_list handlers so only a user-initiated "Zoom
+// Events" click pops a picker — a stray reply can't.
+static std::atomic<bool> g_eventsListPending{false};
+static std::atomic<bool> g_eventsSessionsPending{false};
+
 static unsigned int       g_activeSharerUserId   = 0;
 static unsigned int       g_cachedMyUserId       = 0;
 static unsigned int       g_activeSpeakerUserId  = 0;
@@ -358,6 +365,53 @@ static std::string ExtractJsonStringEscaped(const std::string& json,
             out += c;
             pos += 1;
         }
+    }
+    return out;
+}
+
+// Return the text of the array value for `key` (from its '[' to the matching
+// ']'), string- and bracket-aware. Used to pull the events[]/sessions[] arrays
+// out of the Zoom Events IPC payloads. Mirrors the engine's JsonExtractArrayBody.
+static std::string JsonExtractArrayBody(const std::string& json,
+                                        const std::string& key) {
+    std::string search = "\"" + key + "\"";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return "";
+    pos = json.find('[', pos + search.size());
+    if (pos == std::string::npos) return "";
+
+    int depth = 0; bool inStr = false; bool esc = false;
+    for (size_t i = pos; i < json.size(); ++i) {
+        char c = json[i];
+        if (inStr) {
+            if (esc) esc = false;
+            else if (c == '\\') esc = true;
+            else if (c == '"') inStr = false;
+            continue;
+        }
+        if (c == '"') inStr = true;
+        else if (c == '[') depth++;
+        else if (c == ']') { if (--depth == 0) return json.substr(pos, i - pos + 1); }
+    }
+    return "";
+}
+
+// Split a JSON array body into its top-level object substrings ("{...}"),
+// skipping nested braces and braces inside strings.
+static std::vector<std::string> SplitJsonObjects(const std::string& arr) {
+    std::vector<std::string> out;
+    int depth = 0; bool inStr = false; bool esc = false; size_t start = 0;
+    for (size_t i = 0; i < arr.size(); ++i) {
+        char c = arr[i];
+        if (inStr) {
+            if (esc) esc = false;
+            else if (c == '\\') esc = true;
+            else if (c == '"') inStr = false;
+            continue;
+        }
+        if (c == '"') inStr = true;
+        else if (c == '{') { if (depth++ == 0) start = i; }
+        else if (c == '}') { if (--depth == 0) out.push_back(arr.substr(start, i - start + 1)); }
     }
     return out;
 }
@@ -851,6 +905,7 @@ void OnConnectClick() {
         QPushButton* instantBtn = new QPushButton("Create Instant\nMeeting", &dlg);
         QPushButton* pmiBtn     = new QPushButton(pmiLabel, &dlg);
         QPushButton* linkBtn    = new QPushButton("Join by Number\nor Link", &dlg);
+        QPushButton* eventsBtn  = new QPushButton("Zoom Events", &dlg);
 
         // min-height: multi-line labels + padding need vertical room or Qt
         // crops the second line on some platforms. Both top-row buttons use
@@ -879,6 +934,7 @@ void OnConnectClick() {
         instantBtn->setStyleSheet(emphasizedBtnStyle);
         pmiBtn    ->setStyleSheet(emphasizedBtnStyle);
         linkBtn   ->setStyleSheet(secondaryBtnStyle);
+        eventsBtn ->setStyleSheet(secondaryBtnStyle);
         // Pin button heights to match their stylesheet min-heights so the
         // QHBoxLayout's vertical sizeHint == its content's actual height.
         // Without this, Qt allocates the row extra vertical space (the
@@ -887,6 +943,7 @@ void OnConnectClick() {
         instantBtn->setMaximumHeight(80);
         pmiBtn    ->setMaximumHeight(80);
         linkBtn   ->setMaximumHeight(70);
+        eventsBtn ->setMaximumHeight(70);
 
         // Both emphasized buttons get the same minimum width so they render
         // at equal sizes regardless of their text content lengths. Without
@@ -906,6 +963,7 @@ void OnConnectClick() {
         instantBtn->setFocusPolicy(Qt::NoFocus);
         pmiBtn    ->setFocusPolicy(Qt::NoFocus);
         linkBtn   ->setFocusPolicy(Qt::NoFocus);
+        eventsBtn ->setFocusPolicy(Qt::NoFocus);
 
         QObject::connect(instantBtn, &QPushButton::clicked, &dlg,
                          [&]() { choice = 1; dlg.accept(); });
@@ -913,6 +971,8 @@ void OnConnectClick() {
                          [&]() { choice = 2; dlg.accept(); });
         QObject::connect(linkBtn,    &QPushButton::clicked, &dlg,
                          [&]() { choice = 3; dlg.accept(); });
+        QObject::connect(eventsBtn,  &QPushButton::clicked, &dlg,
+                         [&]() { choice = 4; dlg.accept(); });
 
         QLabel* tipLabel = new QLabel(
             "<span style=\"color:gray;font-style:italic\">"
@@ -940,7 +1000,8 @@ void OnConnectClick() {
         // than spanning the row's full width.
         QHBoxLayout* bottomRow = new QHBoxLayout();
         bottomRow->addStretch();
-        bottomRow->addWidget(linkBtn, 0, Qt::AlignTop);
+        bottomRow->addWidget(linkBtn,   0, Qt::AlignTop);
+        bottomRow->addWidget(eventsBtn, 0, Qt::AlignTop);
         bottomRow->addStretch();
         bottomRow->setAlignment(Qt::AlignTop);
 
@@ -955,6 +1016,17 @@ void OnConnectClick() {
         layout->addLayout(bottomRow);
 
         if (dlg.exec() != QDialog::Accepted || choice == 0) return;
+    }
+
+    // ----- Zoom Events branch -----
+    if (choice == 4) {
+        // Async: ask the engine for the user's events. The events_list reply
+        // (handled on the IPC reader) pops the event picker, which leads to the
+        // session picker and finally join_event_session. Gated by a pending
+        // flag so a stray events_list can't pop a picker unprompted.
+        g_eventsListPending = true;
+        feeds::SendToEngine("{\"type\":\"request_events\"}");
+        return;
     }
 
     // ----- Create Instant Meeting branch -----
@@ -1153,6 +1225,130 @@ void OnConnectClick() {
                       "\"is_pmi\":" + std::string(isPmi ? "true" : "false") + "}";
     feeds::SendToEngine(msg);
 
+    if (g_connectAction) g_connectAction->setEnabled(false);
+}
+
+// ---------------------------------------------------------------------------
+// Zoom Events pickers. Driven async from the IPC handlers (events_list /
+// sessions_list) via QTimer::singleShot, so they always run on the Qt main
+// thread. Each parses the normalized array the engine emitted and, on
+// selection, sends the next IPC step.
+// ---------------------------------------------------------------------------
+static void ShowEventPickerDialog(const std::string& json) {
+    QMainWindow* mainWindow = (QMainWindow*)obs_frontend_get_main_window();
+    std::vector<std::string> objs =
+        SplitJsonObjects(JsonExtractArrayBody(json, "events"));
+
+    if (objs.empty()) {
+        QMessageBox::information(static_cast<QWidget*>(mainWindow),
+            QString::fromUtf8("Feeds - Zoom Events"),
+            QString::fromUtf8(
+                "No upcoming Zoom Events were found on your account."));
+        return;
+    }
+
+    QDialog dlg(mainWindow);
+    dlg.setWindowTitle("Zoom Events");
+
+    QLabel* label = new QLabel("Select an event:", &dlg);
+    QListWidget* list = new QListWidget(&dlg);
+    for (const std::string& o : objs) {
+        std::string id   = ExtractJsonString(o, "event_id");
+        std::string name = ExtractJsonStringEscaped(o, "name");
+        std::string role = ExtractJsonString(o, "role");
+        if (name.empty()) name = "(unnamed event)";
+        QString text = QString::fromStdString(name);
+        if (role == "host")          text += "  [Host]";
+        else if (role == "attendee") text += "  [Attendee]";
+        QListWidgetItem* item = new QListWidgetItem(text, list);
+        item->setData(Qt::UserRole, QString::fromStdString(id));
+    }
+    list->setCurrentRow(0);
+
+    QDialogButtonBox* buttons = new QDialogButtonBox(
+        QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    QObject::connect(list, &QListWidget::itemDoubleClicked, &dlg, &QDialog::accept);
+
+    QVBoxLayout* layout = new QVBoxLayout(&dlg);
+    layout->addWidget(label);
+    layout->addWidget(list);
+    layout->addWidget(buttons);
+
+    if (dlg.exec() != QDialog::Accepted) return;
+    QListWidgetItem* sel = list->currentItem();
+    if (!sel) return;
+    std::string eventId = sel->data(Qt::UserRole).toString().toStdString();
+    if (eventId.empty()) return;
+
+    g_eventsSessionsPending = true;
+    feeds::SendToEngine("{\"type\":\"request_sessions\",\"event_id\":\"" +
+                        JsonEscape(eventId) + "\"}");
+}
+
+static void ShowSessionPickerDialog(const std::string& json) {
+    QMainWindow* mainWindow = (QMainWindow*)obs_frontend_get_main_window();
+    std::string eventId = ExtractJsonString(json, "event_id");
+    std::vector<std::string> objs =
+        SplitJsonObjects(JsonExtractArrayBody(json, "sessions"));
+
+    if (objs.empty()) {
+        QMessageBox::information(static_cast<QWidget*>(mainWindow),
+            QString::fromUtf8("Feeds - Zoom Events"),
+            QString::fromUtf8("This event has no sessions you can join."));
+        return;
+    }
+
+    QDialog dlg(mainWindow);
+    dlg.setWindowTitle("Zoom Events - Sessions");
+
+    QLabel* label = new QLabel("Select a session to join:", &dlg);
+    QListWidget* list = new QListWidget(&dlg);
+    for (const std::string& o : objs) {
+        std::string id    = ExtractJsonString(o, "session_id");
+        std::string name  = ExtractJsonStringEscaped(o, "name");
+        std::string start = ExtractJsonStringEscaped(o, "start_time");
+        long long   type  = ExtractJsonNumber(o, "type");
+        if (name.empty()) name = "(unnamed session)";
+        // type: 0 = meeting, 2 = webinar, 4 = neither.
+        const char* typeStr = (type == 0) ? "Meeting"
+                            : (type == 2) ? "Webinar" : "Session";
+        QString text = QString::fromStdString(name);
+        if (!start.empty()) text += "  —  " + QString::fromStdString(start);
+        text += QString("  (") + typeStr + ")";
+        QListWidgetItem* item = new QListWidgetItem(text, list);
+        item->setData(Qt::UserRole, QString::fromStdString(id));
+    }
+    list->setCurrentRow(0);
+
+    QDialogButtonBox* buttons = new QDialogButtonBox(
+        QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    QObject::connect(list, &QListWidget::itemDoubleClicked, &dlg, &QDialog::accept);
+
+    QVBoxLayout* layout = new QVBoxLayout(&dlg);
+    layout->addWidget(label);
+    layout->addWidget(list);
+    layout->addWidget(buttons);
+
+    if (dlg.exec() != QDialog::Accepted) return;
+    QListWidgetItem* sel = list->currentItem();
+    if (!sel) return;
+    std::string sessionId = sel->data(Qt::UserRole).toString().toStdString();
+    if (sessionId.empty() || eventId.empty()) return;
+
+    // Mirrors the logged-in join_meeting path: fire the join and disable
+    // Connect until meeting_joined / meeting_failed comes back. (We don't set
+    // g_pendingMeetingJoin — that's only for joins deferred until login
+    // completes; here the user is already authenticated.) The engine fetches
+    // the just-in-time join token and joins by token.
+    std::string msg = "{\"type\":\"join_event_session\","
+                      "\"event_id\":\""     + JsonEscape(eventId)          + "\","
+                      "\"session_id\":\""   + JsonEscape(sessionId)        + "\","
+                      "\"display_name\":\"" + JsonEscape(g_userDisplayName) + "\"}";
+    feeds::SendToEngine(msg);
     if (g_connectAction) g_connectAction->setEnabled(false);
 }
 
@@ -3133,6 +3329,39 @@ static void RegisterEngineHandlers() {
                     QString::fromUtf8("Feeds - Join Failed"),
                     QString::fromUtf8(msg.c_str()));
             });
+    });
+
+    // ---- Zoom Events flow ----
+    feeds::RegisterMessageHandler("events_list", [](const std::string& json) {
+        // Ignore unless a "Zoom Events" click is awaiting this reply.
+        if (!g_eventsListPending.exchange(false)) return;
+        std::string payload = json;
+        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
+            [payload]() { ShowEventPickerDialog(payload); });
+    });
+
+    feeds::RegisterMessageHandler("sessions_list", [](const std::string& json) {
+        if (!g_eventsSessionsPending.exchange(false)) return;
+        std::string payload = json;
+        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
+            [payload]() { ShowSessionPickerDialog(payload); });
+    });
+
+    feeds::RegisterMessageHandler("events_auth_required", [](const std::string&) {
+        // The user authorized before the Zoom Events scopes existed. Don't show
+        // a raw error — tell them to re-consent by logging out and back in.
+        g_eventsListPending     = false;
+        g_eventsSessionsPending = false;
+        blog(LOG_WARNING, "[feeds] events_auth_required — Events scope not granted");
+        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
+            QMessageBox::information(
+                static_cast<QWidget*>(obs_frontend_get_main_window()),
+                QString::fromUtf8("Feeds - Zoom Events"),
+                QString::fromUtf8(
+                    "Feeds needs to be re-authorized to access your Zoom Events.\n\n"
+                    "Open the Feeds menu, log out of Zoom, then log back in to "
+                    "grant access — and try Zoom Events again."));
+        });
     });
 
     feeds::RegisterMessageHandler("meeting_left", [](const std::string&) {

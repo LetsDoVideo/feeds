@@ -46,6 +46,13 @@ bool              CreateInstantMeeting(const std::string& topic,
                                        unsigned long long& outId,
                                        std::string& outPassword,
                                        std::string& outJoinUrl);
+// Zoom Events API (parsing lives in engine-api.cpp).
+std::string       FetchEventsArray(bool& authFailed);
+std::string       FetchEventSessionsArray(const std::string& eventId);
+bool              FetchEventJoinToken(const std::string& eventId,
+                                      const std::string& sessionId,
+                                      int& code, std::string& joinToken,
+                                      std::string& errorMessage);
 
 // From engine-video.cpp
 void TearDownAllVideoSubscriptions();
@@ -1183,12 +1190,12 @@ void HandleJoinMeeting(const std::string& json) {
     std::string inputLower = input;
     for (char& c : inputLower) if (c >= 'A' && c <= 'Z') c += 32;
     if (inputLower.find("events.zoom.us") != std::string::npos) {
-        LogToFile("Meeting: rejected Zoom Events link, not supported by Meeting SDK");
+        LogToFile("Meeting: rejected Zoom Events link — use the Zoom Events flow");
         SendToPlugin("{\"type\":\"meeting_failed\",\"code\":-4,"
-                     "\"message\":\"This is a Zoom Events link, which can't be joined "
-                     "from Feeds as it is not yet supported by the Zoom SDK. Schedule "
-                     "the webinar directly in Zoom (not in an Events Hub) and use that "
-                     "link instead.\"}");
+                     "\"message\":\"This looks like a Zoom Events link, which can't "
+                     "be joined by pasting the URL. Use the \\\"Zoom Events\\\" button "
+                     "on the Connect screen instead — it lists your events and joins "
+                     "the session directly.\"}");
         return;
     }
 
@@ -1326,6 +1333,144 @@ void HandleJoinMeeting(const std::string& json) {
     }
 
     LogInfo("Meeting: Join() call returned SUCCESS, waiting for status events");
+}
+
+// ---------------------------------------------------------------------------
+// IPC handlers: Zoom Events
+//   request_events       → events_list / events_auth_required
+//   request_sessions     → sessions_list
+//   join_event_session   → fetch JIT join token, then SDK join-by-token
+// The join itself reuses the without-login JoinParam path, but token-only:
+// no meeting number, no password — eventId/sessionId are a separate ID space.
+// ---------------------------------------------------------------------------
+void HandleRequestEvents(const std::string& /*json*/) {
+    LogToFile("Events: HandleRequestEvents called");
+    bool authFailed = false;
+    std::string events = FetchEventsArray(authFailed);
+    if (authFailed) {
+        LogWarn("Events: events list returned 401/403 — Events scope not granted");
+        SendToPlugin("{\"type\":\"events_auth_required\"}");
+        return;
+    }
+    SendToPlugin("{\"type\":\"events_list\",\"events\":" + events + "}");
+}
+
+void HandleRequestSessions(const std::string& json) {
+    LogToFile("Events: HandleRequestSessions called");
+    std::string eventId = JsonExtractString(json, "event_id");
+    if (eventId.empty()) {
+        SendToPlugin("{\"type\":\"sessions_list\",\"event_id\":\"\",\"sessions\":[]}");
+        return;
+    }
+    std::string sessions = FetchEventSessionsArray(eventId);
+    SendToPlugin("{\"type\":\"sessions_list\",\"event_id\":\"" +
+                 JsonEscape(eventId) + "\",\"sessions\":" + sessions + "}");
+}
+
+void HandleJoinEventSession(const std::string& json) {
+    LogToFile("Events: HandleJoinEventSession called");
+
+    if (!g_meetingService) {
+        SendToPlugin("{\"type\":\"meeting_failed\",\"code\":-1,"
+                     "\"message\":\"Zoom SDK is not ready. Please try logging in again.\"}");
+        return;
+    }
+
+    std::string eventId    = JsonExtractString(json, "event_id");
+    std::string sessionId  = JsonExtractString(json, "session_id");
+    std::string customName = JsonExtractString(json, "display_name");
+    if (eventId.empty() || sessionId.empty()) {
+        SendToPlugin("{\"type\":\"meeting_failed\",\"code\":-2,"
+                     "\"message\":\"No Zoom Events session was selected.\"}");
+        return;
+    }
+
+    // Just-in-time join token — fetched immediately before joining, never
+    // cached (no documented TTL).
+    int code = -1;
+    std::string joinToken, errorMessage;
+    if (!FetchEventJoinToken(eventId, sessionId, code, joinToken, errorMessage)) {
+        std::string friendly;
+        switch (code) {
+            case 1130:
+                friendly = "You don't have a valid ticket for this Zoom Events "
+                           "session, so it can't be joined.";
+                break;
+            case 1150:
+                friendly = "Your ticket for this Zoom Events session has been "
+                           "revoked, so it can't be joined.";
+                break;
+            default:
+                friendly = errorMessage.empty()
+                    ? "Could not get a join token for this Zoom Events session."
+                    : errorMessage;
+                break;
+        }
+        char codeBuf[32];
+        sprintf_s(codeBuf, "%d", code);
+        SendToPlugin("{\"type\":\"meeting_failed\",\"code\":" + std::string(codeBuf) +
+                     ",\"message\":\"" + JsonEscape(friendly) + "\"}");
+        return;
+    }
+
+    std::string zak = FetchZak();
+    const std::string& displayName = GetUserDisplayName();
+    if (zak.empty() || displayName.empty()) {
+        LogWarn("Meeting: could not retrieve ZAK or display name");
+        SendToPlugin("{\"type\":\"meeting_failed\",\"code\":-3,"
+                     "\"message\":\"Could not retrieve your Zoom account details. "
+                     "Please log out and log in again.\"}");
+        return;
+    }
+
+    // Build a without-login join, token-only. tagJoinParam() zero-inits every
+    // field, so the ones we leave unset (meetingNumber, psw, webinarToken,
+    // vanityID, ...) are already empty/null — we set them explicitly here for
+    // clarity since an Events join must carry no meeting number or password.
+    ZOOM_SDK_NAMESPACE::JoinParam joinParam;
+    joinParam.userType = ZOOM_SDK_NAMESPACE::SDK_UT_WITHOUT_LOGIN;
+    ZOOM_SDK_NAMESPACE::JoinParam4WithoutLogin& param =
+        joinParam.param.withoutloginuserJoin;
+    param.isAudioOff = true;
+    param.isVideoOff = true;
+
+    const std::string& effectiveName =
+        customName.empty() ? displayName : customName;
+    static std::wstring s_evtUserName;
+    s_evtUserName  = Utf8ToWide(effectiveName);
+    param.userName = s_evtUserName.c_str();
+    // Webinar registration callbacks (Events sessions can be webinars) respond
+    // with this name.
+    g_configurationListener.SetEffectiveDisplayName(s_evtUserName);
+
+    static std::wstring s_evtZak;
+    s_evtZak      = std::wstring(zak.begin(), zak.end());
+    param.userZAK = s_evtZak.c_str();
+
+    static std::wstring s_evtJoinToken;
+    s_evtJoinToken   = std::wstring(joinToken.begin(), joinToken.end());
+    param.join_token = s_evtJoinToken.c_str();
+
+    param.meetingNumber = 0;        // token-only join: no number to pass
+    param.vanityID      = nullptr;
+    param.psw           = nullptr;
+    param.webinarToken  = nullptr;
+
+    LogInfo("Events: joining session via join_token (token-only, no meeting number)");
+    ZOOM_SDK_NAMESPACE::SDKError joinErr = g_meetingService->Join(joinParam);
+    if (joinErr != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
+        char buf[256];
+        sprintf_s(buf, "Events: Join() call failed immediately: %d", (int)joinErr);
+        LogError(buf);
+        sprintf_s(buf,
+            "{\"type\":\"meeting_failed\",\"code\":%d,"
+            "\"message\":\"Could not start Events session join. SDK error: %d\"}",
+            (int)joinErr, (int)joinErr);
+        SendToPlugin(buf);
+        return;
+    }
+
+    LogInfo("Events: Join() call returned SUCCESS, waiting for status events");
 }
 
 // ---------------------------------------------------------------------------
