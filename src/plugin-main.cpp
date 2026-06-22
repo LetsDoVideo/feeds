@@ -1764,12 +1764,9 @@ void SetupPluginMenu() {
 
     QObject::connect(g_loginLogoutAction, &QAction::triggered, []() {
         if (g_authInProgress && !g_isLoggedIn) {
-            // User clicked "Cancel login". Tell the engine first so it
-            // can unblock its OAuth pipe-reader thread and discard PKCE
-            // state — without this the engine's reader stays parked on
-            // \\.\pipe\FeedsAuth, the pipe name stays bound, and the
-            // next login_start fails on CreateNamedPipe + a stray
-            // browser callback later surfaces as token_exchange_failed.
+            // User clicked "Cancel login". Tell the engine first so it sets
+            // its cancel flag and the worker poll loop exits promptly,
+            // discarding the PKCE verifier/state with the OAuth thread.
             // Then clear local state.
             blog(LOG_INFO, "[feeds] login cancelled by user");
             feeds::SendToEngine("{\"type\":\"login_cancel\"}");
@@ -2718,34 +2715,6 @@ struct obs_source_info zoom_screenshare_info = {};
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("feeds", "en-US")
-
-// ---------------------------------------------------------------------------
-// Protocol handler registration (ldvfeeds://)
-// ---------------------------------------------------------------------------
-static void RegisterProtocolHandler() {
-    char pluginPath[MAX_PATH] = {};
-    GetModuleFileNameA(nullptr, pluginPath, MAX_PATH);
-    std::string obsPath(pluginPath);
-    size_t binPos = obsPath.rfind("obs64.exe");
-    if (binPos == std::string::npos) return;
-
-    std::string helperExe = obsPath.substr(0, binPos) + "FeedsLogin.exe";
-    std::string command = "\"" + helperExe + "\" \"%1\"";
-
-    HKEY hKey;
-    RegCreateKeyExA(HKEY_CURRENT_USER, "Software\\Classes\\ldvfeeds",
-        0, nullptr, 0, KEY_WRITE, nullptr, &hKey, nullptr);
-    RegSetValueExA(hKey, "", 0, REG_SZ, (BYTE*)"URL:Feeds Protocol", 19);
-    RegSetValueExA(hKey, "URL Protocol", 0, REG_SZ, (BYTE*)"", 1);
-    RegCloseKey(hKey);
-
-    RegCreateKeyExA(HKEY_CURRENT_USER,
-        "Software\\Classes\\ldvfeeds\\shell\\open\\command",
-        0, nullptr, 0, KEY_WRITE, nullptr, &hKey, nullptr);
-    RegSetValueExA(hKey, "", 0, REG_SZ,
-        (BYTE*)command.c_str(), (DWORD)command.size() + 1);
-    RegCloseKey(hKey);
-}
 
 // ---------------------------------------------------------------------------
 // Tier reconciliation
@@ -3796,8 +3765,6 @@ bool obs_module_load(void) {
     if (sh) {
         signal_handler_connect(sh, "source_create", OnSourceCreated, nullptr);
     }
-
-    RegisterProtocolHandler();
 
     feeds::StartEngine();
     RegisterEngineHandlers();

@@ -1,10 +1,20 @@
 // engine-oauth.cpp — OAuth 2.0 with PKCE for Zoom Marketplace.
 //
-// Runs inside FeedsEngine.exe. Generates a PKCE verifier/challenge,
-// opens the browser to Zoom's OAuth endpoint, listens on the FeedsAuth
-// named pipe for FeedsLogin.exe to deliver the auth code, exchanges
-// the code for tokens via WinHTTP, and saves them to Windows Credential
-// Manager (DPAPI-protected, same Windows user account only).
+// Runs inside FeedsEngine.exe. Generates a PKCE verifier/challenge and a
+// random state, opens the browser to Zoom's OAuth endpoint, then polls the
+// Feeds worker for the auth code: the loginsuccess page POSTs the code to the
+// worker keyed by our state, and the worker hands it back once on a GET. The
+// engine exchanges the code for tokens via WinHTTP and saves them to Windows
+// Credential Manager (DPAPI-protected, same Windows user account only).
+//
+// This replaced an older browser→desktop handoff (the loginsuccess page fired
+// an ldvfeeds:// protocol that launched FeedsLogin.exe, which wrote the code
+// into the \\.\pipe\FeedsAuth named pipe). Browsers now block that auto-launch
+// without a user gesture, so the worker-poll path is the only handoff.
+//
+// The state is only an unguessable correlator; the auth code stays
+// PKCE-protected, and the verifier never leaving the engine is what makes
+// routing the code through the worker safe.
 
 #include <windows.h>
 #include <wincrypt.h>
@@ -32,36 +42,23 @@ bool AuthenticateSDK();  // defined in engine-sdk.cpp
 // ---------------------------------------------------------------------------
 // In-flight login state — guards the OAuth thread and its cancel signal.
 // Accessed from:
-//   - the OAuth thread (LoginThreadFunc / WaitForAuthCode)
+//   - the OAuth thread (LoginThreadFunc / the worker poll loop)
 //   - the IPC pipe-reader thread (StartLoginFlow / CancelLoginFlow)
 //
-// FeedsAuth pipe ownership: the OAuth thread owns the pipe handle for its
-// entire lifetime. Cancel never touches it. Earlier designs (e4d190c) gave
-// cancel co-ownership and had it CloseHandle the pipe to unblock the OAuth
-// thread, but CloseHandle on a server pipe with a pending synchronous
-// ConnectNamedPipe issued from another thread hangs the calling thread —
-// the kernel can't release the file object until the pending IRP drains,
-// and on a non-overlapped pipe there's no mechanism to drain it. That
-// hang wedged the IPC reader (cancel runs on it) so the engine went
-// completely silent after the first cancel. Fix: pipe is now created with
-// FILE_FLAG_OVERLAPPED and waited on via WaitForMultipleObjects against
-// g_loginCancelEvent.
+// Cancel is trivial now that the auth code arrives over HTTPS from the worker
+// rather than through a named pipe: CancelLoginFlow just sets g_loginCancelled
+// and the poll loop checks it every iteration, breaking out promptly. There is
+// no pipe handle and no cancel event to coordinate — the whole overlapped-I/O
+// apparatus that the FeedsAuth pipe required is gone.
 //
-// g_loginCancelEvent is a manual-reset event the OAuth thread waits on
-// alongside each overlapped pipe operation. Cancel signals it via a single
-// SetEvent call (no handle touches, no blocking). Manual-reset so once
-// signaled, both the ConnectNamedPipe wait AND a subsequent ReadFile wait
-// see it. Reset by LoginGuard at thread exit.
-//
-// g_loginCancelled tells the OAuth thread that its unblock was a user
-// cancel rather than a real auth code, so it exits silently instead of
-// sending login_failed: user_cancelled (which would pop an error MessageBox
-// over a user-initiated cancel).
+// g_loginCancelled also tells the OAuth thread that its exit was a user cancel
+// rather than a real failure, so it exits silently instead of sending
+// login_failed: user_cancelled (which would pop an error MessageBox over a
+// user-initiated cancel).
 // ---------------------------------------------------------------------------
 static std::mutex g_loginMutex;
-static bool       g_loginInProgress  = false;
-static bool       g_loginCancelled   = false;
-static HANDLE     g_loginCancelEvent = nullptr;
+static bool       g_loginInProgress = false;
+static bool       g_loginCancelled  = false;
 
 // ---------------------------------------------------------------------------
 // Crypto, encoding, and JSON helpers
@@ -232,128 +229,102 @@ static void SaveTokensToCredentialManager(const std::string& accessToken,
 }
 
 // ---------------------------------------------------------------------------
-// Named pipe listener — waits for FeedsLogin.exe to deliver the auth code
-// via \\.\pipe\FeedsAuth
+// Worker poll — retrieve the auth code the loginsuccess page POSTed to the
+// Feeds worker, keyed by our OAuth state.
 // ---------------------------------------------------------------------------
 
-// Wait for one overlapped op (ConnectNamedPipe or ReadFile) plus the cancel
-// event. Returns true if the op completed successfully, false on cancel or
-// real failure. On cancel, outCancelled is set; the caller drains the IRP
-// before closing the pipe via CancelIoEx + GetOverlappedResult(..., TRUE).
-static bool WaitOpOrCancel(HANDLE pipe, OVERLAPPED& ov, bool& outCancelled)
+static bool IsLoginCancelled()
 {
-    HANDLE waits[2] = { ov.hEvent, g_loginCancelEvent };
-    DWORD  result   = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
-    if (result == WAIT_OBJECT_0 + 1) {
-        outCancelled = true;
-        CancelIoEx(pipe, &ov);
-        DWORD discarded = 0;
-        GetOverlappedResult(pipe, &ov, &discarded, TRUE);
-        return false;
-    }
-    return result == WAIT_OBJECT_0;
+    std::lock_guard<std::mutex> lock(g_loginMutex);
+    return g_loginCancelled;
 }
 
-// outCancelled is set to true if CancelLoginFlow signaled g_loginCancelEvent
-// while we were waiting. On cancel the returned string is empty and the
-// caller must NOT send login_failed to the plugin.
-static std::string WaitForAuthCode(bool& outCancelled)
+// Polls GET /authresult?state=<state> on the same worker host the engine uses
+// for the entitlement /tier check (same host, different path):
+//   200 {"code":"..."} — the code is ready; pull it and return.
+//   204               — not arrived yet; wait and poll again.
+// Polls about every 1.5s and gives up after roughly two minutes. The cancel
+// flag is checked every iteration (and during the wait, in short slices) so
+// CancelLoginFlow breaks the loop promptly. On cancel the returned string is
+// empty and outCancelled is set; the caller must NOT send login_failed.
+static std::string PollWorkerForAuthCode(const std::string& state, bool& outCancelled)
 {
     outCancelled = false;
 
-    SECURITY_ATTRIBUTES sa = {};
-    sa.nLength        = sizeof(SECURITY_ATTRIBUTES);
-    sa.bInheritHandle = FALSE;
+    const int kPollIntervalMs = 1500;
+    const int kTimeoutMs      = 120000;  // ~2 minutes
+    const int kMaxAttempts    = kTimeoutMs / kPollIntervalMs;
 
-    HANDLE pipe = CreateNamedPipeA(
-        "\\\\.\\pipe\\FeedsAuth",
-        PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
-        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-        1, 512, 512, 0, &sa);
+    std::wstring path = L"/authresult?state=" +
+        std::wstring(state.begin(), state.end());
 
-    if (pipe == INVALID_HANDLE_VALUE) {
-        LogToFile("OAuth: failed to create FeedsAuth pipe");
-        return "";
-    }
+    for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+        if (IsLoginCancelled()) { outCancelled = true; return ""; }
 
-    // Re-check cancel after creating the pipe — a cancel that arrived
-    // between LoginThreadFunc setting g_loginInProgress and us reaching
-    // here would have signaled g_loginCancelEvent, but only the wait
-    // call below actually observes the event. Bail out early to avoid
-    // an unnecessary ConnectNamedPipe round-trip.
-    {
-        std::lock_guard<std::mutex> lock(g_loginMutex);
-        if (g_loginCancelled) {
-            CloseHandle(pipe);
-            outCancelled = true;
-            return "";
+        std::string code;
+        DWORD       statusCode = 0;
+
+        HINTERNET hSession = WinHttpOpen(L"Feeds/1.0",
+                                          WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                          WINHTTP_NO_PROXY_NAME,
+                                          WINHTTP_NO_PROXY_BYPASS, 0);
+        if (hSession) {
+            // Short per-phase timeouts (resolve/connect/send/receive, in ms)
+            // so a stalled request can't hang a single poll, leave Cancel
+            // unresponsive, or overrun the ~2-minute budget.
+            WinHttpSetTimeouts(hSession, 8000, 8000, 8000, 8000);
+
+            HINTERNET hConnect = WinHttpConnect(hSession,
+                L"feeds-entitlement.square-dust-0e00.workers.dev",
+                INTERNET_DEFAULT_HTTPS_PORT, 0);
+            if (hConnect) {
+                HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET",
+                    path.c_str(), nullptr, WINHTTP_NO_REFERER,
+                    WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+                if (hRequest) {
+                    BOOL sentOk = WinHttpSendRequest(hRequest,
+                        WINHTTP_NO_ADDITIONAL_HEADERS, 0, nullptr, 0, 0, 0);
+                    if (sentOk && WinHttpReceiveResponse(hRequest, nullptr)) {
+                        DWORD statusSize = sizeof(statusCode);
+                        WinHttpQueryHeaders(hRequest,
+                            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            WINHTTP_HEADER_NAME_BY_INDEX,
+                            &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
+
+                        std::string response;
+                        char  buf[4096];
+                        DWORD bytesRead = 0;
+                        while (WinHttpReadData(hRequest, buf, sizeof(buf) - 1,
+                                               &bytesRead) && bytesRead > 0) {
+                            buf[bytesRead] = '\0';
+                            response += buf;
+                        }
+                        if (statusCode == 200)
+                            code = JsonExtractString(response, "code");
+                    }
+                    WinHttpCloseHandle(hRequest);
+                }
+                WinHttpCloseHandle(hConnect);
+            }
+            WinHttpCloseHandle(hSession);
+        }
+
+        if (statusCode == 200 && !code.empty()) {
+            LogToFile("OAuth: worker returned auth code");
+            return code;
+        }
+
+        // 204 (not ready yet) or a transient error — wait before the next
+        // poll, but stay responsive to cancel by checking the flag in short
+        // slices rather than sleeping the whole interval at once.
+        for (int slept = 0; slept < kPollIntervalMs; slept += 100) {
+            if (IsLoginCancelled()) { outCancelled = true; return ""; }
+            Sleep(100);
         }
     }
 
-    // Phase 1: wait for the client (FeedsLogin.exe) to connect.
-    OVERLAPPED connectOv = {};
-    connectOv.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);  // manual-reset
-    if (!connectOv.hEvent) {
-        LogToFile("OAuth: CreateEvent for ConnectNamedPipe failed");
-        CloseHandle(pipe);
-        return "";
-    }
-
-    BOOL  connected  = ConnectNamedPipe(pipe, &connectOv);
-    DWORD connectErr = GetLastError();
-    bool  needWait   = false;
-    if (!connected) {
-        if (connectErr == ERROR_IO_PENDING) {
-            needWait = true;
-        } else if (connectErr == ERROR_PIPE_CONNECTED) {
-            // Client connected before ConnectNamedPipe got there; treat
-            // as success without waiting.
-        } else {
-            LogToFile("OAuth: ConnectNamedPipe on FeedsAuth returned an error");
-            CloseHandle(connectOv.hEvent);
-            CloseHandle(pipe);
-            return "";
-        }
-    }
-
-    if (needWait) {
-        bool cancelled = false;
-        if (!WaitOpOrCancel(pipe, connectOv, cancelled)) {
-            CloseHandle(connectOv.hEvent);
-            CloseHandle(pipe);
-            outCancelled = cancelled;
-            return "";
-        }
-    }
-    CloseHandle(connectOv.hEvent);
-
-    // Phase 2: read the auth code. Same overlapped + cancel-event pattern.
-    OVERLAPPED readOv = {};
-    readOv.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
-    if (!readOv.hEvent) {
-        LogToFile("OAuth: CreateEvent for ReadFile failed");
-        CloseHandle(pipe);
-        return "";
-    }
-
-    char  buf[512]  = {};
-    DWORD bytesRead = 0;
-    BOOL  readOk    = ReadFile(pipe, buf, sizeof(buf) - 1, &bytesRead, &readOv);
-    DWORD readErr   = GetLastError();
-    if (!readOk && readErr == ERROR_IO_PENDING) {
-        bool cancelled = false;
-        if (!WaitOpOrCancel(pipe, readOv, cancelled)) {
-            CloseHandle(readOv.hEvent);
-            CloseHandle(pipe);
-            outCancelled = cancelled;
-            return "";
-        }
-        GetOverlappedResult(pipe, &readOv, &bytesRead, FALSE);
-    }
-    CloseHandle(readOv.hEvent);
-    CloseHandle(pipe);
-
-    return std::string(buf, bytesRead);
+    LogWarn("OAuth: timed out waiting for auth code from worker");
+    return "";
 }
 
 // ---------------------------------------------------------------------------
@@ -362,21 +333,13 @@ static std::string WaitForAuthCode(bool& outCancelled)
 
 // RAII clear of in-flight state on thread exit. Guarantees every return path
 // resets the flags so the next StartLoginFlow isn't rejected, even if a
-// future edit adds a new early-return. Also closes g_loginCancelEvent —
-// the OAuth thread is the sole owner; cancel only ever calls SetEvent on
-// it and never closes it.
+// future edit adds a new early-return.
 namespace {
 struct LoginGuard {
     ~LoginGuard() {
-        HANDLE eventToClose = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(g_loginMutex);
-            g_loginInProgress  = false;
-            g_loginCancelled   = false;
-            eventToClose       = g_loginCancelEvent;
-            g_loginCancelEvent = nullptr;
-        }
-        if (eventToClose) CloseHandle(eventToClose);
+        std::lock_guard<std::mutex> lock(g_loginMutex);
+        g_loginInProgress = false;
+        g_loginCancelled  = false;
     }
 };
 }
@@ -389,6 +352,13 @@ static void LoginThreadFunc()
     std::string verifier  = GenerateCodeVerifier();
     std::string challenge = DeriveCodeChallenge(verifier);
 
+    // Random, URL-safe, unguessable correlator for the worker handoff. Same
+    // RNG and encoding as the PKCE verifier (32 random bytes, base64url, so no
+    // URL-encoding needed when appended below). The state only correlates our
+    // browser session with the worker's stored code — the code itself stays
+    // PKCE-protected and the verifier never leaves this engine.
+    std::string state = GenerateCodeVerifier();
+
     std::string authUrl =
         std::string("https://zoom.us/oauth/authorize") +
         "?response_type=code" +
@@ -396,14 +366,15 @@ static void LoginThreadFunc()
         "&redirect_uri="       + UrlEncode("https://letsdovideo.com/loginsuccess") +
         "&code_challenge="     + challenge +
         "&code_challenge_method=S256" +
+        "&state="              + state +
         "&prompt=consent";
 
     LogToFile("OAuth: opening browser to Zoom authorize endpoint");
     ShellExecuteA(NULL, "open", authUrl.c_str(), NULL, NULL, SW_SHOWNORMAL);
 
-    LogToFile("OAuth: waiting for auth code via FeedsAuth pipe");
+    LogToFile("OAuth: polling worker for auth code");
     bool wasCancelled = false;
-    std::string code = WaitForAuthCode(wasCancelled);
+    std::string code = PollWorkerForAuthCode(state, wasCancelled);
 
     if (wasCancelled) {
         // The plugin already cleared its own auth-in-progress state when
@@ -415,7 +386,7 @@ static void LoginThreadFunc()
     }
 
     if (code.empty()) {
-        LogToFile("OAuth: auth code was empty (pipe error, not a user cancel)");
+        LogToFile("OAuth: auth code was empty (worker timeout or error, not a user cancel)");
         SendToPlugin("{\"type\":\"login_failed\",\"error\":\"user_cancelled\"}");
         return;
     }
@@ -450,14 +421,6 @@ bool StartLoginFlow()
 {
     LogToFile("OAuth: StartLoginFlow called");
 
-    // Create the cancel event before flipping the in-progress flag so a
-    // failure here doesn't leave the flag set with no cancel mechanism.
-    HANDLE cancelEvent = CreateEventA(NULL, TRUE, FALSE, NULL);  // manual-reset
-    if (!cancelEvent) {
-        LogToFile("OAuth: CreateEvent for cancel failed");
-        return false;
-    }
-
     {
         std::lock_guard<std::mutex> lock(g_loginMutex);
         if (g_loginInProgress) {
@@ -465,15 +428,13 @@ bool StartLoginFlow()
             // g_authInProgress is already true and showing "Cancel login",
             // which is the correct state — the previous OAuth attempt is
             // still wrapping up, and the user can click Cancel again to
-            // get out (that path is a no-op on the engine but resets the
-            // plugin's flag, restoring the "Login to Zoom" affordance).
+            // get out (that path resets the plugin's flag and sets
+            // g_loginCancelled so the poll loop exits).
             LogToFile("OAuth: StartLoginFlow rejected — login already in progress");
-            CloseHandle(cancelEvent);
             return false;
         }
-        g_loginInProgress  = true;
-        g_loginCancelled   = false;
-        g_loginCancelEvent = cancelEvent;
+        g_loginInProgress = true;
+        g_loginCancelled  = false;
     }
 
     std::thread t(LoginThreadFunc);
@@ -493,10 +454,9 @@ void CancelLoginFlow()
         return;
     }
     g_loginCancelled = true;
-    if (g_loginCancelEvent) SetEvent(g_loginCancelEvent);
-    // No handle closes here — SetEvent is non-blocking and the OAuth
-    // thread owns g_loginCancelEvent's lifetime. PKCE verifier lives on
-    // the OAuth thread's stack and dies with it.
+    // The poll loop checks g_loginCancelled every iteration and exits
+    // promptly. The PKCE verifier and state live on the OAuth thread's
+    // stack and die with it.
 }
 
 } // namespace feeds_engine

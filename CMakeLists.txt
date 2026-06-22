@@ -147,5 +147,3 @@ target_link_libraries(FeedsEngine PRIVATE winhttp crypt32 advapi32 shell32 sdk y
 target_compile_definitions(FeedsEngine PRIVATE
     FEEDS_ZOOM_CLIENT_ID="${FEEDS_ZOOM_CLIENT_ID}"
 )
-
-add_executable(FeedsLogin WIN32 helper/FeedsAuthHelper.cpp)

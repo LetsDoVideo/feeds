@@ -54,7 +54,7 @@ Sent once, when the engine has started and is ready to receive commands.
 ### Authentication
 
 #### `login_start` (P→E)
-User clicked "Login to Zoom". Engine opens browser to Zoom OAuth authorize endpoint, listens on the `FeedsAuth` pipe for the auth code delivered by `FeedsLogin.exe`, exchanges the code for tokens, saves them to Windows Credential Manager, triggers `SDKAuth`, then fetches user info and entitlement.
+User clicked "Login to Zoom". Engine generates a PKCE verifier/challenge and a random state, opens the browser to the Zoom OAuth authorize endpoint (with `&state=`), then polls the Feeds worker at `GET /authresult?state=<state>` for the auth code. The `loginsuccess` page POSTs the code to the worker keyed by that state; the worker returns it once (`200 {"code":"..."}`, or `204` until it arrives). The engine then exchanges the code for tokens, saves them to Windows Credential Manager, triggers `SDKAuth`, then fetches user info and entitlement. (This replaced an older `ldvfeeds://`-protocol + `FeedsLogin.exe` + `FeedsAuth`-pipe handoff that browsers now block without a user gesture.)
 
 ```json
 {"type": "login_start"}

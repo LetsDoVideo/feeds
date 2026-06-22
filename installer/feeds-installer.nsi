@@ -72,14 +72,6 @@ Section "Feeds Plugin" SecMain
     SetOutPath "$INSTDIR\data\obs-plugins\feeds\locale"
     File "${ROOT_DIR}\dist\data\obs-plugins\feeds\locale\en-US.ini"
 
-    ; FeedsLogin.exe -> bin/64bit/
-    SetOutPath "$INSTDIR\bin\64bit"
-    File "${ROOT_DIR}\dist\bin\64bit\FeedsLogin.exe"
-
-   ; FeedsLogin.exe -> bin/64bit/
-    SetOutPath "$INSTDIR\bin\64bit"
-    File "${ROOT_DIR}\dist\bin\64bit\FeedsLogin.exe"
-
     ; Zoom SDK + FeedsEngine.exe -> bin/64bit/zoom-sdk/
     SetOutPath "$INSTDIR\bin\64bit\zoom-sdk"
     File "${ROOT_DIR}\dist\bin\64bit\zoom-sdk\*.dll"
@@ -129,8 +121,6 @@ Section "Uninstall"
     ; Remove stored tokens from Windows Credential Manager
         ; (credentials are stored as Feeds_AccessToken and Feeds_RefreshToken)
 
-    ; Remove FeedsLogin.exe
-    Delete "$INSTDIR\bin\64bit\FeedsLogin.exe"
     ; Note: We do NOT remove Zoom SDK DLLs from bin/64bit as other
     ; apps may depend on them
 

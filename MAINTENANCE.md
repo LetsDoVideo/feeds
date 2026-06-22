@@ -35,11 +35,11 @@ Do both procedures above before rebuilding.
 
 ---
 
-## Auth Helper (FeedsLogin.exe)
+## Login handoff (worker poll)
 
-`FeedsLogin.exe` is built from `helper/FeedsAuthHelper.cpp`. It receives the `ldvfeeds://` deeplink from the browser after Zoom OAuth and passes the auth code to the plugin via named pipe `\\.\pipe\FeedsAuth`.
+After Zoom OAuth, the browser lands on `https://letsdovideo.com/loginsuccess`, which POSTs the auth code to the Feeds worker keyed by the OAuth `state` the engine generated. The engine's OAuth thread (in `engine/engine-oauth.cpp`) polls `GET https://feeds-entitlement.square-dust-0e00.workers.dev/authresult?state=<state>` (~every 1.5s, ~2 min timeout) until the worker returns `200 {"code":"..."}`, then runs the unchanged `ExchangeCodeForToken` path. The worker and the `loginsuccess` page are deployed separately from this repo.
 
-The Windows protocol handler for `ldvfeeds://` is registered in the Windows Registry at runtime by the plugin itself (`obs_module_load`). No installer changes needed if the helper is updated.
+There is no auth helper or custom protocol anymore. An earlier design fired an `ldvfeeds://` protocol from the browser to launch `FeedsLogin.exe`, which wrote the code into the `\\.\pipe\FeedsAuth` named pipe — but browsers now block that auto-launch without a user gesture, so it was retired in favor of the worker poll. The `state` is only an unguessable correlator; the code stays PKCE-protected and the verifier never leaves the engine, so routing the code through the worker is safe.
 
 ---
 
