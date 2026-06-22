@@ -191,8 +191,6 @@ struct CachedParticipant {
 static std::vector<CachedParticipant> g_cachedParticipants;
 static std::mutex                     g_participantsMutex;
 
-static int g_activeParticipantSources = 0;
-
 // ---------------------------------------------------------------------------
 // Tier → limits (matches v1.0.0)
 // 0 = Free (1 feed, 720p)
@@ -1795,10 +1793,12 @@ void SetupPluginMenu() {
 // ---------------------------------------------------------------------------
 // Source callbacks
 // ---------------------------------------------------------------------------
-// Throttle for the "upgrade required" popup. When OBS loads a saved scene,
-// zp_create fires for every source in rapid succession — if the user has
-// more saved sources than their current tier allows, we don't want to
-// stack N popups. Show at most one per throttle window.
+// Throttle for the tier "upgrade required" popup. When OBS loads a saved
+// scene, create callbacks fire for every source in rapid succession — if the
+// user has more sources than their current tier allows, we don't want to
+// stack N popups. Show at most one per throttle window. Used by the
+// screenshare and chat-source create paths; the participant source no longer
+// pops a create-time dialog — it creates a dormant source instead.
 static std::atomic<uint64_t> g_lastTierPopupMs{0};
 static constexpr uint64_t TIER_POPUP_THROTTLE_MS = 3000;
 
@@ -1882,73 +1882,22 @@ static std::string ResolveParticipantName(void* userdata) {
 static void* zp_create(obs_data_t* settings, obs_source_t* source) {
     (void)settings;
 
-    // C++ exceptions must not escape into libobs C frames; the cost of
-    // returning nullptr (OBS treats the create as failed and keeps an
-    // invalid husk source) is far less than a process-wide crash.
+    // A participant source must ALWAYS be created. Returning nullptr from a
+    // create callback makes OBS keep an invalid husk and discard the saved
+    // source during scene load (Failed to create source -> Tried to add a
+    // removed source -> dropped), and the next auto-save bakes in the loss —
+    // so opening OBS while logged out used to permanently delete the user's
+    // participant sources. nullptr is now reserved for genuine
+    // allocation/exception failures only. A source that can't pull a live
+    // feed yet (not logged in, engine not ready, no participant bound, or
+    // over the tier's active limit) is created in a dormant state instead:
+    // its properties panel explains why (logged-out branch / upgrade prompt),
+    // and selecting a participant once live brings it up like any other.
+    //
+    // C++ exceptions must not escape into libobs C frames, so the body stays
+    // wrapped; on a real failure nullptr + OnSourceCreated's husk cleanup is
+    // still far cheaper than a process-wide crash.
   try {
-    // Logged-out gating: refuse to create any Feeds source while the
-    // user has no Zoom session. Throttled-popup helper is reused so a
-    // saved scene loading several Feeds sources at once shows one
-    // login prompt rather than one per source. Order matters — this
-    // runs before the tier check so a logged-out user sees "log in"
-    // instead of a misleading "upgrade your plan".
-    //
-    // Deferred until login_succeeded / login_failed has come back from
-    // the engine — otherwise saved scenes loading at OBS startup race
-    // the engine's authentication of a stored token and pop a
-    // misleading "Please log in" dialog at an already-logged-in user.
-    // Same shape as the tier check below (g_isLoggedIn && tier < N).
-    if (g_loginAttemptCompleted && !g_isLoggedIn) {
-        if (ShouldShowTierPopup()) {
-            ShowTierLimitDialog(
-                "Feeds - Login Required",
-                "Please log in to Zoom to use Feeds.<br><br>"
-                "Open the Feeds menu and click \"Login to Zoom\" to get started.");
-        }
-        return nullptr;
-    }
-
-    // Tier gating: enforce max feeds per the current tier, but only if
-    // logged in. On OBS startup, saved sources may be created before
-    // the engine finishes logging the user in — at that point
-    // g_currentTier is still 0 (default) and would spuriously block
-    // users restoring a saved scene. Skipping the check pre-login means
-    // the source gets created silently; we accept that if the user is
-    // over-tier at login time, nothing re-enforces until next restart.
-    // In practice this is fine: users don't log out and back in as a
-    // lower tier mid-session as a normal workflow.
-    //
-    // When the check does fire (interactive creation while logged in,
-    // or OBS restart after login completes), it's throttled so that
-    // loading a saved scene with many over-tier sources doesn't stack
-    // a popup per source — one popup per ~3 second window.
-    if (g_isLoggedIn &&
-        g_activeParticipantSources >= GetMaxFeedsForTier() &&
-        ShouldShowTierPopup()) {
-        if (g_currentTier >= 3) {
-            ShowTierLimitDialog(
-                "Feeds - Maximum Feeds Reached",
-                "You've reached the maximum number of feeds for "
-                "the Broadcaster plan.<br><br>"
-                "<a href=\"mailto:support@letsdovideo.com\">Contact "
-                "support</a> if you need a custom solution.");
-        } else {
-            ShowTierLimitDialog(
-                "Feeds - Upgrade Required",
-                "You've reached the maximum number of feeds for "
-                "your current plan.<br><br>"
-                "<a href=\"https://letsdovideo.com/feeds-upgrade\">"
-                "Upgrade your plan</a> to add more.");
-        }
-        return nullptr;
-    }
-    // If we're over-tier but the throttle suppressed the popup, still
-    // block creation silently — we don't want to let the user build
-    // past their tier just because we chose not to annoy them.
-    if (g_isLoggedIn && g_activeParticipantSources >= GetMaxFeedsForTier()) {
-        return nullptr;
-    }
-
     obs_source_set_async_unbuffered(source, true);
 
     ZpSourceData* data = new ZpSourceData();
@@ -1960,6 +1909,20 @@ static void* zp_create(obs_data_t* settings, obs_source_t* source) {
     {
         std::lock_guard<std::mutex> lock(g_sourcesMutex);
         g_allParticipantSources.push_back(data);
+
+        // Tier enforcement is now "create dormant," never "refuse to
+        // create." Creation-order position (1-based, matching
+        // ReconcileSourcesToTier) decides eligibility: only the first
+        // GetMaxFeedsForTier() sources may actively pull a feed; the rest
+        // sit tier-disabled and show the upgrade prompt in their
+        // properties, and zp_update refuses to bind them. Only mark it
+        // here when we already know the tier (logged in) — a source
+        // created while logged out stays eligible, and
+        // ReconcileSourcesToTier recomputes every source's state on login.
+        data->source_position = (int)g_allParticipantSources.size();
+        if (g_isLoggedIn)
+            data->tier_disabled =
+                (data->source_position > GetMaxFeedsForTier());
     }
 
     // Per-source ISO recorder. The name hook reads this source's selected
@@ -1971,7 +1934,6 @@ static void* zp_create(obs_data_t* settings, obs_source_t* source) {
     feeds::feeds_iso_recorder_set_enabled(
         data->iso, g_isoRecordingEnabled && g_currentTier >= 1);
 
-    g_activeParticipantSources++;
     return data;
   } catch (const std::exception& e) {
     blog(LOG_ERROR, "[feeds] zp_create exception: %s", e.what());
@@ -2016,8 +1978,6 @@ static void zp_destroy(void* vdata) {
         // CloseSharedMemory takes data->lifecycleMutex internally, so any
         // concurrent handler still inside it serialises here.
         CloseSharedMemory(data, false);
-
-        g_activeParticipantSources--;
     } catch (const std::exception& e) {
         blog(LOG_ERROR, "[feeds] zp_destroy exception: %s", e.what());
     } catch (...) {
@@ -2064,10 +2024,11 @@ static void zp_update(void* vdata, obs_data_t* settings) {
             return;
         }
 
-        // Tier enforcement lives in zp_create — by the time we get here the
-        // source already exists, so blocking subscription wouldn't prevent
-        // the user from creating over-tier sources. Create-time enforcement
-        // is the simpler and more honest gate.
+        // Tier enforcement is the tier_disabled flag (set by creation-order
+        // position in zp_create and recomputed by ReconcileSourcesToTier on
+        // login). A tier-disabled source already returned above, so reaching
+        // here means this source is within the tier's active limit and may
+        // bind a feed — only up to GetMaxFeedsForTier() sources can.
         data->current_user_id = selected_id;
 
         // selected_id == 1 is [Active Speaker] sentinel. Engine handles the
