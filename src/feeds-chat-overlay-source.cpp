@@ -43,14 +43,11 @@ extern std::mutex                       g_avatarCacheMutex;
 extern std::map<unsigned int, QImage>   g_avatarCache;
 extern QImage                           g_fallbackAvatar;
 
-// Tier state + helpers from plugin-main.cpp. Overlay is gated at
-// Streamer (>= 2). Same throttled dialog the participant/screenshare/
-// popup sources use, so stacked over-tier creations don't spam popups.
-extern bool g_isLoggedIn;
-extern bool g_loginAttemptCompleted;
+// Tier state from plugin-main.cpp. Overlay is gated at Streamer (>= 2),
+// enforced by ReconcileChatOverlaySources via the tier_disabled flag.
+// (The create callback no longer gates on login/tier — it always creates a
+// dormant source — so the login/popup-helper externs are no longer needed.)
 extern int  g_currentTier;
-extern bool ShouldShowTierPopup();
-extern void ShowTierLimitDialog(const QString& title, const QString& html);
 
 // Tier threshold for the overlay. Streamer (2) and Broadcaster (3) get
 // it; Free (0) and Basic (1) don't.
@@ -376,35 +373,14 @@ static void fcr_update(void* data, obs_data_t* settings) {
 }
 
 static void* fcr_create(obs_data_t* settings, obs_source_t* source) {
-    // Logged-out gating: refuse creation outright before any tier
-    // check, so a logged-out user gets "log in" rather than "upgrade".
-    // Throttled-popup helper deduplicates across simultaneous loads.
-    // Deferred until login_succeeded / login_failed has come back from
-    // the engine — see g_loginAttemptCompleted in plugin-main.cpp.
-    if (g_loginAttemptCompleted && !g_isLoggedIn) {
-        if (ShouldShowTierPopup()) {
-            ShowTierLimitDialog(
-                "Feeds - Login Required",
-                "Please log in to Zoom to use Feeds.<br><br>"
-                "Open the Feeds menu and click \"Login to Zoom\" to get started.");
-        }
-        return nullptr;
-    }
-
-    // Tier gating, mirroring zp_create / zs_create / fcp_create. Skip
-    // the check pre-login so saved scenes loading before login_succeeded
-    // don't get blocked at default tier=0. The plugin-main
-    // OnSourceCreated husk-sweep handles the NULL-return case.
-    if (g_isLoggedIn && g_currentTier < OVERLAY_MIN_TIER) {
-        if (ShouldShowTierPopup()) {
-            ShowTierLimitDialog(
-                "Feeds - Upgrade Required",
-                "Zoom Chat Overlay is a Streamer-tier feature.<br><br>"
-                "<a href=\"https://letsdovideo.com/feeds-upgrade\">"
-                "Upgrade your plan</a> to enable it.");
-        }
-        return nullptr;
-    }
+    // Always create. Returning nullptr from a create callback makes OBS keep
+    // an invalid husk that OnSourceCreated removes, and the next save bakes in
+    // the loss — so a chat overlay used to vanish from a scene loaded while
+    // logged out or below Streamer tier. Create it dormant instead: with no
+    // chat data (logged out) it renders blank, and fcr_video_render no-ops
+    // while tier_disabled, which ReconcileChatOverlaySources sets on login.
+    // The properties panel carries the logged-out / upgrade message. nullptr
+    // is left only for genuine failure paths.
 
     FeedsChatOverlayData* d = new FeedsChatOverlayData();
     d->source = source;

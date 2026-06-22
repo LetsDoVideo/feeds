@@ -41,15 +41,11 @@ extern std::mutex                       g_avatarCacheMutex;
 extern std::map<unsigned int, QImage>   g_avatarCache;
 extern QImage                           g_fallbackAvatar;
 
-// Tier state + helpers from plugin-main.cpp. Popup is gated at Streamer
-// (>= 2). The throttled dialog is reused from the participant/screenshare
-// create paths so a saved scene loading multiple over-tier sources at
-// once doesn't stack popups.
-extern bool g_isLoggedIn;
-extern bool g_loginAttemptCompleted;
+// Tier state from plugin-main.cpp. Popup is gated at Streamer (>= 2),
+// enforced by ReconcileChatPopupSources via the tier_disabled flag.
+// (The create callback no longer gates on login/tier — it always creates a
+// dormant source — so the login/popup-helper externs are no longer needed.)
 extern int  g_currentTier;
-extern bool ShouldShowTierPopup();
-extern void ShowTierLimitDialog(const QString& title, const QString& html);
 
 // Tier threshold for the popup. Streamer (2) and Broadcaster (3) get it;
 // Free (0) and Basic (1) don't.
@@ -517,39 +513,14 @@ static const char* fcp_get_name(void*) {
 }
 
 static void* fcp_create(obs_data_t* /*settings*/, obs_source_t* source) {
-    // Logged-out gating: refuse creation outright when there's no Zoom
-    // session. Runs before the tier check so a logged-out user sees
-    // "log in" instead of an "upgrade your plan" message that doesn't
-    // apply yet. Throttled-popup helper deduplicates the prompt when a
-    // saved scene loads multiple Feeds sources at once. Deferred until
-    // login_succeeded / login_failed has come back from the engine —
-    // see g_loginAttemptCompleted in plugin-main.cpp.
-    if (g_loginAttemptCompleted && !g_isLoggedIn) {
-        if (ShouldShowTierPopup()) {
-            ShowTierLimitDialog(
-                "Feeds - Login Required",
-                "Please log in to Zoom to use Feeds.<br><br>"
-                "Open the Feeds menu and click \"Login to Zoom\" to get started.");
-        }
-        return nullptr;
-    }
-
-    // Tier gating, mirroring zp_create / zs_create. Only fire the popup
-    // when we know the user's tier (post-login) — saved scenes that load
-    // before login_succeeded would otherwise block creation on the
-    // default tier=0. The plugin-main OnSourceCreated husk-sweep catches
-    // the NULL return and removes the placeholder source from any scene
-    // it landed in.
-    if (g_isLoggedIn && g_currentTier < POPUP_MIN_TIER) {
-        if (ShouldShowTierPopup()) {
-            ShowTierLimitDialog(
-                "Feeds - Upgrade Required",
-                "Zoom Chat Popup is a Streamer-tier feature.<br><br>"
-                "<a href=\"https://letsdovideo.com/feeds-upgrade\">"
-                "Upgrade your plan</a> to enable it.");
-        }
-        return nullptr;
-    }
+    // Always create. Returning nullptr from a create callback makes OBS keep
+    // an invalid husk that OnSourceCreated removes, and the next save bakes in
+    // the loss — so a chat popup used to vanish from a scene loaded while
+    // logged out or below Streamer tier. Create it dormant instead: with no
+    // chat message (logged out) it renders blank, and fcp_video_render no-ops
+    // while tier_disabled, which ReconcileChatPopupSources sets on login. The
+    // properties panel carries the logged-out / upgrade message. nullptr is
+    // left only for genuine failure paths.
 
     FeedsChatPopupData* d = new FeedsChatPopupData();
     d->source = source;

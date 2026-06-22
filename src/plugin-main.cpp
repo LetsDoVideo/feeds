@@ -2450,6 +2450,13 @@ static void CloseShareSharedMemory(ZsSourceData* data, bool clearTexture = true)
 // Called when share_status_changed arrives with a non-zero sharer — at
 // that point the engine has definitely created the region.
 static void OpenSharedMemoryForAllScreenshareSources() {
+    // Eligibility gate: never open a region when the user can't use
+    // screenshare (logged out, or below Basic tier). tier_disabled normally
+    // encodes this, but it defaults to false until the first reconcile after
+    // login — so a source created while logged out would otherwise reach for
+    // a region the engine hasn't created.
+    if (!g_isLoggedIn || g_currentTier < 1) return;
+
     std::lock_guard<std::mutex> lock(g_screenshareSourcesMutex);
     for (ZsSourceData* s : g_allScreenshareSources) {
         // Skip tier-disabled sources — share_status_changed firing
@@ -2474,46 +2481,22 @@ static void* zs_create(obs_data_t* settings, obs_source_t* source) {
 
     // Same exception-boundary reasoning as zp_create.
   try {
-    // Logged-out gating: same throttled-login-prompt pattern as
-    // zp_create / fcp_create / fcr_create. Runs before the tier check
-    // so a logged-out user sees "log in" rather than "upgrade". Deferred
-    // until login_succeeded / login_failed has come back from the engine
-    // — see g_loginAttemptCompleted in plugin-main.cpp.
-    if (g_loginAttemptCompleted && !g_isLoggedIn) {
-        if (ShouldShowTierPopup()) {
-            ShowTierLimitDialog(
-                "Feeds - Login Required",
-                "Please log in to Zoom to use Feeds.<br><br>"
-                "Open the Feeds menu and click \"Login to Zoom\" to get started.");
-        }
-        return nullptr;
-    }
-
-    // Tier gating: screenshare is a paid feature (Basic tier and up).
-    // Same login-deferred logic as zp_create — if the user has a saved
-    // scene with a screenshare source and login hasn't completed yet,
-    // we don't want to spuriously block creation. Once logged in, free
-    // tier users get a friendly upgrade prompt.
-    if (g_isLoggedIn && g_currentTier == 0 && ShouldShowTierPopup()) {
-        ShowTierLimitDialog(
-            "Feeds - Upgrade Required",
-            "Screenshare is a paid feature.<br><br>"
-            "Your current tier is Free. Upgrade to Basic, Streamer, "
-            "or Broadcaster to use Zoom Screenshare in OBS.<br><br>"
-            "<a href=\"https://letsdovideo.com/feeds-upgrade\">"
-            "Upgrade your plan</a>");
-        return nullptr;
-    }
-    // If popup was throttled, still block creation silently — same
-    // reasoning as zp_create: we don't grant the feature just because
-    // we chose not to annoy the user.
-    if (g_isLoggedIn && g_currentTier == 0) {
-        return nullptr;
-    }
+    // A screenshare source must ALWAYS be created. Returning nullptr from a
+    // create callback makes OBS keep an invalid husk that OnSourceCreated
+    // removes, and the next save bakes in the loss — so a screenshare source
+    // used to vanish from a scene loaded while logged out or on the Free
+    // tier. nullptr is reserved for genuine allocation/exception failures
+    // (and the one-instance rule below). A source that can't show content
+    // yet is created dormant: it sits blank, its properties panel explains
+    // why (logged-out / upgrade branch), and ReconcileSourcesToTier re-tiers
+    // it on login. The screenshare opens its own shared-memory region rather
+    // than binding on a user selection, so the eligibility gate lives on the
+    // open paths below instead.
 
     // One screenshare source per scene. Zoom only exposes a single
     // active sharer at a time, so a second source would render the
-    // same stream.
+    // same stream. This is a genuine one-instance constraint, not an
+    // external-state gate, so it still refuses (with its own dialog).
     bool alreadyHaveScreenshare;
     {
         std::lock_guard<std::mutex> lock(g_screenshareSourcesMutex);
@@ -2540,9 +2523,14 @@ static void* zs_create(obs_data_t* settings, obs_source_t* source) {
         g_allScreenshareSources.push_back(data);
     }
 
-    // If we're already in a meeting with an active share, open the
-    // mapping immediately. Otherwise, wait for share_status_changed.
-    if (g_isInMeeting && g_rawLiveStreamGranted && g_activeSharerUserId != 0) {
+    // Open the mapping immediately only when eligible (logged in, Basic+
+    // tier) AND already in a meeting with an active share. The eligibility
+    // check matters now that creation is never refused: without it a Free or
+    // logged-out source created mid-share would reach for a region the engine
+    // hasn't authorized. Otherwise we wait for share_status_changed, whose
+    // open path is eligibility-gated too.
+    if (g_isLoggedIn && g_currentTier >= 1 &&
+        g_isInMeeting && g_rawLiveStreamGranted && g_activeSharerUserId != 0) {
         OpenShareSharedMemory(data);
     }
 
