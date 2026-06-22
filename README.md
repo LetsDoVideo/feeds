@@ -4,7 +4,7 @@
 
 https://github.com/user-attachments/assets/afe838b2-f571-47ee-a9d1-389b3247d3ed
 
-Feeds is a native Windows plugin for OBS Studio that uses the Zoom Meeting SDK to give broadcasters clean, isolated video feeds from each Zoom participant. No screen capturing, no grid layouts, just raw high-quality video piped directly into your OBS scene.
+Feeds is a native Windows plugin for OBS Studio that uses the Zoom Meeting SDK to give broadcasters clean, isolated video feeds from each Zoom participant. No screen capturing, no grid layouts, just raw high-quality video piped directly into your OBS scene. 
 
 ---
 
