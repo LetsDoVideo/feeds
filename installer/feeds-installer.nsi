@@ -72,6 +72,14 @@ Section "Feeds Plugin" SecMain
     SetOutPath "$INSTDIR\data\obs-plugins\feeds\locale"
     File "${ROOT_DIR}\dist\data\obs-plugins\feeds\locale\en-US.ini"
 
+    ; Plugin logo (About dialog + fallback avatar) -> data/obs-plugins/feeds/
+    SetOutPath "$INSTDIR\data\obs-plugins\feeds"
+    File "${ROOT_DIR}\dist\data\obs-plugins\feeds\feeds-logo.png"
+
+    ; Connect-chooser icons -> data/obs-plugins/feeds/icons/
+    SetOutPath "$INSTDIR\data\obs-plugins\feeds\icons"
+    File "${ROOT_DIR}\dist\data\obs-plugins\feeds\icons\*.svg"
+
     ; Zoom SDK + FeedsEngine.exe -> bin/64bit/zoom-sdk/
     SetOutPath "$INSTDIR\bin\64bit\zoom-sdk"
     File "${ROOT_DIR}\dist\bin\64bit\zoom-sdk\*.dll"
@@ -109,6 +117,9 @@ Section "Uninstall"
     Delete "$INSTDIR\obs-plugins\64bit\feeds.dll"
     Delete "$INSTDIR\data\obs-plugins\feeds\locale\en-US.ini"
     RMDir "$INSTDIR\data\obs-plugins\feeds\locale"
+    Delete "$INSTDIR\data\obs-plugins\feeds\icons\*.svg"
+    RMDir "$INSTDIR\data\obs-plugins\feeds\icons"
+    Delete "$INSTDIR\data\obs-plugins\feeds\feeds-logo.png"
     RMDir "$INSTDIR\data\obs-plugins\feeds"
 
     ; Remove uninstaller

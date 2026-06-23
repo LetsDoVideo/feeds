@@ -62,9 +62,11 @@ jobs:
           New-Item -ItemType Directory -Force -Path "dist/obs-plugins/64bit"
           Copy-Item "build/Release/feeds.dll" -Destination "dist/obs-plugins/64bit/"
           Copy-Item "build/Release/feeds.pdb" -Destination "dist/obs-plugins/64bit/"
-          New-Item -ItemType Directory -Force -Path "dist/data/obs-plugins/feeds/locale"
-          Copy-Item "data/locale/en-US.ini" -Destination "dist/data/obs-plugins/feeds/locale/"
-          Copy-Item "data/feeds-logo.png" -Destination "dist/data/obs-plugins/feeds/"
+          # Copy the whole data/ tree wholesale so new assets (e.g. the
+          # Connect-chooser icons under data/icons/) ship automatically rather
+          # than each needing its own enumerated copy line here.
+          New-Item -ItemType Directory -Force -Path "dist/data/obs-plugins/feeds"
+          Copy-Item "data/*" -Destination "dist/data/obs-plugins/feeds/" -Recurse
           New-Item -ItemType Directory -Force -Path "dist/bin/64bit/zoom-sdk"
           Get-ChildItem "zoom-sdk/bin" -File | Copy-Item -Destination "dist/bin/64bit/zoom-sdk/"
           New-Item -ItemType Directory -Force -Path "dist/bin/64bit/zoom-sdk/language"
