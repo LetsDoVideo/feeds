@@ -1329,6 +1329,10 @@ static void ShowEventPickerDialog(const std::string& json) {
 
     QLabel* label = new QLabel("Select an event:", &dlg);
     QListWidget* list = new QListWidget(&dlg);
+    // Elide long event titles on the right rather than forcing a horizontal
+    // scrollbar; the full name lives in each item's tooltip (set below).
+    list->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    list->setTextElideMode(Qt::ElideRight);
     for (const std::string& o : objs) {
         std::string id   = ExtractJsonString(o, "event_id");
         std::string name = ExtractJsonStringEscaped(o, "name");
@@ -1339,6 +1343,7 @@ static void ShowEventPickerDialog(const std::string& json) {
         else if (role == "attendee") text += "  [Attendee]";
         QListWidgetItem* item = new QListWidgetItem(text, list);
         item->setData(Qt::UserRole, QString::fromStdString(id));
+        item->setToolTip(QString::fromStdString(name));
     }
     list->setCurrentRow(0);
 
@@ -1352,6 +1357,12 @@ static void ShowEventPickerDialog(const std::string& json) {
     layout->addWidget(label);
     layout->addWidget(list);
     layout->addWidget(buttons);
+
+    // Open comfortably wide so event names aren't cut off. A resize (not a
+    // fixed size) keeps the dialog user-resizable for the occasional very long
+    // title; the minimum width stops it collapsing back to the cramped state.
+    dlg.resize(580, 420);
+    dlg.setMinimumWidth(480);
 
     if (dlg.exec() != QDialog::Accepted) return;
     QListWidgetItem* sel = list->currentItem();
@@ -1382,6 +1393,10 @@ static void ShowSessionPickerDialog(const std::string& json) {
 
     QLabel* label = new QLabel("Select a session to join:", &dlg);
     QListWidget* list = new QListWidget(&dlg);
+    // Elide long session labels on the right rather than forcing a horizontal
+    // scrollbar; the full label lives in each item's tooltip (set below).
+    list->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    list->setTextElideMode(Qt::ElideRight);
     for (const std::string& o : objs) {
         std::string id    = ExtractJsonString(o, "session_id");
         std::string name  = ExtractJsonStringEscaped(o, "name");
@@ -1396,6 +1411,7 @@ static void ShowSessionPickerDialog(const std::string& json) {
         text += QString("  (") + typeStr + ")";
         QListWidgetItem* item = new QListWidgetItem(text, list);
         item->setData(Qt::UserRole, QString::fromStdString(id));
+        item->setToolTip(text);
     }
     list->setCurrentRow(0);
 
@@ -1409,6 +1425,12 @@ static void ShowSessionPickerDialog(const std::string& json) {
     layout->addWidget(label);
     layout->addWidget(list);
     layout->addWidget(buttons);
+
+    // Open comfortably wide so session labels aren't cut off. A resize (not a
+    // fixed size) keeps the dialog user-resizable for the occasional very long
+    // title; the minimum width stops it collapsing back to the cramped state.
+    dlg.resize(580, 420);
+    dlg.setMinimumWidth(480);
 
     if (dlg.exec() != QDialog::Accepted) return;
     QListWidgetItem* sel = list->currentItem();
