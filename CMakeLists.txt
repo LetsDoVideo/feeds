@@ -48,12 +48,15 @@ if(ENABLE_FRONTEND_API)
 endif()
 
 if(ENABLE_QT)
-    find_package(Qt6 COMPONENTS Widgets Core QUIET)
+    # Svg: the Connect chooser renders bundled Tabler glyph SVGs (data/icons)
+    # tinted via QSvgRenderer. OBS ships Qt6Svg.dll and the obs-deps Qt6
+    # prebuilt includes the Svg dev module, so this resolves in CI.
+    find_package(Qt6 COMPONENTS Widgets Core Svg QUIET)
     if(NOT Qt6_FOUND)
-        find_package(Qt5 COMPONENTS Widgets Core REQUIRED)
-        target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE Qt5::Core Qt5::Widgets)
+        find_package(Qt5 COMPONENTS Widgets Core Svg REQUIRED)
+        target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE Qt5::Core Qt5::Widgets Qt5::Svg)
     else()
-        target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE Qt6::Core Qt6::Widgets)
+        target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE Qt6::Core Qt6::Widgets Qt6::Svg)
     endif()
 endif()
 

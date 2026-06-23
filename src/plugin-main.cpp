@@ -52,8 +52,16 @@
 #include <QPushButton>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
+#include <QGridLayout>
 #include <QImage>
 #include <QPixmap>
+#include <QSvgRenderer>
+#include <QFile>
+#include <QByteArray>
+#include <QCursor>
+#include <QMouseEvent>
+#include <QEnterEvent>
+#include <QFontMetrics>
 #include <QUrl>
 #include <QUrlQuery>
 #include <QVariant>
@@ -841,6 +849,135 @@ void OnLogoutClick() {
     feeds::SendToEngine("{\"type\":\"logout\"}");
 }
 
+// ---------------------------------------------------------------------------
+// Connect-chooser tile support
+//
+// The Connect-to-Zoom chooser is a 2x2 launcher-style grid of icon tiles.
+// Each tile is a rounded colored square holding a centered Tabler glyph, with
+// a text label on the dialog background beneath it. The glyphs ship as bundled
+// monochrome SVGs in data/icons (stroke="currentColor"); we recolor them per
+// tile by substituting the stroke color and rasterizing with QSvgRenderer.
+// ---------------------------------------------------------------------------
+
+// Load a bundled SVG from the plugin data dir, recolor its `currentColor`
+// stroke to `color`, and rasterize it to a `sizePx`-logical-pixel pixmap.
+// Rendered at 2x for crispness on HiDPI displays. Returns a null pixmap if the
+// asset is missing or unparseable — the tile just shows an empty square then.
+static QPixmap LoadTintedIcon(const char* fileName, const QString& color,
+                              int sizePx) {
+    char* resolved = obs_module_file(fileName);
+    if (!resolved) {
+        blog(LOG_WARNING, "[feeds] chooser icon not found: %s", fileName);
+        return QPixmap();
+    }
+    QFile f(QString::fromUtf8(resolved));
+    bfree(resolved);
+    if (!f.open(QIODevice::ReadOnly)) return QPixmap();
+    QByteArray svg = f.readAll();
+    f.close();
+    svg.replace("currentColor", color.toUtf8());
+
+    QSvgRenderer renderer(svg);
+    if (!renderer.isValid()) return QPixmap();
+
+    const qreal dpr = 2.0;
+    QPixmap pm(int(sizePx * dpr), int(sizePx * dpr));
+    pm.fill(Qt::transparent);
+    QPainter p(&pm);
+    p.setRenderHint(QPainter::Antialiasing, true);
+    renderer.render(&p);
+    p.end();
+    pm.setDevicePixelRatio(dpr);
+    return pm;
+}
+
+// A launcher-style clickable tile: a rounded colored square with a centered
+// icon, and a label on the dialog background beneath it. Hover lightens the
+// square (plus a pointer cursor); press darkens it; releasing inside fires the
+// click. The whole tile is the hit area — the child labels are transparent to
+// mouse events so enter/leave/press/release all land on the tile itself.
+//
+// Deliberately NOT a Q_OBJECT: it carries no signals/slots, so it needs no moc
+// pass and compiles cleanly inside this translation unit (which #undefs the Qt
+// keyword macros). The click is delivered through a std::function instead.
+class ConnectTile : public QWidget {
+public:
+    ConnectTile(const QString& labelText, const QPixmap& icon,
+                const QString& baseColor, const QString& hoverColor,
+                const QString& pressColor, std::function<void()> onClick,
+                QWidget* parent = nullptr)
+        : QWidget(parent),
+          m_base(baseColor), m_hover(hoverColor), m_press(pressColor),
+          m_onClick(std::move(onClick)) {
+        setCursor(Qt::PointingHandCursor);
+        setFocusPolicy(Qt::NoFocus);
+
+        m_square = new QLabel(this);
+        m_square->setPixmap(icon);
+        m_square->setAlignment(Qt::AlignCenter);
+        m_square->setFixedSize(kSquare, kSquare);
+        m_square->setAttribute(Qt::WA_TransparentForMouseEvents);
+        ApplyColor(m_base);
+
+        m_label = new QLabel(labelText, this);
+        m_label->setAlignment(Qt::AlignHCenter | Qt::AlignTop);
+        m_label->setWordWrap(true);
+        m_label->setFixedWidth(kTileWidth);
+        m_label->setStyleSheet("QLabel { color: #d6d8da; }");
+        m_label->setAttribute(Qt::WA_TransparentForMouseEvents);
+        // Reserve two text lines so all four tiles are the same height and the
+        // colored squares stay row-aligned regardless of label wrapping.
+        QFontMetrics fm(m_label->font());
+        m_label->setFixedHeight(fm.height() * 2 + 4);
+
+        QVBoxLayout* v = new QVBoxLayout(this);
+        v->setContentsMargins(0, 0, 0, 0);
+        v->setSpacing(8);
+        v->addWidget(m_square, 0, Qt::AlignHCenter);
+        v->addWidget(m_label, 0, Qt::AlignHCenter | Qt::AlignTop);
+    }
+
+protected:
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+    void enterEvent(QEnterEvent*) override { ApplyColor(m_hover); }
+#else
+    void enterEvent(QEvent*) override { ApplyColor(m_hover); }
+#endif
+    void leaveEvent(QEvent*) override {
+        m_pressed = false;
+        ApplyColor(m_base);
+    }
+    void mousePressEvent(QMouseEvent* e) override {
+        if (e->button() == Qt::LeftButton) {
+            m_pressed = true;
+            ApplyColor(m_press);
+        }
+    }
+    void mouseReleaseEvent(QMouseEvent* e) override {
+        if (e->button() != Qt::LeftButton || !m_pressed) return;
+        m_pressed = false;
+        const bool inside = rect().contains(e->pos());
+        ApplyColor(inside ? m_hover : m_base);
+        if (inside && m_onClick) m_onClick();
+    }
+
+private:
+    void ApplyColor(const QString& c) {
+        m_square->setStyleSheet(
+            "QLabel { background-color: " + c +
+            "; border-radius: 16px; }");
+    }
+
+    static constexpr int kSquare = 112;     // colored square edge, px
+    static constexpr int kTileWidth = 132;  // tile/label width, px
+
+    QLabel* m_square = nullptr;
+    QLabel* m_label = nullptr;
+    QString m_base, m_hover, m_press;
+    std::function<void()> m_onClick;
+    bool m_pressed = false;
+};
+
 void OnConnectClick() {
     if (!g_isLoggedIn) {
         g_pendingMeetingJoin = true;
@@ -887,134 +1024,74 @@ void OnConnectClick() {
         return out;
     };
 
-    // Two-row choice screen. Top row groups the two "host your own meeting"
-    // paths (Instant + PMI) — both put the user in as host with no permission
-    // prompt and get equal emphasis. Bottom row holds the "join someone
-    // else's meeting" path in the demoted secondary style. Captured `choice`
-    // discriminates the branches:
-    // 1 = Create Instant Meeting, 2 = PMI, 3 = Join by Number or Link.
+    // Icon-tile chooser — a 2x2 launcher-style grid of equal square tiles.
+    // Top row is blue ("your own room, no permission prompt"): Instant +
+    // PMI. Bottom row is grey (the rest): Join-by-number/link + Zoom Events.
+    // The blue/grey split carries the meaning the old "Tip:" line used to.
+    // Captured `choice` discriminates the downstream branches:
+    // 1 = Create Instant Meeting, 2 = PMI, 3 = Join by Number or Link,
+    // 4 = Zoom Events. (Behavior is unchanged from the old button chooser.)
     int choice = 0;
     {
         QDialog dlg(mainWindow);
         dlg.setWindowTitle("Connect to Zoom Meeting");
 
-        QString pmiLabel = "My Personal Meeting Room";
+        // Tile palette. Blue marks the two host-your-own-room actions; grey
+        // marks the rest. Hover lightens the fill, press darkens it — same
+        // "obviously clickable" affordance the old stylesheet buttons gave.
+        const QString kBlueBase  = "#3a6fe0";
+        const QString kBlueHover = "#5285ea";
+        const QString kBluePress = "#2f5cc0";
+        const QString kGreyBase  = "#4a4f55";
+        const QString kGreyHover = "#5c626a";
+        const QString kGreyPress = "#3e4147";
+        const QString kBlueIcon  = "#ffffff";
+        const QString kGreyIcon  = "#d6d8da";
+        const int kIconPx = 52;  // glyph size inside the 112px square
+
+        QPixmap instantIcon = LoadTintedIcon("icons/video.svg",  kBlueIcon, kIconPx);
+        QPixmap pmiIcon     = LoadTintedIcon("icons/user.svg",   kBlueIcon, kIconPx);
+        QPixmap linkIcon    = LoadTintedIcon("icons/link.svg",   kGreyIcon, kIconPx);
+        QPixmap eventsIcon  = LoadTintedIcon("icons/ticket.svg", kGreyIcon, kIconPx);
+
+        ConnectTile* instantTile = new ConnectTile(
+            "Instant Meeting", instantIcon, kBlueBase, kBlueHover, kBluePress,
+            [&]() { choice = 1; dlg.accept(); }, &dlg);
+        ConnectTile* pmiTile = new ConnectTile(
+            "Personal Meeting (PMI)", pmiIcon, kBlueBase, kBlueHover, kBluePress,
+            [&]() { choice = 2; dlg.accept(); }, &dlg);
+        ConnectTile* linkTile = new ConnectTile(
+            "Join by Number or Link", linkIcon, kGreyBase, kGreyHover, kGreyPress,
+            [&]() { choice = 3; dlg.accept(); }, &dlg);
+        ConnectTile* eventsTile = new ConnectTile(
+            "Zoom Events", eventsIcon, kGreyBase, kGreyHover, kGreyPress,
+            [&]() { choice = 4; dlg.accept(); }, &dlg);
+
+        // Preserve the PMI number — which the old PMI button showed inline —
+        // by surfacing it in the tile's tooltip instead.
         if (!g_userPMI.empty())
-            pmiLabel += "\n(" + QString::fromStdString(g_userPMI) + ")";
+            pmiTile->setToolTip("Personal Meeting ID: " +
+                                QString::fromStdString(g_userPMI));
 
-        QPushButton* instantBtn = new QPushButton("Create Instant\nMeeting", &dlg);
-        QPushButton* pmiBtn     = new QPushButton(pmiLabel, &dlg);
-        QPushButton* linkBtn    = new QPushButton("Join by Number\nor Link", &dlg);
-        QPushButton* eventsBtn  = new QPushButton("Zoom Events", &dlg);
-
-        // min-height: multi-line labels + padding need vertical room or Qt
-        // crops the second line on some platforms. Both top-row buttons use
-        // the emphasized style with the larger padding → 80px. Link uses
-        // the compact secondary style → 70px.
-        // Transparent border in the base state reserves space so the button
-        // doesn't grow by 2px when the hover border appears — without this
-        // reservation, Qt would re-layout on hover, jittering the row.
-        const char* emphasizedBtnStyle =
-            "QPushButton { "
-                "background-color: palette(highlight); "
-                "color: palette(highlighted-text); "
-                "font-weight: bold; "
-                "padding: 18px 28px; "
-                "min-height: 80px; "
-                "border: 1px solid transparent; "
-            "} "
-            "QPushButton:hover { "
-                "border: 1px solid palette(highlighted-text); "
-            "}";
-        const char* secondaryBtnStyle =
-            "QPushButton { "
-                "padding: 12px 16px; "
-                "min-height: 70px; "
-            "}";
-        instantBtn->setStyleSheet(emphasizedBtnStyle);
-        pmiBtn    ->setStyleSheet(emphasizedBtnStyle);
-        linkBtn   ->setStyleSheet(secondaryBtnStyle);
-        eventsBtn ->setStyleSheet(secondaryBtnStyle);
-        // Pin button heights to match their stylesheet min-heights so the
-        // QHBoxLayout's vertical sizeHint == its content's actual height.
-        // Without this, Qt allocates the row extra vertical space (the
-        // buttons' sizeHint exceeds their min-height when style padding
-        // is factored in), which manifests as a gap between tip and row.
-        instantBtn->setMaximumHeight(80);
-        pmiBtn    ->setMaximumHeight(80);
-        linkBtn   ->setMaximumHeight(70);
-        eventsBtn ->setMaximumHeight(70);
-
-        // Both emphasized buttons get the same minimum width so they render
-        // at equal sizes regardless of their text content lengths. Without
-        // this, QPushButton sizes each button to fit its own label, which
-        // makes PMI (long account name + meeting number) much wider than
-        // Instant Meeting. The minimum is sized to comfortably fit
-        // "My Personal Meeting Room" plus padding — the longest expected
-        // label.
-        instantBtn->setMinimumWidth(240);
-        pmiBtn    ->setMinimumWidth(240);
-
-        // Mouse-driven dialog — disable keyboard focus on all three buttons
-        // so the initially-focused button doesn't render with a focus border
-        // that looks identical to a hover border (made Instant appear "stuck
-        // highlighted" until OBS lost Windows focus). Esc-to-cancel still
-        // works because that's handled by the QDialog itself, not the buttons.
-        instantBtn->setFocusPolicy(Qt::NoFocus);
-        pmiBtn    ->setFocusPolicy(Qt::NoFocus);
-        linkBtn   ->setFocusPolicy(Qt::NoFocus);
-        eventsBtn ->setFocusPolicy(Qt::NoFocus);
-
-        QObject::connect(instantBtn, &QPushButton::clicked, &dlg,
-                         [&]() { choice = 1; dlg.accept(); });
-        QObject::connect(pmiBtn,     &QPushButton::clicked, &dlg,
-                         [&]() { choice = 2; dlg.accept(); });
-        QObject::connect(linkBtn,    &QPushButton::clicked, &dlg,
-                         [&]() { choice = 3; dlg.accept(); });
-        QObject::connect(eventsBtn,  &QPushButton::clicked, &dlg,
-                         [&]() { choice = 4; dlg.accept(); });
-
-        QLabel* tipLabel = new QLabel(
-            "<span style=\"color:gray;font-style:italic\">"
-            "Tip: Joining your own meeting avoids permission prompts."
-            "</span>", &dlg);
-        tipLabel->setTextFormat(Qt::RichText);
-        tipLabel->setAlignment(Qt::AlignCenter);
-        // Fixed vertical policy — without this Qt lets the label expand
-        // vertically to absorb spare space, which manifests as a big gap
-        // between the tip and the buttons below it.
-        tipLabel->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
-
-        // Top row — the two "host your own meeting" paths, equal emphasis.
-        // Per-widget Qt::AlignTop anchors each button to the top of the row's
-        // allocated rect; row->setAlignment(Qt::AlignTop) positions the row
-        // itself within the parent VBox. Both are needed (per the v1.0.8
-        // debug session) to keep Qt from injecting vertical dead space.
-        QHBoxLayout* topRow = new QHBoxLayout();
-        topRow->addWidget(instantBtn, 0, Qt::AlignTop);
-        topRow->addWidget(pmiBtn,     0, Qt::AlignTop);
-        topRow->setAlignment(Qt::AlignTop);
-
-        // Bottom row — the "join someone else's meeting" path, centered with
-        // stretch on both sides so the button keeps its natural size rather
-        // than spanning the row's full width.
-        QHBoxLayout* bottomRow = new QHBoxLayout();
-        bottomRow->addStretch();
-        bottomRow->addWidget(linkBtn,   0, Qt::AlignTop);
-        bottomRow->addWidget(eventsBtn, 0, Qt::AlignTop);
-        bottomRow->addStretch();
-        bottomRow->setAlignment(Qt::AlignTop);
+        // 2x2 grid: both columns equal width so all four tiles align. No
+        // centered-and-narrower bottom row like the old layout had.
+        QGridLayout* grid = new QGridLayout();
+        grid->setHorizontalSpacing(16);
+        grid->setVerticalSpacing(14);
+        grid->addWidget(instantTile, 0, 0);
+        grid->addWidget(pmiTile,     0, 1);
+        grid->addWidget(linkTile,    1, 0);
+        grid->addWidget(eventsTile,  1, 1);
 
         QVBoxLayout* layout = new QVBoxLayout(&dlg);
-        // SetFixedSize sizes the dialog to exactly the layout's sizeHint
-        // with no slack — combined with per-widget Qt::AlignTop on the
-        // row's children, the dialog renders flush with the contents.
+        // SetFixedSize sizes the dialog to exactly the grid's sizeHint with no
+        // leftover empty space.
         layout->setSizeConstraint(QLayout::SetFixedSize);
-        layout->addWidget(tipLabel);
-        layout->addSpacing(8);
-        layout->addLayout(topRow);
-        layout->addLayout(bottomRow);
+        layout->addLayout(grid);
 
+        // Mouse-driven dialog: tiles take no keyboard focus (so none renders a
+        // focus border that reads as a stuck hover). Esc-to-cancel still works
+        // — that's handled by the QDialog itself, not the tiles.
         if (dlg.exec() != QDialog::Accepted || choice == 0) return;
     }
 
