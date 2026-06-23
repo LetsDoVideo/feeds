@@ -1067,12 +1067,6 @@ void OnConnectClick() {
             "Zoom Events", eventsIcon, kGreyBase, kGreyHover, kGreyPress,
             [&]() { choice = 4; dlg.accept(); }, &dlg);
 
-        // Preserve the PMI number — which the old PMI button showed inline —
-        // by surfacing it in the tile's tooltip instead.
-        if (!g_userPMI.empty())
-            pmiTile->setToolTip("Personal Meeting ID: " +
-                                QString::fromStdString(g_userPMI));
-
         // 2x2 grid: both columns equal width so all four tiles align. No
         // centered-and-narrower bottom row like the old layout had.
         QGridLayout* grid = new QGridLayout();
@@ -1343,7 +1337,6 @@ static void ShowEventPickerDialog(const std::string& json) {
         else if (role == "attendee") text += "  [Attendee]";
         QListWidgetItem* item = new QListWidgetItem(text, list);
         item->setData(Qt::UserRole, QString::fromStdString(id));
-        item->setToolTip(QString::fromStdString(name));
     }
     list->setCurrentRow(0);
 
@@ -1411,7 +1404,6 @@ static void ShowSessionPickerDialog(const std::string& json) {
         text += QString("  (") + typeStr + ")";
         QListWidgetItem* item = new QListWidgetItem(text, list);
         item->setData(Qt::UserRole, QString::fromStdString(id));
-        item->setToolTip(text);
     }
     list->setCurrentRow(0);
 

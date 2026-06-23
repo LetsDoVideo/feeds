@@ -1390,22 +1390,40 @@ void HandleJoinEventSession(const std::string& json) {
     int code = -1;
     std::string joinToken, errorMessage;
     if (!FetchEventJoinToken(eventId, sessionId, code, joinToken, errorMessage)) {
+        // Map Zoom's documented join-token error codes to friendly text. We
+        // never surface Zoom's raw error_message to the user — codes like 1140
+        // come back as unhelpful strings like "system busy" — so the default
+        // shows a generic message and the raw code/message go to the log only.
         std::string friendly;
         switch (code) {
+            case 1120:
+                friendly = "Zoom couldn't process the request to join this "
+                           "session.";
+                break;
             case 1130:
                 friendly = "You don't have a valid ticket for this Zoom Events "
                            "session, so it can't be joined.";
+                break;
+            case 1140:
+                friendly = "This Zoom Events session can't be joined — it may "
+                           "have already ended, or Zoom is temporarily busy. "
+                           "Try again, or pick a session that's currently live "
+                           "or upcoming.";
                 break;
             case 1150:
                 friendly = "Your ticket for this Zoom Events session has been "
                            "revoked, so it can't be joined.";
                 break;
             default:
-                friendly = errorMessage.empty()
-                    ? "Could not get a join token for this Zoom Events session."
-                    : errorMessage;
+                friendly = "This Zoom Events session couldn't be joined. "
+                           "Please try again, or choose a different session.";
                 break;
         }
+        char logBuf[512];
+        sprintf_s(logBuf,
+                  "Events: join-token fetch failed, code=%d, message=%s",
+                  code, errorMessage.c_str());
+        LogWarn(logBuf);
         char codeBuf[32];
         sprintf_s(codeBuf, "%d", code);
         SendToPlugin("{\"type\":\"meeting_failed\",\"code\":" + std::string(codeBuf) +
