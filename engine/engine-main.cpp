@@ -23,7 +23,7 @@
 // ===========================================================================
 #define FEEDS_HEARTBEAT 1
 #if FEEDS_HEARTBEAT
-#define PSAPI_VERSION 1          // route GetProcessMemoryInfo to kernel32 (K32*),
+#define PSAPI_VERSION 2          // route GetProcessMemoryInfo to kernel32 (K32*),
 #include <psapi.h>               // so no psapi.lib link is needed
 #include <tlhelp32.h>
 #include <condition_variable>
