@@ -602,6 +602,13 @@ void TearDownAllVideoSubscriptions() {
     g_currentActiveSpeaker = 0;
 }
 
+// === TEMPORARY (freeze diagnostic): live-subscription count for the engine
+// heartbeat in engine-main.cpp. Remove together with the heartbeat block. ===
+size_t GetActiveSubscriptionCount() {
+    std::lock_guard<std::mutex> lock(g_subsMutex);
+    return g_subs.size();
+}
+
 // Blank any subscriptions currently bound to the given user ID. Called
 // from the participants listener's onUserLeft so OBS sources tied to a
 // departed participant clear immediately instead of freezing on the last

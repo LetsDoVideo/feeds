@@ -15,6 +15,30 @@
 #include "feeds-version.h"
 #include "engine-shared.h"
 
+// ===========================================================================
+// TEMPORARY — freeze-investigation heartbeat (remove after the hard-hang
+// cause is found). Everything for this diagnostic is gated on FEEDS_HEARTBEAT
+// and tagged "[feeds-hb]" in the log; grep FEEDS_HEARTBEAT to pull it out.
+// See the HeartbeatLoop block lower in this file for what each tick records.
+// ===========================================================================
+#define FEEDS_HEARTBEAT 1
+#if FEEDS_HEARTBEAT
+#define PSAPI_VERSION 1          // route GetProcessMemoryInfo to kernel32 (K32*),
+#include <psapi.h>               // so no psapi.lib link is needed
+#include <tlhelp32.h>
+#include <condition_variable>
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
+
+// Total protocol messages over IPC since start. Incremented in SendToPlugin
+// (outbound) and PipeReaderLoop (inbound). Relaxed atomics — diagnostic only,
+// behavior-neutral. Log lines bypass SendToPlugin, so they are NOT counted
+// here; this counts real protocol messages only.
+static std::atomic<uint64_t> g_hbIpcSent{0};
+static std::atomic<uint64_t> g_hbIpcRecv{0};
+#endif // FEEDS_HEARTBEAT
+
 // Defined here, declared extern in engine-shared.h so engine-meeting.cpp
 // can post WM_FEEDS_SEND_CHAT to it from the pipe thread. Set inside
 // WinMain right after CreateWindowExW succeeds.
@@ -206,6 +230,9 @@ bool SendToPlugin(const std::string& json)
     std::string type = ExtractJsonStringField(json, "type");
     if (type.empty()) type = "(unknown)";
     LogToFile(("Sent: " + type).c_str());
+#if FEEDS_HEARTBEAT
+    g_hbIpcSent.fetch_add(1, std::memory_order_relaxed);  // TEMPORARY (heartbeat)
+#endif
     return true;
 }
 
@@ -273,6 +300,9 @@ static void PipeReaderLoop()
 
         if (bytesRead > 0) {
             buffer[bytesRead] = '\0';
+#if FEEDS_HEARTBEAT
+            g_hbIpcRecv.fetch_add(1, std::memory_order_relaxed);  // TEMPORARY (heartbeat)
+#endif
             std::string json(buffer, bytesRead);
 
             // Redaction: log only the message type, never the payload.
@@ -376,6 +406,135 @@ static LRESULT CALLBACK EngineWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProc(hwnd, msg, wp, lp);
 }
 
+#if FEEDS_HEARTBEAT
+// ===========================================================================
+// TEMPORARY — freeze-investigation heartbeat thread.
+//
+// Wakes on a fixed interval (default 30s; set env FEEDS_HB_INTERVAL_MS, e.g.
+// 10000 for a denser curve, or edit kHbDefaultIntervalMs) and writes ONE compact
+// "[feeds-hb]" line per tick at INFO level so it lands in the default OBS log.
+// Runs independently of SDK/login state — started right after the pipes
+// connect and never gated on InitializeSDK — so it covers the idle,
+// logged-in-but-not-connected state we're chasing.
+//
+// Each line is a time series row: monotonic seconds-since-start (t=) and
+// wall-clock HH:MM:SS (wall=) for row-for-row alignment with a Performance
+// Monitor capture, then the richest per-process snapshot obtainable in-proc:
+//   OS counters  : handles, threads, working-set MB, private-bytes MB,
+//                  GDI objects, USER objects
+//   Feeds-internal: live source subscriptions (subs=), and total protocol
+//                  IPC messages out/in since start (ipcout=/ipcin=)
+// (There is no IPC queue and no log buffer in this engine — writes are
+// synchronous and ForwardLog never buffers — so there is nothing of that kind
+// to report; subs= is the only container that grows over a session.)
+//
+// Allocation-free per tick: fixed stack buffers, atomics, and a Toolhelp
+// snapshot that is a kernel object freed each tick. The line is flushed out of
+// the engine immediately — the last line before a hang is the whole point.
+// ===========================================================================
+namespace feeds_engine { size_t GetActiveSubscriptionCount(); }
+
+static const DWORD          kHbDefaultIntervalMs = 30000;  // edit or set FEEDS_HB_INTERVAL_MS
+static std::atomic<bool>    g_hbStop{false};
+static std::mutex           g_hbMutex;
+static std::condition_variable g_hbCv;
+static std::thread          g_hbThread;
+
+// Thread count for our own process. No direct Win32 API for this, so snapshot
+// the process table and read our entry's cntThreads. Walks all processes —
+// the one mildly-costly call here, but at a 10–30s cadence it's negligible.
+static unsigned HbSelfThreadCount()
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    PROCESSENTRY32W pe; pe.dwSize = sizeof(pe);
+    DWORD me = GetCurrentProcessId();
+    unsigned count = 0;
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (pe.th32ProcessID == me) { count = pe.cntThreads; break; }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return count;
+}
+
+// Push whatever is already in the pipe out of the engine now. WriteFile in
+// WriteToPipeRaw already delivers synchronously, so the line is "out" before
+// this returns regardless; this is belt-and-braces per the flush requirement.
+static void HbFlush()
+{
+    if (g_writePipe != INVALID_HANDLE_VALUE) FlushFileBuffers(g_writePipe);
+}
+
+static void HeartbeatLoop()
+{
+    DWORD intervalMs = kHbDefaultIntervalMs;
+    char env[32];
+    if (GetEnvironmentVariableA("FEEDS_HB_INTERVAL_MS", env, sizeof(env)) > 0) {
+        int v = atoi(env);
+        if (v >= 1000) intervalMs = (DWORD)v;  // floor at 1s; ignore garbage
+    }
+
+    const ULONGLONG startTick = GetTickCount64();
+    const HANDLE     proc      = GetCurrentProcess();
+
+    {
+        char banner[160];
+        sprintf_s(banner,
+            "[feeds-hb] heartbeat started, interval=%lums (TEMPORARY freeze diagnostic)",
+            intervalMs);
+        LogInfo(banner);
+        HbFlush();
+    }
+
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lk(g_hbMutex);
+            g_hbCv.wait_for(lk, std::chrono::milliseconds(intervalMs),
+                            [] { return g_hbStop.load(); });
+            if (g_hbStop.load()) break;
+        }
+
+        const ULONGLONG nowTick   = GetTickCount64();
+        const unsigned long long uptimeSec = (nowTick - startTick) / 1000ULL;
+
+        SYSTEMTIME lt; GetLocalTime(&lt);
+
+        DWORD handles = 0; GetProcessHandleCount(proc, &handles);
+        unsigned threads = HbSelfThreadCount();
+
+        PROCESS_MEMORY_COUNTERS_EX pmc; ZeroMemory(&pmc, sizeof(pmc));
+        pmc.cb = sizeof(pmc);
+        double wsMB = 0.0, privMB = 0.0;
+        if (GetProcessMemoryInfo(proc, (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc))) {
+            wsMB   = pmc.WorkingSetSize / (1024.0 * 1024.0);
+            privMB = pmc.PrivateUsage  / (1024.0 * 1024.0);
+        }
+
+        DWORD gdi  = GetGuiResources(proc, GR_GDIOBJECTS);
+        DWORD user = GetGuiResources(proc, GR_USEROBJECTS);
+
+        size_t             subs   = feeds_engine::GetActiveSubscriptionCount();
+        unsigned long long ipcOut = g_hbIpcSent.load(std::memory_order_relaxed);
+        unsigned long long ipcIn  = g_hbIpcRecv.load(std::memory_order_relaxed);
+
+        char line[512];
+        sprintf_s(line,
+            "[feeds-hb] t=%06llu wall=%02d:%02d:%02d handles=%lu threads=%u "
+            "ws=%.1fM priv=%.1fM gdi=%lu user=%lu subs=%zu ipcout=%llu ipcin=%llu",
+            uptimeSec, lt.wHour, lt.wMinute, lt.wSecond,
+            (unsigned long)handles, threads, wsMB, privMB,
+            (unsigned long)gdi, (unsigned long)user, subs, ipcOut, ipcIn);
+        LogInfo(line);
+        HbFlush();
+    }
+
+    LogInfo("[feeds-hb] heartbeat stopped");
+    HbFlush();
+}
+#endif // FEEDS_HEARTBEAT
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
 {
     // --- TEMPORARY MIGRATION (remove in a few releases) --------------------
@@ -466,6 +625,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
         return 1;
     }
 
+#if FEEDS_HEARTBEAT
+    // TEMPORARY (freeze diagnostic): start the heartbeat now — after the pipes
+    // are up so its lines reach the OBS log, and before InitializeSDK so it
+    // covers the idle, logged-in-but-not-connected state regardless of SDK
+    // or login state. Stopped and joined during shutdown below.
+    g_hbThread = std::thread(HeartbeatLoop);
+#endif
+
     // Initialize the Zoom SDK. Must happen on the thread that runs the message
     // pump and created the window.
     feeds_engine::InitializeSDK();
@@ -489,6 +656,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     if (pipeThread.joinable()) {
         pipeThread.join();
     }
+
+#if FEEDS_HEARTBEAT
+    // TEMPORARY (freeze diagnostic): stop the heartbeat and join cleanly so it
+    // can't touch the pipe after teardown.
+    {
+        std::lock_guard<std::mutex> lk(g_hbMutex);
+        g_hbStop = true;
+    }
+    g_hbCv.notify_all();
+    if (g_hbThread.joinable()) g_hbThread.join();
+#endif
 
     DestroyWindow(hwnd);
     LogToFile("FeedsEngine.exe exiting normally");
