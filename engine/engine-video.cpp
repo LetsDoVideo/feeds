@@ -315,6 +315,18 @@ public:
         // Create the SDK renderer with this object as the delegate.
         ZOOM_SDK_NAMESPACE::SDKError err =
             ZOOM_SDK_NAMESPACE::createRenderer(&m_renderer, this);
+        // TEMPORARY diagnostic ([feeds-rls], grep to remove) — record every
+        // createRenderer attempt and its result code (12 == SDKERR_NO_PERMISSION
+        // is the grant-instant readiness failure we're chasing) so the ordering
+        // of grant sent -> readiness-callback firings -> createRenderer attempts
+        // is visible in one rejoin's log. No behavior change.
+        {
+            char rls[160];
+            sprintf_s(rls,
+                "[feeds-rls] createRenderer attempt source='%s' userId=%u result=%d",
+                m_sourceUuid.c_str(), m_userId, (int)err);
+            LogInfo(rls);
+        }
         if (err != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS || !m_renderer) {
             char msg[128];
             sprintf_s(msg, "Video: createRenderer failed: %d", (int)err);
