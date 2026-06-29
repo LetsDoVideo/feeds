@@ -256,8 +256,12 @@ struct ZpSourceData {
     // against double-subscribing the same source/id when more than one of the
     // subscribe paths (manual pick, name reconcile, privilege-granted handler)
     // fires for it. A rebind changes current_user_id, so this stops matching
-    // and the source is correctly re-subscribed to the new id. Reset to 0 when
-    // the subscription is torn down (unselect, meeting_left, logout, expiry).
+    // and the source is correctly re-subscribed to the new id. Cleared to 0
+    // when the subscription is torn down (unselect, meeting_left, logout,
+    // expiry) and, authoritatively, at raw_livestream_granted — the engine
+    // holds no subscriptions on meeting (re)entry, so the grant-time sweep
+    // always re-subscribes every bound source fresh regardless of leave-side
+    // teardown ordering.
     unsigned int  subscribed_user_id = 0;
     // Per-source ISO recorder (feeds-iso-recorder). Created in zp_create,
     // torn down in zp_destroy. Records this source to its own MP4 alongside
@@ -3725,16 +3729,28 @@ static void RegisterEngineHandlers() {
         // binding came from a manual dropdown pick or from name-based reconcile
         // (including [Active Speaker], sentinel 1).
         //
-        // Re-derive bindings from the live roster FIRST: a source rebound by
-        // name (e.g. after a restart-rejoin) may have been bound while privilege
-        // was still pending — its subscribe was gated off then, and reconcile's
-        // own privilege check can't have fired. Running reconcile here (with
-        // privilege now true) re-binds from the current roster and subscribes
-        // freshly-bound sources via SubscribeBoundSourceLocked. The loop then
-        // catches sources that were already bound before the grant (reconcile's
-        // rename-refresh path leaves those without re-subscribing). The
-        // subscribed_user_id guard keeps the two passes from double-subscribing.
+        // Engine truth on (re)entry: the engine holds NO participant
+        // subscriptions at this point — they are torn down on leave
+        // (TearDownAllVideoSubscriptions), and a fresh process has none. So
+        // clear every subscribed_user_id FIRST, making the engine's state
+        // authoritative and decoupling us from leave-side teardown ordering.
+        // This closes the leave/rejoin seam: when a returning participant reused
+        // its old runtime id, reconcile would keep the binding (current_user_id
+        // unchanged) while a stale subscribed_user_id still equalled it, so
+        // SubscribeBoundSourceLocked suppressed the re-subscribe and the source
+        // stayed black even though the engine had dropped the subscription.
+        //
+        // After the clear, re-derive bindings from the live roster (reconcile,
+        // now with privilege true, subscribes freshly-bound sources) and then
+        // sweep every source through SubscribeBoundSourceLocked to catch those
+        // bound before the grant. The guard now only prevents double-subscribing
+        // within this single grant cycle (reconcile subscribes, the sweep skips).
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
+            {
+                std::lock_guard<std::mutex> lock(g_sourcesMutex);
+                for (ZpSourceData* s : g_allParticipantSources)
+                    if (s) s->subscribed_user_id = 0;
+            }
             ReconcileRememberedParticipants();
             {
                 std::lock_guard<std::mutex> lock(g_sourcesMutex);
