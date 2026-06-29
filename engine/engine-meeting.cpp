@@ -679,13 +679,22 @@ public:
             "[feeds-rls] onUserRawLiveStreamingStatusChanged count=%d myself=%u",
             count, mySelf);
         LogInfo(buf);
+        bool selfPresent = false;
         for (int i = 0; i < count; ++i) {
             ZOOM_SDK_NAMESPACE::RawLiveStreamInfo info = liveStreamList->GetItem(i);
+            bool isSelf = (mySelf != 0 && info.userId == mySelf);
+            if (isSelf) selfPresent = true;
             sprintf_s(buf, "[feeds-rls]   entry[%d] userId=%u is_self=%d",
-                      i, info.userId,
-                      (mySelf != 0 && info.userId == mySelf) ? 1 : 0);
+                      i, info.userId, isSelf ? 1 : 0);
             LogInfo(buf);
         }
+
+        // Self present in the raw-live-streaming list == the raw-data renderer
+        // subsystem is ready. Open the readiness gate so engine-video drains any
+        // subscribes queued at the grant instant (the Option C fix). The
+        // [feeds-rls] lines above stay in to verify the gate on the live test;
+        // they come out with the heartbeat in the pre-tag cleanup.
+        if (selfPresent) NotifyRawRenderReady();
     }
     virtual void onLiveStreamReminderStatusChanged(bool) override {}
     virtual void onLiveStreamReminderStatusChangeFailed() override {}

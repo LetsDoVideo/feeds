@@ -3999,6 +3999,27 @@ static void RegisterEngineHandlers() {
         ZpSourceData* s = FindSourceByUuid(sourceId);
         if (s) CloseSharedMemory(s);
     });
+
+    feeds::RegisterMessageHandler("participant_source_subscribe_failed",
+    [](const std::string& json) {
+        std::string sourceId = ExtractJsonString(json, "source_id");
+        if (sourceId.empty()) return;
+
+        // The engine's readiness-gated renderer creation gave up for this
+        // source (retries exhausted, or a non-retryable error). Clear our
+        // subscribed marker so SubscribeBoundSourceLocked isn't wedged into
+        // believing the source is still subscribed — a later grant /
+        // participant_list_changed, or a manual reselect, can then retry it.
+        // (The remembered participant_name / current_user_id binding is left
+        // intact; only the subscribe-state guard is reset.)
+        blog(LOG_WARNING,
+             "[feeds] participant_source_subscribe_failed: source=%s "
+             "(clearing subscribed marker so it can retry)", sourceId.c_str());
+
+        std::lock_guard<std::mutex> lock(g_sourcesMutex);
+        ZpSourceData* s = FindSourceByUuid(sourceId);
+        if (s) s->subscribed_user_id = 0;
+    });
 }
 
 // Find the scene item(s) for a given source across all scenes and apply

@@ -413,6 +413,14 @@ static LRESULT CALLBACK EngineWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         feeds_engine::BringUpSdkOnMainThread();
         return 0;
     }
+    if (msg == WM_FEEDS_PROCESS_RENDERERS || msg == WM_TIMER) {
+        // Readiness-gated renderer creation + retry backstop. Posted when a
+        // subscribe is queued or readiness arrives; WM_TIMER drives retries.
+        // All createRenderer calls run here, on the pump thread. (The engine
+        // sets no other timers, so any WM_TIMER is the renderer retry tick.)
+        feeds_engine::ProcessPendingRenderers();
+        return 0;
+    }
     return DefWindowProc(hwnd, msg, wp, lp);
 }
 

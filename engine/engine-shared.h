@@ -30,8 +30,16 @@
 // pumps messages; EnsureSdkUpThen (engine-sdk.cpp) posts this and the window
 // proc calls feeds_engine::BringUpSdkOnMainThread. See engine-sdk.cpp.
 
-#define WM_FEEDS_SEND_CHAT (WM_APP + 1)
-#define WM_FEEDS_INIT_SDK  (WM_APP + 2)
+// WM_FEEDS_PROCESS_RENDERERS — posted (no params) to drive the readiness-gated
+// renderer-creation queue on the main thread. Posted by the pipe thread when a
+// participant_source_subscribe is queued, and by the raw-render readiness
+// notification. The window proc calls feeds_engine::ProcessPendingRenderers.
+// A WM_TIMER on the anchor window drives the retry backstop into the same
+// function. See engine-video.cpp.
+
+#define WM_FEEDS_SEND_CHAT         (WM_APP + 1)
+#define WM_FEEDS_INIT_SDK          (WM_APP + 2)
+#define WM_FEEDS_PROCESS_RENDERERS (WM_APP + 3)
 
 // Defined in engine-main.cpp. Set right after the anchor window is
 // created in WinMain. NULL before that (which the pipe handler
@@ -50,5 +58,16 @@ void SendChatMessageOnMainThread(const std::string& content);
 // triggered by the first connect); the queued join(s) drain once the auth
 // callback returns.
 void BringUpSdkOnMainThread();
+
+// Defined in engine-video.cpp. Runs the readiness-gated renderer-creation
+// queue on the main thread. Invoked by EngineWndProc on WM_FEEDS_PROCESS_RENDERERS
+// and on the retry WM_TIMER.
+void ProcessPendingRenderers();
+
+// Defined in engine-video.cpp. Called from the raw-live-stream status callback
+// (engine-meeting.cpp) when our own user appears in the raw-live-streaming list
+// — the signal that the raw-data renderer subsystem is ready. Flips the gate
+// open and drains any queued subscribes.
+void NotifyRawRenderReady();
 
 } // namespace feeds_engine

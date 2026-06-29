@@ -15,10 +15,12 @@
 #include <windows.h>
 #include <string>
 #include <map>
+#include <vector>
 #include <mutex>
 #include <memory>
 #include <cstdio>
 
+#include "engine-shared.h"
 #include "zoom_sdk.h"
 #include "zoom_sdk_raw_data_def.h"
 #include "meeting_service_interface.h"
@@ -49,6 +51,12 @@ unsigned int GetMySelfUserId();
 // The sentinel user ID the plugin sends when a source is set to
 // "[Active Speaker]". Matches the sentinel in plugin-main.cpp.
 static constexpr unsigned int ACTIVE_SPEAKER_SENTINEL = 1;
+
+// Result of ParticipantSubscription::Start(). RetryNotReady means createRenderer
+// returned a transient not-ready code (SDKERR_VIDEO_NOTREADY 11 / NO_PERMISSION
+// 12) — the raw-data renderer subsystem isn't up yet, so the caller should keep
+// the request queued and retry. Failed is a real, non-retryable failure.
+enum class SubStart { Started, RetryNotReady, Failed };
 
 // Map the current tier to the SDK resolution enum. Same values as v1.0.0.
 // Tier 0 (Free) = 720p, everything else = 1080p.
@@ -303,13 +311,13 @@ public:
     // true and no speaker is yet known (m_userId == ACTIVE_SPEAKER_SENTINEL),
     // we skip the subscribe call; caller should call Resubscribe once an
     // active speaker is available. Returns true on success.
-    bool Start() {
+    SubStart Start() {
         // Shared memory first so it's ready before any frames arrive.
         uint32_t pid = GetCurrentProcessId();
         std::string name = feeds_shared::MakeFrameRegionName(pid, m_sourceUuid);
         if (!m_writer.Open(name)) {
             LogError("Video: failed to open shared memory, aborting subscription");
-            return false;
+            return SubStart::Failed;
         }
 
         // Create the SDK renderer with this object as the delegate.
@@ -332,7 +340,16 @@ public:
             sprintf_s(msg, "Video: createRenderer failed: %d", (int)err);
             LogError(msg);
             m_writer.Close();
-            return false;
+            m_renderer = nullptr;
+            // 11 (VIDEO_NOTREADY) / 12 (NO_PERMISSION) are the transient
+            // raw-data-subsystem-not-ready codes seen at/just after the grant —
+            // tell the caller to keep the request queued and retry. Any other
+            // code is a real failure.
+            if (err == ZOOM_SDK_NAMESPACE::SDKERR_VIDEO_NOTREADY ||
+                err == ZOOM_SDK_NAMESPACE::SDKERR_NO_PERMISSION) {
+                return SubStart::RetryNotReady;
+            }
+            return SubStart::Failed;
         }
 
         // Set resolution based on the current tier. Tier 0 caps at 720p;
@@ -386,7 +403,7 @@ public:
             LogToFile(msg);
         }
 
-        return true;
+        return SubStart::Started;
     }
 
     bool FollowsActiveSpeaker() const { return m_followActiveSpeaker; }
@@ -603,6 +620,37 @@ static std::mutex g_subsMutex;
 // with the subscription map.
 static unsigned int g_currentActiveSpeaker = 0;
 
+// ---------------------------------------------------------------------------
+// Raw-render readiness gate + retry backstop (createRenderer-at-grant fix).
+//
+// createRenderer returns SDKERR_VIDEO_NOTREADY (11) / SDKERR_NO_PERMISSION (12)
+// when called before the SDK's raw-data renderer subsystem is ready — the case
+// for tens of ms right after raw_livestream_granted. The reliable readiness
+// signal is our own user appearing in onUserRawLiveStreamingStatusChanged
+// (-> NotifyRawRenderReady). So new-subscription requests are NOT turned into
+// renderers immediately: they are queued here and drained once readiness is
+// observed. A bounded retry (every kRenderRetryIntervalMs, up to kRenderGiveUpMs)
+// backstops the residual case where the renderer is still briefly unready after
+// the signal; on terminal give-up we tell the plugin so its subscribed-state
+// guard can't wedge the source black forever.
+//
+// All renderer creation runs on the MAIN (pump) thread in ProcessPendingRenderers,
+// reached via WM_FEEDS_PROCESS_RENDERERS (posted on queue/ready) and a WM_TIMER
+// retry tick. State guarded by g_subsMutex.
+// ---------------------------------------------------------------------------
+struct PendingRender {
+    std::string  sourceId;
+    unsigned int userId;               // resolved id (active-speaker pre-resolved)
+    bool         followActiveSpeaker;
+    ULONGLONG    deadlineTick;          // GetTickCount64() past which we give up
+};
+static bool                       g_rawRenderReady   = false;
+static std::vector<PendingRender> g_pendingRenders;
+static bool                       g_retryTimerActive = false;
+static const UINT_PTR  kRenderRetryTimerId    = 1;
+static const UINT      kRenderRetryIntervalMs = 300;
+static const ULONGLONG kRenderGiveUpMs        = 15000;
+
 void TearDownAllVideoSubscriptions() {
     std::lock_guard<std::mutex> lock(g_subsMutex);
     if (!g_subs.empty()) {
@@ -612,6 +660,12 @@ void TearDownAllVideoSubscriptions() {
     }
     g_subs.clear();
     g_currentActiveSpeaker = 0;
+    // The raw-data subsystem is gone until the next grant re-readies it: reset
+    // the gate and drop any queued/retrying requests. The retry WM_TIMER, if
+    // running, stops itself on its next tick when it finds the queue empty
+    // (KillTimer is owned by ProcessPendingRenderers on the main thread).
+    g_rawRenderReady = false;
+    g_pendingRenders.clear();
 }
 
 // === TEMPORARY (freeze diagnostic): live-subscription count for the engine
@@ -715,28 +769,146 @@ void HandleParticipantSourceSubscribe(const std::string& json) {
         return;
     }
 
-    // New subscription.
-    auto sub = std::make_unique<ParticipantSubscription>(
-        sourceId, actualUserId, followActiveSpeaker);
-    if (!sub->Start()) {
-        LogError("Video: subscription Start failed");
-        return;
+    // New subscription. Do NOT create the renderer here: it must wait for the
+    // raw-data renderer subsystem to be ready (else createRenderer returns
+    // NO_PERMISSION/VIDEO_NOTREADY and the source stays black). Queue the
+    // request (replacing any prior queued one for this source) and nudge the
+    // main thread, which owns all renderer creation via ProcessPendingRenderers.
+    bool replaced = false;
+    for (auto& p : g_pendingRenders) {
+        if (p.sourceId == sourceId) {
+            p.userId              = actualUserId;
+            p.followActiveSpeaker = followActiveSpeaker;
+            p.deadlineTick        = GetTickCount64() + kRenderGiveUpMs;
+            replaced = true;
+            break;
+        }
+    }
+    if (!replaced) {
+        g_pendingRenders.push_back(
+            {sourceId, actualUserId, followActiveSpeaker,
+             GetTickCount64() + kRenderGiveUpMs});
     }
 
-    g_subs[sourceId] = std::move(sub);
+    char rls[256];
+    sprintf_s(rls,
+        "[feeds-rls] subscribe queued source='%s' userId=%u ready=%d pending=%zu",
+        sourceId.c_str(), actualUserId, g_rawRenderReady ? 1 : 0,
+        g_pendingRenders.size());
+    LogInfo(rls);
 
-    uint32_t pid = GetCurrentProcessId();
-    char resp[512];
-    sprintf_s(resp,
-        "{\"type\":\"source_texture_ready\","
-        "\"source_id\":\"%s\","
-        "\"pid\":%u,"
-        "\"width\":%u,"
-        "\"height\":%u}",
-        sourceId.c_str(), pid,
-        feeds_shared::MAX_FRAME_WIDTH,
-        feeds_shared::MAX_FRAME_HEIGHT);
-    SendToPlugin(resp);
+    if (g_anchorWnd)
+        PostMessageW(g_anchorWnd, WM_FEEDS_PROCESS_RENDERERS, 0, 0);
+    else
+        LogError("Video: no anchor window to drive pending renderer creation");
+}
+
+// ---------------------------------------------------------------------------
+// Readiness-gated renderer creation — runs on the MAIN (pump) thread, reached
+// from EngineWndProc via WM_FEEDS_PROCESS_RENDERERS and the retry WM_TIMER.
+// Creates renderers for queued subscribes once the raw-data subsystem is ready,
+// retries the transient not-ready failures, and gives up (notifying the plugin)
+// past the per-request deadline.
+// ---------------------------------------------------------------------------
+void ProcessPendingRenderers() {
+    std::lock_guard<std::mutex> lock(g_subsMutex);
+    const ULONGLONG now = GetTickCount64();
+
+    for (size_t i = 0; i < g_pendingRenders.size(); ) {
+        const std::string  sourceId = g_pendingRenders[i].sourceId;
+        unsigned int       uid      = g_pendingRenders[i].userId;
+        const bool         follow   = g_pendingRenders[i].followActiveSpeaker;
+        const ULONGLONG    deadline = g_pendingRenders[i].deadlineTick;
+
+        // Re-resolve a follow-active-speaker request that was queued before any
+        // speaker was known, in case one became active during the gate wait.
+        if (follow && uid == ACTIVE_SPEAKER_SENTINEL && g_currentActiveSpeaker != 0)
+            uid = g_currentActiveSpeaker;
+
+        // Already created (e.g. a prior tick, or an out-of-order request that
+        // hit the existing-sub path): re-point and drop the queue entry.
+        auto existing = g_subs.find(sourceId);
+        if (existing != g_subs.end()) {
+            existing->second->SetFollowsActiveSpeaker(follow);
+            existing->second->Resubscribe(uid);
+            g_pendingRenders.erase(g_pendingRenders.begin() + i);
+            continue;
+        }
+
+        // Past the deadline — give up and tell the plugin so its
+        // subscribed_user_id guard can't pin the source black forever.
+        if (now > deadline) {
+            LogWarn("[feeds-rls] subscribe gave up (renderer not ready in time) "
+                    "— notifying plugin");
+            SendToPlugin("{\"type\":\"participant_source_subscribe_failed\","
+                         "\"source_id\":\"" + sourceId + "\"}");
+            g_pendingRenders.erase(g_pendingRenders.begin() + i);
+            continue;
+        }
+
+        // Gate: until the subsystem is ready, leave it queued (the readiness
+        // notification and the retry tick will bring us back here).
+        if (!g_rawRenderReady) { ++i; continue; }
+
+        // Ready — attempt to create the renderer now.
+        auto sub = std::make_unique<ParticipantSubscription>(
+            sourceId, uid, follow);
+        SubStart r = sub->Start();
+        if (r == SubStart::Started) {
+            g_subs[sourceId] = std::move(sub);
+            g_pendingRenders.erase(g_pendingRenders.begin() + i);
+
+            uint32_t pid = GetCurrentProcessId();
+            char resp[512];
+            sprintf_s(resp,
+                "{\"type\":\"source_texture_ready\","
+                "\"source_id\":\"%s\",\"pid\":%u,\"width\":%u,\"height\":%u}",
+                sourceId.c_str(), pid,
+                feeds_shared::MAX_FRAME_WIDTH, feeds_shared::MAX_FRAME_HEIGHT);
+            SendToPlugin(resp);
+            continue;
+        }
+        if (r == SubStart::RetryNotReady) {
+            // Transient — keep queued; the retry timer will re-attempt.
+            ++i;
+            continue;
+        }
+        // Non-retryable failure.
+        LogError("[feeds-rls] subscription Start failed (non-retryable) "
+                 "— notifying plugin");
+        SendToPlugin("{\"type\":\"participant_source_subscribe_failed\","
+                     "\"source_id\":\"" + sourceId + "\"}");
+        g_pendingRenders.erase(g_pendingRenders.begin() + i);
+    }
+
+    // Timer lifecycle: tick while anything is still queued (gated or retrying),
+    // stop once the queue drains. Owned here so it's only touched on the main
+    // thread.
+    if (!g_pendingRenders.empty()) {
+        if (!g_retryTimerActive && g_anchorWnd) {
+            SetTimer(g_anchorWnd, kRenderRetryTimerId, kRenderRetryIntervalMs,
+                     nullptr);
+            g_retryTimerActive = true;
+        }
+    } else if (g_retryTimerActive && g_anchorWnd) {
+        KillTimer(g_anchorWnd, kRenderRetryTimerId);
+        g_retryTimerActive = false;
+    }
+}
+
+// Called from engine-meeting.cpp's onUserRawLiveStreamingStatusChanged when our
+// own user appears in the raw-live-streaming list — the renderer subsystem is
+// ready. Opens the gate and nudges the main thread to drain queued subscribes.
+void NotifyRawRenderReady() {
+    {
+        std::lock_guard<std::mutex> lock(g_subsMutex);
+        if (g_rawRenderReady) return;   // already open — nothing to do
+        g_rawRenderReady = true;
+    }
+    LogInfo("[feeds-rls] raw render subsystem READY (self present) — "
+            "draining queued subscribes");
+    if (g_anchorWnd)
+        PostMessageW(g_anchorWnd, WM_FEEDS_PROCESS_RENDERERS, 0, 0);
 }
 
 // Called from engine-meeting.cpp when the SDK reports an active speaker
