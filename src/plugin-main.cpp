@@ -3140,6 +3140,14 @@ static void RegisterEngineHandlers() {
             });
     });
 
+    // sdk_authenticated now means "credentials are valid and Feeds is ready to
+    // connect" — NOT "the Zoom SDK is initialized and authenticated." As of the
+    // idle-footprint change, the engine defers SDK init+auth until the first
+    // connect, so at this point no SDK is up: the engine sends this purely to
+    // flip the UI to logged-in and enable Connect. Clicking Connect is what
+    // brings the SDK up (lazily, engine-side). The send sites are documented in
+    // engine-sdk.cpp's AnnounceLoginSucceeded. Nothing here needs to change for
+    // that semantic — enabling Connect on valid credentials is exactly right.
     feeds::RegisterMessageHandler("sdk_authenticated", [](const std::string&) {
         blog(LOG_INFO, "[feeds] sdk_authenticated");
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {

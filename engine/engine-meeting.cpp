@@ -11,6 +11,7 @@
 #include <wincred.h>
 #include <string>
 #include <sstream>
+#include <functional>
 #include <cstdio>
 
 #include "zoom_sdk.h"
@@ -62,6 +63,14 @@ void BlankSubscriptionsForUser(unsigned int userId);
 // From engine-screenshare.cpp
 void UpdateShareSubscription();
 void TearDownScreenShare();
+
+// From engine-sdk.cpp — lazy SDK bring-up. EnsureSdkUpThen returns true when
+// the SDK isn't up yet (it queued `action` and kicked off init+auth on the
+// main thread; the action re-runs after auth) and false when the SDK is
+// already authenticated (caller proceeds inline). ResetSdkBringupState clears
+// the bring-up flags on logout so the next connect re-auths.
+bool EnsureSdkUpThen(std::function<void()> action);
+void ResetSdkBringupState();
 
 // ---------------------------------------------------------------------------
 // State owned by this translation unit
@@ -1156,6 +1165,13 @@ bool InitializeMeetingSession() {
 void HandleJoinMeeting(const std::string& json) {
     LogToFile("Meeting: HandleJoinMeeting called");
 
+    // Lazy SDK bring-up: if the Zoom SDK isn't up yet (idle, logged-in-but-
+    // not-connected state), queue this join and trigger init+auth. This
+    // handler re-runs once auth lands; the second time through EnsureSdkUpThen
+    // returns false and we fall past it into the real join.
+    if (EnsureSdkUpThen([json]() { HandleJoinMeeting(json); }))
+        return;
+
     if (!g_meetingService) {
         LogToFile("Meeting: join requested but meeting service not initialized");
         SendToPlugin("{\"type\":\"meeting_failed\",\"code\":-1,"
@@ -1370,6 +1386,10 @@ void HandleRequestSessions(const std::string& json) {
 void HandleJoinEventSession(const std::string& json) {
     LogToFile("Events: HandleJoinEventSession called");
 
+    // Lazy SDK bring-up — see HandleJoinMeeting. Queue and re-run after auth.
+    if (EnsureSdkUpThen([json]() { HandleJoinEventSession(json); }))
+        return;
+
     if (!g_meetingService) {
         SendToPlugin("{\"type\":\"meeting_failed\",\"code\":-1,"
                      "\"message\":\"Zoom SDK is not ready. Please try logging in again.\"}");
@@ -1514,6 +1534,12 @@ void HandleJoinEventSession(const std::string& json) {
 // ---------------------------------------------------------------------------
 void HandleCreateInstantMeeting(const std::string& json) {
     LogToFile("Meeting: HandleCreateInstantMeeting called");
+
+    // Lazy SDK bring-up — see HandleJoinMeeting. Gate before the REST
+    // provisioning below so the create call only runs once the SDK is up
+    // (otherwise a queued-then-re-run pass would provision twice).
+    if (EnsureSdkUpThen([json]() { HandleCreateInstantMeeting(json); }))
+        return;
 
     if (!g_meetingService) {
         LogToFile("Meeting: create requested but meeting service not initialized");
@@ -1789,6 +1815,11 @@ void HandleLogout(const std::string& /*json*/) {
     ClearUserInfo();
     CredDeleteA("Feeds_AccessToken",  CRED_TYPE_GENERIC, 0);
     CredDeleteA("Feeds_RefreshToken", CRED_TYPE_GENERIC, 0);
+
+    // The SDK just logged out, so its prior SDKAuth no longer counts as
+    // "ready to connect." Reset the lazy bring-up so a subsequent login +
+    // connect re-runs init+auth instead of trying to Join on a logged-out SDK.
+    ResetSdkBringupState();
 
     SendToPlugin("{\"type\":\"logout_complete\"}");
 }

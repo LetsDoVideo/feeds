@@ -37,7 +37,11 @@ extern void LogError(const char* msg);
 extern bool SendToPlugin(const std::string& json);
 
 namespace feeds_engine {
-bool AuthenticateSDK();  // defined in engine-sdk.cpp
+// Defined in engine-sdk.cpp. Announces a completed login to the plugin over
+// REST (login_succeeded + sdk_authenticated) without bringing up the Zoom SDK;
+// the SDK comes up lazily on the first connect. Safe to call inline here — we
+// are already on the OAuth background thread.
+void AnnounceLoginSucceededFromLoginThread();
 
 // ---------------------------------------------------------------------------
 // In-flight login state — guards the OAuth thread and its cancel signal.
@@ -406,11 +410,12 @@ static void LoginThreadFunc()
     LogToFile("OAuth: got tokens, saving to Credential Manager");
     SaveTokensToCredentialManager(accessToken, refreshToken);
 
-    LogToFile("OAuth: triggering SDK authentication with new token");
-    AuthenticateSDK();
-
-    LogToFile("OAuth: login complete, notifying plugin");
-    SendToPlugin("{\"type\":\"login_succeeded\"}");
+    // Defer SDK init+auth to the first connect, exactly like a restored
+    // session: announce the login over REST so the UI flips to logged-in
+    // without bringing up the Zoom SDK. AnnounceLoginSucceededFromLoginThread
+    // sends login_succeeded (with name/PMI/tier) then sdk_authenticated.
+    LogToFile("OAuth: login complete, announcing over REST (SDK stays down until connect)");
+    AnnounceLoginSucceededFromLoginThread();
 }
 
 // ---------------------------------------------------------------------------

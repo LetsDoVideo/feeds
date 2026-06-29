@@ -51,9 +51,13 @@ static HANDLE g_readPipe  = INVALID_HANDLE_VALUE;  // engine reads from P2E
 static HANDLE g_writePipe = INVALID_HANDLE_VALUE;  // engine writes to E2P
 static std::map<std::string, std::function<void(const std::string&)>> g_messageHandlers;
 
-namespace feeds_engine { 
-    bool InitializeSDK();
-    bool AuthenticateSDK();
+namespace feeds_engine {
+    // REST-only session restore, run at startup in place of the old
+    // InitializeSDK() call — restores the logged-in appearance from a stored
+    // token without bringing up the Zoom SDK. The SDK comes up lazily on the
+    // first connect (see engine-sdk.cpp). BringUpSdkOnMainThread (the
+    // WM_FEEDS_INIT_SDK target) is declared in engine-shared.h.
+    void RestoreSessionFromStoredToken();
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +407,12 @@ static LRESULT CALLBACK EngineWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
     }
+    if (msg == WM_FEEDS_INIT_SDK) {
+        // Lazy SDK bring-up, marshaled here from the pipe thread by
+        // EnsureSdkUpThen. InitSDK/SDKAuth must run on this (pump) thread.
+        feeds_engine::BringUpSdkOnMainThread();
+        return 0;
+    }
     return DefWindowProc(hwnd, msg, wp, lp);
 }
 
@@ -633,9 +643,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     g_hbThread = std::thread(HeartbeatLoop);
 #endif
 
-    // Initialize the Zoom SDK. Must happen on the thread that runs the message
-    // pump and created the window.
-    feeds_engine::InitializeSDK();
+    // Restore the logged-in appearance over REST if a token is stored — but
+    // do NOT initialize the Zoom SDK here. An idle, logged-in-but-not-connected
+    // Feeds now runs no SDK and holds no Zoom authenticated session, so it adds
+    // no steady load. The SDK is brought up lazily on the first connect, on
+    // this same (pump) thread via WM_FEEDS_INIT_SDK. See engine-sdk.cpp.
+    feeds_engine::RestoreSessionFromStoredToken();
 
     // Pipe reading runs on a background thread so the main thread is free
     // to pump Windows messages (required for Zoom SDK async callbacks).
