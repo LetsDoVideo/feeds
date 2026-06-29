@@ -824,6 +824,65 @@ static void ReconcileRememberedParticipants() {
 }
 
 // ---------------------------------------------------------------------------
+// Post-join re-assert — safety net for the rejoin black-box.
+//
+// When a participant (re)joins the meeting (no new raw_livestream_granted
+// fires), the engine re-points the kept renderer of each bound source via
+// Resubscribe; the SDK has been observed to stop delivering frames to a
+// re-pointed renderer, leaving the source black while its dropdown still shows
+// the right selection. The reliable recovery is a FRESH renderer — exactly what
+// the manual deselect/reselect does. (The engine-side silent-drop root cause is
+// tracked as separate debt; this automates the manual workaround.)
+//
+// On a participant-join roster event, re-assert every source bound to a
+// (re)joined participant by sending unsubscribe + subscribe: the engine tears
+// the kept subscription down (g_subs.erase -> renderer destroyed) and the
+// re-subscribe finds no existing sub, so it routes through the readiness-gated
+// path (ProcessPendingRenderers -> createRenderer) and a fresh renderer is
+// created once the subsystem is ready — inheriting the Option C gate's
+// guarantee, no guessed delay.
+//
+// Deliberately bypasses SubscribeBoundSourceLocked's subscribed_user_id guard
+// (the whole point is the believed-subscribed state may be stale). Targeted to
+// the joiner's sources (current_user_id in joinedIds, computed from the roster
+// diff) so unrelated working sources — e.g. a "Browser" pinned to a stable
+// participant — are never disturbed; the join is the only moment the bug
+// appears, so it's the only trigger, and it fires once per roster change then
+// settles. Runs on the UI thread.
+static void ReassertJoinedSources(const std::vector<unsigned int>& joinedIds) {
+    if (joinedIds.empty()) return;
+    // Can't (and needn't) re-subscribe before privilege exists — the grant
+    // handler's own sweep covers the fresh-join/host-rejoin path. This is for
+    // mid-session (re)joins, where privilege is already granted.
+    if (!(g_isInMeeting && g_rawLiveStreamGranted)) return;
+
+    std::lock_guard<std::mutex> lock(g_sourcesMutex);
+    for (ZpSourceData* s : g_allParticipantSources) {
+        if (!s || s->uuid.empty()) continue;
+        if (s->tier_disabled) continue;
+        if (s->current_user_id <= 1) continue;   // unbound (0) / active-speaker (1)
+        if (std::find(joinedIds.begin(), joinedIds.end(),
+                      s->current_user_id) == joinedIds.end())
+            continue;                            // not bound to a (re)joiner
+
+        std::string sid8 = s->uuid.substr(0, 8);
+        feeds::SendToEngine("{\"type\":\"participant_source_unsubscribe\","
+                            "\"source_id\":\"" + s->uuid + "\"}");
+        feeds::SendToEngine("{\"type\":\"participant_source_subscribe\","
+                            "\"source_id\":\"" + s->uuid + "\","
+                            "\"participant_id\":" +
+                            std::to_string(s->current_user_id) + "}");
+        // We just re-subscribed to this id; keep the marker consistent so the
+        // normal guard stays correct afterwards.
+        s->subscribed_user_id = s->current_user_id;
+
+        blog(LOG_INFO, "[feeds-rls] reassert SENT src=%s userId=%u "
+             "(joiner refresh: unsubscribe+subscribe -> fresh renderer)",
+             sid8.c_str(), s->current_user_id);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pump thread — reads frames from shared memory, feeds them to OBS.
 //
 // One instance runs per active Zoom Participant source with a live shared
@@ -3880,6 +3939,7 @@ static void RegisterEngineHandlers() {
         }
 
         bool changed = false;
+        std::vector<unsigned int> joinedIds;   // ids present now but not before
         {
             std::lock_guard<std::mutex> lock(g_participantsMutex);
             if (myUserId != g_cachedMyUserId ||
@@ -3894,6 +3954,17 @@ static void RegisterEngineHandlers() {
                     }
                 }
             }
+            // Detect (re)joins: any id present now that wasn't in the previous
+            // roster. Drives the post-join re-assert (ReassertJoinedSources).
+            // A rejoining participant — same id or new id — appears here because
+            // the drop removed them from the prior roster first.
+            for (const auto& np : newList) {
+                bool wasPresent = false;
+                for (const auto& op : g_cachedParticipants) {
+                    if (op.id == np.id) { wasPresent = true; break; }
+                }
+                if (!wasPresent) joinedIds.push_back(np.id);
+            }
             g_cachedMyUserId     = myUserId;
             g_cachedParticipants = std::move(newList);
         }
@@ -3903,14 +3974,19 @@ static void RegisterEngineHandlers() {
         blog(LOG_INFO, "[feeds] participant_list_changed: %zu participants",
              (size_t)g_cachedParticipants.size());
 
-        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
-            // Auto-rebind participant-pinned sources to their remembered name
-            // BEFORE refreshing properties, so the dropdowns reflect any newly
-            // bound participant_id. Covers the join sweep, per-newcomer rejoin,
-            // and rename-refresh (see ReconcileRememberedParticipants).
-            ReconcileRememberedParticipants();
-            RefreshAllSourceProperties();
-        });
+        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
+            [joinedIds]() {
+                // Auto-rebind participant-pinned sources to their remembered
+                // name BEFORE refreshing properties, so the dropdowns reflect
+                // any newly bound participant_id. Covers the join sweep,
+                // per-newcomer rejoin, and rename-refresh.
+                ReconcileRememberedParticipants();
+                // Then, for any participant that just (re)joined, re-assert its
+                // bound sources with a fresh-renderer subscribe to clear the
+                // rejoin black-box (see ReassertJoinedSources).
+                ReassertJoinedSources(joinedIds);
+                RefreshAllSourceProperties();
+            });
     });
 
     feeds::RegisterMessageHandler("chat_message",
