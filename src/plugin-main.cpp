@@ -251,6 +251,14 @@ struct ZpSourceData {
     // ID is re-bound by remembered name instead. Reset on meeting_left /
     // logout / session_expired.
     bool          bound_this_session = false;
+    // Runtime-only (never persisted): the participant id we currently have an
+    // active engine subscription for (0 = not subscribed). The single guard
+    // against double-subscribing the same source/id when more than one of the
+    // subscribe paths (manual pick, name reconcile, privilege-granted handler)
+    // fires for it. A rebind changes current_user_id, so this stops matching
+    // and the source is correctly re-subscribed to the new id. Reset to 0 when
+    // the subscription is torn down (unselect, meeting_left, logout, expiry).
+    unsigned int  subscribed_user_id = 0;
     // Per-source ISO recorder (feeds-iso-recorder). Created in zp_create,
     // torn down in zp_destroy. Records this source to its own MP4 alongside
     // OBS's main recording when the properties checkbox is enabled.
@@ -629,6 +637,37 @@ static void RefreshAllSourceProperties() {
     }, nullptr);
 }
 
+// (Re)subscribe a participant source to its currently-bound participant, if it
+// is bound (current_user_id >= 1, which covers both a pinned participant and
+// the [Active Speaker] sentinel 1), we are in a meeting with raw-livestream
+// privilege, and we are not already subscribed to that same id. Returns true
+// if a subscribe was sent. Caller MUST hold g_sourcesMutex.
+//
+// This is the single choke point for "(re)subscribe a bound source." It is
+// called from name reconcile and the raw_livestream_granted handler — either of
+// which can be the first to run once privilege exists — and the
+// subscribed_user_id guard keeps them from double-subscribing the same
+// source/id. (zp_update, the manual-pick path, maintains subscribed_user_id
+// inline; its own "selection unchanged" guard already prevents a redundant
+// resubscribe.) A rebind moves current_user_id off subscribed_user_id, so the
+// guard correctly lets the source re-subscribe to the new id.
+static bool SubscribeBoundSourceLocked(ZpSourceData* s) {
+    if (!s || s->uuid.empty()) return false;
+    if (s->tier_disabled) return false;
+    if (s->current_user_id < 1) return false;            // unbound (0)
+    if (!(g_isInMeeting && g_rawLiveStreamGranted)) return false;
+    if (s->subscribed_user_id == s->current_user_id)     // already subscribed
+        return false;
+
+    std::string msg = "{\"type\":\"participant_source_subscribe\","
+                      "\"source_id\":\"" + s->uuid + "\","
+                      "\"participant_id\":" +
+                      std::to_string(s->current_user_id) + "}";
+    feeds::SendToEngine(msg);
+    s->subscribed_user_id = s->current_user_id;
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Persistent participant selection — auto-rebind by remembered display name.
 //
@@ -720,18 +759,14 @@ static void ReconcileRememberedParticipants() {
 
         // Bind: persist the runtime id (keeps the dropdown selection in sync
         // and survives same-session scene save), mark the binding live, and
-        // subscribe. If privilege isn't granted yet (initial join sweep), the
-        // raw_livestream_granted handler's loop subscribes by current_user_id.
+        // subscribe. If privilege isn't granted yet (initial join sweep),
+        // SubscribeBoundSourceLocked is a no-op and the raw_livestream_granted
+        // handler subscribes this source once privilege exists.
         s->current_user_id    = newId;
         s->bound_this_session = true;
         obs_data_set_int(settings, "participant_id", (long long)newId);
 
-        if (g_isInMeeting && g_rawLiveStreamGranted) {
-            std::string msg = "{\"type\":\"participant_source_subscribe\","
-                              "\"source_id\":\"" + s->uuid + "\","
-                              "\"participant_id\":" + std::to_string(newId) + "}";
-            feeds::SendToEngine(msg);
-        }
+        SubscribeBoundSourceLocked(s);
         obs_data_release(settings);
     }
 }
@@ -2426,6 +2461,7 @@ static void zp_update(void* vdata, obs_data_t* settings) {
         // 0 is "--- Select Participant ---" — no subscription.
         if (selected_id == 0) {
             data->current_user_id = 0;
+            data->subscribed_user_id = 0;  // subscription torn down below
             if (!data->uuid.empty()) {
                 std::string msg = "{\"type\":\"participant_source_unsubscribe\","
                                   "\"source_id\":\"" + data->uuid + "\"}";
@@ -2450,6 +2486,9 @@ static void zp_update(void* vdata, obs_data_t* settings) {
                               "\"source_id\":\"" + data->uuid + "\","
                               "\"participant_id\":" + std::to_string(selected_id) + "}";
             feeds::SendToEngine(msg);
+            // Record what we subscribed so the reconcile / privilege-granted
+            // paths don't redundantly re-subscribe this same id.
+            data->subscribed_user_id = selected_id;
         }
     } catch (const std::exception& e) {
         blog(LOG_ERROR, "[feeds] zp_update exception: %s", e.what());
@@ -3375,7 +3414,8 @@ static void RegisterEngineHandlers() {
             std::lock_guard<std::mutex> lock(g_sourcesMutex);
             for (ZpSourceData* s : g_allParticipantSources) {
                 CloseSharedMemory(s);
-                if (s) s->bound_this_session = false;  // runtime IDs are dead
+                // Runtime IDs are dead and the engine tore down subscriptions.
+                if (s) { s->bound_this_session = false; s->subscribed_user_id = 0; }
             }
         }
         CloseSharedMemoryForAllScreenshareSources();
@@ -3437,7 +3477,8 @@ static void RegisterEngineHandlers() {
             std::lock_guard<std::mutex> lock(g_sourcesMutex);
             for (ZpSourceData* s : g_allParticipantSources) {
                 CloseSharedMemory(s);
-                if (s) s->bound_this_session = false;  // runtime IDs are dead
+                // Runtime IDs are dead and the engine tore down subscriptions.
+                if (s) { s->bound_this_session = false; s->subscribed_user_id = 0; }
             }
         }
         CloseSharedMemoryForAllScreenshareSources();
@@ -3648,7 +3689,9 @@ static void RegisterEngineHandlers() {
                 // session-confirmed flag so the next join re-binds purely by
                 // remembered name (and a reused ID can't masquerade as a live
                 // binding). The remembered name in obs_data is untouched.
-                if (s) s->bound_this_session = false;
+                // The engine tore down the subscriptions, so clear the
+                // subscribed marker too — the next join must re-subscribe.
+                if (s) { s->bound_this_session = false; s->subscribed_user_id = 0; }
             }
         }
         CloseSharedMemoryForAllScreenshareSources();
@@ -3677,22 +3720,26 @@ static void RegisterEngineHandlers() {
         g_rawLiveStreamGranted = true;
         g_rawPrivilegeState    = RawPrivilegeState::Granted;
 
-        // Auto-subscribe any sources that had a participant (including
-        // [Active Speaker], sentinel 1) picked before the meeting was
-        // joined / privilege was granted, then refresh the properties
-        // panels from the privilege-pending UI to the normal layout.
+        // Privilege now exists — this is the reliable single place that
+        // subscribes every currently-bound source, regardless of whether the
+        // binding came from a manual dropdown pick or from name-based reconcile
+        // (including [Active Speaker], sentinel 1).
+        //
+        // Re-derive bindings from the live roster FIRST: a source rebound by
+        // name (e.g. after a restart-rejoin) may have been bound while privilege
+        // was still pending — its subscribe was gated off then, and reconcile's
+        // own privilege check can't have fired. Running reconcile here (with
+        // privilege now true) re-binds from the current roster and subscribes
+        // freshly-bound sources via SubscribeBoundSourceLocked. The loop then
+        // catches sources that were already bound before the grant (reconcile's
+        // rename-refresh path leaves those without re-subscribing). The
+        // subscribed_user_id guard keeps the two passes from double-subscribing.
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
+            ReconcileRememberedParticipants();
             {
                 std::lock_guard<std::mutex> lock(g_sourcesMutex);
-                for (ZpSourceData* s : g_allParticipantSources) {
-                    if (s && s->current_user_id >= 1 && !s->uuid.empty()) {
-                        std::string msg = "{\"type\":\"participant_source_subscribe\","
-                                          "\"source_id\":\"" + s->uuid + "\","
-                                          "\"participant_id\":" +
-                                          std::to_string(s->current_user_id) + "}";
-                        feeds::SendToEngine(msg);
-                    }
-                }
+                for (ZpSourceData* s : g_allParticipantSources)
+                    SubscribeBoundSourceLocked(s);
             }
             RefreshAllSourceProperties();
         });
