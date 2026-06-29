@@ -358,6 +358,7 @@ namespace feeds_engine {
 namespace feeds_engine {
     void HandleParticipantSourceSubscribe(const std::string&);
     void HandleParticipantSourceUnsubscribe(const std::string&);
+    void HandleParticipantSourceRecreate(const std::string&);
 }
 
 static void HandleShutdown(const std::string& json)
@@ -629,6 +630,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     RegisterHandler("request_sessions",               feeds_engine::HandleRequestSessions);
     RegisterHandler("join_event_session",             feeds_engine::HandleJoinEventSession);
     RegisterHandler("participant_source_subscribe",   feeds_engine::HandleParticipantSourceSubscribe);
+    RegisterHandler("participant_source_recreate",    feeds_engine::HandleParticipantSourceRecreate);
     RegisterHandler("participant_source_unsubscribe", feeds_engine::HandleParticipantSourceUnsubscribe);
     RegisterHandler("shutdown",                       HandleShutdown);
 

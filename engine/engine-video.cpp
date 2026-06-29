@@ -669,9 +669,18 @@ static unsigned int g_currentActiveSpeaker = 0;
 // the signal; on terminal give-up we tell the plugin so its subscribed-state
 // guard can't wedge the source black forever.
 //
+// SEQUENCING: the gate also creates at most ONE renderer per
+// kRenderRetryIntervalMs. A burst of createRenderer+subscribe calls for the
+// same userId makes the Zoom SDK establish delivery for only one renderer and
+// silently drop the rest (proven: a spaced manual setup feeds many same-user
+// renderers; a same-millisecond burst feeds only one). Spacing them ~one per
+// tick lets each establish — mirroring the manual one-at-a-time reselect, the
+// one reliable recovery. This is global (all sources, not just same-userId);
+// it slightly staggers bring-up of many sources, which is acceptable.
+//
 // All renderer creation runs on the MAIN (pump) thread in ProcessPendingRenderers,
 // reached via WM_FEEDS_PROCESS_RENDERERS (posted on queue/ready) and a WM_TIMER
-// retry tick. State guarded by g_subsMutex.
+// retry/sequencing tick. State guarded by g_subsMutex.
 // ---------------------------------------------------------------------------
 struct PendingRender {
     std::string  sourceId;
@@ -679,11 +688,12 @@ struct PendingRender {
     bool         followActiveSpeaker;
     ULONGLONG    deadlineTick;          // GetTickCount64() past which we give up
 };
-static bool                       g_rawRenderReady   = false;
+static bool                       g_rawRenderReady       = false;
 static std::vector<PendingRender> g_pendingRenders;
-static bool                       g_retryTimerActive = false;
+static bool                       g_retryTimerActive     = false;
+static ULONGLONG                  g_lastRenderCreateTick = 0;  // sequencing clock
 static const UINT_PTR  kRenderRetryTimerId    = 1;
-static const UINT      kRenderRetryIntervalMs = 300;
+static const UINT      kRenderRetryIntervalMs = 300;  // spacing + retry interval
 static const ULONGLONG kRenderGiveUpMs        = 15000;
 
 void TearDownAllVideoSubscriptions() {
@@ -701,6 +711,7 @@ void TearDownAllVideoSubscriptions() {
     // (KillTimer is owned by ProcessPendingRenderers on the main thread).
     g_rawRenderReady = false;
     g_pendingRenders.clear();
+    g_lastRenderCreateTick = 0;   // next meeting's first create is immediate
 }
 
 // === TEMPORARY (freeze diagnostic): live-subscription count for the engine
@@ -739,6 +750,42 @@ void BlankSubscriptionsForUser(unsigned int userId) {
 // ---------------------------------------------------------------------------
 // IPC handlers
 // ---------------------------------------------------------------------------
+
+// Queue a (re)create request for the readiness-gated, SEQUENCED renderer
+// creation in ProcessPendingRenderers (one per kRenderRetryIntervalMs).
+// Replaces any prior queued request for the same source. Caller MUST hold
+// g_subsMutex.
+static void EnqueuePendingRenderLocked(const std::string& sourceId,
+                                       unsigned int actualUserId,
+                                       bool followActiveSpeaker) {
+    bool replaced = false;
+    for (auto& p : g_pendingRenders) {
+        if (p.sourceId == sourceId) {
+            p.userId              = actualUserId;
+            p.followActiveSpeaker = followActiveSpeaker;
+            p.deadlineTick        = GetTickCount64() + kRenderGiveUpMs;
+            replaced = true;
+            break;
+        }
+    }
+    if (!replaced) {
+        g_pendingRenders.push_back(
+            {sourceId, actualUserId, followActiveSpeaker,
+             GetTickCount64() + kRenderGiveUpMs});
+    }
+
+    char rls[256];
+    sprintf_s(rls,
+        "[feeds-rls] render queued source='%s' userId=%u ready=%d pending=%zu",
+        sourceId.c_str(), actualUserId, g_rawRenderReady ? 1 : 0,
+        g_pendingRenders.size());
+    LogInfo(rls);
+
+    if (g_anchorWnd)
+        PostMessageW(g_anchorWnd, WM_FEEDS_PROCESS_RENDERERS, 0, 0);
+    else
+        LogError("Video: no anchor window to drive pending renderer creation");
+}
 
 // participant_source_subscribe — plugin requests video for a source.
 //   {"type":"participant_source_subscribe",
@@ -805,37 +852,35 @@ void HandleParticipantSourceSubscribe(const std::string& json) {
     }
 
     // New subscription. Do NOT create the renderer here: it must wait for the
-    // raw-data renderer subsystem to be ready (else createRenderer returns
-    // NO_PERMISSION/VIDEO_NOTREADY and the source stays black). Queue the
-    // request (replacing any prior queued one for this source) and nudge the
-    // main thread, which owns all renderer creation via ProcessPendingRenderers.
-    bool replaced = false;
-    for (auto& p : g_pendingRenders) {
-        if (p.sourceId == sourceId) {
-            p.userId              = actualUserId;
-            p.followActiveSpeaker = followActiveSpeaker;
-            p.deadlineTick        = GetTickCount64() + kRenderGiveUpMs;
-            replaced = true;
-            break;
-        }
-    }
-    if (!replaced) {
-        g_pendingRenders.push_back(
-            {sourceId, actualUserId, followActiveSpeaker,
-             GetTickCount64() + kRenderGiveUpMs});
-    }
+    // raw-data renderer subsystem to be ready, and creation is sequenced. Queue
+    // it for the gate.
+    EnqueuePendingRenderLocked(sourceId, actualUserId, followActiveSpeaker);
+}
 
-    char rls[256];
-    sprintf_s(rls,
-        "[feeds-rls] subscribe queued source='%s' userId=%u ready=%d pending=%zu",
-        sourceId.c_str(), actualUserId, g_rawRenderReady ? 1 : 0,
-        g_pendingRenders.size());
-    LogInfo(rls);
+// participant_source_recreate — re-establish a source with a FRESH renderer
+// (the gate destroys any existing one, then creates new) through the SEQUENCED
+// gate. Sent by the plugin's auto-rebind / grant / rejoin path
+// (SubscribeBoundSourceLocked), because a kept or re-pointed renderer loses SDK
+// frame delivery on a participant drop→rejoin; only a fresh createRenderer,
+// sequenced (not bursted), reliably recovers it — the automated equivalent of
+// the manual deselect/reselect. Unlike subscribe this ALWAYS queues (no inline
+// Resubscribe), so multi-source rejoins flow through the one-per-tick gate.
+// Manual dropdown changes still use participant_source_subscribe (gentle inline
+// re-point), which is fine because it's a single, user-paced operation.
+void HandleParticipantSourceRecreate(const std::string& json) {
+    std::string sourceId = JsonExtractString(json, "source_id");
+    uint32_t    userId   = JsonExtractUint(json, "participant_id");
+    if (sourceId.empty() || userId == 0) {
+        LogToFile("Video: recreate received with missing source_id or participant_id");
+        return;
+    }
+    bool followActiveSpeaker = (userId == ACTIVE_SPEAKER_SENTINEL);
 
-    if (g_anchorWnd)
-        PostMessageW(g_anchorWnd, WM_FEEDS_PROCESS_RENDERERS, 0, 0);
-    else
-        LogError("Video: no anchor window to drive pending renderer creation");
+    std::lock_guard<std::mutex> lock(g_subsMutex);
+    unsigned int actualUserId = followActiveSpeaker
+        ? (g_currentActiveSpeaker != 0 ? g_currentActiveSpeaker : ACTIVE_SPEAKER_SENTINEL)
+        : userId;
+    EnqueuePendingRenderLocked(sourceId, actualUserId, followActiveSpeaker);
 }
 
 // ---------------------------------------------------------------------------
@@ -849,6 +894,13 @@ void ProcessPendingRenderers() {
     std::lock_guard<std::mutex> lock(g_subsMutex);
     const ULONGLONG now = GetTickCount64();
 
+    // SEQUENCING: create at most ONE renderer per kRenderRetryIntervalMs, even
+    // across multiple back-to-back invocations (several WM_FEEDS_PROCESS_RENDERERS
+    // posts can arrive from a multi-source rejoin). The clock is g_lastRenderCreateTick;
+    // until the interval elapses, ready entries stay queued and the WM_TIMER
+    // brings us back. This is what defeats the same-user burst that makes the SDK
+    // drop all-but-one renderer. Cheap, non-create handling (deadline give-ups,
+    // gated waits) still runs for every entry.
     for (size_t i = 0; i < g_pendingRenders.size(); ) {
         const std::string  sourceId = g_pendingRenders[i].sourceId;
         unsigned int       uid      = g_pendingRenders[i].userId;
@@ -859,16 +911,6 @@ void ProcessPendingRenderers() {
         // speaker was known, in case one became active during the gate wait.
         if (follow && uid == ACTIVE_SPEAKER_SENTINEL && g_currentActiveSpeaker != 0)
             uid = g_currentActiveSpeaker;
-
-        // Already created (e.g. a prior tick, or an out-of-order request that
-        // hit the existing-sub path): re-point and drop the queue entry.
-        auto existing = g_subs.find(sourceId);
-        if (existing != g_subs.end()) {
-            existing->second->SetFollowsActiveSpeaker(follow);
-            existing->second->Resubscribe(uid);
-            g_pendingRenders.erase(g_pendingRenders.begin() + i);
-            continue;
-        }
 
         // Past the deadline — give up and tell the plugin so its
         // subscribed_user_id guard can't pin the source black forever.
@@ -885,10 +927,23 @@ void ProcessPendingRenderers() {
         // notification and the retry tick will bring us back here).
         if (!g_rawRenderReady) { ++i; continue; }
 
-        // Ready — attempt to create the renderer now.
+        // Spacing: only one create per interval. If it's too soon since the
+        // last create, stop here — the remaining entries are created on
+        // subsequent WM_TIMER ticks, one at a time.
+        if ((now - g_lastRenderCreateTick) < kRenderRetryIntervalMs)
+            break;
+
+        // Always produce a FRESH renderer: destroy any existing subscription
+        // for this source first (a rejoin's kept renderer is stale — the SDK
+        // has stopped delivering to it), then create new. Mirrors the manual
+        // deselect/reselect, the one reliable recovery. A no-op for a brand-new
+        // source.
+        g_subs.erase(sourceId);
+
         auto sub = std::make_unique<ParticipantSubscription>(
             sourceId, uid, follow);
         SubStart r = sub->Start();
+        g_lastRenderCreateTick = now;   // start the spacing clock for the next
         if (r == SubStart::Started) {
             g_subs[sourceId] = std::move(sub);
             g_pendingRenders.erase(g_pendingRenders.begin() + i);
@@ -901,24 +956,22 @@ void ProcessPendingRenderers() {
                 sourceId.c_str(), pid,
                 feeds_shared::MAX_FRAME_WIDTH, feeds_shared::MAX_FRAME_HEIGHT);
             SendToPlugin(resp);
-            continue;
+        } else if (r == SubStart::RetryNotReady) {
+            // Transient — keep queued; a later tick re-attempts (also spaced).
+        } else {
+            // Non-retryable failure.
+            LogError("[feeds-rls] subscription Start failed (non-retryable) "
+                     "— notifying plugin");
+            SendToPlugin("{\"type\":\"participant_source_subscribe_failed\","
+                         "\"source_id\":\"" + sourceId + "\"}");
+            g_pendingRenders.erase(g_pendingRenders.begin() + i);
         }
-        if (r == SubStart::RetryNotReady) {
-            // Transient — keep queued; the retry timer will re-attempt.
-            ++i;
-            continue;
-        }
-        // Non-retryable failure.
-        LogError("[feeds-rls] subscription Start failed (non-retryable) "
-                 "— notifying plugin");
-        SendToPlugin("{\"type\":\"participant_source_subscribe_failed\","
-                     "\"source_id\":\"" + sourceId + "\"}");
-        g_pendingRenders.erase(g_pendingRenders.begin() + i);
+        break;   // one create per invocation — the rest wait for the timer
     }
 
-    // Timer lifecycle: tick while anything is still queued (gated or retrying),
-    // stop once the queue drains. Owned here so it's only touched on the main
-    // thread.
+    // Timer lifecycle: tick while anything is still queued (gated, retrying, or
+    // waiting its turn under the one-per-tick spacing), stop once the queue
+    // drains. Owned here so it's only touched on the main thread.
     if (!g_pendingRenders.empty()) {
         if (!g_retryTimerActive && g_anchorWnd) {
             SetTimer(g_anchorWnd, kRenderRetryTimerId, kRenderRetryIntervalMs,
