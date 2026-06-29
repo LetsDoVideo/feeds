@@ -248,6 +248,24 @@ public:
         MemoryBarrier();
 
         m_header->write_index++;
+
+        // TEMPORARY diagnostic ([feeds-rls], grep to remove) — per-source
+        // frame-write counter, so a multi-source-one-participant rejoin log
+        // shows, per region, whether write_index is actually advancing (i.e.
+        // the engine is writing real frames). First write logged explicitly,
+        // then ~once/second (every 30th). Pairs with the frame-recv counter in
+        // onRawDataFrameReceived: recv-but-no-write => engine write path;
+        // no-recv => SDK never delivers to this renderer.
+        ++m_writeCount;
+        if (m_writeCount == 1 || (m_writeCount % 30) == 0) {
+            std::string tag = m_regionName;
+            size_t us = tag.rfind('_');
+            if (us != std::string::npos) tag = tag.substr(us + 1, 8);
+            char dbg[160];
+            sprintf_s(dbg, "[feeds-rls] frame-write source=%s writes=%llu",
+                      tag.c_str(), (unsigned long long)m_writeCount);
+            LogInfo(dbg);
+        }
     }
 
     // Write a "blank" sentinel slot. The plugin reads (width==0 ||
@@ -287,6 +305,7 @@ private:
     feeds_shared::SharedFrameHeader* m_header = nullptr;
     feeds_shared::FrameSlot*         m_slots  = nullptr;
     std::mutex                       m_writeMutex;
+    unsigned long long               m_writeCount = 0;  // TEMPORARY ([feeds-rls])
 };
 
 // ---------------------------------------------------------------------------
@@ -491,6 +510,21 @@ public:
     // Broadcaster-tier multi-renderer setups from serialising past one
     // frame's budget (research §12.4).
     virtual void onRawDataFrameReceived(YUVRawDataI420* data) override {
+        // TEMPORARY diagnostic ([feeds-rls], grep to remove) — per-source SDK
+        // frame-delivery counter, logged BEFORE any guard so it counts every
+        // delivery the SDK makes to THIS renderer. If a black source never logs
+        // a frame-recv line, the SDK isn't delivering to its (recreated)
+        // renderer; if it logs frame-recv but no frame-write, the drop is in
+        // the engine write path. First delivery explicit, then ~every 30th.
+        ++m_frameRecvCount;
+        if (m_frameRecvCount == 1 || (m_frameRecvCount % 30) == 0) {
+            std::string tag = m_sourceUuid.substr(0, 8);
+            char dbg[160];
+            sprintf_s(dbg, "[feeds-rls] frame-recv source=%s recv=%llu",
+                      tag.c_str(), (unsigned long long)m_frameRecvCount);
+            LogInfo(dbg);
+        }
+
         if (!data || !m_worker) return;
 
         const uint8_t* y = (const uint8_t*)data->GetYBuffer();
@@ -600,9 +634,10 @@ private:
 
     // SDK-callback-only state; never read from outside that thread, so
     // no synchronisation needed.
-    int           m_lastSrcW       = 0;  // last frame's width (0 = none yet)
-    int           m_lastSrcH       = 0;
-    unsigned int  m_loggedFailures = 0;  // bitfield from validation_failures
+    int                m_lastSrcW       = 0;  // last frame's width (0 = none yet)
+    int                m_lastSrcH       = 0;
+    unsigned int       m_loggedFailures = 0;  // bitfield from validation_failures
+    unsigned long long m_frameRecvCount = 0;  // TEMPORARY ([feeds-rls])
 };
 
 // ---------------------------------------------------------------------------
