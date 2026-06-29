@@ -230,10 +230,27 @@ static void UpdateLoginLogoutMenuItem();
 // ---------------------------------------------------------------------------
 // Per-source data
 // ---------------------------------------------------------------------------
+
+// obs_data key for the durable "remembered participant" — the display name a
+// participant-pinned source was last bound to. Unlike participant_id (a Zoom
+// runtime user ID that is reassigned every session/rejoin), the name survives
+// a mid-session drop/rejoin, an OBS restart, and scene-collection save/load,
+// so it is the key we auto-rebind on. See ReconcileRememberedParticipants.
+static constexpr const char* kParticipantNameKey = "participant_name";
+
 struct ZpSourceData {
     obs_source_t* source          = nullptr;
     std::string   uuid;
     unsigned int  current_user_id = 0;
+    // Runtime-only (never persisted): true once current_user_id was bound to a
+    // real present participant THIS session — via a manual pick or a name
+    // match in ReconcileRememberedParticipants. Distinguishes a live, trusted
+    // binding from a stale participant_id loaded from a prior session (whose
+    // runtime ID can coincidentally collide with a different person). Only a
+    // session-confirmed binding is trusted for rename-refresh; a stale loaded
+    // ID is re-bound by remembered name instead. Reset on meeting_left /
+    // logout / session_expired.
+    bool          bound_this_session = false;
     // Per-source ISO recorder (feeds-iso-recorder). Created in zp_create,
     // torn down in zp_destroy. Records this source to its own MP4 alongside
     // OBS's main recording when the properties checkbox is enabled.
@@ -610,6 +627,113 @@ static void RefreshAllSourceProperties() {
         }
         return true;
     }, nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// Persistent participant selection — auto-rebind by remembered display name.
+//
+// Each participant-pinned source remembers (in obs_data, key kParticipantNameKey)
+// the display name it was last bound to. This runs on the UI thread on every
+// participant_list_changed — which the engine sends at meeting-join (the
+// initial sweep of everyone already present), on each newcomer (onUserJoin),
+// on rename (onUserNamesChanged), and on leave — so a single pass covers the
+// join sweep, the per-newcomer rebind (the mid-session drop/rejoin case), and
+// keeping the durable name fresh on rename.
+//
+// Rules (deliberately fail-closed to manual selection):
+//   - Match on exact display name only; never fuzzy/partial. The name is the
+//     only identifier present for every participant including guests, and a
+//     rejoining participant almost always keeps the same name.
+//   - Auto-bind only when the remembered name matches exactly ONE present
+//     candidate. Zero matches → leave unbound and waiting. Two+ matches
+//     (duplicate names) → leave for manual selection. A wrong auto-bind is
+//     worse than none.
+//   - Active-speaker sources (participant_id == 1) bind to a role, not a
+//     person, so a remembered name is meaningless — skip them entirely.
+//   - Self is excluded (mirrors the dropdown), as are tier-disabled sources.
+// ---------------------------------------------------------------------------
+static void ReconcileRememberedParticipants() {
+    // Snapshot the present roster: id → name, plus per-name occurrence count
+    // and the single matching id (the count guards against duplicate names).
+    // Self is excluded so a source can never auto-bind to the Feeds user, the
+    // same exclusion the participant dropdown applies.
+    std::map<unsigned int, std::string> presentById;
+    std::map<std::string, unsigned int> idByName;
+    std::map<std::string, int>          countByName;
+    {
+        std::lock_guard<std::mutex> lock(g_participantsMutex);
+        for (const auto& p : g_cachedParticipants) {
+            if (g_cachedMyUserId != 0 && p.id == g_cachedMyUserId) continue;
+            if (p.name.empty()) continue;
+            presentById[p.id] = p.name;
+            idByName[p.name]  = p.id;
+            countByName[p.name]++;
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(g_sourcesMutex);
+    for (ZpSourceData* s : g_allParticipantSources) {
+        if (!s || !s->source || s->uuid.empty()) continue;
+        if (s->tier_disabled) continue;
+
+        obs_data_t* settings = obs_source_get_settings(s->source);
+        if (!settings) continue;
+
+        long long pid = obs_data_get_int(settings, "participant_id");
+        if (pid == 1) { obs_data_release(settings); continue; }  // active speaker
+
+        const char* rememberedC = obs_data_get_string(settings, kParticipantNameKey);
+        std::string remembered  = rememberedC ? rememberedC : "";
+
+        // Case A: a live, this-session binding whose participant is still
+        // present. Keep the binding; only refresh the durable name if they
+        // renamed (so a later rejoin under the new name still matches). The
+        // bound_this_session guard is essential: a participant_id loaded from a
+        // prior session is NOT trusted here, so a stale ID that coincidentally
+        // collides with a different present person can't hijack the name.
+        if (s->bound_this_session && s->current_user_id > 1) {
+            auto it = presentById.find(s->current_user_id);
+            if (it != presentById.end()) {
+                if (!it->second.empty() && it->second != remembered)
+                    obs_data_set_string(settings, kParticipantNameKey,
+                                        it->second.c_str());
+                obs_data_release(settings);
+                continue;
+            }
+            // Bound participant is absent (dropped) — fall through and try to
+            // re-bind them by remembered name (handles the rejoin).
+        }
+
+        // Case B: unbound, or bound-but-absent. Auto-bind only on an exact
+        // name match with exactly one present candidate.
+        if (remembered.empty()) { obs_data_release(settings); continue; }
+        auto cit = countByName.find(remembered);
+        if (cit == countByName.end() || cit->second != 1) {
+            obs_data_release(settings);  // no match, or duplicate names
+            continue;
+        }
+        unsigned int newId = idByName[remembered];
+        if (s->bound_this_session && newId == s->current_user_id) {
+            obs_data_release(settings);  // already correctly bound
+            continue;
+        }
+
+        // Bind: persist the runtime id (keeps the dropdown selection in sync
+        // and survives same-session scene save), mark the binding live, and
+        // subscribe. If privilege isn't granted yet (initial join sweep), the
+        // raw_livestream_granted handler's loop subscribes by current_user_id.
+        s->current_user_id    = newId;
+        s->bound_this_session = true;
+        obs_data_set_int(settings, "participant_id", (long long)newId);
+
+        if (g_isInMeeting && g_rawLiveStreamGranted) {
+            std::string msg = "{\"type\":\"participant_source_subscribe\","
+                              "\"source_id\":\"" + s->uuid + "\","
+                              "\"participant_id\":" + std::to_string(newId) + "}";
+            feeds::SendToEngine(msg);
+        }
+        obs_data_release(settings);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2409,6 +2533,45 @@ static std::string PrivilegeStatusText() {
     }
 }
 
+// Fires ONLY when the user changes the participant dropdown in the properties
+// dialog (not on scene load / programmatic update) — exactly the "manual
+// selection" hook. Manual selection overrides and updates the remembered name
+// so it doesn't revert next session; picking a real participant (>1) records
+// their name and marks the binding live, while unselect (0) or [Active Speaker]
+// (1) clears the remembered name (clearing on unselect is what lets the user
+// actually unbind a present participant without ReconcileRememberedParticipants
+// immediately re-binding them). Writing the name only on a genuine user action
+// is deliberate: it avoids clobbering the durable name from a stale
+// participant_id loaded on OBS restart, whose runtime ID can collide with a
+// different present person.
+static bool zp_participant_modified(void* priv, obs_properties_t* props,
+                                    obs_property_t* property,
+                                    obs_data_t* settings) {
+    (void)props;
+    (void)property;
+    ZpSourceData* data = static_cast<ZpSourceData*>(priv);
+    long long sel = obs_data_get_int(settings, "participant_id");
+
+    if (sel > 1) {
+        std::string name;
+        {
+            std::lock_guard<std::mutex> lock(g_participantsMutex);
+            for (const auto& p : g_cachedParticipants) {
+                if (p.id == (unsigned int)sel) { name = p.name; break; }
+            }
+        }
+        // Only overwrite the durable key when we actually resolved a name;
+        // a momentary cache miss must not erase a good remembered name.
+        if (!name.empty())
+            obs_data_set_string(settings, kParticipantNameKey, name.c_str());
+        if (data) data->bound_this_session = true;
+    } else {
+        obs_data_set_string(settings, kParticipantNameKey, "");
+        if (data) data->bound_this_session = false;
+    }
+    return false;  // settings change persists; no property layout change needed
+}
+
 static obs_properties_t* zp_properties(void* data) {
   // C++ exceptions must not escape into libobs C frames. On exception we
   // return an empty properties object so the dialog still opens (instead
@@ -2499,6 +2662,11 @@ static obs_properties_t* zp_properties(void* data) {
                     if (g_cachedMyUserId != 0 && p.id == g_cachedMyUserId) continue;
                     obs_property_list_add_int(list, p.name.c_str(), (long long)p.id);
                 }
+                // Capture manual selections into the durable remembered-name
+                // key (priv = this source's data, for the bound_this_session
+                // flag). Only attached to the live, selectable dropdown.
+                obs_property_set_modified_callback2(
+                    list, zp_participant_modified, data);
             }
         }
     }
@@ -3207,6 +3375,7 @@ static void RegisterEngineHandlers() {
             std::lock_guard<std::mutex> lock(g_sourcesMutex);
             for (ZpSourceData* s : g_allParticipantSources) {
                 CloseSharedMemory(s);
+                if (s) s->bound_this_session = false;  // runtime IDs are dead
             }
         }
         CloseSharedMemoryForAllScreenshareSources();
@@ -3268,6 +3437,7 @@ static void RegisterEngineHandlers() {
             std::lock_guard<std::mutex> lock(g_sourcesMutex);
             for (ZpSourceData* s : g_allParticipantSources) {
                 CloseSharedMemory(s);
+                if (s) s->bound_this_session = false;  // runtime IDs are dead
             }
         }
         CloseSharedMemoryForAllScreenshareSources();
@@ -3474,6 +3644,11 @@ static void RegisterEngineHandlers() {
             std::lock_guard<std::mutex> lock(g_sourcesMutex);
             for (ZpSourceData* s : g_allParticipantSources) {
                 CloseSharedMemory(s);
+                // The meeting's runtime user IDs are now dead. Drop the
+                // session-confirmed flag so the next join re-binds purely by
+                // remembered name (and a reused ID can't masquerade as a live
+                // binding). The remembered name in obs_data is untouched.
+                if (s) s->bound_this_session = false;
             }
         }
         CloseSharedMemoryForAllScreenshareSources();
@@ -3618,6 +3793,11 @@ static void RegisterEngineHandlers() {
              (size_t)g_cachedParticipants.size());
 
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
+            // Auto-rebind participant-pinned sources to their remembered name
+            // BEFORE refreshing properties, so the dropdowns reflect any newly
+            // bound participant_id. Covers the join sweep, per-newcomer rejoin,
+            // and rename-refresh (see ReconcileRememberedParticipants).
+            ReconcileRememberedParticipants();
             RefreshAllSourceProperties();
         });
     });
