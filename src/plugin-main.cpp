@@ -659,15 +659,33 @@ static bool SubscribeBoundSourceLocked(ZpSourceData* s) {
     if (!s || s->uuid.empty()) return false;
     if (s->tier_disabled) return false;
     if (s->current_user_id < 1) return false;            // unbound (0)
-    if (!(g_isInMeeting && g_rawLiveStreamGranted)) return false;
-    if (s->subscribed_user_id == s->current_user_id)     // already subscribed
+    // TEMPORARY diagnostic ([feeds-rls], grep to remove) — log the per-source
+    // (re)subscribe decision so a two-sources-one-participant rejoin shows, by
+    // source uuid, whether each bound source actually sent its subscribe or was
+    // suppressed. The engine can only see subscribes that are sent; this is the
+    // plugin-side decision the engine log can't observe.
+    std::string sid8 = s->uuid.substr(0, 8);
+    if (!(g_isInMeeting && g_rawLiveStreamGranted)) {
+        blog(LOG_INFO, "[feeds-rls] subscribe-locked SKIP src=%s reason=not-ready "
+             "cur=%u sub=%u", sid8.c_str(), s->current_user_id,
+             s->subscribed_user_id);
         return false;
+    }
+    if (s->subscribed_user_id == s->current_user_id) {   // already subscribed
+        blog(LOG_INFO, "[feeds-rls] subscribe-locked SUPPRESS src=%s "
+             "reason=already-subscribed cur=%u sub=%u", sid8.c_str(),
+             s->current_user_id, s->subscribed_user_id);
+        return false;
+    }
 
     std::string msg = "{\"type\":\"participant_source_subscribe\","
                       "\"source_id\":\"" + s->uuid + "\","
                       "\"participant_id\":" +
                       std::to_string(s->current_user_id) + "}";
     feeds::SendToEngine(msg);
+    blog(LOG_INFO, "[feeds-rls] subscribe-locked SENT src=%s userId=%u "
+         "(was sub=%u)", sid8.c_str(), s->current_user_id,
+         s->subscribed_user_id);
     s->subscribed_user_id = s->current_user_id;
     return true;
 }
@@ -722,11 +740,27 @@ static void ReconcileRememberedParticipants() {
         obs_data_t* settings = obs_source_get_settings(s->source);
         if (!settings) continue;
 
+        // TEMPORARY diagnostic ([feeds-rls], grep to remove) — per-source
+        // reconcile decision, so a two-sources-one-participant rejoin shows, by
+        // source uuid, which branch each source took (Case A keep / Case B
+        // bind / no-match / already-bound) and the state behind it. This is the
+        // plugin-side decision the engine log can't observe.
+        std::string sid8 = s->uuid.substr(0, 8);
+
         long long pid = obs_data_get_int(settings, "participant_id");
         if (pid == 1) { obs_data_release(settings); continue; }  // active speaker
 
         const char* rememberedC = obs_data_get_string(settings, kParticipantNameKey);
         std::string remembered  = rememberedC ? rememberedC : "";
+        int remCount = 0;
+        {
+            auto cnt = countByName.find(remembered);
+            if (cnt != countByName.end()) remCount = cnt->second;
+        }
+        blog(LOG_INFO, "[feeds-rls] reconcile src=%s name='%s' cur=%u sub=%u "
+             "bound=%d presentCount=%d", sid8.c_str(), remembered.c_str(),
+             s->current_user_id, s->subscribed_user_id,
+             s->bound_this_session ? 1 : 0, remCount);
 
         // Case A: a live, this-session binding whose participant is still
         // present. Keep the binding; only refresh the durable name if they
@@ -740,6 +774,9 @@ static void ReconcileRememberedParticipants() {
                 if (!it->second.empty() && it->second != remembered)
                     obs_data_set_string(settings, kParticipantNameKey,
                                         it->second.c_str());
+                blog(LOG_INFO, "[feeds-rls] reconcile src=%s -> CASE_A keep "
+                     "cur=%u present (no resubscribe)", sid8.c_str(),
+                     s->current_user_id);
                 obs_data_release(settings);
                 continue;
             }
@@ -749,14 +786,23 @@ static void ReconcileRememberedParticipants() {
 
         // Case B: unbound, or bound-but-absent. Auto-bind only on an exact
         // name match with exactly one present candidate.
-        if (remembered.empty()) { obs_data_release(settings); continue; }
+        if (remembered.empty()) {
+            blog(LOG_INFO, "[feeds-rls] reconcile src=%s -> CASE_B skip "
+                 "(no remembered name)", sid8.c_str());
+            obs_data_release(settings);
+            continue;
+        }
         auto cit = countByName.find(remembered);
         if (cit == countByName.end() || cit->second != 1) {
+            blog(LOG_INFO, "[feeds-rls] reconcile src=%s -> CASE_B skip "
+                 "(presentCount=%d, need exactly 1)", sid8.c_str(), remCount);
             obs_data_release(settings);  // no match, or duplicate names
             continue;
         }
         unsigned int newId = idByName[remembered];
         if (s->bound_this_session && newId == s->current_user_id) {
+            blog(LOG_INFO, "[feeds-rls] reconcile src=%s -> CASE_B already-bound "
+                 "cur=%u (no rebind)", sid8.c_str(), s->current_user_id);
             obs_data_release(settings);  // already correctly bound
             continue;
         }
@@ -766,6 +812,8 @@ static void ReconcileRememberedParticipants() {
         // subscribe. If privilege isn't granted yet (initial join sweep),
         // SubscribeBoundSourceLocked is a no-op and the raw_livestream_granted
         // handler subscribes this source once privilege exists.
+        blog(LOG_INFO, "[feeds-rls] reconcile src=%s -> CASE_B BIND newId=%u "
+             "(was cur=%u)", sid8.c_str(), newId, s->current_user_id);
         s->current_user_id    = newId;
         s->bound_this_session = true;
         obs_data_set_int(settings, "participant_id", (long long)newId);
