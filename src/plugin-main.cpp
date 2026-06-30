@@ -4170,6 +4170,124 @@ static void ApplyFeedsBoundsToSceneItem(obs_source_t* source) {
     obs_enum_scenes(enum_cb, &ctx);
 }
 
+// Participant-video initial placement (v1.4.0). Unlike screenshare (which
+// keeps the Fit bounds in ApplyFeedsBoundsToSceneItem above), participant
+// video uses Automatic bounds (OBS_BOUNDS_NONE) so the user can crop it
+// naturally with Alt-drag. The engine frame scaler already normalizes
+// participant frames to a constant per-tier size before OBS sees them, so
+// Fit is no longer needed to absorb Zoom's resolution drops — see the
+// resolution-change investigation. Screenshare is variable-size and MUST
+// stay on Fit; that's why the OnSourceCreated dispatch routes the two types
+// to different functions.
+//
+// To preserve today's "drop it in and it fills the screen" default we set
+// an initial scale that aspect-fits the source inside the canvas (the same
+// geometry SCALE_INNER produced) and center it. Automatic needs the
+// source's real pixel dimensions to compute that scale, but a freshly
+// created participant source reports 0x0 until its first frame arrives, so
+// we poll for non-zero dimensions before applying (bounded so a camera-off
+// participant doesn't spin a thread forever).
+//
+// One-shot: a sentinel in the source's settings records that we've placed
+// it, so reloading a saved scene does NOT stomp a crop/position the user
+// set earlier. obs_data_has_user_value is false on fresh creation and true
+// for a source restored from a saved scene collection (the sentinel is
+// serialized with it), same trick ApplyChatOverlayDefaults uses for width.
+static void ApplyParticipantPlacement(obs_source_t* source) {
+    if (!source) return;
+
+    // Skip if we've already placed this source in a previous session — the
+    // user's saved scene-item geometry (including any crop) wins on reload.
+    {
+        obs_data_t* settings = obs_source_get_settings(source);
+        bool alreadyPlaced = settings &&
+            obs_data_has_user_value(settings, "feeds_initial_placement_done");
+        if (settings) obs_data_release(settings);
+        if (alreadyPlaced) return;
+    }
+
+    // Canvas size for the fit math + centering.
+    obs_video_info ovi;
+    uint32_t canvasW = 1920;
+    uint32_t canvasH = 1080;
+    if (obs_get_video_info(&ovi)) {
+        canvasW = ovi.base_width;
+        canvasH = ovi.base_height;
+    }
+
+    // Wait for the source to report real dimensions (first frame). The
+    // engine scaler guarantees these are constant once they appear, so a
+    // one-shot placement is correct and survives Zoom resolution drops.
+    // Bounded to ~10s (100 × 100ms): comfortably covers the first frame and
+    // a "turn the camera on after adding the source" delay, but a source
+    // that never produces frames just stays at OBS defaults rather than
+    // leaking a polling thread.
+    uint32_t srcW = 0;
+    uint32_t srcH = 0;
+    for (int i = 0; i < 100; ++i) {
+        srcW = obs_source_get_width(source);
+        srcH = obs_source_get_height(source);
+        if (srcW > 0 && srcH > 0) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (srcW == 0 || srcH == 0) return;
+
+    // Aspect-preserving fit (the geometry OBS_BOUNDS_SCALE_INNER yields):
+    // scale so the source lands wholly inside the canvas.
+    const float scaleW = (float)canvasW / (float)srcW;
+    const float scaleH = (float)canvasH / (float)srcH;
+    const float fit    = (scaleW < scaleH) ? scaleW : scaleH;
+
+    vec2 scaleVec;
+    scaleVec.x = fit;
+    scaleVec.y = fit;
+    vec2 pos;
+    pos.x = (float)canvasW * 0.5f;
+    pos.y = (float)canvasH * 0.5f;
+
+    struct SearchContext {
+        obs_source_t* target;
+        vec2          scale;
+        vec2          pos;
+    };
+    SearchContext ctx = { source, scaleVec, pos };
+
+    auto enum_cb = [](void* param, obs_source_t* scene_src) -> bool {
+        SearchContext* c = (SearchContext*)param;
+        obs_scene_t* scene = obs_scene_from_source(scene_src);
+        if (!scene) return true;
+
+        auto item_cb = [](obs_scene_t*, obs_sceneitem_t* item, void* p) -> bool {
+            SearchContext* c = (SearchContext*)p;
+            obs_source_t* item_src = obs_sceneitem_get_source(item);
+            if (item_src == c->target) {
+                // Automatic bounds — no bbox constraint, so Alt-drag crops
+                // the source naturally. Center alignment makes our centered
+                // position anchor the source's middle.
+                obs_sceneitem_set_bounds_type(item, OBS_BOUNDS_NONE);
+                obs_sceneitem_set_alignment(item, OBS_ALIGN_CENTER);
+                obs_sceneitem_set_scale(item, &c->scale);
+                obs_sceneitem_set_pos(item, &c->pos);
+            }
+            return true;
+        };
+
+        obs_scene_enum_items(scene, item_cb, c);
+        return true;
+    };
+
+    obs_enum_scenes(enum_cb, &ctx);
+
+    // Record that we've done the initial placement so future reloads don't
+    // override the user's adjustments. Written after the geometry is set.
+    obs_data_t* settings = obs_source_get_settings(source);
+    if (settings) {
+        obs_data_set_bool(settings, "feeds_initial_placement_done", true);
+        obs_source_update(source, settings);
+        obs_data_release(settings);
+    }
+}
+
 // Place a newly-created popup source at bottom-center of the canvas with
 // a 50px margin from the bottom edge. Chat overlays conventionally live
 // there; the (0,0) default that OBS gives new sources is wrong for ~all
@@ -4314,13 +4432,16 @@ static void OnSourceCreated(void* /*data*/, calldata_t* cd) {
     const char* id = obs_source_get_id(source);
     if (!id) return;
 
-    // Only apply to Feeds source types.
-    const bool isParticipantOrShare =
-        strcmp(id, "zoom_participant_source") == 0 ||
-        strcmp(id, "zoom_screenshare_source") == 0;
+    // Only apply to Feeds source types. Participant and screenshare are
+    // split deliberately: participant video gets Automatic bounds (the
+    // engine scaler holds its size constant), screenshare keeps Fit bounds
+    // (its frames are variable-size and Fit absorbs content-size changes).
+    const bool isParticipant = strcmp(id, "zoom_participant_source") == 0;
+    const bool isScreenshare = strcmp(id, "zoom_screenshare_source") == 0;
     const bool isChatPopup   = strcmp(id, "feeds_chat_popup")   == 0;
     const bool isChatOverlay = strcmp(id, "feeds_chat_overlay") == 0;
-    if (!isParticipantOrShare && !isChatPopup && !isChatOverlay) return;
+    if (!isParticipant && !isScreenshare && !isChatPopup && !isChatOverlay)
+        return;
 
     // When our create callback returns NULL on a tier block, OBS keeps
     // the obs_source_t alive with context.data == NULL ("husk"). Mark
@@ -4342,7 +4463,7 @@ static void OnSourceCreated(void* /*data*/, calldata_t* cd) {
     obs_weak_source_t* weak = obs_source_get_weak_source(source);
     if (!weak) return;
 
-    std::thread([weak, isChatPopup, isChatOverlay]() {
+    std::thread([weak, isParticipant, isChatPopup, isChatOverlay]() {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
         obs_source_t* strong = obs_weak_source_get_source(weak);
@@ -4351,7 +4472,11 @@ static void OnSourceCreated(void* /*data*/, calldata_t* cd) {
                 ApplyChatPopupDefaultPosition(strong);
             } else if (isChatOverlay) {
                 ApplyChatOverlayDefaults(strong);
+            } else if (isParticipant) {
+                // Automatic bounds + fill-canvas-centered initial placement.
+                ApplyParticipantPlacement(strong);
             } else {
+                // Screenshare: keep the existing Fit bounds path, unchanged.
                 ApplyFeedsBoundsToSceneItem(strong);
             }
             obs_source_release(strong);
