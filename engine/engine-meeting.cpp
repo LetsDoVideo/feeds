@@ -604,17 +604,6 @@ public:
             g_meetingService->GetMeetingAudioController();
         if (ac) ac->SetEvent(&g_audioListener);
 
-        // TEMPORARY diagnostic ([feeds-rls], grep to remove) — stamp our own
-        // user id at the instant the grant is sent, so the readiness-callback
-        // firings and the createRenderer attempts can be correlated to it.
-        {
-            char rlsBuf[96];
-            sprintf_s(rlsBuf,
-                "[feeds-rls] raw_livestream_granted sent, myself=%u",
-                GetMySelfUserId());
-            LogInfo(rlsBuf);
-        }
-
         // Tell the plugin the meeting is fully ready. This is the signal
         // that zp_properties / zs_properties should flip from the "click to
         // connect" prompt to the connected state.
@@ -664,36 +653,16 @@ public:
     virtual void onUserRawLiveStreamingStatusChanged(
         ZOOM_SDK_NAMESPACE::IList<
             ZOOM_SDK_NAMESPACE::RawLiveStreamInfo>* liveStreamList) override {
-        // TEMPORARY diagnostic ([feeds-rls], grep to remove) — deciding
-        // Option B (gate the subscribe on this readiness signal) vs Option A
-        // (bounded retry) for the createRenderer NO_PERMISSION-at-grant bug.
-        // Logs whether our own user appears in the raw-live-streaming list and
-        // when, so it can be correlated against the grant send ([feeds-rls]
-        // raw_livestream_granted...) and the createRenderer attempts
-        // ([feeds-rls] createRenderer...). NO behavior change — this does not
-        // gate, defer, or retry anything.
+        // Self present in the raw-live-streaming list == the raw-data renderer
+        // subsystem is ready. Open the readiness gate so engine-video drains any
+        // subscribes queued at the grant instant (the Option C fix).
         unsigned int mySelf = GetMySelfUserId();
         int count = liveStreamList ? liveStreamList->GetCount() : 0;
-        char buf[160];
-        sprintf_s(buf,
-            "[feeds-rls] onUserRawLiveStreamingStatusChanged count=%d myself=%u",
-            count, mySelf);
-        LogInfo(buf);
         bool selfPresent = false;
         for (int i = 0; i < count; ++i) {
             ZOOM_SDK_NAMESPACE::RawLiveStreamInfo info = liveStreamList->GetItem(i);
-            bool isSelf = (mySelf != 0 && info.userId == mySelf);
-            if (isSelf) selfPresent = true;
-            sprintf_s(buf, "[feeds-rls]   entry[%d] userId=%u is_self=%d",
-                      i, info.userId, isSelf ? 1 : 0);
-            LogInfo(buf);
+            if (mySelf != 0 && info.userId == mySelf) { selfPresent = true; break; }
         }
-
-        // Self present in the raw-live-streaming list == the raw-data renderer
-        // subsystem is ready. Open the readiness gate so engine-video drains any
-        // subscribes queued at the grant instant (the Option C fix). The
-        // [feeds-rls] lines above stay in to verify the gate on the live test;
-        // they come out with the heartbeat in the pre-tag cleanup.
         if (selfPresent) NotifyRawRenderReady();
     }
     virtual void onLiveStreamReminderStatusChanged(bool) override {}

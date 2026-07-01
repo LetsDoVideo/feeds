@@ -248,24 +248,6 @@ public:
         MemoryBarrier();
 
         m_header->write_index++;
-
-        // TEMPORARY diagnostic ([feeds-rls], grep to remove) — per-source
-        // frame-write counter, so a multi-source-one-participant rejoin log
-        // shows, per region, whether write_index is actually advancing (i.e.
-        // the engine is writing real frames). First write logged explicitly,
-        // then ~once/second (every 30th). Pairs with the frame-recv counter in
-        // onRawDataFrameReceived: recv-but-no-write => engine write path;
-        // no-recv => SDK never delivers to this renderer.
-        ++m_writeCount;
-        if (m_writeCount == 1 || (m_writeCount % 30) == 0) {
-            std::string tag = m_regionName;
-            size_t us = tag.rfind('_');
-            if (us != std::string::npos) tag = tag.substr(us + 1, 8);
-            char dbg[160];
-            sprintf_s(dbg, "[feeds-rls] frame-write source=%s writes=%llu",
-                      tag.c_str(), (unsigned long long)m_writeCount);
-            LogInfo(dbg);
-        }
     }
 
     // Write a "blank" sentinel slot. The plugin reads (width==0 ||
@@ -305,7 +287,6 @@ private:
     feeds_shared::SharedFrameHeader* m_header = nullptr;
     feeds_shared::FrameSlot*         m_slots  = nullptr;
     std::mutex                       m_writeMutex;
-    unsigned long long               m_writeCount = 0;  // TEMPORARY ([feeds-rls])
 };
 
 // ---------------------------------------------------------------------------
@@ -342,18 +323,6 @@ public:
         // Create the SDK renderer with this object as the delegate.
         ZOOM_SDK_NAMESPACE::SDKError err =
             ZOOM_SDK_NAMESPACE::createRenderer(&m_renderer, this);
-        // TEMPORARY diagnostic ([feeds-rls], grep to remove) — record every
-        // createRenderer attempt and its result code (12 == SDKERR_NO_PERMISSION
-        // is the grant-instant readiness failure we're chasing) so the ordering
-        // of grant sent -> readiness-callback firings -> createRenderer attempts
-        // is visible in one rejoin's log. No behavior change.
-        {
-            char rls[160];
-            sprintf_s(rls,
-                "[feeds-rls] createRenderer attempt source='%s' userId=%u result=%d",
-                m_sourceUuid.c_str(), m_userId, (int)err);
-            LogInfo(rls);
-        }
         if (err != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS || !m_renderer) {
             char msg[128];
             sprintf_s(msg, "Video: createRenderer failed: %d", (int)err);
@@ -510,21 +479,6 @@ public:
     // Broadcaster-tier multi-renderer setups from serialising past one
     // frame's budget (research §12.4).
     virtual void onRawDataFrameReceived(YUVRawDataI420* data) override {
-        // TEMPORARY diagnostic ([feeds-rls], grep to remove) — per-source SDK
-        // frame-delivery counter, logged BEFORE any guard so it counts every
-        // delivery the SDK makes to THIS renderer. If a black source never logs
-        // a frame-recv line, the SDK isn't delivering to its (recreated)
-        // renderer; if it logs frame-recv but no frame-write, the drop is in
-        // the engine write path. First delivery explicit, then ~every 30th.
-        ++m_frameRecvCount;
-        if (m_frameRecvCount == 1 || (m_frameRecvCount % 30) == 0) {
-            std::string tag = m_sourceUuid.substr(0, 8);
-            char dbg[160];
-            sprintf_s(dbg, "[feeds-rls] frame-recv source=%s recv=%llu",
-                      tag.c_str(), (unsigned long long)m_frameRecvCount);
-            LogInfo(dbg);
-        }
-
         if (!data || !m_worker) return;
 
         const uint8_t* y = (const uint8_t*)data->GetYBuffer();
@@ -637,7 +591,6 @@ private:
     int                m_lastSrcW       = 0;  // last frame's width (0 = none yet)
     int                m_lastSrcH       = 0;
     unsigned int       m_loggedFailures = 0;  // bitfield from validation_failures
-    unsigned long long m_frameRecvCount = 0;  // TEMPORARY ([feeds-rls])
 };
 
 // ---------------------------------------------------------------------------
@@ -714,13 +667,6 @@ void TearDownAllVideoSubscriptions() {
     g_lastRenderCreateTick = 0;   // next meeting's first create is immediate
 }
 
-// === TEMPORARY (freeze diagnostic): live-subscription count for the engine
-// heartbeat in engine-main.cpp. Remove together with the heartbeat block. ===
-size_t GetActiveSubscriptionCount() {
-    std::lock_guard<std::mutex> lock(g_subsMutex);
-    return g_subs.size();
-}
-
 // Blank any subscriptions currently bound to the given user ID. Called
 // from the participants listener's onUserLeft so OBS sources tied to a
 // departed participant clear immediately instead of freezing on the last
@@ -773,13 +719,6 @@ static void EnqueuePendingRenderLocked(const std::string& sourceId,
             {sourceId, actualUserId, followActiveSpeaker,
              GetTickCount64() + kRenderGiveUpMs});
     }
-
-    char rls[256];
-    sprintf_s(rls,
-        "[feeds-rls] render queued source='%s' userId=%u ready=%d pending=%zu",
-        sourceId.c_str(), actualUserId, g_rawRenderReady ? 1 : 0,
-        g_pendingRenders.size());
-    LogInfo(rls);
 
     if (g_anchorWnd)
         PostMessageW(g_anchorWnd, WM_FEEDS_PROCESS_RENDERERS, 0, 0);
@@ -915,7 +854,7 @@ void ProcessPendingRenderers() {
         // Past the deadline — give up and tell the plugin so its
         // subscribed_user_id guard can't pin the source black forever.
         if (now > deadline) {
-            LogWarn("[feeds-rls] subscribe gave up (renderer not ready in time) "
+            LogWarn("Video: subscribe gave up (renderer not ready in time) "
                     "— notifying plugin");
             SendToPlugin("{\"type\":\"participant_source_subscribe_failed\","
                          "\"source_id\":\"" + sourceId + "\"}");
@@ -960,7 +899,7 @@ void ProcessPendingRenderers() {
             // Transient — keep queued; a later tick re-attempts (also spaced).
         } else {
             // Non-retryable failure.
-            LogError("[feeds-rls] subscription Start failed (non-retryable) "
+            LogError("Video: subscription Start failed (non-retryable) "
                      "— notifying plugin");
             SendToPlugin("{\"type\":\"participant_source_subscribe_failed\","
                          "\"source_id\":\"" + sourceId + "\"}");
@@ -993,7 +932,7 @@ void NotifyRawRenderReady() {
         if (g_rawRenderReady) return;   // already open — nothing to do
         g_rawRenderReady = true;
     }
-    LogInfo("[feeds-rls] raw render subsystem READY (self present) — "
+    LogInfo("Video: raw render subsystem READY (self present) — "
             "draining queued subscribes");
     if (g_anchorWnd)
         PostMessageW(g_anchorWnd, WM_FEEDS_PROCESS_RENDERERS, 0, 0);
