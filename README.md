@@ -74,7 +74,7 @@ Download the latest **Feeds.zip** from the [Releases](https://github.com/LetsDoV
 | Free | 1 | 720p |
 | Basic | 3 | 1080p |
 | Streamer | 5 | 1080p |
-| Broadcaster | 10 | 1080p |
+| Broadcaster | 8 | 1080p |
 
 Upgrade your tier at the [Zoom App Marketplace](https://marketplace.zoom.us).
 
