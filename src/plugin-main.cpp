@@ -2600,23 +2600,26 @@ static std::string PrivilegeStatusText() {
     }
 }
 
-// Fires ONLY when the user changes the participant dropdown in the properties
-// dialog (not on scene load / programmatic update) — exactly the "manual
-// selection" hook. Manual selection overrides and updates the remembered name
-// so it doesn't revert next session; picking a real participant (>1) records
-// their name and marks the binding live, while unselect (0) or [Active Speaker]
-// (1) clears the remembered name (clearing on unselect is what lets the user
-// actually unbind a present participant without ReconcileRememberedParticipants
-// immediately re-binding them). Writing the name only on a genuine user action
-// is deliberate: it avoids clobbering the durable name from a stale
-// participant_id loaded on OBS restart, whose runtime ID can collide with a
-// different present person.
-static bool zp_participant_modified(void* priv, obs_properties_t* props,
-                                    obs_property_t* property,
-                                    obs_data_t* settings) {
-    (void)props;
-    (void)property;
-    ZpSourceData* data = static_cast<ZpSourceData*>(priv);
+// Record the "binding-record" half of an interactive participant selection into
+// the given source's settings/data: resolve the selected id (read from the
+// passed-in settings) to a display name, persist the durable remembered-name key
+// only when a non-empty name resolves, and set bound_this_session from the id
+// bucket. This is the shared choke point both interactive UIs drive — the
+// properties dropdown (zp_participant_modified) today, and the participant dock
+// later — so both produce identical binding behavior. It does NOT subscribe;
+// the subscribe half stays in the deferred zp_update on the graphics thread.
+//
+// Contract — MUST be called on the UI (Qt main) thread. It writes
+// bound_this_session WITHOUT any lock, which is safe only because every writer
+// of that flag is serialized on the UI thread (or holds g_sourcesMutex, which
+// this helper deliberately does not). Callers pass the ZpSourceData* directly
+// (as zp_participant_modified does via priv) and must NOT do a g_sourcesMutex
+// source lookup around this call: that would nest g_sourcesMutex -> the
+// g_participantsMutex taken below, the opposite of ReconcileRememberedParticipants'
+// ordering (which never holds the two at once), and a latent deadlock. This
+// helper takes g_participantsMutex only, never g_sourcesMutex.
+static void RecordParticipantBinding(ZpSourceData* data, obs_data_t* settings) {
+    if (!settings) return;
     long long sel = obs_data_get_int(settings, "participant_id");
 
     if (sel > 1) {
@@ -2636,6 +2639,30 @@ static bool zp_participant_modified(void* priv, obs_properties_t* props,
         obs_data_set_string(settings, kParticipantNameKey, "");
         if (data) data->bound_this_session = false;
     }
+}
+
+// Fires ONLY when the user changes the participant dropdown in the properties
+// dialog (not on scene load / programmatic update) — exactly the "manual
+// selection" hook. Manual selection overrides and updates the remembered name
+// so it doesn't revert next session; picking a real participant (>1) records
+// their name and marks the binding live, while unselect (0) or [Active Speaker]
+// (1) clears the remembered name (clearing on unselect is what lets the user
+// actually unbind a present participant without ReconcileRememberedParticipants
+// immediately re-binding them). Writing the name only on a genuine user action
+// is deliberate: it avoids clobbering the durable name from a stale
+// participant_id loaded on OBS restart, whose runtime ID can collide with a
+// different present person.
+//
+// Thin wrapper over RecordParticipantBinding — the shared binding-record path.
+// Runs on the UI thread (properties-dialog modified callback), satisfying the
+// helper's UI-thread contract.
+static bool zp_participant_modified(void* priv, obs_properties_t* props,
+                                    obs_property_t* property,
+                                    obs_data_t* settings) {
+    (void)props;
+    (void)property;
+    ZpSourceData* data = static_cast<ZpSourceData*>(priv);
+    RecordParticipantBinding(data, settings);
     return false;  // settings change persists; no property layout change needed
 }
 
