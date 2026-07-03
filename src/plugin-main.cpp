@@ -2848,6 +2848,16 @@ static void RecordParticipantBinding(ZpSourceData* data, obs_data_t* settings) {
         obs_data_set_string(settings, kParticipantNameKey, "");
         if (data) data->bound_this_session = false;
     }
+
+    // Interactive assignment changed — refresh the participant dock. This is the
+    // per-user-pick choke point for every interactive UI (properties dropdown
+    // today, dock dropdown later), and it's the only assignment-mutation path
+    // not already covered by the RefreshAllSourceProperties co-located refresh
+    // (reconcile / grant / tier changes all route through that). Marshalled, so
+    // by the time Refresh() runs the new participant_id is already committed to
+    // the source's settings (the properties view edits the source's live
+    // settings object, so the combo write lands synchronously before this).
+    PostParticipantDockRefresh();
 }
 
 // Fires ONLY when the user changes the participant dropdown in the properties
