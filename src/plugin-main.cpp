@@ -37,6 +37,7 @@
 #include <QSignalBlocker>
 #include <QDateTime>
 #include <QInputDialog>
+#include <QComboBox>
 #include <QLineEdit>
 #include <QListWidget>
 #include <QListWidgetItem>
@@ -230,6 +231,9 @@ static void UpdateLoginLogoutMenuItem();
 // Marshal a read-only participant-dock rebuild onto the Qt UI thread. Safe to
 // call from any thread (defined after the dock class + g_participantDock).
 static void PostParticipantDockRefresh();
+// Dock combo pick handler — commit a participant reassignment for the source
+// with the given UUID (defined after RecordParticipantBinding; UI thread only).
+static void OnDockParticipantPicked(const std::string& uuid, long long selectedId);
 
 // ---------------------------------------------------------------------------
 // Per-source data
@@ -2021,6 +2025,8 @@ public:
         }
 
         struct Row {
+            std::string uuid;        // stable source id — the pick handler resolves
+                                     // combo -> source by this (name can change/collide)
             std::string name;        // OBS source name (copied — pointer not owned)
             long long   pid = 0;     // participant_id setting
             bool        disabled = false;  // tier_disabled (authoritative only when logged in)
@@ -2033,6 +2039,7 @@ public:
             for (ZpSourceData* s : g_allParticipantSources) {
                 if (!s || !s->source) continue;
                 Row r;
+                r.uuid = s->uuid;
                 const char* nm = obs_source_get_name(s->source);
                 r.name = nm ? nm : "";
                 // Only participant_id is needed for display; the remembered-name
@@ -2119,19 +2126,70 @@ public:
         }
 
         // Enabled (tier-active) rows on top, in vector = creation order. Logged
-        // out, no row is treated as disabled, so all render here. When not live,
-        // every row is greyed and forced to em-dash regardless of participant_id
-        // (including the active-speaker sentinel) — a shown name always means an
-        // actual live feed. When live, un-greyed with roster-only resolution.
+        // out, no row is treated as disabled, so all render here.
         for (const auto& r : rows) {
             if (loggedIn && r.disabled) continue;
-            QString assign = live ? ResolveAssignment(r.pid, roster)
-                                  : QString::fromUtf8("—");
-            QLabel* lbl = new QLabel(
-                QString::fromStdString(r.name) + "  →  " + assign);
-            lbl->setWordWrap(true);
-            if (!live) lbl->setStyleSheet("QLabel { color: #7a7d80; }");
-            m_root->addWidget(lbl);
+
+            if (!live) {
+                // Not live: greyed source name forced to an em-dash status
+                // regardless of participant_id (including the active-speaker
+                // sentinel) — a shown name always means an actual live feed.
+                QLabel* lbl = new QLabel(
+                    QString::fromStdString(r.name) + "  →  " + QString::fromUtf8("—"));
+                lbl->setWordWrap(true);
+                lbl->setStyleSheet("QLabel { color: #7a7d80; }");
+                m_root->addWidget(lbl);
+                continue;
+            }
+
+            // Live: source name + an interactive reassignment combo, populated
+            // identically to the properties dropdown (0 unselect / 1 [Active
+            // Speaker] / roster-minus-self by user id), each entry carrying its
+            // participant_id as item data. Built from the roster snapshot already
+            // taken above — no re-lock. A live row only exists when others are
+            // present, so this never hits the "Waiting for participants..." case.
+            QWidget* rowW = new QWidget();
+            QHBoxLayout* rowL = new QHBoxLayout(rowW);
+            rowL->setContentsMargins(0, 0, 0, 0);
+            rowL->setSpacing(6);
+
+            QLabel* nameLbl = new QLabel(QString::fromStdString(r.name));
+            nameLbl->setWordWrap(true);
+            rowL->addWidget(nameLbl);
+
+            QComboBox* combo = new QComboBox();
+            combo->addItem("--- Select Participant ---", QVariant((qulonglong)0));
+            combo->addItem("[Active Speaker]",           QVariant((qulonglong)1));
+            for (const auto& kv : roster) {
+                if (myId != 0 && kv.first == myId) continue;   // exclude self
+                combo->addItem(QString::fromStdString(kv.second),
+                               QVariant((qulonglong)kv.first));
+            }
+
+            // Initial selection from the committed participant_id. findData == -1
+            // (bound participant not in the current roster) leaves it on index 0,
+            // the "--- Select Participant ---" entry — matching the properties
+            // not-found behavior. Set BEFORE connecting so the programmatic index
+            // can never reach the handler.
+            int idx = combo->findData(QVariant((qulonglong)r.pid));
+            if (idx >= 0) combo->setCurrentIndex(idx);
+
+            // Connect to activated (genuine user interaction only) — NOT
+            // currentIndexChanged. activated never fires on setCurrentIndex /
+            // addItem / any programmatic change, so a full rebuild that recreates
+            // every combo and sets its index can't trigger a write: no
+            // pick -> write -> refresh loop, and an unrelated roster-change
+            // refresh can't silently rewrite a binding. Populate-then-connect is
+            // kept as redundant insurance; activated is the guarantee.
+            const std::string uuid = r.uuid;
+            QObject::connect(combo, QOverload<int>::of(&QComboBox::activated),
+                [combo, uuid](int) {
+                    OnDockParticipantPicked(
+                        uuid, (long long)combo->currentData().toULongLong());
+                });
+
+            rowL->addWidget(combo, /*stretch=*/1);
+            m_root->addWidget(rowW);
         }
 
         if (atOrOverCap) {
@@ -2173,21 +2231,6 @@ public:
     }
 
 private:
-    // Resolve participant_id to a display string, ROSTER-ONLY (no remembered-name
-    // fallback): 0 -> em-dash, 1 -> active speaker, >1 -> live roster name,
-    // not-in-roster -> em-dash. Only called for a live row; the caller forces
-    // em-dash for non-live rows before reaching here.
-    static QString ResolveAssignment(
-            long long pid,
-            const std::map<unsigned int, std::string>& roster) {
-        if (pid == 0) return QString::fromUtf8("—");            // —
-        if (pid == 1) return "[Active Speaker]";
-        auto it = roster.find((unsigned int)pid);
-        if (it != roster.end() && !it->second.empty())
-            return QString::fromStdString(it->second);
-        return QString::fromUtf8("—");                          // —
-    }
-
     // Remove every widget/spacer from the root layout so Refresh can rebuild.
     //
     // Widgets are DEFERRED-deleted (deleteLater), not deleted immediately.
@@ -2940,6 +2983,42 @@ static void RecordParticipantBinding(ZpSourceData* data, obs_data_t* settings) {
     // the source's settings (the properties view edits the source's live
     // settings object, so the combo write lands synchronously before this).
     PostParticipantDockRefresh();
+}
+
+// Commit a participant reassignment picked in the dock combo, reproducing the
+// properties path's binding sequence exactly so the two UIs are identical by
+// construction. UI-thread only (called from a QComboBox::activated slot).
+//
+// Reaches the source without g_sourcesMutex: obs_get_source_by_uuid returns an
+// addref'd source whose ref keeps the source AND its ZpSourceData alive for the
+// handler's duration (zp_destroy can't run while ref-held) — exactly how OBS
+// keeps the source alive during the properties modified-callback. ZpSourceData
+// comes from obs_obj_get_data (the create-returned instance data; borrowed, may
+// be null for a husk — RecordParticipantBinding null-guards it). Never touches
+// g_sourcesMutex, so the two locks are never nested; the helper locks only
+// g_participantsMutex internally with nothing held across it.
+//
+// Sequence order is load-bearing: set_int commits participant_id to the source's
+// LIVE settings object (obs_source_get_settings returns it, not a copy), so
+// RecordParticipantBinding then reads the just-committed id, and the deferred
+// zp_update (scheduled by obs_source_update on this VIDEO-flagged source) reads
+// it on the next graphics tick to drive the subscribe. The subscribe is
+// asynchronous — the engine has not been messaged when this returns; we don't
+// wait on or check it. RecordParticipantBinding already posts the single dock
+// refresh; the handler must not post another (double-rebuild).
+static void OnDockParticipantPicked(const std::string& uuid, long long selectedId) {
+    obs_source_t* src = obs_get_source_by_uuid(uuid.c_str());
+    if (!src) return;   // source destroyed since the combo was built — nothing to do
+
+    ZpSourceData* data = static_cast<ZpSourceData*>(obs_obj_get_data(src));
+    obs_data_t* settings = obs_source_get_settings(src);
+    if (settings) {
+        obs_data_set_int(settings, "participant_id", selectedId);
+        RecordParticipantBinding(data, settings);
+        obs_source_update(src, settings);
+        obs_data_release(settings);
+    }
+    obs_source_release(src);
 }
 
 // Fires ONLY when the user changes the participant dropdown in the properties
