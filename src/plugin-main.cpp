@@ -63,6 +63,8 @@
 #include <QCursor>
 #include <QMouseEvent>
 #include <QEnterEvent>
+#include <QResizeEvent>
+#include <QScrollArea>
 #include <QFontMetrics>
 #include <QUrl>
 #include <QUrlQuery>
@@ -1987,6 +1989,34 @@ private:
 // this only so the chat_message IPC handler can route messages to it.
 static FeedsChatDock* g_chatDock = nullptr;
 
+// Single-line label that elides its (full) text to the current width with a
+// trailing ellipsis and carries the full text as a tooltip. Used for source-box
+// headers so a long source name never wraps (wrapping makes box heights jump) —
+// it stays one line and truncates with "…", re-eliding as the dock is resized.
+// minimumSizeHint width is 0 so a long name can't force the box (or the dock)
+// wider; the box shrinks to the dock width and the header elides to fit.
+class ElidingLabel : public QLabel {
+public:
+    explicit ElidingLabel(const QString& text, QWidget* parent = nullptr)
+        : QLabel(parent), m_full(text) {
+        setToolTip(text);
+        setTextFormat(Qt::PlainText);
+        QLabel::setText(text);   // re-elided on first resizeEvent
+    }
+    QSize minimumSizeHint() const override {
+        return QSize(0, QFontMetrics(font()).height());
+    }
+protected:
+    void resizeEvent(QResizeEvent* e) override {
+        QLabel::resizeEvent(e);
+        // Elide against the content width (inside this label's own margins).
+        QFontMetrics fm(fontMetrics());
+        QLabel::setText(fm.elidedText(m_full, Qt::ElideRight, contentsRect().width()));
+    }
+private:
+    QString m_full;
+};
+
 // ---------------------------------------------------------------------------
 // Read-only participant dock — lists every participant source and its current
 // assignment, live-reacting to roster / source / tier changes. Phase 1: no
@@ -1996,11 +2026,35 @@ static FeedsChatDock* g_chatDock = nullptr;
 class FeedsParticipantDock : public QWidget {
 public:
     explicit FeedsParticipantDock(QWidget* parent = nullptr) : QWidget(parent) {
-        m_root = new QVBoxLayout(this);
+        // A scroll area wraps the content so a tall stack (several boxes + cap
+        // chrome + upgrade prompt) can overflow the dock height reachably. Matches
+        // the chat dock's QListWidget behavior: vertical scrollbar only when the
+        // content overflows; horizontal scrolling off (single-column boxes track
+        // the viewport width and elide). The boxes live in the inner content
+        // widget's layout (m_root), NOT the dock's outer layout — ClearContent
+        // walks m_root, so it still sees exactly the boxes/divider/chrome.
+        QVBoxLayout* outer = new QVBoxLayout(this);
+        outer->setContentsMargins(0, 0, 0, 0);
+        outer->setSpacing(0);
+
+        QScrollArea* scroll = new QScrollArea(this);
+        scroll->setWidgetResizable(true);
+        scroll->setFrameShape(QFrame::NoFrame);
+        scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        scroll->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+
+        QWidget* content = new QWidget();
+        m_root = new QVBoxLayout(content);
         m_root->setContentsMargins(8, 8, 8, 8);
-        m_root->setSpacing(4);
+        m_root->setSpacing(8);   // between boxes/chrome; box-internal spacing is tighter
         m_root->setAlignment(Qt::AlignTop);
-        setMinimumSize(200, 300);
+
+        scroll->setWidget(content);
+        outer->addWidget(scroll);
+
+        // Width is derived from the live theme/font in Refresh() (setMinimumWidth
+        // on the dock root, propagating to the QDockWidget). Height floor as before.
+        setMinimumHeight(300);
         Refresh();
     }
 
@@ -2024,13 +2078,6 @@ public:
                 roster[p.id] = p.name;
         }
 
-        struct Row {
-            std::string uuid;        // stable source id — the pick handler resolves
-                                     // combo -> source by this (name can change/collide)
-            std::string name;        // OBS source name (copied — pointer not owned)
-            long long   pid = 0;     // participant_id setting
-            bool        disabled = false;  // tier_disabled (authoritative only when logged in)
-        };
         std::vector<Row> rows;
         size_t sourceCount = 0;
         {
@@ -2084,6 +2131,14 @@ public:
         // multi-source logged-out user as over-cap). Independent of meeting state.
         const bool   atOrOverCap = loggedIn && (sourceCount >= (size_t)maxFeeds);
 
+        // Derive the dock's minimum width from the live theme/font so a box's
+        // single column (header + combo) is comfortable with margin — not tight
+        // on the current setup, not clipping on a larger-font theme. Set on the
+        // dock root (propagates to the QDockWidget), only when it actually changes
+        // (theme/font change), so normal refreshes don't churn geometry.
+        int mw = ComputeMinDockWidth();
+        if (mw != m_minWidth) { m_minWidth = mw; setMinimumWidth(mw); }
+
         ClearContent();
 
         // Top slot — three states, mirroring the properties dialog's single
@@ -2125,71 +2180,15 @@ public:
             return;
         }
 
-        // Enabled (tier-active) rows on top, in vector = creation order. Logged
-        // out, no row is treated as disabled, so all render here.
+        // Enabled (tier-active) sources on top, in vector = creation order,
+        // each a self-contained framed box. Logged out, no row is treated as
+        // disabled, so all render here. A live source is an interactive box
+        // (header + functional combo); a non-live one is the same box greyed and
+        // combo-less (header + "→ —") so its identity/position stays stable across
+        // the live/non-live flip rather than the box appearing/disappearing.
         for (const auto& r : rows) {
             if (loggedIn && r.disabled) continue;
-
-            if (!live) {
-                // Not live: greyed source name forced to an em-dash status
-                // regardless of participant_id (including the active-speaker
-                // sentinel) — a shown name always means an actual live feed.
-                QLabel* lbl = new QLabel(
-                    QString::fromStdString(r.name) + "  →  " + QString::fromUtf8("—"));
-                lbl->setWordWrap(true);
-                lbl->setStyleSheet("QLabel { color: #7a7d80; }");
-                m_root->addWidget(lbl);
-                continue;
-            }
-
-            // Live: source name + an interactive reassignment combo, populated
-            // identically to the properties dropdown (0 unselect / 1 [Active
-            // Speaker] / roster-minus-self by user id), each entry carrying its
-            // participant_id as item data. Built from the roster snapshot already
-            // taken above — no re-lock. A live row only exists when others are
-            // present, so this never hits the "Waiting for participants..." case.
-            QWidget* rowW = new QWidget();
-            QHBoxLayout* rowL = new QHBoxLayout(rowW);
-            rowL->setContentsMargins(0, 0, 0, 0);
-            rowL->setSpacing(6);
-
-            QLabel* nameLbl = new QLabel(QString::fromStdString(r.name));
-            nameLbl->setWordWrap(true);
-            rowL->addWidget(nameLbl);
-
-            QComboBox* combo = new QComboBox();
-            combo->addItem("--- Select Participant ---", QVariant((qulonglong)0));
-            combo->addItem("[Active Speaker]",           QVariant((qulonglong)1));
-            for (const auto& kv : roster) {
-                if (myId != 0 && kv.first == myId) continue;   // exclude self
-                combo->addItem(QString::fromStdString(kv.second),
-                               QVariant((qulonglong)kv.first));
-            }
-
-            // Initial selection from the committed participant_id. findData == -1
-            // (bound participant not in the current roster) leaves it on index 0,
-            // the "--- Select Participant ---" entry — matching the properties
-            // not-found behavior. Set BEFORE connecting so the programmatic index
-            // can never reach the handler.
-            int idx = combo->findData(QVariant((qulonglong)r.pid));
-            if (idx >= 0) combo->setCurrentIndex(idx);
-
-            // Connect to activated (genuine user interaction only) — NOT
-            // currentIndexChanged. activated never fires on setCurrentIndex /
-            // addItem / any programmatic change, so a full rebuild that recreates
-            // every combo and sets its index can't trigger a write: no
-            // pick -> write -> refresh loop, and an unrelated roster-change
-            // refresh can't silently rewrite a binding. Populate-then-connect is
-            // kept as redundant insurance; activated is the guarantee.
-            const std::string uuid = r.uuid;
-            QObject::connect(combo, QOverload<int>::of(&QComboBox::activated),
-                [combo, uuid](int) {
-                    OnDockParticipantPicked(
-                        uuid, (long long)combo->currentData().toULongLong());
-                });
-
-            rowL->addWidget(combo, /*stretch=*/1);
-            m_root->addWidget(rowW);
+            m_root->addWidget(MakeSourceBox(r, live, myId, roster));
         }
 
         if (atOrOverCap) {
@@ -2231,6 +2230,112 @@ public:
     }
 
 private:
+    // Plain-value snapshot of one participant source (no OBS/Qt handles retained).
+    struct Row {
+        std::string uuid;        // stable source id — the pick handler resolves
+                                 // combo -> source by this (name can change/collide)
+        std::string name;        // OBS source name (copied — pointer not owned)
+        long long   pid = 0;     // participant_id setting
+        bool        disabled = false;  // tier_disabled (authoritative only when logged in)
+    };
+
+    // Build one enabled source's framed box. Live -> header + functional combo;
+    // non-live -> the same box greyed and combo-less (header + "→ —"). A QFrame
+    // container (not QGroupBox: that renders inconsistently across OBS themes and
+    // its title isn't a swappable widget for the later rename). Frame border and
+    // header fill use semi-transparent neutral greys so one rule reads on both
+    // dark and light themes; the non-live frame is dimmed (lower alpha) so a
+    // greyed source doesn't read as more prominent than an active one.
+    QWidget* MakeSourceBox(const Row& r, bool live, unsigned int myId,
+                           const std::map<unsigned int, std::string>& roster) {
+        QFrame* box = new QFrame();
+        box->setObjectName("feedsSourceBox");
+        box->setStyleSheet(QString(
+            "QFrame#feedsSourceBox { border: 1px solid rgba(128,128,128,%1);"
+            " border-radius: 4px; }").arg(live ? "0.40" : "0.22"));
+
+        QVBoxLayout* boxL = new QVBoxLayout(box);
+        boxL->setContentsMargins(8, 6, 8, 8);
+        boxL->setSpacing(4);   // tight header <-> combo so the box reads as one unit
+
+        // Header — a swappable child QLabel (objectName so the later
+        // double-click-to-edit increment can find/replace it), not a frame
+        // decoration. Elides to one line with the full name in a tooltip.
+        ElidingLabel* header = new ElidingLabel(QString::fromStdString(r.name));
+        header->setObjectName("feedsSourceHeader");
+        header->setStyleSheet(QString(
+            "QLabel#feedsSourceHeader { background: rgba(128,128,128,0.15);"
+            " border-radius: 3px; padding: 3px 6px; font-weight: bold;%1 }")
+            .arg(live ? "" : " color: #7a7d80;"));
+        boxL->addWidget(header);
+
+        if (!live) {
+            // Non-live: greyed em-dash status in place of the combo.
+            QLabel* status = new QLabel(QString::fromUtf8("→  —"));
+            status->setStyleSheet("QLabel { color: #7a7d80; }");
+            boxL->addWidget(status);
+            return box;
+        }
+
+        // Live: the functional combo, populated identically to the properties
+        // dropdown (0 unselect / 1 [Active Speaker] / roster-minus-self by user
+        // id), each entry carrying its participant_id as item data. Built from
+        // the roster snapshot — no re-lock. A live row only exists when others
+        // are present, so this never hits the "Waiting for participants..." case.
+        QComboBox* combo = new QComboBox();
+        combo->addItem("--- Select Participant ---", QVariant((qulonglong)0));
+        combo->addItem("[Active Speaker]",           QVariant((qulonglong)1));
+        for (const auto& kv : roster) {
+            if (myId != 0 && kv.first == myId) continue;   // exclude self
+            combo->addItem(QString::fromStdString(kv.second),
+                           QVariant((qulonglong)kv.first));
+        }
+
+        // Initial selection from the committed participant_id. findData == -1
+        // (bound participant not in the current roster) leaves it on index 0,
+        // the "--- Select Participant ---" entry — matching the properties
+        // not-found behavior. Set BEFORE connecting so the programmatic index
+        // can never reach the handler.
+        int idx = combo->findData(QVariant((qulonglong)r.pid));
+        if (idx >= 0) combo->setCurrentIndex(idx);
+
+        // Connect to activated (genuine user interaction only) — NOT
+        // currentIndexChanged. activated never fires on setCurrentIndex /
+        // addItem / any programmatic change, so a full rebuild that recreates
+        // every combo and sets its index can't trigger a write: no
+        // pick -> write -> refresh loop, and an unrelated roster-change refresh
+        // can't silently rewrite a binding. Populate-then-connect is redundant
+        // insurance; activated is the guarantee.
+        const std::string uuid = r.uuid;
+        QObject::connect(combo, QOverload<int>::of(&QComboBox::activated),
+            [combo, uuid](int) {
+                OnDockParticipantPicked(
+                    uuid, (long long)combo->currentData().toULongLong());
+            });
+        boxL->addWidget(combo);
+        return box;
+    }
+
+    // Derive a comfortable dock minimum width from the live theme/font: measure a
+    // representative worst-case combo and source-name header (sizeHint, which
+    // includes themed padding/frame/arrow at the current font), take the wider,
+    // add box + root margins and a comfort margin. Recomputed per Refresh so it
+    // tracks a theme/font change; the caller only re-applies it when it changes.
+    static int ComputeMinDockWidth() {
+        QComboBox probe;
+        probe.addItem(QStringLiteral("Jonathan Featherstonehaugh (Guest)"));
+        probe.ensurePolished();
+        const int comboW = probe.sizeHint().width();
+
+        QLabel hdr(QStringLiteral("Jonathan Featherstonehaugh Camera"));
+        hdr.ensurePolished();
+        const int hdrW = hdr.sizeHint().width();
+
+        const int contentW = qMax(comboW, hdrW);
+        // box contents margins (8+8) + frame (2) + root layout margins (8+8) + comfort.
+        return contentW + 16 + 2 + 16 + 24;
+    }
+
     // Remove every widget/spacer from the root layout so Refresh can rebuild.
     //
     // Widgets are DEFERRED-deleted (deleteLater), not deleted immediately.
@@ -2244,16 +2349,22 @@ private:
     // hardening landed in isolation, before any interactive widget exists.
     //
     // takeAt removes the widget from layout management but leaves it parented to
-    // this dock at its last geometry, so a deferred-deleted widget would render
-    // on top of the rebuilt content for one event-loop turn (a ghost/overlap).
-    // hide() it immediately to stop that render now while the free stays
-    // deferred; hide() only flips visibility (frees nothing), so it's safe to
-    // call from within a widget's own slot and preserves the point of deleteLater.
+    // the scrolled content widget at its last geometry, so a deferred-deleted
+    // widget would render on top of the rebuilt content for one event-loop turn
+    // (a ghost/overlap). hide() it immediately to stop that render now while the
+    // free stays deferred; hide() only flips visibility (frees nothing), so it's
+    // safe to call from a widget's own slot and preserves the point of deleteLater.
     //
     // No unbounded pending-delete pile: each Refresh runs to completion and
     // arrives via its own singleShot(0), so the event loop turns (processing
     // DeferredDelete events) between successive refreshes — at most ~one refresh
     // of widgets is ever awaiting free, even under rapid roster/meeting/tier churn.
+    //
+    // Enumerates only m_root (the inner content layout), so each item is a box /
+    // divider / prompt / top-slot widget at that level — never a box's nested
+    // header or combo. Each box is one QObject whose deleteLater frees its header
+    // and combo transitively (they're parented into the box by its layout), so a
+    // box's children are freed exactly once, none orphaned, no combo surviving.
     //
     // The QLayoutItem wrappers are not QObjects (no deleteLater) — keep deleting
     // those immediately; only the widget's own free is deferred.
@@ -2268,7 +2379,8 @@ private:
         }
     }
 
-    QVBoxLayout* m_root = nullptr;
+    QVBoxLayout* m_root = nullptr;   // inner (scrolled) content layout; boxes live here
+    int          m_minWidth = 0;     // last-applied theme-derived dock min width
 };
 
 // Non-owning pointer to the participant dock — same ownership model as
