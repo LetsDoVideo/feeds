@@ -2009,8 +2009,13 @@ public:
         // touching g_sourcesMutex — never nest the two (matches
         // ReconcileRememberedParticipants' ordering).
         std::map<unsigned int, std::string> roster;
+        unsigned int myId = 0;
         {
             std::lock_guard<std::mutex> lock(g_participantsMutex);
+            // g_cachedMyUserId is guarded by g_participantsMutex (same as the
+            // roster) — capture it here, in the same locked block, to exclude
+            // self from the "others present" count below (mirrors zp_properties).
+            myId = g_cachedMyUserId;
             for (const auto& p : g_cachedParticipants)
                 roster[p.id] = p.name;
         }
@@ -2047,16 +2052,25 @@ public:
 
         const bool   loggedIn    = g_isLoggedIn;
         const bool   inMeeting   = g_isInMeeting;
+        const bool   granted     = (g_rawPrivilegeState == RawPrivilegeState::Granted);
+        // Others present: roster entries excluding self (myId). Same count the
+        // properties dialog uses to decide between a live dropdown and the
+        // "Waiting for participants..." state. Computed from the released roster
+        // snapshot — no lock held here.
+        size_t othersPresent = 0;
+        for (const auto& kv : roster)
+            if (myId == 0 || kv.first != myId) ++othersPresent;
+
         // "Live" is the single per-Refresh authority for un-greying rows and
-        // showing roster names: in a meeting AND raw-livestream privilege
-        // granted — the exact condition the properties dialog uses to decide it
-        // can show a live dropdown, so dock and properties agree on "live". The
-        // post-join / pre-grant window (inMeeting true, not yet granted) is not
-        // live: no button (we're in a meeting) and greyed rows — "connected,
-        // feeds coming up". Evaluated once here so every row keys off the same
-        // value; no row can read live while another reads greyed.
-        const bool   live        = inMeeting &&
-                                   (g_rawPrivilegeState == RawPrivilegeState::Granted);
+        // showing roster names: in a meeting, raw-livestream privilege granted,
+        // AND at least one other participant present — matching the properties
+        // dialog, which omits the live dropdown (and the [Active Speaker] entry)
+        // while alone. Connected-but-alone and the post-join / pre-grant window
+        // are both non-live: greyed rows — "connected, feeds coming up". The
+        // others-present clause is what hides "[Active Speaker]" until someone
+        // joins, with no special-casing of pid == 1. Evaluated once here so every
+        // row keys off the same value; no row can read live while another greyed.
+        const bool   live        = inMeeting && granted && (othersPresent > 0);
         const int    maxFeeds    = GetMaxFeedsForTier();
         // Cap chrome only when logged in (logged out, tier defaults to a cap of
         // 1 and tier_disabled is not authoritative, which would falsely read a
@@ -2065,11 +2079,17 @@ public:
 
         ClearContent();
 
-        // Top state button — shown whenever not in a meeting, independent of row
-        // content (renders above the empty-state hint too). Split on login state
-        // only; no tier lock (this dock is not tier-gated, so a Free user sees
-        // and uses it). Same labels/actions as the properties dialog's buttons.
+        // Top slot — three states, mirroring the properties dialog's single
+        // state-driven top slot:
+        //   not in a meeting            -> connect/login button
+        //   in a meeting, granted, alone-> greyed "Waiting for participants..."
+        //   live (other participant)    -> neither
+        // The pre-grant window (in a meeting, not granted) shows neither.
         if (!inMeeting) {
+            // Button independent of row content (renders above the empty-state
+            // hint too). Split on login state only; no tier lock (this dock is
+            // not tier-gated, so a Free user sees and uses it). Same labels/
+            // actions as the properties dialog's buttons.
             QPushButton* btn = new QPushButton(
                 loggedIn ? "Logged in. Click to Connect to Zoom Meeting."
                          : "Not logged in to Zoom. Click to Login.");
@@ -2078,6 +2098,13 @@ public:
             else
                 QObject::connect(btn, &QPushButton::clicked, []() { OnLoginClick(); });
             m_root->addWidget(btn);
+        } else if (granted && othersPresent == 0) {
+            // Connected but alone — one greyed waiting line at the top (not per
+            // row). Same string and #7a7d80 styling as the properties dialog.
+            QLabel* waiting = new QLabel("Waiting for participants...");
+            waiting->setStyleSheet("QLabel { color: #7a7d80; }");
+            waiting->setWordWrap(true);
+            m_root->addWidget(waiting);
         }
 
         if (rows.empty()) {
