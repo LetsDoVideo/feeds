@@ -2188,14 +2188,39 @@ private:
         return QString::fromUtf8("—");                          // —
     }
 
-    // Delete every widget/spacer currently in the root layout so Refresh can
-    // rebuild from scratch. Runs on the UI thread inside a timer callback (never
-    // re-enters a child's slot), so immediate delete is safe and avoids ghost
-    // widgets lingering until a deferred delete.
+    // Remove every widget/spacer from the root layout so Refresh can rebuild.
+    //
+    // Widgets are DEFERRED-deleted (deleteLater), not deleted immediately.
+    // Today's read-only widget set emits nothing re-entrant and every Refresh
+    // arrives via a queued singleShot(0), so immediate delete would be safe now
+    // — but Phase 2 adds an interactive QComboBox, and a teardown that fires
+    // while that combo is mid-signal-emission must not free it out from under
+    // its own executing slot. deleteLater defers the free until the current slot
+    // unwinds and the event loop turns, making teardown safe regardless of what
+    // the write path (or OBS internals it calls) does. This is forward-looking
+    // hardening landed in isolation, before any interactive widget exists.
+    //
+    // takeAt removes the widget from layout management but leaves it parented to
+    // this dock at its last geometry, so a deferred-deleted widget would render
+    // on top of the rebuilt content for one event-loop turn (a ghost/overlap).
+    // hide() it immediately to stop that render now while the free stays
+    // deferred; hide() only flips visibility (frees nothing), so it's safe to
+    // call from within a widget's own slot and preserves the point of deleteLater.
+    //
+    // No unbounded pending-delete pile: each Refresh runs to completion and
+    // arrives via its own singleShot(0), so the event loop turns (processing
+    // DeferredDelete events) between successive refreshes — at most ~one refresh
+    // of widgets is ever awaiting free, even under rapid roster/meeting/tier churn.
+    //
+    // The QLayoutItem wrappers are not QObjects (no deleteLater) — keep deleting
+    // those immediately; only the widget's own free is deferred.
     void ClearContent() {
         QLayoutItem* item;
         while ((item = m_root->takeAt(0)) != nullptr) {
-            if (QWidget* w = item->widget()) delete w;
+            if (QWidget* w = item->widget()) {
+                w->hide();
+                w->deleteLater();
+            }
             delete item;
         }
     }
