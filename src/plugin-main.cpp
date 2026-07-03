@@ -53,6 +53,7 @@
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QGridLayout>
+#include <QFrame>
 #include <QImage>
 #include <QPixmap>
 #include <QSvgRenderer>
@@ -226,6 +227,9 @@ void OnLoginClick();
 void OnLogoutClick();
 void OnConnectClick();
 static void UpdateLoginLogoutMenuItem();
+// Marshal a read-only participant-dock rebuild onto the Qt UI thread. Safe to
+// call from any thread (defined after the dock class + g_participantDock).
+static void PostParticipantDockRefresh();
 
 // ---------------------------------------------------------------------------
 // Per-source data
@@ -639,6 +643,13 @@ static void RefreshAllSourceProperties() {
         }
         return true;
     }, nullptr);
+
+    // Co-located dock rebuild: every RefreshAllSourceProperties call site (roster
+    // change, meeting join/leave, login/logout/expiry, all raw-privilege
+    // transitions, and tier/cap change) also needs the participant dock rebuilt.
+    // This runs only from UI-thread contexts, but PostParticipantDockRefresh
+    // marshals uniformly regardless.
+    PostParticipantDockRefresh();
 }
 
 // (Re)subscribe a participant source to its currently-bound participant, if it
@@ -1973,6 +1984,185 @@ private:
 static FeedsChatDock* g_chatDock = nullptr;
 
 // ---------------------------------------------------------------------------
+// Read-only participant dock — lists every participant source and its current
+// assignment, live-reacting to roster / source / tier changes. Phase 1: no
+// dropdown, no create button (later phases). Rebuilds its whole content on
+// each Refresh() from a lock-safe snapshot.
+// ---------------------------------------------------------------------------
+class FeedsParticipantDock : public QWidget {
+public:
+    explicit FeedsParticipantDock(QWidget* parent = nullptr) : QWidget(parent) {
+        m_root = new QVBoxLayout(this);
+        m_root->setContentsMargins(8, 8, 8, 8);
+        m_root->setSpacing(4);
+        m_root->setAlignment(Qt::AlignTop);
+        setMinimumSize(200, 300);
+        Refresh();
+    }
+
+    // MUST run on the Qt UI thread (mutates widgets). All callers marshal via
+    // PostParticipantDockRefresh. The gather half takes the two mutexes; the
+    // build half touches Qt only after both are released.
+    void Refresh() {
+        // --- Gather a plain-value snapshot (no OBS/Qt handles retained) ---
+        // Roster copy first, under g_participantsMutex, then release it before
+        // touching g_sourcesMutex — never nest the two (matches
+        // ReconcileRememberedParticipants' ordering).
+        std::map<unsigned int, std::string> roster;
+        {
+            std::lock_guard<std::mutex> lock(g_participantsMutex);
+            for (const auto& p : g_cachedParticipants)
+                roster[p.id] = p.name;
+        }
+
+        struct Row {
+            std::string name;        // OBS source name (copied — pointer not owned)
+            long long   pid = 0;     // participant_id setting
+            std::string remembered;  // kParticipantNameKey fallback
+            bool        disabled = false;  // tier_disabled (authoritative only when logged in)
+        };
+        std::vector<Row> rows;
+        size_t sourceCount = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_sourcesMutex);
+            sourceCount = g_allParticipantSources.size();
+            for (ZpSourceData* s : g_allParticipantSources) {
+                if (!s || !s->source) continue;
+                Row r;
+                const char* nm = obs_source_get_name(s->source);
+                r.name = nm ? nm : "";
+                // obs_source_get_settings is refcounted — release each iteration.
+                obs_data_t* st = obs_source_get_settings(s->source);
+                if (st) {
+                    r.pid = obs_data_get_int(st, "participant_id");
+                    const char* rem = obs_data_get_string(st, kParticipantNameKey);
+                    r.remembered = rem ? rem : "";
+                    obs_data_release(st);
+                }
+                r.disabled = s->tier_disabled;
+                rows.push_back(std::move(r));
+            }
+        }
+        // --- Both mutexes released. From here on, Qt only. ---
+
+        const bool   loggedIn    = g_isLoggedIn;
+        const int    maxFeeds    = GetMaxFeedsForTier();
+        // Cap chrome only when logged in (logged out, tier defaults to a cap of
+        // 1 and tier_disabled is not authoritative, which would falsely read a
+        // multi-source logged-out user as over-cap).
+        const bool   atOrOverCap = loggedIn && (sourceCount >= (size_t)maxFeeds);
+
+        ClearContent();
+
+        if (rows.empty()) {
+            QLabel* empty = new QLabel(
+                "No Zoom Participant sources yet.\n"
+                "Add one from the Sources dock (+ → Zoom Participant).");
+            empty->setWordWrap(true);
+            empty->setStyleSheet("QLabel { color: #7a7d80; }");
+            m_root->addWidget(empty);
+            m_root->addStretch(1);
+            return;
+        }
+
+        // Enabled (tier-active) rows on top, in vector = creation order. Logged
+        // out, no row is treated as disabled, so all render here.
+        for (const auto& r : rows) {
+            if (loggedIn && r.disabled) continue;
+            QString assign = ResolveAssignment(r.pid, r.remembered, roster);
+            QLabel* lbl = new QLabel(
+                QString::fromStdString(r.name) + "  →  " + assign);
+            lbl->setWordWrap(true);
+            m_root->addWidget(lbl);
+        }
+
+        if (atOrOverCap) {
+            QFrame* line = new QFrame();
+            line->setFrameShape(QFrame::HLine);
+            line->setFrameShadow(QFrame::Sunken);
+            m_root->addWidget(line);
+
+            // Over-cap sources: greyed name only, no assignment, no controls.
+            // Empty at exactly-cap — then only the prompt sits below the divider.
+            for (const auto& r : rows) {
+                if (!(loggedIn && r.disabled)) continue;
+                QLabel* lbl = new QLabel(QString::fromStdString(r.name));
+                lbl->setStyleSheet("QLabel { color: #7a7d80; }");
+                lbl->setWordWrap(true);
+                m_root->addWidget(lbl);
+            }
+
+            // One shared, group-level upgrade prompt pinned at the bottom.
+            QLabel* msg = new QLabel(
+                QString("Your current plan allows %1 participant source%2. "
+                        "Upgrade to activate more feeds.")
+                    .arg(maxFeeds)
+                    .arg(maxFeeds == 1 ? "" : "s"));
+            msg->setWordWrap(true);
+            m_root->addWidget(msg);
+
+            QPushButton* btn =
+                new QPushButton("Upgrade your plan to activate more feeds");
+            // Same upgrade destination as the properties-dialog upgrade button.
+            QObject::connect(btn, &QPushButton::clicked, []() {
+                QDesktopServices::openUrl(
+                    QUrl("https://letsdovideo.com/feeds-upgrade"));
+            });
+            m_root->addWidget(btn);
+        }
+
+        m_root->addStretch(1);
+    }
+
+private:
+    // Resolve participant_id to a display string: 0 -> unassigned, 1 -> active
+    // speaker, >1 -> live roster name, else remembered name, else "—".
+    static QString ResolveAssignment(
+            long long pid,
+            const std::string& remembered,
+            const std::map<unsigned int, std::string>& roster) {
+        if (pid == 0) return QString::fromUtf8("—");            // —
+        if (pid == 1) return "[Active Speaker]";
+        auto it = roster.find((unsigned int)pid);
+        if (it != roster.end() && !it->second.empty())
+            return QString::fromStdString(it->second);
+        if (!remembered.empty())
+            return QString::fromStdString(remembered);
+        return QString::fromUtf8("—");                          // —
+    }
+
+    // Delete every widget/spacer currently in the root layout so Refresh can
+    // rebuild from scratch. Runs on the UI thread inside a timer callback (never
+    // re-enters a child's slot), so immediate delete is safe and avoids ghost
+    // widgets lingering until a deferred delete.
+    void ClearContent() {
+        QLayoutItem* item;
+        while ((item = m_root->takeAt(0)) != nullptr) {
+            if (QWidget* w = item->widget()) delete w;
+            delete item;
+        }
+    }
+
+    QVBoxLayout* m_root = nullptr;
+};
+
+// Non-owning pointer to the participant dock — same ownership model as
+// g_chatDock (OBS owns the widget after registration). Read as the QObject
+// context for marshalled refreshes so a destroyed widget auto-cancels them.
+static FeedsParticipantDock* g_participantDock = nullptr;
+
+static void PostParticipantDockRefresh() {
+    if (!g_participantDock) return;
+    // Marshal onto the dock's (UI) thread. Using the dock itself as the context
+    // object means the queued call auto-cancels if OBS destroys the widget —
+    // the primary guard against a shutdown-time use-after-free, since source
+    // destroy (which posts these) runs on OBS's destruction worker thread.
+    QTimer::singleShot(0, g_participantDock, []() {
+        if (g_participantDock) g_participantDock->Refresh();
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Avatar cache
 // ---------------------------------------------------------------------------
 // Populated by the chat_message IPC handler as messages arrive (one entry
@@ -2049,6 +2239,14 @@ static void SetupChatDock() {
     obs_frontend_add_dock_by_id(
         "feeds_chat_dock", "Zoom Chat", g_chatDock);
     blog(LOG_INFO, "[feeds] chat dock registered");
+}
+
+static void SetupParticipantDock() {
+    // Stable id — never change this across versions (see SetupChatDock).
+    g_participantDock = new FeedsParticipantDock();
+    obs_frontend_add_dock_by_id(
+        "feeds_participant_dock", "Zoom Participants", g_participantDock);
+    blog(LOG_INFO, "[feeds] participant dock registered");
 }
 
 // Push the global ISO-recording state to every active participant source's
@@ -2399,6 +2597,10 @@ static void* zp_create(obs_data_t* settings, obs_source_t* source) {
                 (data->source_position > GetMaxFeedsForTier());
     }
 
+    // A new source joined the registry — rebuild the participant dock. Marshalled
+    // to the UI thread; the new source shows as unassigned until it's bound.
+    PostParticipantDockRefresh();
+
     // Per-source ISO recorder. The name hook reads this source's selected
     // participant; the tier seed gates recording until the user is Basic+.
     // Seed the enabled state from the global toggle so a source created
@@ -2442,6 +2644,13 @@ static void zp_destroy(void* vdata) {
             if (it != g_allParticipantSources.end())
                 g_allParticipantSources.erase(it);
         }
+
+        // Source left the registry — rebuild the dock. Captures nothing
+        // source-specific (this ZpSourceData is about to be deleted); the
+        // marshalled Refresh runs on the UI thread AFTER this erase, so its
+        // re-snapshot already excludes the dead source. zp_destroy runs on
+        // OBS's destruction worker thread, so marshalling is mandatory here.
+        PostParticipantDockRefresh();
 
         // Tear down the ISO recorder while the source is still valid (it
         // borrows the source pointer). Synchronous, drain-aware, bounded.
@@ -4463,6 +4672,18 @@ static void OnSourceCreated(void* /*data*/, calldata_t* cd) {
     }).detach();
 }
 
+// Global source_rename signal handler — the participant dock shows OBS source
+// names, so a rename must rebuild it. Filtered to our participant source type
+// (same id check OnSourceCreated uses). Fires on whatever thread renamed the
+// source; PostParticipantDockRefresh marshals to the UI thread.
+static void OnSourceRenamed(void* /*data*/, calldata_t* cd) {
+    obs_source_t* source = (obs_source_t*)calldata_ptr(cd, "source");
+    if (!source) return;
+    const char* id = obs_source_get_id(source);
+    if (!id || strcmp(id, "zoom_participant_source") != 0) return;
+    PostParticipantDockRefresh();
+}
+
 // ---------------------------------------------------------------------------
 // Module load/unload
 // ---------------------------------------------------------------------------
@@ -4505,6 +4726,9 @@ bool obs_module_load(void) {
     signal_handler_t* sh = obs_get_signal_handler();
     if (sh) {
         signal_handler_connect(sh, "source_create", OnSourceCreated, nullptr);
+        // Participant dock reacts to OBS source renames (create/destroy are
+        // driven from zp_create/zp_destroy directly). Disconnected in unload.
+        signal_handler_connect(sh, "source_rename", OnSourceRenamed, nullptr);
     }
 
     feeds::StartEngine();
@@ -4519,6 +4743,7 @@ bool obs_module_load(void) {
     // (Countdown, AudioMonitor, DSK) all do dock registration here for the
     // same reason.
     SetupChatDock();
+    SetupParticipantDock();
 
     obs_frontend_add_event_callback([](enum obs_frontend_event event, void*) {
         if (event == OBS_FRONTEND_EVENT_FINISHED_LOADING) {
@@ -4536,6 +4761,11 @@ void obs_module_unload(void) {
     signal_handler_t* sh = obs_get_signal_handler();
     if (sh) {
         signal_handler_disconnect(sh, "source_create", OnSourceCreated, nullptr);
+        // Stop posting dock refreshes during teardown. Combined with the
+        // dock-as-context single-shot (auto-cancels on widget destruction) and
+        // the g_participantDock null-check, this closes the shutdown-time
+        // use-after-free window as OBS destroys every source in a burst.
+        signal_handler_disconnect(sh, "source_rename", OnSourceRenamed, nullptr);
     }
     if (g_updateCheckThread.joinable()) g_updateCheckThread.join();
 
