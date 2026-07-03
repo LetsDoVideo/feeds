@@ -2018,7 +2018,6 @@ public:
         struct Row {
             std::string name;        // OBS source name (copied — pointer not owned)
             long long   pid = 0;     // participant_id setting
-            std::string remembered;  // kParticipantNameKey fallback
             bool        disabled = false;  // tier_disabled (authoritative only when logged in)
         };
         std::vector<Row> rows;
@@ -2031,12 +2030,13 @@ public:
                 Row r;
                 const char* nm = obs_source_get_name(s->source);
                 r.name = nm ? nm : "";
-                // obs_source_get_settings is refcounted — release each iteration.
+                // Only participant_id is needed for display; the remembered-name
+                // key (kParticipantNameKey) is no longer a display input (names
+                // come from the live roster only). obs_source_get_settings is
+                // refcounted — release each iteration.
                 obs_data_t* st = obs_source_get_settings(s->source);
                 if (st) {
                     r.pid = obs_data_get_int(st, "participant_id");
-                    const char* rem = obs_data_get_string(st, kParticipantNameKey);
-                    r.remembered = rem ? rem : "";
                     obs_data_release(st);
                 }
                 r.disabled = s->tier_disabled;
@@ -2046,13 +2046,39 @@ public:
         // --- Both mutexes released. From here on, Qt only. ---
 
         const bool   loggedIn    = g_isLoggedIn;
+        const bool   inMeeting   = g_isInMeeting;
+        // "Live" is the single per-Refresh authority for un-greying rows and
+        // showing roster names: in a meeting AND raw-livestream privilege
+        // granted — the exact condition the properties dialog uses to decide it
+        // can show a live dropdown, so dock and properties agree on "live". The
+        // post-join / pre-grant window (inMeeting true, not yet granted) is not
+        // live: no button (we're in a meeting) and greyed rows — "connected,
+        // feeds coming up". Evaluated once here so every row keys off the same
+        // value; no row can read live while another reads greyed.
+        const bool   live        = inMeeting &&
+                                   (g_rawPrivilegeState == RawPrivilegeState::Granted);
         const int    maxFeeds    = GetMaxFeedsForTier();
         // Cap chrome only when logged in (logged out, tier defaults to a cap of
         // 1 and tier_disabled is not authoritative, which would falsely read a
-        // multi-source logged-out user as over-cap).
+        // multi-source logged-out user as over-cap). Independent of meeting state.
         const bool   atOrOverCap = loggedIn && (sourceCount >= (size_t)maxFeeds);
 
         ClearContent();
+
+        // Top state button — shown whenever not in a meeting, independent of row
+        // content (renders above the empty-state hint too). Split on login state
+        // only; no tier lock (this dock is not tier-gated, so a Free user sees
+        // and uses it). Same labels/actions as the properties dialog's buttons.
+        if (!inMeeting) {
+            QPushButton* btn = new QPushButton(
+                loggedIn ? "Logged in. Click to Connect to Zoom Meeting."
+                         : "Not logged in to Zoom. Click to Login.");
+            if (loggedIn)
+                QObject::connect(btn, &QPushButton::clicked, []() { OnConnectClick(); });
+            else
+                QObject::connect(btn, &QPushButton::clicked, []() { OnLoginClick(); });
+            m_root->addWidget(btn);
+        }
 
         if (rows.empty()) {
             QLabel* empty = new QLabel(
@@ -2066,13 +2092,18 @@ public:
         }
 
         // Enabled (tier-active) rows on top, in vector = creation order. Logged
-        // out, no row is treated as disabled, so all render here.
+        // out, no row is treated as disabled, so all render here. When not live,
+        // every row is greyed and forced to em-dash regardless of participant_id
+        // (including the active-speaker sentinel) — a shown name always means an
+        // actual live feed. When live, un-greyed with roster-only resolution.
         for (const auto& r : rows) {
             if (loggedIn && r.disabled) continue;
-            QString assign = ResolveAssignment(r.pid, r.remembered, roster);
+            QString assign = live ? ResolveAssignment(r.pid, roster)
+                                  : QString::fromUtf8("—");
             QLabel* lbl = new QLabel(
                 QString::fromStdString(r.name) + "  →  " + assign);
             lbl->setWordWrap(true);
+            if (!live) lbl->setStyleSheet("QLabel { color: #7a7d80; }");
             m_root->addWidget(lbl);
         }
 
@@ -2115,19 +2146,18 @@ public:
     }
 
 private:
-    // Resolve participant_id to a display string: 0 -> unassigned, 1 -> active
-    // speaker, >1 -> live roster name, else remembered name, else "—".
+    // Resolve participant_id to a display string, ROSTER-ONLY (no remembered-name
+    // fallback): 0 -> em-dash, 1 -> active speaker, >1 -> live roster name,
+    // not-in-roster -> em-dash. Only called for a live row; the caller forces
+    // em-dash for non-live rows before reaching here.
     static QString ResolveAssignment(
             long long pid,
-            const std::string& remembered,
             const std::map<unsigned int, std::string>& roster) {
         if (pid == 0) return QString::fromUtf8("—");            // —
         if (pid == 1) return "[Active Speaker]";
         auto it = roster.find((unsigned int)pid);
         if (it != roster.end() && !it->second.empty())
             return QString::fromStdString(it->second);
-        if (!remembered.empty())
-            return QString::fromStdString(remembered);
         return QString::fromUtf8("—");                          // —
     }
 
