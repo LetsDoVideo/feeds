@@ -764,7 +764,27 @@ static void ReconcileRememberedParticipants(
         if (!settings) continue;
 
         long long pid = obs_data_get_int(settings, "participant_id");
-        if (pid == 1) { obs_data_release(settings); continue; }  // active speaker
+        // Active-speaker source (sentinel 1): binds to a role, not a name, so the
+        // name-rebind logic below is meaningless — take its own path here, before
+        // Case A / Case B. Seed the runtime binding: current_user_id stays 0 across
+        // a fresh load (zp_create ignores settings), and reconcile is where every
+        // regular source gets its runtime id from the roster — the sentinel gets
+        // its here too. Then subscribe: SubscribeBoundSourceLocked sends
+        // participant_source_recreate with participant_id 1, and its
+        // subscribed_user_id guard makes repeat reconcile passes idempotent (no
+        // re-fire, so the follow doesn't churn). Everything downstream — the
+        // engine's recreate -> gate -> Start-in-waiting -> NotifyActiveSpeakerChanged
+        // -> Resubscribe follow path — already exists; fresh start just never
+        // reached it because the source was never marked bound. bound_this_session
+        // is harmless for a sentinel (Case A needs current_user_id > 1, and nothing
+        // name-rebinds it).
+        if (pid == 1) {
+            s->current_user_id    = 1;
+            s->bound_this_session = true;
+            SubscribeBoundSourceLocked(s);
+            obs_data_release(settings);
+            continue;
+        }
 
         const char* rememberedC = obs_data_get_string(settings, kParticipantNameKey);
         std::string remembered  = rememberedC ? rememberedC : "";
