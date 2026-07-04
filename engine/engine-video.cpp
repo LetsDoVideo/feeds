@@ -1030,9 +1030,21 @@ void ProcessPendingRenderers() {
 
         // uid is free — produce a FRESH renderer: destroy any existing
         // subscription for this source first (a rejoin's kept renderer is stale),
-        // then create new. Mirrors the manual deselect/reselect. A no-op for a
-        // brand-new source.
+        // then create new. Mirrors the manual deselect/reselect.
+        //
+        // Faithful-reselect on the region surface: if there WAS a prior
+        // subscription, emit source_texture_released after destroying it —
+        // exactly what HandleParticipantSourceUnsubscribe does — so the plugin
+        // closes its shared-memory region and reopens it cleanly on the
+        // source_texture_ready below (Close -> Open, in order over E2P), instead
+        // of reusing a stale region. Skipped for a brand-new source that never
+        // had a region, so a first-time create doesn't double-release.
+        const bool hadPriorSub = (g_subs.find(sourceId) != g_subs.end());
         g_subs.erase(sourceId);
+        if (hadPriorSub) {
+            SendToPlugin("{\"type\":\"source_texture_released\",\"source_id\":\""
+                         + sourceId + "\"}");
+        }
 
         auto sub = std::make_unique<ParticipantSubscription>(
             sourceId, uid, follow);
