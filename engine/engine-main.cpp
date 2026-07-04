@@ -25,6 +25,10 @@ static const wchar_t* E2P_PIPE_NAME = L"\\\\.\\pipe\\FeedsEngine_E2P";
 
 static HANDLE g_readPipe  = INVALID_HANDLE_VALUE;  // engine reads from P2E
 static HANDLE g_writePipe = INVALID_HANDLE_VALUE;  // engine writes to E2P
+// P2E message-read-mode result, captured at connect and logged once E2P (the
+// log channel) is up. See ConnectToPipes.
+static BOOL  g_p2eModeOk  = FALSE;
+static DWORD g_p2eModeErr = 0;
 static std::map<std::string, std::function<void(const std::string&)>> g_messageHandlers;
 
 namespace feeds_engine {
@@ -154,19 +158,14 @@ static bool ConnectToPipes()
             LogToFile("Connected to P2E pipe");
             // Message read-mode is what preserves per-WriteFile message
             // boundaries; without it a byte-mode read coalesces bunched writes
-            // into one buffer and DispatchIpcMessage parses only the first,
-            // silently dropping the rest. The return was previously unchecked —
-            // a real latent framing bug — so verify and log it permanently.
+            // into one buffer. (The reader now also splits coalesced buffers, so
+            // this is the first line of defense, not the only one.) The result is
+            // logged AFTER E2P connects below — LogInfo/LogError forward over E2P,
+            // which isn't open yet here, so logging now would be silently dropped
+            // (why the earlier check never appeared in the log).
             DWORD mode = PIPE_READMODE_MESSAGE;
-            if (SetNamedPipeHandleState(g_readPipe, &mode, NULL, NULL)) {
-                LogInfo("P2E read mode set to MESSAGE (message framing active)");
-            } else {
-                char msg[160];
-                sprintf_s(msg,
-                    "P2E SetNamedPipeHandleState(READMODE_MESSAGE) FAILED: %lu "
-                    "— reads may coalesce and drop messages", GetLastError());
-                LogError(msg);
-            }
+            g_p2eModeOk  = SetNamedPipeHandleState(g_readPipe, &mode, NULL, NULL);
+            g_p2eModeErr = g_p2eModeOk ? 0 : GetLastError();
             break;
         }
 
@@ -192,6 +191,17 @@ static bool ConnectToPipes()
 
         if (g_writePipe != INVALID_HANDLE_VALUE) {
             LogToFile("Connected to E2P pipe");
+            // E2P (the log channel) is up now — report the P2E message-mode
+            // result captured above.
+            if (g_p2eModeOk) {
+                LogInfo("P2E read mode set to MESSAGE (message framing active)");
+            } else {
+                char msg[160];
+                sprintf_s(msg,
+                    "P2E SetNamedPipeHandleState(READMODE_MESSAGE) FAILED: %lu "
+                    "— relying on reader-side message splitting", g_p2eModeErr);
+                LogError(msg);
+            }
             return true;
         }
 
@@ -276,6 +286,11 @@ static void DispatchIpcMessage(const std::string& json)
 static void PipeReaderLoop()
 {
     char buffer[4096];
+    // Partial trailing object carried across reads. A single message can straddle
+    // a ReadFile boundary (byte-mode reads, or a message-mode message larger than
+    // one read); it must be reassembled, not dropped.
+    std::string leftover;
+
     while (true) {
         DWORD bytesRead = 0;
         BOOL ok = ReadFile(g_readPipe, buffer, sizeof(buffer) - 1, &bytesRead, NULL);
@@ -288,38 +303,71 @@ static void PipeReaderLoop()
             break;
         }
 
-        if (bytesRead > 0) {
-            buffer[bytesRead] = '\0';
-            std::string json(buffer, bytesRead);
+        if (bytesRead == 0) continue;
 
-            // TEMPORARY diagnostic ([feeds-rls], grep to remove) — per-ReadFile
-            // framing counter. Counts complete top-level JSON objects in this one
-            // read by brace depth (P2E messages are flat — no nested braces, and
-            // no braces inside string values — so each depth-0 close-brace is one
-            // message). msgs>1 means this single ReadFile coalesced multiple
-            // messages; because DispatchIpcMessage parses only the first, the rest
-            // are silently dropped. That is the decisive coalescing signal.
-            {
-                int depth = 0, msgs = 0;
-                for (char c : json) {
-                    if (c == '{') ++depth;
-                    else if (c == '}') { if (--depth == 0) ++msgs; }
-                }
-                char rls[160];
-                sprintf_s(rls, "[feeds-rls] read bytes=%lu msgs=%d%s",
-                          (unsigned long)bytesRead, msgs,
-                          msgs > 1 ? " COALESCED" : "");
-                LogInfo(rls);
+        // TEMPORARY diagnostic ([feeds-rls], grep to remove) — per-ReadFile
+        // framing counter over the RAW read: complete top-level JSON objects by
+        // brace depth. msgs>1 means this ReadFile coalesced multiple messages
+        // (the decisive coalescing signal). Now that the reader splits and
+        // dispatches every message, this proves the coalescing is HANDLED rather
+        // than dropped (pair it with the dispatch-split line below).
+        {
+            int depth = 0, msgs = 0;
+            for (DWORD k = 0; k < bytesRead; ++k) {
+                char c = buffer[k];
+                if (c == '{') ++depth;
+                else if (c == '}') { if (depth > 0 && --depth == 0) ++msgs; }
             }
+            char rls[160];
+            sprintf_s(rls, "[feeds-rls] read bytes=%lu msgs=%d%s",
+                      (unsigned long)bytesRead, msgs, msgs > 1 ? " COALESCED" : "");
+            LogInfo(rls);
+        }
 
-            // Redaction: log only the message type, never the payload.
-            // Incoming join_meeting carries password, ZAK, join_token, and
-            // webinar_token — none of which may reach the shared OBS log.
-            std::string type = ExtractJsonStringField(json, "type");
-            if (type.empty()) type = "(unknown)";
-            LogToFile(("Received: " + type).c_str());
+        // Reassemble: prepend any partial from the previous read, then split into
+        // complete top-level {...} objects by brace depth and dispatch each in
+        // order. These P2E messages are flat JSON — no nested braces, no braces
+        // inside string values — so each depth-0 close-brace ends one message.
+        // A trailing unbalanced object is held in `leftover` for the next read.
+        std::string chunk;
+        chunk.reserve(leftover.size() + bytesRead);
+        chunk.assign(leftover);
+        chunk.append(buffer, bytesRead);
+        leftover.clear();
 
-            DispatchIpcMessage(json);
+        size_t objStart = 0;
+        int    depth      = 0;
+        int    dispatched = 0;
+        for (size_t p = 0; p < chunk.size(); ++p) {
+            const char c = chunk[p];
+            if (c == '{') {
+                if (depth == 0) objStart = p;   // start of a new top-level object
+                ++depth;
+            } else if (c == '}') {
+                if (depth > 0 && --depth == 0) {
+                    std::string one = chunk.substr(objStart, p - objStart + 1);
+
+                    // Redaction: log only the message type, never the payload
+                    // (join_meeting carries password/ZAK/join_token/webinar_token).
+                    std::string type = ExtractJsonStringField(one, "type");
+                    if (type.empty()) type = "(unknown)";
+                    LogToFile(("Received: " + type).c_str());
+
+                    DispatchIpcMessage(one);
+                    ++dispatched;
+                }
+            }
+        }
+        // Anything after the last complete object (an open, unbalanced object) is
+        // a partial message — carry it to the next read rather than dropping it.
+        if (depth > 0)
+            leftover = chunk.substr(objStart);
+
+        if (dispatched > 1) {
+            char rls[128];
+            sprintf_s(rls, "[feeds-rls] dispatch: split read into %d messages",
+                      dispatched);
+            LogInfo(rls);
         }
     }
 }
