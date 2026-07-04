@@ -298,6 +298,15 @@ struct ZpSourceData {
     HANDLE            pumpWakeEvent = nullptr;
     uint32_t          lastReadIndex = 0;
 
+    // Monotonic os_gettime_ns() of the last REAL frame (width>0) the pump output
+    // for this source — the "receiving video now" signal the dock's live
+    // indicator reads. Stamped only on the real-frame branch (never on the
+    // width==0 camera-off sentinel, never when the write index isn't advancing),
+    // so a camera-off OR a silent stall both let it go stale, and "live" is
+    // simply (os_gettime_ns() - tick) < a short threshold. Written lock-free by
+    // the pump thread, read lock-free by the dock poll; 0 = no real frame yet.
+    std::atomic<uint64_t> lastRealFrameTick{0};
+
     // Serialises the pump-thread + shared-memory lifecycle for this source.
     // Held across the full body of Open/CloseSharedMemory (which themselves
     // call StartPumpThread / StopPumpThread). Without this, the graphics
@@ -897,6 +906,11 @@ static void PumpThreadFunc(ZpSourceData* data) {
         obsFrame.timestamp = os_gettime_ns();
 
         obs_source_output_video(data->source, &obsFrame);
+
+        // Real frame delivered — stamp the "live" tick (this branch only, so a
+        // camera-off sentinel or a stall leaves it stale). Lock-free; the dock
+        // poll reads it to drive the live indicator.
+        data->lastRealFrameTick.store(os_gettime_ns(), std::memory_order_relaxed);
 
         data->header->last_read_index = currentWrite;
         data->lastReadIndex = currentWrite;
@@ -2056,6 +2070,18 @@ public:
         // on the dock root, propagating to the QDockWidget). Height floor as before.
         setMinimumHeight(300);
         Refresh();
+
+        // Live-indicator poll. Parented to the dock (destroyed with it) and the
+        // slot uses `this` as context, so it can't fire against a destroyed
+        // widget — same teardown discipline as the marshalled refreshes. Each
+        // tick reads per-source lastRealFrameTick (atomics, under g_sourcesMutex
+        // briefly) and updates each row's live dot in place — no Refresh(), no
+        // box rebuild. Gated on isVisible() inside the poll.
+        m_liveTimer = new QTimer(this);
+        m_liveTimer->setInterval(400);
+        QObject::connect(m_liveTimer, &QTimer::timeout, this,
+                         [this]() { PollLiveIndicators(); });
+        m_liveTimer->start();
     }
 
     // MUST run on the Qt UI thread (mutates widgets). All callers marshal via
@@ -2099,6 +2125,11 @@ public:
                     obs_data_release(st);
                 }
                 r.disabled = s->tier_disabled;
+                // Initial live state for the box's dot (kept updated by the poll
+                // between rebuilds). Read the atomic here under g_sourcesMutex.
+                uint64_t tick = s->lastRealFrameTick.load(std::memory_order_relaxed);
+                r.liveNow = (tick != 0) &&
+                            (os_gettime_ns() - tick) < kLiveThresholdNs;
                 rows.push_back(std::move(r));
             }
         }
@@ -2237,7 +2268,63 @@ private:
         std::string name;        // OBS source name (copied — pointer not owned)
         long long   pid = 0;     // participant_id setting
         bool        disabled = false;  // tier_disabled (authoritative only when logged in)
+        bool        liveNow = false;   // receiving real frames now (for the live dot)
     };
+
+    // In-place per-row indicator handles, keyed by source uuid, rebuilt on each
+    // Refresh() alongside the boxes and cleared in ClearContent(). Between
+    // refreshes the poll/status paths update a row's indicator by uuid without a
+    // full rebuild. `live` (and, later, a mute icon) are owned by their box —
+    // this map only borrows the pointers, so it is cleared, never deleted.
+    struct RowIndicators {
+        QLabel* live      = nullptr;   // the live/receiving dot
+        bool    liveShown = false;     // last-applied state (skip redundant restyle)
+    };
+    std::map<std::string, RowIndicators> m_rowIndicators;
+
+    // "Live" = a real frame within this window. 500ms comfortably spans a 30fps
+    // (~33ms) or 60fps gap; a camera-off or stall stops advancing the tick and
+    // the dot flips off within ~this window plus one poll interval.
+    static constexpr uint64_t kLiveThresholdNs = 500000000ULL;
+
+    // Set a live dot's appearance + tooltip. Semi-transparent so both states
+    // read on dark and light OBS themes (matching the box styling); not loud.
+    static void SetLiveDot(QLabel* dot, bool receiving) {
+        if (!dot) return;
+        dot->setStyleSheet(receiving
+            ? "QLabel { background: rgba(64,192,96,0.95); border-radius: 5px; }"
+            : "QLabel { background: rgba(128,128,128,0.30); border-radius: 5px; }");
+        dot->setToolTip(receiving ? "Receiving video" : "Not receiving video");
+    }
+
+    // Live-indicator poll (UI thread, ~every 400ms). Reads per-source
+    // lastRealFrameTick under g_sourcesMutex (atomics only — no widget work while
+    // holding the lock), then updates each row's dot in place by uuid. Takes ONLY
+    // g_sourcesMutex, briefly, so no lock-ordering interaction with
+    // g_participantsMutex. Skips entirely when the dock is hidden.
+    void PollLiveIndicators() {
+        if (!isVisible() || m_rowIndicators.empty()) return;
+
+        const uint64_t now = os_gettime_ns();
+        std::map<std::string, bool> liveByUuid;
+        {
+            std::lock_guard<std::mutex> lock(g_sourcesMutex);
+            for (ZpSourceData* s : g_allParticipantSources) {
+                if (!s) continue;
+                uint64_t tick = s->lastRealFrameTick.load(std::memory_order_relaxed);
+                liveByUuid[s->uuid] =
+                    (tick != 0) && (now - tick) < kLiveThresholdNs;
+            }
+        }
+        for (auto& kv : m_rowIndicators) {
+            auto it = liveByUuid.find(kv.first);
+            bool live = (it != liveByUuid.end()) && it->second;
+            if (live != kv.second.liveShown) {
+                SetLiveDot(kv.second.live, live);
+                kv.second.liveShown = live;
+            }
+        }
+    }
 
     // Build one enabled source's framed box. Live -> header + functional combo;
     // non-live -> the same box greyed and combo-less (header + "→ —"). A QFrame
@@ -2267,15 +2354,32 @@ private:
             "QLabel#feedsSourceHeader { background: rgba(128,128,128,0.15);"
             " border-radius: 3px; padding: 3px 6px; font-weight: bold;%1 }")
             .arg(live ? "" : " color: #7a7d80;"));
-        boxL->addWidget(header);
 
         if (!live) {
-            // Non-live: greyed em-dash status in place of the combo.
+            // Non-live: greyed header, no live dot (the whole box already reads
+            // "not active" — a second not-receiving treatment would just stack),
+            // and a greyed em-dash status in place of the combo.
+            boxL->addWidget(header);
             QLabel* status = new QLabel(QString::fromUtf8("→  —"));
             status->setStyleSheet("QLabel { color: #7a7d80; }");
             boxL->addWidget(status);
             return box;
         }
+
+        // Live box: header row = live dot + name. The dot's initial state comes
+        // from the snapshot (r.liveNow); the poll keeps it updated in place. The
+        // dot pointer is recorded in m_rowIndicators (owned by this box).
+        QWidget*     headerRow = new QWidget();
+        QHBoxLayout* headerL   = new QHBoxLayout(headerRow);
+        headerL->setContentsMargins(0, 0, 0, 0);
+        headerL->setSpacing(6);
+        QLabel* liveDot = new QLabel();
+        liveDot->setFixedSize(10, 10);
+        SetLiveDot(liveDot, r.liveNow);
+        headerL->addWidget(liveDot);
+        headerL->addWidget(header, 1);   // header takes the remaining width, elides
+        boxL->addWidget(headerRow);
+        m_rowIndicators[r.uuid] = { liveDot, r.liveNow };
 
         // Live: the functional combo, populated identically to the properties
         // dropdown (0 unselect / 1 [Active Speaker] / roster-minus-self by user
@@ -2369,6 +2473,9 @@ private:
     // The QLayoutItem wrappers are not QObjects (no deleteLater) — keep deleting
     // those immediately; only the widget's own free is deferred.
     void ClearContent() {
+        // Drop borrowed indicator pointers BEFORE deleting the boxes that own
+        // them, so the poll can never touch a freed dot between clear and rebuild.
+        m_rowIndicators.clear();
         QLayoutItem* item;
         while ((item = m_root->takeAt(0)) != nullptr) {
             if (QWidget* w = item->widget()) {
@@ -2381,6 +2488,7 @@ private:
 
     QVBoxLayout* m_root = nullptr;   // inner (scrolled) content layout; boxes live here
     int          m_minWidth = 0;     // last-applied theme-derived dock min width
+    QTimer*      m_liveTimer = nullptr;  // live-indicator poll (parented to dock)
 };
 
 // Non-owning pointer to the participant dock — same ownership model as
