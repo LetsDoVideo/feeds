@@ -64,6 +64,7 @@
 #include <QByteArray>
 #include <QCursor>
 #include <QMouseEvent>
+#include <QKeyEvent>
 #include <QEnterEvent>
 #include <QResizeEvent>
 #include <QScrollArea>
@@ -2039,13 +2040,17 @@ class ElidingLabel : public QLabel {
 public:
     explicit ElidingLabel(const QString& text, QWidget* parent = nullptr)
         : QLabel(parent), m_full(text) {
-        setToolTip(text);
+        // No tooltip by design: this label is only used for the source-box header,
+        // whose name is already shown in the box; a tooltip would be redundant.
         setTextFormat(Qt::PlainText);
         QLabel::setText(text);   // re-elided on first resizeEvent
     }
     QSize minimumSizeHint() const override {
         return QSize(0, QFontMetrics(font()).height());
     }
+    // Optional double-click affordance (source-box header rename). No signal/moc:
+    // the owner installs a plain callback, invoked from the event override below.
+    std::function<void()> onDoubleClick;
 protected:
     void resizeEvent(QResizeEvent* e) override {
         QLabel::resizeEvent(e);
@@ -2053,8 +2058,58 @@ protected:
         QFontMetrics fm(fontMetrics());
         QLabel::setText(fm.elidedText(m_full, Qt::ElideRight, contentsRect().width()));
     }
+    void mouseDoubleClickEvent(QMouseEvent* e) override {
+        if (onDoubleClick) onDoubleClick();
+        else QLabel::mouseDoubleClickEvent(e);
+    }
 private:
     QString m_full;
+};
+
+// Inline rename editor for a source-box header. Double-clicking the header swaps
+// one of these in (FeedsParticipantDock::BeginRename); Enter or focus-out commits,
+// Escape cancels. No Q_OBJECT/signals — the two outcomes are delivered through
+// std::function callbacks fired exactly once. The m_done latch guards against
+// Escape-then-focus-out (or commit-then-teardown) double-firing; the owner's
+// EndRenameUi does the widget swap-back and deletion.
+class RenameLineEdit : public QLineEdit {
+public:
+    explicit RenameLineEdit(const QString& text, QWidget* parent = nullptr)
+        : QLineEdit(text, parent) {}
+
+    std::function<void(const QString&)> onCommit;  // Enter or focus-out
+    std::function<void()>               onCancel;  // Escape
+
+    // Neutralise pending callbacks (dock teardown): a focus-out fired while the
+    // dock is being destroyed must not re-enter a half-torn-down dock.
+    void Detach() { m_done = true; onCommit = nullptr; onCancel = nullptr; }
+
+protected:
+    void keyPressEvent(QKeyEvent* e) override {
+        if (e->key() == Qt::Key_Escape)                                { fireCancel(); return; }
+        if (e->key() == Qt::Key_Return || e->key() == Qt::Key_Enter)   { fireCommit(); return; }
+        QLineEdit::keyPressEvent(e);
+    }
+    void focusOutEvent(QFocusEvent* e) override {
+        QLineEdit::focusOutEvent(e);
+        fireCommit();   // commit on focus loss (mirrors OBS's own rename editor)
+    }
+private:
+    bool m_done = false;
+    // Copy the callback + text before invoking: the callback may deleteLater this
+    // widget, so we must touch no members after the call.
+    void fireCommit() {
+        if (m_done) return;
+        m_done = true;
+        auto f = onCommit; const QString t = text();
+        if (f) f(t);
+    }
+    void fireCancel() {
+        if (m_done) return;
+        m_done = true;
+        auto f = onCancel;
+        if (f) f();
+    }
 };
 
 // Current mute state per participant userId, for the dock's mute indicator.
@@ -2121,10 +2176,25 @@ public:
         m_liveTimer->start();
     }
 
+    ~FeedsParticipantDock() override {
+        // If an inline rename is somehow still open at teardown, neutralise its
+        // callbacks so the focus-out Qt fires while destroying children can't
+        // re-enter this half-destroyed dock. The editor itself is a child widget,
+        // freed by the QWidget base destructor.
+        if (m_activeEdit) m_activeEdit->Detach();
+    }
+
     // MUST run on the Qt UI thread (mutates widgets). All callers marshal via
     // PostParticipantDockRefresh. The gather half takes the two mutexes; the
     // build half touches Qt only after both are released.
     void Refresh() {
+        // An inline rename is in progress — don't tear the box (and the edit
+        // field) out from under the user. Coalesce: remember a refresh is due and
+        // run it once the edit commits or cancels (EndRenameUi flushes it). Every
+        // edit resolves via focus-out at the latest, so this can't wedge the dock
+        // into a permanently-deferred state.
+        if (m_activeEdit) { m_refreshPending = true; return; }
+
         // --- Gather a plain-value snapshot (no OBS/Qt handles retained) ---
         // Roster copy first, under g_participantsMutex, then release it before
         // touching g_sourcesMutex — never nest the two (matches
@@ -2485,6 +2555,139 @@ public:
     }
 private:
 
+    // --- Inline source-box rename (double-click the header) --------------------
+    //
+    // BeginRename swaps the header ElidingLabel for a RenameLineEdit in the same
+    // layout slot (so the live dot and mute mark don't move); Commit/Cancel swap
+    // it back. While m_activeEdit is set, Refresh() defers (m_refreshPending), so
+    // an unrelated roster-change rebuild can't destroy the field mid-type; the
+    // deferred refresh is flushed when the edit ends. The commit itself renames
+    // the OBS source, whose source_rename signal (OnSourceRenamed) rebuilds the
+    // box with the new name — so on a real rename we let that be the single
+    // rebuild and don't also flush the deferred one.
+
+    void BeginRename(const std::string& uuid, ElidingLabel* header) {
+        if (m_activeEdit) return;                      // one edit at a time
+        if (!header || !header->parentWidget()) return;
+        QBoxLayout* lay = qobject_cast<QBoxLayout*>(header->parentWidget()->layout());
+        if (!lay) return;
+        const int idx = lay->indexOf(header);
+        if (idx < 0) return;
+
+        // Authoritative current name from the source (not the elided label text).
+        QString cur;
+        if (obs_source_t* src = obs_get_source_by_uuid(uuid.c_str())) {
+            const char* nm = obs_source_get_name(src);
+            cur = nm ? QString::fromUtf8(nm) : QString();
+            obs_source_release(src);
+        }
+
+        RenameLineEdit* edit = new RenameLineEdit(cur);
+        edit->setObjectName("feedsRenameEdit");
+        edit->setStyleSheet(
+            "QLineEdit#feedsRenameEdit { background: rgba(128,128,128,0.18);"
+            " border: 1px solid rgba(128,128,128,0.55); border-radius: 3px;"
+            " padding: 2px 5px; font-weight: bold; }");
+
+        // Swap header -> edit in the same slot, preserving the stretch factor so
+        // the live dot (before) and mute mark (after) keep their positions.
+        const int stretch = lay->stretch(idx);
+        delete lay->replaceWidget(header, edit);       // frees the old wrapper item only
+        if (stretch > 0) lay->setStretch(lay->indexOf(edit), stretch);
+        header->hide();
+
+        edit->onCommit = [this, uuid, header](const QString& t) {
+            CommitRename(uuid, header, t);
+        };
+        edit->onCancel = [this, header]() { CancelRename(header); };
+        m_activeEdit = edit;
+        edit->setFocus(Qt::MouseFocusReason);
+        edit->selectAll();
+    }
+
+    // Restore the header in the editor's slot and dispose of the editor. Clears
+    // m_activeEdit FIRST so any Refresh triggered hereafter runs normally.
+    void EndRenameUi(ElidingLabel* header) {
+        RenameLineEdit* edit = m_activeEdit;
+        if (!edit) return;
+        m_activeEdit = nullptr;
+
+        QWidget*    parent = edit->parentWidget();
+        QBoxLayout* lay = parent ? qobject_cast<QBoxLayout*>(parent->layout()) : nullptr;
+        if (lay && header) {
+            const int idx     = lay->indexOf(edit);
+            const int stretch = idx >= 0 ? lay->stretch(idx) : 0;
+            delete lay->replaceWidget(edit, header);
+            if (stretch > 0) lay->setStretch(lay->indexOf(header), stretch);
+        }
+        if (header) header->show();
+        edit->Detach();
+        edit->hide();
+        edit->deleteLater();
+    }
+
+    // OBS's own localized string for a frontend key (e.g. "NameExists.Text"), so
+    // our dialogs read identically to a Sources-dock rename and in the user's
+    // language. Null-guarded: falls back to the English literal if the key is
+    // ever absent.
+    static QString ObsLocaleStr(const char* key, const char* fallback) {
+        const char* s = obs_frontend_get_locale_string(key);
+        return QString::fromUtf8((s && *s) ? s : fallback);
+    }
+
+    void CommitRename(const std::string& uuid, ElidingLabel* header,
+                      const QString& newText) {
+        EndRenameUi(header);                           // revert UI first (mirrors OBS)
+        bool renamed = false;
+
+        // Reproduce OBS's rename validation exactly (SourceTreeItem::
+        // ExitEditModeInternal), on the RAW editor text — OBS does not trim, so a
+        // whitespace-only name is a valid rename. Same checks, same order, and the
+        // dialog text comes from OBS's own localization so it matches a Sources-
+        // dock rename. OBS imposes no length or character rules, so we add none.
+        QWidget*          mainWin = (QWidget*)obs_frontend_get_main_window();
+        const std::string raw     = newText.toUtf8().constData();  // untrimmed
+
+        if (raw.empty()) {
+            // Empty name -> reject, revert.
+            QMessageBox::information(
+                mainWin,
+                ObsLocaleStr("NoNameEntered.Title", "Please enter a valid name"),
+                ObsLocaleStr("NoNameEntered.Text",  "You cannot use empty names."));
+        } else if (obs_source_t* src = obs_get_source_by_uuid(uuid.c_str())) {
+            const char* curC = obs_source_get_name(src);
+            if (curC && raw == curC) {
+                // Unchanged -> silent no-op, no dialog (OBS returns here).
+            } else {
+                // A DIFFERENT source already using the name -> reject, revert. The
+                // clash != src guard means renaming to our own name is never a
+                // collision (case above catches the exact-same-name path first).
+                obs_source_t* clash = obs_get_source_by_name(raw.c_str());
+                if (clash && clash != src) {
+                    QMessageBox::information(
+                        mainWin,
+                        ObsLocaleStr("NameExists.Title", "Name already exists"),
+                        ObsLocaleStr("NameExists.Text",  "The name is already in use."));
+                } else {
+                    obs_source_set_name(src, raw.c_str());
+                    renamed = true;   // source_rename -> OnSourceRenamed -> refresh
+                }
+                if (clash) obs_source_release(clash);
+            }
+            obs_source_release(src);
+        }
+
+        // Flush a refresh deferred during the edit. If we renamed, the
+        // source_rename rebuild already reflects current state (roster included),
+        // so don't fire a redundant second rebuild.
+        if (m_refreshPending) { m_refreshPending = false; if (!renamed) Refresh(); }
+    }
+
+    void CancelRename(ElidingLabel* header) {
+        EndRenameUi(header);
+        if (m_refreshPending) { m_refreshPending = false; Refresh(); }
+    }
+
     // Build one enabled source's framed box. Live -> header + functional combo;
     // non-live -> the same box greyed and combo-less (header + "→ —"). A QFrame
     // container (not QGroupBox: that renders inconsistently across OBS themes and
@@ -2513,6 +2716,16 @@ private:
             "QLabel#feedsSourceHeader { background: rgba(128,128,128,0.15);"
             " border-radius: 3px; padding: 3px 6px; font-weight: bold;%1 }")
             .arg(live ? "" : " color: #7a7d80;"));
+        // Double-click the header to rename the underlying OBS source. Wired for
+        // both live and non-live boxes (both are real sources); over-cap rows are
+        // plain labels below and are intentionally not renamable here. The combo
+        // is a separate sibling, so this can't interfere with dropdown clicks.
+        {
+            const std::string uuid = r.uuid;
+            header->onDoubleClick = [this, uuid, header]() {
+                BeginRename(uuid, header);
+            };
+        }
 
         if (!live) {
             // Non-live: greyed header, no live dot (the whole box already reads
@@ -2659,6 +2872,12 @@ private:
     QVBoxLayout* m_root = nullptr;   // inner (scrolled) content layout; boxes live here
     int          m_minWidth = 0;     // last-applied theme-derived dock min width
     QTimer*      m_liveTimer = nullptr;  // live-indicator poll (parented to dock)
+
+    // Inline rename state (UI thread). m_activeEdit != null means an edit is open:
+    // Refresh() defers while it is, and m_refreshPending records that a deferred
+    // refresh is owed (flushed when the edit ends). See BeginRename/EndRenameUi.
+    RenameLineEdit* m_activeEdit     = nullptr;
+    bool            m_refreshPending = false;
 };
 
 // Non-owning pointer to the participant dock — same ownership model as
