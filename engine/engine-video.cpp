@@ -17,6 +17,7 @@
 #include <map>
 #include <vector>
 #include <mutex>
+#include <atomic>
 #include <memory>
 #include <cstdio>
 
@@ -525,6 +526,18 @@ public:
             LogInfo(dbg);
         }
 
+        // Delivery is confirmed: this renderer is actually receiving frames.
+        // Signal the sequencing gate ONCE, on the 0->1 transition only, so the
+        // next same-userId create proceeds promptly instead of waiting for the
+        // poll tick. exchange() makes the post fire exactly once per renderer
+        // (never per frame). PostMessageW is thread-safe from this SDK thread;
+        // the WM_TIMER poll is the fallback if a post is ever missed. This
+        // callback touches no mutex and never advances the queue itself.
+        if (!m_gotFirstFrame.exchange(true, std::memory_order_release)) {
+            if (g_anchorWnd)
+                PostMessageW(g_anchorWnd, WM_FEEDS_PROCESS_RENDERERS, 0, 0);
+        }
+
         if (!data || !m_worker) return;
 
         const uint8_t* y = (const uint8_t*)data->GetYBuffer();
@@ -638,6 +651,15 @@ private:
     int                m_lastSrcH       = 0;
     unsigned int       m_loggedFailures = 0;  // bitfield from validation_failures
     unsigned long long m_frameRecvCount = 0;  // TEMPORARY ([feeds-rls])
+
+public:
+    // Delivery-established signal for the per-userId sequencing gate: set true
+    // on the FIRST frame the SDK routes to this renderer. Written (release) on
+    // the SDK callback thread, read (acquire) by ProcessPendingRenderers on the
+    // main thread — a lock-free cross-thread flag so the frame callback takes no
+    // mutex. Lifetime-safe: TearDown unSubscribe()s + destroyRenderer()s before
+    // the object destructs, so no callback races the read/free.
+    std::atomic<bool> m_gotFirstFrame{false};
 };
 
 // ---------------------------------------------------------------------------
@@ -669,18 +691,24 @@ static unsigned int g_currentActiveSpeaker = 0;
 // the signal; on terminal give-up we tell the plugin so its subscribed-state
 // guard can't wedge the source black forever.
 //
-// SEQUENCING: the gate also creates at most ONE renderer per
-// kRenderRetryIntervalMs. A burst of createRenderer+subscribe calls for the
-// same userId makes the Zoom SDK establish delivery for only one renderer and
-// silently drop the rest (proven: a spaced manual setup feeds many same-user
-// renderers; a same-millisecond burst feeds only one). Spacing them ~one per
-// tick lets each establish — mirroring the manual one-at-a-time reselect, the
-// one reliable recovery. This is global (all sources, not just same-userId);
-// it slightly staggers bring-up of many sources, which is acceptable.
+// SEQUENCING (delivery-gated, per-userId): a burst of createRenderer+subscribe
+// calls for the SAME userId makes the Zoom SDK establish delivery for only one
+// renderer and silently drop the rest (proven: a spaced manual setup feeds many
+// same-user renderers; a burst feeds only one — and blind ~300ms pacing was
+// shown insufficient, leaving createRenderer=success with zero frames). So we do
+// NOT create same-userId renderer N+1 until renderer N confirms delivery by
+// actually receiving its first frame (m_gotFirstFrame), or a generous timeout
+// (kEstablishTimeoutMs) elapses — replicating the manual reselect, which
+// establishes one renderer in confirmed isolation. The gate is keyed on userId
+// (g_inflightByUser): different-userId entries never wait on each other and are
+// created immediately even while another userId is establishing; only same-userId
+// siblings serialise. On timeout we proceed (leave the renderer created; that
+// source recovers via a manual reselect as before) — no requeue-for-retry here.
 //
 // All renderer creation runs on the MAIN (pump) thread in ProcessPendingRenderers,
-// reached via WM_FEEDS_PROCESS_RENDERERS (posted on queue/ready) and a WM_TIMER
-// retry/sequencing tick. State guarded by g_subsMutex.
+// reached via WM_FEEDS_PROCESS_RENDERERS (posted on queue/ready, and once from the
+// frame callback on a renderer's first frame) and a WM_TIMER poll tick that
+// re-checks the gate. State guarded by g_subsMutex.
 // ---------------------------------------------------------------------------
 struct PendingRender {
     std::string  sourceId;
@@ -688,13 +716,30 @@ struct PendingRender {
     bool         followActiveSpeaker;
     ULONGLONG    deadlineTick;          // GetTickCount64() past which we give up
 };
+
+// Per-userId in-flight establishment tracking for the delivery gate. One entry
+// per userId that has a just-created renderer not yet confirmed delivering (or
+// timed out). A same-userId queued entry waits while its userId is in-flight;
+// different-userId entries are unaffected.
+struct InflightEstablish {
+    std::string sourceId;    // the renderer we're waiting on for this userId
+    ULONGLONG   createTick;  // GetTickCount64() at create — establishment clock
+};
+static std::map<unsigned int, InflightEstablish> g_inflightByUser;
+
 static bool                       g_rawRenderReady       = false;
 static std::vector<PendingRender> g_pendingRenders;
 static bool                       g_retryTimerActive     = false;
-static ULONGLONG                  g_lastRenderCreateTick = 0;  // sequencing clock
 static const UINT_PTR  kRenderRetryTimerId    = 1;
-static const UINT      kRenderRetryIntervalMs = 300;  // spacing + retry interval
+static const UINT      kRenderRetryIntervalMs = 300;  // gate poll + not-ready retry
 static const ULONGLONG kRenderGiveUpMs        = 15000;
+// Per-renderer establishment timeout: how long to wait for a created renderer's
+// first frame before proceeding to the next same-userId create. Deliberately
+// generous — first frame arrives ~26ms when it works, but the legitimate worst
+// case is unknown, so err high so a slow-but-real establishment is never
+// abandoned into timeout-paced creation. Distinct from kRenderGiveUpMs (which is
+// the never-created deadline); this is the created-but-not-yet-delivering clock.
+static const ULONGLONG kEstablishTimeoutMs    = 2000;
 
 void TearDownAllVideoSubscriptions() {
     std::lock_guard<std::mutex> lock(g_subsMutex);
@@ -711,7 +756,7 @@ void TearDownAllVideoSubscriptions() {
     // (KillTimer is owned by ProcessPendingRenderers on the main thread).
     g_rawRenderReady = false;
     g_pendingRenders.clear();
-    g_lastRenderCreateTick = 0;   // next meeting's first create is immediate
+    g_inflightByUser.clear();     // no renderers in flight; next create is immediate
 }
 
 // Blank any subscriptions currently bound to the given user ID. Called
@@ -903,13 +948,11 @@ void ProcessPendingRenderers() {
     std::lock_guard<std::mutex> lock(g_subsMutex);
     const ULONGLONG now = GetTickCount64();
 
-    // SEQUENCING: create at most ONE renderer per kRenderRetryIntervalMs, even
-    // across multiple back-to-back invocations (several WM_FEEDS_PROCESS_RENDERERS
-    // posts can arrive from a multi-source rejoin). The clock is g_lastRenderCreateTick;
-    // until the interval elapses, ready entries stay queued and the WM_TIMER
-    // brings us back. This is what defeats the same-user burst that makes the SDK
-    // drop all-but-one renderer. Cheap, non-create handling (deadline give-ups,
-    // gated waits) still runs for every entry.
+    // DELIVERY-GATED, PER-USERID SEQUENCING: scan the queue and create the first
+    // entry of each userId whose previous renderer has confirmed delivery (or
+    // timed out); skip (do not break on) an entry whose userId is still
+    // establishing. Different userIds proceed in parallel; only same-userId
+    // siblings serialise. Non-create handling (give-ups, not-ready) still runs.
     for (size_t i = 0; i < g_pendingRenders.size(); ) {
         const std::string  sourceId = g_pendingRenders[i].sourceId;
         unsigned int       uid      = g_pendingRenders[i].userId;
@@ -936,26 +979,70 @@ void ProcessPendingRenderers() {
         // notification and the retry tick will bring us back here).
         if (!g_rawRenderReady) { ++i; continue; }
 
-        // Spacing: only one create per interval. If it's too soon since the
-        // last create, stop here — the remaining entries are created on
-        // subsequent WM_TIMER ticks, one at a time.
-        if ((now - g_lastRenderCreateTick) < kRenderRetryIntervalMs)
-            break;
+        // Per-userId delivery gate: if this userId already has an in-flight
+        // renderer, hold this sibling until that renderer's first frame confirms
+        // the SDK routed delivery, or the establishment timeout elapses.
+        auto inf = g_inflightByUser.find(uid);
+        if (inf != g_inflightByUser.end()) {
+            const ULONGLONG elapsed = now - inf->second.createTick;
+            const std::string wtag  = inf->second.sourceId.substr(0, 8);
+            bool confirmed = false, timedOut = false;
+            auto sit = g_subs.find(inf->second.sourceId);
+            if (sit != g_subs.end() && sit->second) {
+                if (sit->second->m_gotFirstFrame.load(std::memory_order_acquire))
+                    confirmed = true;
+                else if (elapsed >= kEstablishTimeoutMs)
+                    timedOut = true;
+            } else {
+                // The in-flight renderer is gone (replaced/unsubscribed) — this
+                // userId is no longer establishing; free it.
+                confirmed = true;
+            }
 
-        // Always produce a FRESH renderer: destroy any existing subscription
-        // for this source first (a rejoin's kept renderer is stale — the SDK
-        // has stopped delivering to it), then create new. Mirrors the manual
-        // deselect/reselect, the one reliable recovery. A no-op for a brand-new
-        // source.
+            if (confirmed) {
+                char rls[200];
+                sprintf_s(rls, "[feeds-rls] gate: %s first-frame confirmed after "
+                          "%llums — creating next", wtag.c_str(),
+                          (unsigned long long)elapsed);
+                LogInfo(rls);
+                g_inflightByUser.erase(inf);
+                // uid is now free — fall through and create this entry.
+            } else if (timedOut) {
+                char rls[200];
+                sprintf_s(rls, "[feeds-rls] gate: %s establishment TIMEOUT after "
+                          "%llums — proceeding", wtag.c_str(),
+                          (unsigned long long)elapsed);
+                LogInfo(rls);
+                g_inflightByUser.erase(inf);
+                // Proceed only: leave the timed-out renderer created (no worse
+                // than before; recovers via manual reselect). uid now free.
+            } else {
+                // Still establishing — skip this sibling, keep it queued.
+                char rls[200];
+                sprintf_s(rls, "[feeds-rls] gate: waiting on %s (userId=%u) "
+                          "first-frame, elapsed=%llums", wtag.c_str(), uid,
+                          (unsigned long long)elapsed);
+                LogInfo(rls);
+                ++i;
+                continue;
+            }
+        }
+
+        // uid is free — produce a FRESH renderer: destroy any existing
+        // subscription for this source first (a rejoin's kept renderer is stale),
+        // then create new. Mirrors the manual deselect/reselect. A no-op for a
+        // brand-new source.
         g_subs.erase(sourceId);
 
         auto sub = std::make_unique<ParticipantSubscription>(
             sourceId, uid, follow);
         SubStart r = sub->Start();
-        g_lastRenderCreateTick = now;   // start the spacing clock for the next
         if (r == SubStart::Started) {
             g_subs[sourceId] = std::move(sub);
             g_pendingRenders.erase(g_pendingRenders.begin() + i);
+            // Mark uid in-flight: same-userId siblings now wait for this
+            // renderer's first frame (or timeout) before they are created.
+            g_inflightByUser[uid] = { sourceId, now };
 
             uint32_t pid = GetCurrentProcessId();
             char resp[512];
@@ -965,8 +1052,12 @@ void ProcessPendingRenderers() {
                 sourceId.c_str(), pid,
                 feeds_shared::MAX_FRAME_WIDTH, feeds_shared::MAX_FRAME_HEIGHT);
             SendToPlugin(resp);
+            // Do NOT break — keep scanning to create entries for OTHER userIds
+            // that are free (different participants don't wait on each other).
+            // The just-created entry was erased, so the next entry slides into i.
         } else if (r == SubStart::RetryNotReady) {
-            // Transient — keep queued; a later tick re-attempts (also spaced).
+            // Transient — keep queued; a later tick re-attempts.
+            ++i;
         } else {
             // Non-retryable failure.
             LogError("Video: subscription Start failed (non-retryable) "
@@ -975,12 +1066,14 @@ void ProcessPendingRenderers() {
                          "\"source_id\":\"" + sourceId + "\"}");
             g_pendingRenders.erase(g_pendingRenders.begin() + i);
         }
-        break;   // one create per invocation — the rest wait for the timer
     }
 
-    // Timer lifecycle: tick while anything is still queued (gated, retrying, or
-    // waiting its turn under the one-per-tick spacing), stop once the queue
-    // drains. Owned here so it's only touched on the main thread.
+    // Timer lifecycle: tick while anything is still queued (readiness-gated,
+    // retrying, or waiting on a same-userId establishment), stop once the queue
+    // drains. The tick is the poll fallback for the delivery gate — it re-checks
+    // whether an in-flight renderer confirmed or timed out. (A confirmed first
+    // frame also posts WM_FEEDS_PROCESS_RENDERERS directly, so the common case
+    // doesn't wait for a tick.) Owned here so it's only touched on the main thread.
     if (!g_pendingRenders.empty()) {
         if (!g_retryTimerActive && g_anchorWnd) {
             SetTimer(g_anchorWnd, kRenderRetryTimerId, kRenderRetryIntervalMs,
