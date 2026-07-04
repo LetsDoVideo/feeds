@@ -2031,6 +2031,13 @@ private:
     QString m_full;
 };
 
+// Current mute state per participant userId, for the dock's mute indicator.
+// UI-thread-owned (no mutex): written only inside the marshalled lambdas of the
+// participant_list_changed seed and the participant_audio_status live update,
+// and read only by the dock on the UI thread (MakeSourceBox seed). Absence of an
+// entry = unknown -> no mute mark.
+static std::map<unsigned int, bool> g_muteByUserId;
+
 // ---------------------------------------------------------------------------
 // Read-only participant dock — lists every participant source and its current
 // assignment, live-reacting to roster / source / tier changes. Phase 1: no
@@ -2277,8 +2284,11 @@ private:
     // full rebuild. `live` (and, later, a mute icon) are owned by their box —
     // this map only borrows the pointers, so it is cleared, never deleted.
     struct RowIndicators {
-        QLabel* live      = nullptr;   // the live/receiving dot
-        bool    liveShown = false;     // last-applied state (skip redundant restyle)
+        QLabel*   live      = nullptr; // the live/receiving dot
+        bool      liveShown = false;   // last-applied live state (skip redundant restyle)
+        QLabel*   mute      = nullptr; // muted-mic mark (fixed 10px slot; painted only when muted)
+        bool      muteShown = false;   // last-applied mute state
+        long long pid       = 0;       // bound userId, for userId -> row resolution
     };
     std::map<std::string, RowIndicators> m_rowIndicators;
 
@@ -2326,6 +2336,52 @@ private:
         }
     }
 
+    // Seed mute state for a row from g_muteByUserId (UI thread). pid <= 1 (0
+    // unselect / 1 Active-Speaker sentinel) is never a real userId, so it has no
+    // mute state and shows no mark — the Active-Speaker case. Unknown (no map
+    // entry) reads unmuted -> no mark.
+    static bool MutedForPid(long long pid) {
+        if (pid <= 1) return false;
+        auto it = g_muteByUserId.find((unsigned int)pid);
+        return it != g_muteByUserId.end() && it->second;
+    }
+
+    // Paint-only toggle on a permanently-reserved 10px slot. We never hide the
+    // label (setVisible would collapse it out of the layout, handing ~10px back
+    // to the stretched header and re-eliding the name on every toggle). Instead
+    // the icon always occupies its fixed 10x10 box; muted paints a quiet amber
+    // mark (distinct from the green/grey live dot, semi-transparent for both
+    // themes), unmuted/unknown paints a transparent box. So toggling changes only
+    // pixels inside the box — the live dot and name never reflow.
+    static void SetMuteIcon(QLabel* icon, bool muted) {
+        if (!icon) return;
+        if (muted) {
+            icon->setStyleSheet(
+                "QLabel { background: rgba(230,150,60,0.90); border-radius: 5px; }");
+            icon->setToolTip("Muted");
+        } else {
+            icon->setStyleSheet("QLabel { background: transparent; }");
+            icon->setToolTip(QString());
+        }
+    }
+
+    // In-place mute update (UI thread), marshalled from the participant_audio_status
+    // IPC handler. One userId can back multiple rows, so update every row whose
+    // pid matches. No Refresh(), no box rebuild. Active-Speaker rows (pid == 1)
+    // never match a real userId, so they stay mark-less. Public: called via
+    // g_participantDock-> from the IPC handler's marshalled lambda.
+public:
+    void UpdateMuteIndicator(unsigned int userId, bool muted) {
+        for (auto& kv : m_rowIndicators) {
+            if (kv.second.pid == (long long)userId &&
+                muted != kv.second.muteShown) {
+                SetMuteIcon(kv.second.mute, muted);
+                kv.second.muteShown = muted;
+            }
+        }
+    }
+private:
+
     // Build one enabled source's framed box. Live -> header + functional combo;
     // non-live -> the same box greyed and combo-less (header + "→ —"). A QFrame
     // container (not QGroupBox: that renders inconsistently across OBS themes and
@@ -2366,9 +2422,13 @@ private:
             return box;
         }
 
-        // Live box: header row = live dot + name. The dot's initial state comes
-        // from the snapshot (r.liveNow); the poll keeps it updated in place. The
-        // dot pointer is recorded in m_rowIndicators (owned by this box).
+        // Live box: header row = live dot + name + mute mark. Both indicators
+        // seed from the snapshot / g_muteByUserId; the poll (live) and the
+        // participant_audio_status update (mute) keep them updated in place. The
+        // mute mark holds a permanently-reserved 10px slot after the stretched
+        // header and only repaints on toggle, so muting never reflows the dot or
+        // name. Pointers are recorded in m_rowIndicators (owned by this box) for
+        // the in-place update paths.
         QWidget*     headerRow = new QWidget();
         QHBoxLayout* headerL   = new QHBoxLayout(headerRow);
         headerL->setContentsMargins(0, 0, 0, 0);
@@ -2378,8 +2438,13 @@ private:
         SetLiveDot(liveDot, r.liveNow);
         headerL->addWidget(liveDot);
         headerL->addWidget(header, 1);   // header takes the remaining width, elides
+        QLabel* muteIcon = new QLabel();
+        muteIcon->setFixedSize(10, 10);
+        const bool mutedNow = MutedForPid(r.pid);
+        SetMuteIcon(muteIcon, mutedNow);
+        headerL->addWidget(muteIcon);
         boxL->addWidget(headerRow);
-        m_rowIndicators[r.uuid] = { liveDot, r.liveNow };
+        m_rowIndicators[r.uuid] = { liveDot, r.liveNow, muteIcon, mutedNow, r.pid };
 
         // Live: the functional combo, populated identically to the properties
         // dropdown (0 unselect / 1 [Active Speaker] / roster-minus-self by user
@@ -4462,6 +4527,7 @@ static void RegisterEngineHandlers() {
         unsigned int myUserId = (unsigned int)ExtractJsonNumber(json, "my_user_id");
 
         std::vector<CachedParticipant> newList;
+        std::map<unsigned int, bool>   mutedSnap;  // userId -> muted, dock seed
         size_t pos = json.find("\"participants\"");
         if (pos != std::string::npos) {
             pos = json.find('[', pos);
@@ -4479,8 +4545,10 @@ static void RegisterEngineHandlers() {
                     CachedParticipant p;
                     p.id   = (unsigned int)ExtractJsonNumber(obj, "id");
                     p.name = ExtractJsonString(obj, "name");
-                    if (p.id != 0 && !p.name.empty())
+                    if (p.id != 0 && !p.name.empty()) {
                         newList.push_back(p);
+                        mutedSnap[p.id] = ExtractJsonNumber(obj, "muted") != 0;
+                    }
                     cursor = objEnd + 1;
                 }
             }
@@ -4524,7 +4592,12 @@ static void RegisterEngineHandlers() {
              (size_t)g_cachedParticipants.size());
 
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
-            [joinedIds]() {
+            [joinedIds, mutedSnap = std::move(mutedSnap)]() {
+                // Re-seed the UI-thread-owned mute map from this roster's fresh
+                // muted fields (wholesale: drops departed users, reflects current
+                // state) BEFORE the refresh so the dock rebuild seeds correct
+                // mute marks. participant_audio_status keeps it live in between.
+                g_muteByUserId = mutedSnap;
                 // Auto-rebind participant-pinned sources to their remembered
                 // name, then refresh properties. joinedIds drives the in-
                 // reconcile rejoin re-establishment: a source already bound to
@@ -4621,6 +4694,21 @@ static void RegisterEngineHandlers() {
     [](const std::string& json) {
         g_activeSpeakerUserId =
             (unsigned int)ExtractJsonNumber(json, "participant_id");
+    });
+
+    // Per-user mute change from the engine's audio listener. Marshal to the UI
+    // thread (dock-as-context, auto-cancels if the dock is gone): update the
+    // UI-thread-owned mute map, then flip the mute mark on every affected row in
+    // place — no Refresh(), no box rebuild. Runs on the pipe-reader thread here.
+    feeds::RegisterMessageHandler("participant_audio_status",
+    [](const std::string& json) {
+        unsigned int userId = (unsigned int)ExtractJsonNumber(json, "participant_id");
+        if (userId == 0 || !g_participantDock) return;
+        bool muted = ExtractJsonNumber(json, "muted") != 0;
+        QTimer::singleShot(0, g_participantDock, [userId, muted]() {
+            g_muteByUserId[userId] = muted;
+            if (g_participantDock) g_participantDock->UpdateMuteIndicator(userId, muted);
+        });
     });
 
     feeds::RegisterMessageHandler("share_status_changed",

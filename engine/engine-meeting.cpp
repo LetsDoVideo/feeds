@@ -255,8 +255,12 @@ static void SendParticipantList() {
 
             std::string name = WideToUtf8(info->GetUserName());
             if (!first) msg << ",";
+            // Seed current mute state so a dock row shows the right mute mark
+            // immediately (not blank until the next toggle). onUserAudioStatusChange
+            // keeps it live between roster changes.
             msg << "{\"id\":" << uid
-                << ",\"name\":\"" << JsonEscape(name) << "\"}";
+                << ",\"name\":\"" << JsonEscape(name) << "\""
+                << ",\"muted\":" << (info->IsAudioMuted() ? 1 : 0) << "}";
             first = false;
         }
     }
@@ -291,21 +295,35 @@ public:
     virtual void onUserAudioStatusChange(
         ZOOM_SDK_NAMESPACE::IList<ZOOM_SDK_NAMESPACE::IUserAudioStatus*>* lst,
         const zchar_t* = nullptr) override {
-        // TEMPORARY diagnostic ([feeds-rls], grep to remove) — confirm this SDK
-        // event actually fires at runtime (the handler was a no-op, so there's
-        // zero evidence it does) before building the mute indicator on it. Log
-        // every entry unconditionally so the test also shows Audio_None at join
-        // and whether host-mute/mute-all fire, not just self-mute. AudioStatus:
-        // None=0, Muted=1, UnMuted=2, Muted_ByHost=3, UnMuted_ByHost=4,
-        // MutedAll_ByHost=5, UnMutedAll_ByHost=6.
+        // Per-user mute change -> tell the plugin so the dock's mute indicator
+        // updates live. Muted = Audio_Muted/Muted_ByHost/MutedAll_ByHost (1/3/5);
+        // unmuted = the UnMuted family (2/4/6). Audio_None (0) is "no audio
+        // connected yet / unknown" — skip it so it can't seed a false state.
+        // On the SDK audio thread: no lock, no g_subs work — just the pipe write,
+        // exactly like onUserActiveAudioChange's active_speaker_changed send.
         if (!lst) return;
         for (int i = 0; i < lst->GetCount(); ++i) {
             ZOOM_SDK_NAMESPACE::IUserAudioStatus* s = lst->GetItem(i);
             if (!s) continue;
+            ZOOM_SDK_NAMESPACE::AudioStatus st = s->GetStatus();
+            bool muted;
+            switch (st) {
+                case ZOOM_SDK_NAMESPACE::Audio_Muted:
+                case ZOOM_SDK_NAMESPACE::Audio_Muted_ByHost:
+                case ZOOM_SDK_NAMESPACE::Audio_MutedAll_ByHost:
+                    muted = true;  break;
+                case ZOOM_SDK_NAMESPACE::Audio_UnMuted:
+                case ZOOM_SDK_NAMESPACE::Audio_UnMuted_ByHost:
+                case ZOOM_SDK_NAMESPACE::Audio_UnMutedAll_ByHost:
+                    muted = false; break;
+                default:  // Audio_None — unknown, don't seed a state
+                    continue;
+            }
             char buf[96];
-            sprintf_s(buf, "[feeds-rls] audio-status user=%u status=%d",
-                      s->GetUserId(), (int)s->GetStatus());
-            LogInfo(buf);
+            sprintf_s(buf,
+                "{\"type\":\"participant_audio_status\",\"participant_id\":%u,"
+                "\"muted\":%d}", s->GetUserId(), muted ? 1 : 0);
+            SendToPlugin(buf);
         }
     }
     virtual void onHostRequestStartAudio(
