@@ -866,6 +866,19 @@ void HandleParticipantSourceSubscribe(const std::string& json) {
 void HandleParticipantSourceRecreate(const std::string& json) {
     std::string sourceId = JsonExtractString(json, "source_id");
     uint32_t    userId   = JsonExtractUint(json, "participant_id");
+    // TEMPORARY diagnostic ([feeds-rls], grep to remove) — handler-entry counter,
+    // logged BEFORE the empty/zero guard so it counts every recreate that reached
+    // the handler. The middle triangulation point: compare its count per bind
+    // burst against plugin SENT(recreate) (upstream) and render queued
+    // (downstream). entry < SENT => lost before the handler (pipe/coalescing);
+    // entry == SENT but queued < entry => the guard below rejected some (and an
+    // empty source or userId=0 here is the fingerprint of a coalesced tail).
+    {
+        char rls[256];
+        sprintf_s(rls, "[feeds-rls] recreate handler-entry source='%s' userId=%u",
+                  sourceId.c_str(), userId);
+        LogInfo(rls);
+    }
     if (sourceId.empty() || userId == 0) {
         LogToFile("Video: recreate received with missing source_id or participant_id");
         return;

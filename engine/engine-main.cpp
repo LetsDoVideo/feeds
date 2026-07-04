@@ -152,8 +152,21 @@ static bool ConnectToPipes()
 
         if (g_readPipe != INVALID_HANDLE_VALUE) {
             LogToFile("Connected to P2E pipe");
+            // Message read-mode is what preserves per-WriteFile message
+            // boundaries; without it a byte-mode read coalesces bunched writes
+            // into one buffer and DispatchIpcMessage parses only the first,
+            // silently dropping the rest. The return was previously unchecked —
+            // a real latent framing bug — so verify and log it permanently.
             DWORD mode = PIPE_READMODE_MESSAGE;
-            SetNamedPipeHandleState(g_readPipe, &mode, NULL, NULL);
+            if (SetNamedPipeHandleState(g_readPipe, &mode, NULL, NULL)) {
+                LogInfo("P2E read mode set to MESSAGE (message framing active)");
+            } else {
+                char msg[160];
+                sprintf_s(msg,
+                    "P2E SetNamedPipeHandleState(READMODE_MESSAGE) FAILED: %lu "
+                    "— reads may coalesce and drop messages", GetLastError());
+                LogError(msg);
+            }
             break;
         }
 
@@ -278,6 +291,26 @@ static void PipeReaderLoop()
         if (bytesRead > 0) {
             buffer[bytesRead] = '\0';
             std::string json(buffer, bytesRead);
+
+            // TEMPORARY diagnostic ([feeds-rls], grep to remove) — per-ReadFile
+            // framing counter. Counts complete top-level JSON objects in this one
+            // read by brace depth (P2E messages are flat — no nested braces, and
+            // no braces inside string values — so each depth-0 close-brace is one
+            // message). msgs>1 means this single ReadFile coalesced multiple
+            // messages; because DispatchIpcMessage parses only the first, the rest
+            // are silently dropped. That is the decisive coalescing signal.
+            {
+                int depth = 0, msgs = 0;
+                for (char c : json) {
+                    if (c == '{') ++depth;
+                    else if (c == '}') { if (--depth == 0) ++msgs; }
+                }
+                char rls[160];
+                sprintf_s(rls, "[feeds-rls] read bytes=%lu msgs=%d%s",
+                          (unsigned long)bytesRead, msgs,
+                          msgs > 1 ? " COALESCED" : "");
+                LogInfo(rls);
+            }
 
             // Redaction: log only the message type, never the payload.
             // Incoming join_meeting carries password, ZAK, join_token, and
