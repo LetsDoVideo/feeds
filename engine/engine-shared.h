@@ -40,6 +40,10 @@
 #define WM_FEEDS_SEND_CHAT         (WM_APP + 1)
 #define WM_FEEDS_INIT_SDK          (WM_APP + 2)
 #define WM_FEEDS_PROCESS_RENDERERS (WM_APP + 3)
+// WM_FEEDS_CAMERA_ON — the video listener (engine-meeting.cpp) posts this on an
+// SDK thread when a participant's camera turns on; WPARAM carries the userId.
+// EngineWndProc hands it to QueueCameraOnReestablish on the main thread.
+#define WM_FEEDS_CAMERA_ON         (WM_APP + 4)
 
 // Defined in engine-main.cpp. Set right after the anchor window is
 // created in WinMain. NULL before that (which the pipe handler
@@ -69,5 +73,15 @@ void ProcessPendingRenderers();
 // — the signal that the raw-data renderer subsystem is ready. Flips the gate
 // open and drains any queued subscribes.
 void NotifyRawRenderReady();
+
+// Defined in engine-video.cpp. Main-thread WM_TIMER dispatcher — the engine now
+// runs two timers (the renderer readiness/retry/gate poll and the camera-on
+// debounce); this routes by timer id. Invoked by EngineWndProc on WM_TIMER.
+void OnEngineTimer(UINT_PTR timerId);
+
+// Defined in engine-video.cpp. Main-thread entry for a participant's camera
+// turning on: debounces, then re-establishes that userId's sources through the
+// delivery-gated recreate path. Invoked by EngineWndProc on WM_FEEDS_CAMERA_ON.
+void QueueCameraOnReestablish(unsigned int userId);
 
 } // namespace feeds_engine

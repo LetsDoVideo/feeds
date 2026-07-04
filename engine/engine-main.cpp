@@ -465,12 +465,24 @@ static LRESULT CALLBACK EngineWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         feeds_engine::BringUpSdkOnMainThread();
         return 0;
     }
-    if (msg == WM_FEEDS_PROCESS_RENDERERS || msg == WM_TIMER) {
-        // Readiness-gated renderer creation + retry backstop. Posted when a
-        // subscribe is queued or readiness arrives; WM_TIMER drives retries.
-        // All createRenderer calls run here, on the pump thread. (The engine
-        // sets no other timers, so any WM_TIMER is the renderer retry tick.)
+    if (msg == WM_FEEDS_PROCESS_RENDERERS) {
+        // Readiness-gated renderer creation. Posted when a subscribe is queued,
+        // readiness arrives, or a renderer's first frame confirms. All
+        // createRenderer calls run here, on the pump thread.
         feeds_engine::ProcessPendingRenderers();
+        return 0;
+    }
+    if (msg == WM_TIMER) {
+        // The engine runs two timers (renderer readiness/retry/gate poll and the
+        // camera-on debounce); OnEngineTimer routes by timer id (wp).
+        feeds_engine::OnEngineTimer((UINT_PTR)wp);
+        return 0;
+    }
+    if (msg == WM_FEEDS_CAMERA_ON) {
+        // A participant's camera turned on (posted by the video listener on the
+        // SDK thread). wp carries the userId; debounce + re-establish that
+        // participant's sources through the delivery-gated recreate path.
+        feeds_engine::QueueCameraOnReestablish((unsigned int)wp);
         return 0;
     }
     return DefWindowProc(hwnd, msg, wp, lp);

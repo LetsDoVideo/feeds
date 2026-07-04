@@ -22,6 +22,7 @@
 #include "meeting_service_components/meeting_chat_interface.h"
 #include "meeting_service_components/meeting_configuration_interface.h"
 #include "meeting_service_components/meeting_participants_ctrl_interface.h"
+#include "meeting_service_components/meeting_video_interface.h"
 #include "meeting_service_components/meeting_live_stream_interface.h"
 #include "meeting_service_components/meeting_sharing_interface.h"
 #include "setting_service_interface.h"
@@ -434,6 +435,60 @@ public:
     virtual void onGrantCoOwnerPrivilegeChanged(bool) override {}
 };
 static ZoomParticipantsListener g_participantsListener;
+
+// ---------------------------------------------------------------------------
+// Video controller listener — drives camera-on re-establishment. When a
+// participant turns their camera on, some of their same-userId renderers can be
+// left created-but-unfed (the SDK resumes delivery to only some, and nothing
+// re-establishes the rest); a camera toggle also changes no userId, so it fires
+// no reconcile/recreate on its own. On Video_ON we re-run the delivery-gated
+// recreate path for that participant's sources. The status log fires for EVERY
+// transition — it's the confirmation instrument for whether this SDK event
+// actually fires (esp. on the rejoin-camera-off -> on path).
+// ---------------------------------------------------------------------------
+class ZoomVideoListener
+    : public ZOOM_SDK_NAMESPACE::IMeetingVideoCtrlEvent {
+public:
+    virtual void onUserVideoStatusChange(
+        unsigned int userId,
+        ZOOM_SDK_NAMESPACE::VideoStatus status) override {
+        char msg[96];
+        sprintf_s(msg, "[feeds-rls] video-status user=%u status=%d",
+                  userId, (int)status);   // Video_ON=0 / Video_OFF=1 / Mute_ByHost=2
+        LogInfo(msg);
+
+        // Camera turned on: re-establish this participant's sources via the
+        // existing delivery-gated recreate path. Hand off to the main thread —
+        // this runs on an SDK thread, so no g_subs access / no lock here
+        // (mirrors the frame-recv post). The main-thread handler debounces.
+        if (status == ZOOM_SDK_NAMESPACE::Video_ON && g_anchorWnd) {
+            PostMessageW(g_anchorWnd, WM_FEEDS_CAMERA_ON, (WPARAM)userId, 0);
+        }
+    }
+
+    // Remaining IMeetingVideoCtrlEvent callbacks — required by the pure-virtual
+    // interface, unused by Feeds.
+    virtual void onSpotlightedUserListChangeNotification(
+        ZOOM_SDK_NAMESPACE::IList<unsigned int>*) override {}
+    virtual void onHostRequestStartVideo(
+        ZOOM_SDK_NAMESPACE::IRequestStartVideoHandler*) override {}
+    virtual void onActiveSpeakerVideoUserChanged(unsigned int) override {}
+    virtual void onActiveVideoUserChanged(unsigned int) override {}
+    virtual void onHostVideoOrderUpdated(
+        ZOOM_SDK_NAMESPACE::IList<unsigned int>*) override {}
+    virtual void onLocalVideoOrderUpdated(
+        ZOOM_SDK_NAMESPACE::IList<unsigned int>*) override {}
+    virtual void onFollowHostVideoOrderChanged(bool) override {}
+    virtual void onUserVideoQualityChanged(
+        ZOOM_SDK_NAMESPACE::VideoConnectionQuality, unsigned int) override {}
+    virtual void onVideoAlphaChannelStatusChanged(bool) override {}
+    virtual void onCameraControlRequestReceived(
+        unsigned int, ZOOM_SDK_NAMESPACE::CameraControlRequestType,
+        ZOOM_SDK_NAMESPACE::ICameraControlRequestHandler*) override {}
+    virtual void onCameraControlRequestResult(
+        unsigned int, ZOOM_SDK_NAMESPACE::CameraControlRequestResult) override {}
+};
+static ZoomVideoListener g_videoListener;
 
 // ---------------------------------------------------------------------------
 // Chat listener — receives messages from the SDK's chat controller and
@@ -897,6 +952,21 @@ public:
                 LogToFile("Meeting: chat controller listener attached");
             } else {
                 LogToFile("Meeting: chat controller unavailable at join");
+            }
+
+            // Attach the video listener so a participant turning their camera ON
+            // re-runs the delivery-gated recreate path for their sources
+            // (recovers renderers left created-but-unfed while the camera was
+            // off — the camera-toggle and rejoin-camera-off cases). Same
+            // register-at-join lifecycle as the other controllers; the SDK tears
+            // the controller down on meeting end.
+            ZOOM_SDK_NAMESPACE::IMeetingVideoController* vc =
+                g_meetingService->GetMeetingVideoController();
+            if (vc) {
+                vc->SetEvent(&g_videoListener);
+                LogToFile("Meeting: video controller listener attached");
+            } else {
+                LogToFile("Meeting: video controller unavailable at join");
             }
 
             // Attach the livestream listener. Depending on whether the

@@ -15,6 +15,7 @@
 #include <windows.h>
 #include <string>
 #include <map>
+#include <set>
 #include <vector>
 #include <mutex>
 #include <atomic>
@@ -741,6 +742,14 @@ static const ULONGLONG kRenderGiveUpMs        = 15000;
 // the never-created deadline); this is the created-but-not-yet-delivering clock.
 static const ULONGLONG kEstablishTimeoutMs    = 2000;
 
+// Camera-on re-establishment debounce (trailing-edge). A participant's Video_ON
+// posts WM_FEEDS_CAMERA_ON; a flickering camera is coalesced by (re)arming this
+// timer and only re-establishing once it settles. Main-thread-owned, alongside
+// the renderer-timer state above.
+static const UINT_PTR         kCameraOnDebounceTimerId = 2;
+static const UINT             kCameraOnDebounceMs      = 600;
+static std::set<unsigned int> g_cameraOnPending;   // userIds awaiting re-establish
+
 void TearDownAllVideoSubscriptions() {
     std::lock_guard<std::mutex> lock(g_subsMutex);
     if (!g_subs.empty()) {
@@ -1096,6 +1105,61 @@ void ProcessPendingRenderers() {
         KillTimer(g_anchorWnd, kRenderRetryTimerId);
         g_retryTimerActive = false;
     }
+}
+
+// Re-establish every source currently bound to userId through the SAME
+// delivery-gated recreate path a rejoin uses: enqueue each into the gate, which
+// does g_subs.erase + source_texture_released (Fix 2) + a fresh, first-frame-
+// confirmed Start. Caller MUST hold g_subsMutex (mirrors EnqueuePendingRenderLocked).
+// Scoped strictly to this participant's sources — not others, not all sources —
+// with each source's follow-active-speaker flag preserved. When a camera turns
+// on, this recovers renderers left created-but-unfed while it was off.
+static void ReestablishSourcesForUserLocked(unsigned int userId) {
+    int count = 0;
+    for (auto& kv : g_subs) {
+        if (kv.second && kv.second->UserId() == userId) {
+            EnqueuePendingRenderLocked(kv.first, userId,
+                                       kv.second->FollowsActiveSpeaker());
+            ++count;
+        }
+    }
+    char rls[128];
+    sprintf_s(rls, "[feeds-rls] camera-on re-establish user=%u sources=%d",
+              userId, count);
+    LogInfo(rls);
+}
+
+// Debounce fired (main thread): re-establish all pending userIds, then clear.
+// KillTimer at the top makes the (periodic) debounce timer one-shot per settle.
+static void ProcessCameraOnDebounce() {
+    if (g_anchorWnd) KillTimer(g_anchorWnd, kCameraOnDebounceTimerId);
+
+    std::vector<unsigned int> users(g_cameraOnPending.begin(),
+                                    g_cameraOnPending.end());
+    g_cameraOnPending.clear();
+    if (users.empty()) return;
+
+    std::lock_guard<std::mutex> lock(g_subsMutex);
+    for (unsigned int uid : users)
+        ReestablishSourcesForUserLocked(uid);
+}
+
+// Main-thread entry from WM_FEEDS_CAMERA_ON (posted by the video listener on a
+// participant's Video_ON). Add the userId to the pending set and (re)arm the
+// trailing-edge debounce timer so a flickering camera collapses to one
+// re-establishment pass after it settles.
+void QueueCameraOnReestablish(unsigned int userId) {
+    if (userId == 0) return;
+    g_cameraOnPending.insert(userId);
+    if (g_anchorWnd)
+        SetTimer(g_anchorWnd, kCameraOnDebounceTimerId, kCameraOnDebounceMs, nullptr);
+}
+
+// Single WM_TIMER dispatcher — the engine now runs two timers (the camera-on
+// debounce and the renderer readiness/retry/gate poll); route by timer id.
+void OnEngineTimer(UINT_PTR timerId) {
+    if (timerId == kCameraOnDebounceTimerId) ProcessCameraOnDebounce();
+    else                                     ProcessPendingRenderers();
 }
 
 // Called from engine-meeting.cpp's onUserRawLiveStreamingStatusChanged when our
