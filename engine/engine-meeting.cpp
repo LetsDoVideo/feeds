@@ -452,15 +452,11 @@ public:
     virtual void onUserVideoStatusChange(
         unsigned int userId,
         ZOOM_SDK_NAMESPACE::VideoStatus status) override {
-        char msg[96];
-        sprintf_s(msg, "[feeds-rls] video-status user=%u status=%d",
-                  userId, (int)status);   // Video_ON=0 / Video_OFF=1 / Mute_ByHost=2
-        LogInfo(msg);
-
         // Camera turned on: re-establish this participant's sources via the
-        // existing delivery-gated recreate path. Hand off to the main thread —
-        // this runs on an SDK thread, so no g_subs access / no lock here
-        // (mirrors the frame-recv post). The main-thread handler debounces.
+        // existing delivery-gated recreate path (recovers renderers left
+        // created-but-unfed while the camera was off). Hand off to the main
+        // thread — this runs on an SDK thread, so no g_subs access / no lock
+        // here (mirrors the frame-recv post). The main-thread handler debounces.
         if (status == ZOOM_SDK_NAMESPACE::Video_ON && g_anchorWnd) {
             PostMessageW(g_anchorWnd, WM_FEEDS_CAMERA_ON, (WPARAM)userId, 0);
         }

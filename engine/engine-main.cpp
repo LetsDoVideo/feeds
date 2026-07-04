@@ -305,25 +305,6 @@ static void PipeReaderLoop()
 
         if (bytesRead == 0) continue;
 
-        // TEMPORARY diagnostic ([feeds-rls], grep to remove) — per-ReadFile
-        // framing counter over the RAW read: complete top-level JSON objects by
-        // brace depth. msgs>1 means this ReadFile coalesced multiple messages
-        // (the decisive coalescing signal). Now that the reader splits and
-        // dispatches every message, this proves the coalescing is HANDLED rather
-        // than dropped (pair it with the dispatch-split line below).
-        {
-            int depth = 0, msgs = 0;
-            for (DWORD k = 0; k < bytesRead; ++k) {
-                char c = buffer[k];
-                if (c == '{') ++depth;
-                else if (c == '}') { if (depth > 0 && --depth == 0) ++msgs; }
-            }
-            char rls[160];
-            sprintf_s(rls, "[feeds-rls] read bytes=%lu msgs=%d%s",
-                      (unsigned long)bytesRead, msgs, msgs > 1 ? " COALESCED" : "");
-            LogInfo(rls);
-        }
-
         // Reassemble: prepend any partial from the previous read, then split into
         // complete top-level {...} objects by brace depth and dispatch each in
         // order. These P2E messages are flat JSON — no nested braces, no braces
@@ -336,8 +317,7 @@ static void PipeReaderLoop()
         leftover.clear();
 
         size_t objStart = 0;
-        int    depth      = 0;
-        int    dispatched = 0;
+        int    depth    = 0;
         for (size_t p = 0; p < chunk.size(); ++p) {
             const char c = chunk[p];
             if (c == '{') {
@@ -354,7 +334,6 @@ static void PipeReaderLoop()
                     LogToFile(("Received: " + type).c_str());
 
                     DispatchIpcMessage(one);
-                    ++dispatched;
                 }
             }
         }
@@ -362,13 +341,6 @@ static void PipeReaderLoop()
         // a partial message — carry it to the next read rather than dropping it.
         if (depth > 0)
             leftover = chunk.substr(objStart);
-
-        if (dispatched > 1) {
-            char rls[128];
-            sprintf_s(rls, "[feeds-rls] dispatch: split read into %d messages",
-                      dispatched);
-            LogInfo(rls);
-        }
     }
 }
 
