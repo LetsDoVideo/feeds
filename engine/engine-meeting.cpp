@@ -289,8 +289,25 @@ public:
         NotifyActiveSpeakerChanged(newSpeaker);
     }
     virtual void onUserAudioStatusChange(
-        ZOOM_SDK_NAMESPACE::IList<ZOOM_SDK_NAMESPACE::IUserAudioStatus*>*,
-        const zchar_t* = nullptr) override {}
+        ZOOM_SDK_NAMESPACE::IList<ZOOM_SDK_NAMESPACE::IUserAudioStatus*>* lst,
+        const zchar_t* = nullptr) override {
+        // TEMPORARY diagnostic ([feeds-rls], grep to remove) — confirm this SDK
+        // event actually fires at runtime (the handler was a no-op, so there's
+        // zero evidence it does) before building the mute indicator on it. Log
+        // every entry unconditionally so the test also shows Audio_None at join
+        // and whether host-mute/mute-all fire, not just self-mute. AudioStatus:
+        // None=0, Muted=1, UnMuted=2, Muted_ByHost=3, UnMuted_ByHost=4,
+        // MutedAll_ByHost=5, UnMutedAll_ByHost=6.
+        if (!lst) return;
+        for (int i = 0; i < lst->GetCount(); ++i) {
+            ZOOM_SDK_NAMESPACE::IUserAudioStatus* s = lst->GetItem(i);
+            if (!s) continue;
+            char buf[96];
+            sprintf_s(buf, "[feeds-rls] audio-status user=%u status=%d",
+                      s->GetUserId(), (int)s->GetStatus());
+            LogInfo(buf);
+        }
+    }
     virtual void onHostRequestStartAudio(
         ZOOM_SDK_NAMESPACE::IRequestStartAudioHandler*) override {}
     virtual void onJoin3rdPartyTelephonyAudio(const zchar_t*) override {}
