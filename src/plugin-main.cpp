@@ -57,6 +57,8 @@
 #include <QFrame>
 #include <QImage>
 #include <QPixmap>
+#include <QIcon>
+#include <QScreen>
 #include <QSvgRenderer>
 #include <QFile>
 #include <QByteArray>
@@ -201,6 +203,10 @@ static std::atomic<bool> g_eventsSessionsPending{false};
 
 static unsigned int       g_activeSharerUserId   = 0;
 static unsigned int       g_cachedMyUserId       = 0;
+// UI-thread-owned: written only in marshalled lambdas (the active_speaker_changed
+// handler and the meeting-end/left resets), read only by the dock on the UI
+// thread. The dock's Active-Speaker row (participant_id sentinel 1) resolves its
+// mute mark through this. 0 = no active speaker yet -> that row shows no mark.
 static unsigned int       g_activeSpeakerUserId  = 0;
 
 struct CachedParticipant {
@@ -2038,6 +2044,10 @@ private:
 // entry = unknown -> no mute mark.
 static std::map<unsigned int, bool> g_muteByUserId;
 
+// Reserved fixed slot (px) for the mute mark in a source-box header. The slot is
+// always present (paint-only toggle, no reflow); 14px reads the mic glyph clearly.
+static constexpr int kMuteSlotPx = 14;
+
 // ---------------------------------------------------------------------------
 // Read-only participant dock — lists every participant source and its current
 // assignment, live-reacting to roster / source / tier changes. Phase 1: no
@@ -2336,47 +2346,120 @@ private:
         }
     }
 
-    // Seed mute state for a row from g_muteByUserId (UI thread). pid <= 1 (0
-    // unselect / 1 Active-Speaker sentinel) is never a real userId, so it has no
-    // mute state and shows no mark — the Active-Speaker case. Unknown (no map
-    // entry) reads unmuted -> no mark.
+    // Resolve a row's mute state (UI thread). The Active-Speaker row uses the
+    // sentinel participant_id 1: it has no fixed userId, so its mute follows the
+    // *current* active speaker (g_activeSpeakerUserId) — muted iff that user is
+    // muted, and no mark before anyone speaks (id 0). pid <= 0 is a genuinely
+    // unbound row -> no mark. pid > 1 is a real userId -> direct lookup. Unknown
+    // (no map entry) reads unmuted -> no mark. (If the local user is the active
+    // speaker, the row shows their own mute state — intentional, consistent with
+    // the row showing whoever is on screen.)
     static bool MutedForPid(long long pid) {
-        if (pid <= 1) return false;
+        if (pid == 1) {                             // Active Speaker
+            if (g_activeSpeakerUserId == 0) return false;   // no speaker yet
+            pid = (long long)g_activeSpeakerUserId;
+        }
+        if (pid <= 0) return false;                 // unbound
         auto it = g_muteByUserId.find((unsigned int)pid);
         return it != g_muteByUserId.end() && it->second;
     }
 
-    // Paint-only toggle on a permanently-reserved 10px slot. We never hide the
-    // label (setVisible would collapse it out of the layout, handing ~10px back
-    // to the stretched header and re-eliding the name on every toggle). Instead
-    // the icon always occupies its fixed 10x10 box; muted paints a quiet amber
-    // mark (distinct from the green/grey live dot, semi-transparent for both
-    // themes), unmuted/unknown paints a transparent box. So toggling changes only
-    // pixels inside the box — the live dot and name never reflow.
+    // The mute mark's pixmap: OBS's own Audio-Input microphone icon, recolored
+    // red. OBS exposes that icon as a readable Q_PROPERTY on the main window, so
+    // we get the theme-rendered QIcon with no OBSBasic header/link and no QtSvg
+    // dependency. The glyph is alpha-shape only, so we tint by compositing red
+    // into its alpha (SourceIn) — identical on dark/light themes and at HiDPI.
+    // If the property read yields a null icon (OBS internals changed), we fall
+    // back to an asset-free drawn red mic. Built once, cached; the one-time log
+    // line records which path we took.
+    static const QPixmap& RedMicPixmap() {
+        static QPixmap cached;
+        static bool    built = false;
+        if (built) return cached;
+        built = true;
+
+        const QColor red(220, 50, 50);
+        QIcon mic;
+        if (QWidget* mw = (QWidget*)obs_frontend_get_main_window())
+            mic = qvariant_cast<QIcon>(mw->property("audioInputIcon"));
+        const bool haveObsIcon = !mic.isNull();
+        blog(LOG_INFO, "[feeds] mute-mark icon source: %s",
+             haveObsIcon ? "OBS audioInputIcon (tinted red)"
+                         : "drawn fallback (OBS audioInputIcon null)");
+
+        if (haveObsIcon) {
+            // Tint by alpha: keep the glyph's shape (and its own HiDPI pixmap /
+            // devicePixelRatio), replace its color with red via SourceIn.
+            QPixmap src = mic.pixmap(QSize(kMuteSlotPx, kMuteSlotPx));
+            cached = QPixmap(src.size());
+            cached.setDevicePixelRatio(src.devicePixelRatio());
+            cached.fill(Qt::transparent);
+            QPainter p(&cached);
+            p.drawPixmap(0, 0, src);
+            p.setCompositionMode(QPainter::CompositionMode_SourceIn);
+            p.fillRect(cached.rect(), red);
+            p.end();
+            return cached;
+        }
+
+        // Fallback: draw a simple red microphone (capsule body + stem + base) at
+        // the screen's DPR so it stays crisp. Rarely hit — only if OBS stops
+        // exposing the icon — but always legible and red.
+        qreal dpr = 1.0;
+        if (QScreen* s = (qApp ? qApp->primaryScreen() : nullptr))
+            dpr = s->devicePixelRatio();
+        const int px = (int)(kMuteSlotPx * dpr);
+        cached = QPixmap(px, px);
+        cached.setDevicePixelRatio(dpr);
+        cached.fill(Qt::transparent);
+        const qreal w = kMuteSlotPx, h = kMuteSlotPx;
+        QPainter p(&cached);
+        p.setRenderHint(QPainter::Antialiasing, true);
+        p.setPen(Qt::NoPen);
+        p.setBrush(red);
+        p.drawRoundedRect(QRectF(w * 0.34, h * 0.10, w * 0.32, h * 0.48),
+                          w * 0.16, w * 0.16);                  // capsule body
+        QPen pen(red);
+        pen.setWidthF(w * 0.10);
+        pen.setCapStyle(Qt::RoundCap);
+        p.setPen(pen);
+        p.drawLine(QPointF(w * 0.50, h * 0.66), QPointF(w * 0.50, h * 0.86)); // stem
+        p.drawLine(QPointF(w * 0.34, h * 0.88), QPointF(w * 0.66, h * 0.88)); // base
+        p.end();
+        return cached;
+    }
+
+    // Paint-only toggle on the permanently-reserved kMuteSlotPx slot. We never
+    // hide the label (setVisible would collapse it out of the layout and re-elide
+    // the name on every toggle); the label always occupies its fixed box. Muted
+    // paints the red microphone mark; unmuted/unknown clears the pixmap. So a
+    // toggle changes only pixels inside the box — the live dot and name never
+    // reflow.
     static void SetMuteIcon(QLabel* icon, bool muted) {
         if (!icon) return;
         if (muted) {
-            icon->setStyleSheet(
-                "QLabel { background: rgba(230,150,60,0.90); border-radius: 5px; }");
+            icon->setPixmap(RedMicPixmap());
             icon->setToolTip("Muted");
         } else {
-            icon->setStyleSheet("QLabel { background: transparent; }");
+            icon->setPixmap(QPixmap());
             icon->setToolTip(QString());
         }
     }
 
-    // In-place mute update (UI thread), marshalled from the participant_audio_status
-    // IPC handler. One userId can back multiple rows, so update every row whose
-    // pid matches. No Refresh(), no box rebuild. Active-Speaker rows (pid == 1)
-    // never match a real userId, so they stay mark-less. Public: called via
-    // g_participantDock-> from the IPC handler's marshalled lambda.
+    // Recompute every row's mute mark in place from current UI-thread state
+    // (g_muteByUserId + g_activeSpeakerUserId). Both mute triggers route through
+    // here: a participant_audio_status update (after writing g_muteByUserId) and
+    // an active_speaker_changed (after writing g_activeSpeakerUserId). Resolving
+    // per-row via MutedForPid means an Active-Speaker row (pid 1) re-resolves to
+    // the current speaker automatically, and direct rows update as before. No
+    // Refresh(), no rebuild; O(rows). Public: called via g_participantDock->.
 public:
-    void UpdateMuteIndicator(unsigned int userId, bool muted) {
+    void RecomputeMuteMarks() {
         for (auto& kv : m_rowIndicators) {
-            if (kv.second.pid == (long long)userId &&
-                muted != kv.second.muteShown) {
-                SetMuteIcon(kv.second.mute, muted);
-                kv.second.muteShown = muted;
+            const bool want = MutedForPid(kv.second.pid);
+            if (want != kv.second.muteShown) {
+                SetMuteIcon(kv.second.mute, want);
+                kv.second.muteShown = want;
             }
         }
     }
@@ -2423,12 +2506,13 @@ private:
         }
 
         // Live box: header row = live dot + name + mute mark. Both indicators
-        // seed from the snapshot / g_muteByUserId; the poll (live) and the
-        // participant_audio_status update (mute) keep them updated in place. The
-        // mute mark holds a permanently-reserved 10px slot after the stretched
-        // header and only repaints on toggle, so muting never reflows the dot or
-        // name. Pointers are recorded in m_rowIndicators (owned by this box) for
-        // the in-place update paths.
+        // seed from the snapshot / g_muteByUserId (mute resolved via MutedForPid,
+        // which follows the active speaker for a pid==1 row); the poll (live) and
+        // RecomputeMuteMarks (mute) keep them updated in place. The mute mark
+        // holds a permanently-reserved kMuteSlotPx slot after the stretched header
+        // and only repaints on toggle, so muting never reflows the dot or name.
+        // Pointers are recorded in m_rowIndicators (owned by this box) for the
+        // in-place update paths.
         QWidget*     headerRow = new QWidget();
         QHBoxLayout* headerL   = new QHBoxLayout(headerRow);
         headerL->setContentsMargins(0, 0, 0, 0);
@@ -2439,7 +2523,8 @@ private:
         headerL->addWidget(liveDot);
         headerL->addWidget(header, 1);   // header takes the remaining width, elides
         QLabel* muteIcon = new QLabel();
-        muteIcon->setFixedSize(10, 10);
+        muteIcon->setFixedSize(kMuteSlotPx, kMuteSlotPx);
+        muteIcon->setAlignment(Qt::AlignCenter);
         const bool mutedNow = MutedForPid(r.pid);
         SetMuteIcon(muteIcon, mutedNow);
         headerL->addWidget(muteIcon);
@@ -4690,16 +4775,25 @@ static void RegisterEngineHandlers() {
             });
     });
 
+    // Active speaker changed. Marshal the write onto the UI thread (dock-as-
+    // context) so g_activeSpeakerUserId is fully UI-thread-owned, then recompute
+    // mute marks: an Active-Speaker dock row (pid 1) re-resolves to the new
+    // speaker's mute state. Runs on the pipe-reader thread here.
     feeds::RegisterMessageHandler("active_speaker_changed",
     [](const std::string& json) {
-        g_activeSpeakerUserId =
-            (unsigned int)ExtractJsonNumber(json, "participant_id");
+        if (!g_participantDock) return;   // only the dock reads g_activeSpeakerUserId
+        unsigned int userId = (unsigned int)ExtractJsonNumber(json, "participant_id");
+        QTimer::singleShot(0, g_participantDock, [userId]() {
+            g_activeSpeakerUserId = userId;
+            if (g_participantDock) g_participantDock->RecomputeMuteMarks();
+        });
     });
 
     // Per-user mute change from the engine's audio listener. Marshal to the UI
     // thread (dock-as-context, auto-cancels if the dock is gone): update the
-    // UI-thread-owned mute map, then flip the mute mark on every affected row in
-    // place — no Refresh(), no box rebuild. Runs on the pipe-reader thread here.
+    // UI-thread-owned mute map, then recompute mute marks in place — no Refresh(),
+    // no box rebuild. A pid==1 row picks this up when userId is the active
+    // speaker; direct rows update by pid. Runs on the pipe-reader thread here.
     feeds::RegisterMessageHandler("participant_audio_status",
     [](const std::string& json) {
         unsigned int userId = (unsigned int)ExtractJsonNumber(json, "participant_id");
@@ -4707,7 +4801,7 @@ static void RegisterEngineHandlers() {
         bool muted = ExtractJsonNumber(json, "muted") != 0;
         QTimer::singleShot(0, g_participantDock, [userId, muted]() {
             g_muteByUserId[userId] = muted;
-            if (g_participantDock) g_participantDock->UpdateMuteIndicator(userId, muted);
+            if (g_participantDock) g_participantDock->RecomputeMuteMarks();
         });
     });
 
