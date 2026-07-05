@@ -38,6 +38,7 @@
 #include <QDateTime>
 #include <QInputDialog>
 #include <QComboBox>
+#include <QListView>
 #include <QLineEdit>
 #include <QListWidget>
 #include <QListWidgetItem>
@@ -2608,23 +2609,6 @@ private:
         return cached;
     }
 
-    // Collision marker for a colliding source's header row. A conditional widget —
-    // only created (and only added) when the source actually collides, so a non-
-    // colliding row spends no width on it. Collision state changes only on an
-    // assignment change, which rebuilds the dock, so appear/disappear happens via
-    // rebuild (not a live in-place toggle) — no reflow of a displayed row.
-    static QLabel* MakeCollisionMarker() {
-        QLabel* m = new QLabel();
-        m->setFixedSize(14, 14);
-        m->setAlignment(Qt::AlignCenter);
-        m->setPixmap(WarningPixmap());
-        m->setToolTip(
-            "This selection is also used by another source. To show one "
-            "participant in multiple scenes, use a copy of the source "
-            "(the + button) instead.");
-        return m;
-    }
-
     // Plain-value snapshot of one participant source (no OBS/Qt handles retained).
     struct Row {
         std::string uuid;        // stable source id — the pick handler resolves
@@ -2643,8 +2627,8 @@ private:
     struct RowIndicators {
         QLabel*   live      = nullptr; // the connection dot (fixed 10px slot)
         int       dotCode   = -1;      // last-applied dot render code (-1 = none applied yet)
-        QLabel*   mute      = nullptr; // muted-mic mark (fixed 10px slot; painted only when muted)
-        bool      muteShown = false;   // last-applied mute state
+        QLabel*   mute      = nullptr; // always-on mic (fixed slot; grey none / red muted / green unmuted)
+        int       micTone   = -1;      // last-applied mic tone (-1 = none applied yet)
         long long pid       = 0;       // bound userId, for userId -> row resolution
     };
     std::map<std::string, RowIndicators> m_rowIndicators;
@@ -2703,12 +2687,19 @@ private:
     static void ApplyDot(QLabel* dot, int code) {
         if (!dot) return;
         QString css, tip;
-        if (code == 0) {              // case 1: no dot
-            css = "QLabel { background: transparent; border-radius: 5px; }";
-        } else if (code == 1) {       // case 2: present but dark
-            // Dark fill + a thin ring so it still reads on a dark OBS theme
-            // (a pure-black dot would vanish). Border draws inside the fixed
-            // 10px, so no size change vs the other states — no reflow.
+        if (code == 0) {              // case 1: no participant assigned
+            // Hollow outline: transparent center + thin grey ring — reads "empty".
+            // Deliberately distinct from the camera-off dot below, which is FILLED
+            // dark (present but dark). Empty vs filled is the at-a-glance cue; the
+            // ring is visible on both dark and light themes.
+            css = "QLabel { background: transparent;"
+                  " border: 1px solid rgba(150,150,150,0.65); border-radius: 5px; }";
+            tip = "No participant";
+        } else if (code == 1) {       // case 2: present but dark (camera off)
+            // FILLED dark disc + a thin ring so it still reads on a dark OBS theme
+            // (a pure-black dot would vanish) and reads "present but dark" — filled,
+            // not the hollow no-participant ring above. Border draws inside the
+            // fixed 10px, so no size change vs the other states — no reflow.
             css = "QLabel { background: rgba(30,30,30,0.90);"
                   " border: 1px solid rgba(150,150,150,0.55); border-radius: 5px; }";
             tip = "Camera off";
@@ -2784,102 +2775,130 @@ private:
         return it != g_muteByUserId.end() && it->second;
     }
 
-    // The mute mark's pixmap: OBS's own Audio-Input microphone icon, recolored
-    // red. OBS exposes that icon as a readable Q_PROPERTY on the main window, so
-    // we get the theme-rendered QIcon with no OBSBasic header/link and no QtSvg
-    // dependency. The glyph is alpha-shape only, so we tint by compositing red
-    // into its alpha (SourceIn) — identical on dark/light themes and at HiDPI.
-    // If the property read yields a null icon (OBS internals changed), we fall
-    // back to an asset-free drawn red mic. Built once, cached; the one-time log
-    // line records which path we took.
-    static const QPixmap& RedMicPixmap() {
-        static QPixmap cached;
+    // Mic tone: 0 = grey (no participant assigned), 1 = red (muted), 2 = green
+    // (unmuted). Kept in sync with the dot's no-participant state via the shared
+    // EffectiveUserId(pid) == 0 check, so mic and dot show "nobody assigned"
+    // together (grey mic + hollow dot).
+    enum { MicGrey = 0, MicRed = 1, MicGreen = 2 };
+
+    // The mute mic pixmap, tinted by tone. OBS's own Audio-Input microphone icon
+    // is a readable Q_PROPERTY on the main window, so we get the theme-rendered
+    // QIcon with no OBSBasic header/link and no QtSvg dependency. The glyph is
+    // alpha-shape only, so we tint by compositing the color into its alpha
+    // (SourceIn) — identical on dark/light and at HiDPI. If the property read
+    // yields a null icon, we fall back to an asset-free drawn mic. All three tones
+    // are built once (from one icon read) and cached; a one-time log records the path.
+    static const QPixmap& MicPixmap(int tone) {
+        static QPixmap cache[3];
         static bool    built = false;
-        if (built) return cached;
-        built = true;
+        if (!built) {
+            built = true;
+            const QColor colors[3] = { QColor(150, 150, 150),   // grey  (no participant)
+                                       QColor(220, 50, 50),      // red   (muted)
+                                       QColor(64, 180, 96) };    // green (unmuted)
+            QIcon mic;
+            if (QWidget* mw = (QWidget*)obs_frontend_get_main_window())
+                mic = qvariant_cast<QIcon>(mw->property("audioInputIcon"));
+            const bool haveObs = !mic.isNull();
+            blog(LOG_INFO, "[feeds] mute-mic icon source: %s",
+                 haveObs ? "OBS audioInputIcon (tinted)" : "drawn fallback");
 
-        const QColor red(220, 50, 50);
-        QIcon mic;
-        if (QWidget* mw = (QWidget*)obs_frontend_get_main_window())
-            mic = qvariant_cast<QIcon>(mw->property("audioInputIcon"));
-        const bool haveObsIcon = !mic.isNull();
-        blog(LOG_INFO, "[feeds] mute-mark icon source: %s",
-             haveObsIcon ? "OBS audioInputIcon (tinted red)"
-                         : "drawn fallback (OBS audioInputIcon null)");
-
-        if (haveObsIcon) {
-            // Tint by alpha: keep the glyph's shape (and its own HiDPI pixmap /
-            // devicePixelRatio), replace its color with red via SourceIn.
-            QPixmap src = mic.pixmap(QSize(kMuteSlotPx, kMuteSlotPx));
-            cached = QPixmap(src.size());
-            cached.setDevicePixelRatio(src.devicePixelRatio());
-            cached.fill(Qt::transparent);
-            QPainter p(&cached);
-            p.drawPixmap(0, 0, src);
-            p.setCompositionMode(QPainter::CompositionMode_SourceIn);
-            p.fillRect(cached.rect(), red);
-            p.end();
-            return cached;
+            auto tint = [&](const QColor& c) -> QPixmap {
+                if (haveObs) {
+                    // Keep the glyph shape (and its HiDPI pixmap / DPR), replace
+                    // its color with c via SourceIn.
+                    QPixmap src = mic.pixmap(QSize(kMuteSlotPx, kMuteSlotPx));
+                    QPixmap out(src.size());
+                    out.setDevicePixelRatio(src.devicePixelRatio());
+                    out.fill(Qt::transparent);
+                    QPainter p(&out);
+                    p.drawPixmap(0, 0, src);
+                    p.setCompositionMode(QPainter::CompositionMode_SourceIn);
+                    p.fillRect(out.rect(), c);
+                    p.end();
+                    return out;
+                }
+                // Drawn fallback: capsule body + stem + base, at screen DPR.
+                qreal dpr = 1.0;
+                if (QScreen* s = (qApp ? qApp->primaryScreen() : nullptr))
+                    dpr = s->devicePixelRatio();
+                const int px = (int)(kMuteSlotPx * dpr);
+                QPixmap out(px, px);
+                out.setDevicePixelRatio(dpr);
+                out.fill(Qt::transparent);
+                const qreal w = kMuteSlotPx, h = kMuteSlotPx;
+                QPainter p(&out);
+                p.setRenderHint(QPainter::Antialiasing, true);
+                p.setPen(Qt::NoPen);
+                p.setBrush(c);
+                p.drawRoundedRect(QRectF(w * 0.34, h * 0.10, w * 0.32, h * 0.48),
+                                  w * 0.16, w * 0.16);
+                QPen pen(c);
+                pen.setWidthF(w * 0.10);
+                pen.setCapStyle(Qt::RoundCap);
+                p.setPen(pen);
+                p.drawLine(QPointF(w * 0.50, h * 0.66), QPointF(w * 0.50, h * 0.86));
+                p.drawLine(QPointF(w * 0.34, h * 0.88), QPointF(w * 0.66, h * 0.88));
+                p.end();
+                return out;
+            };
+            for (int i = 0; i < 3; ++i) cache[i] = tint(colors[i]);
         }
-
-        // Fallback: draw a simple red microphone (capsule body + stem + base) at
-        // the screen's DPR so it stays crisp. Rarely hit — only if OBS stops
-        // exposing the icon — but always legible and red.
-        qreal dpr = 1.0;
-        if (QScreen* s = (qApp ? qApp->primaryScreen() : nullptr))
-            dpr = s->devicePixelRatio();
-        const int px = (int)(kMuteSlotPx * dpr);
-        cached = QPixmap(px, px);
-        cached.setDevicePixelRatio(dpr);
-        cached.fill(Qt::transparent);
-        const qreal w = kMuteSlotPx, h = kMuteSlotPx;
-        QPainter p(&cached);
-        p.setRenderHint(QPainter::Antialiasing, true);
-        p.setPen(Qt::NoPen);
-        p.setBrush(red);
-        p.drawRoundedRect(QRectF(w * 0.34, h * 0.10, w * 0.32, h * 0.48),
-                          w * 0.16, w * 0.16);                  // capsule body
-        QPen pen(red);
-        pen.setWidthF(w * 0.10);
-        pen.setCapStyle(Qt::RoundCap);
-        p.setPen(pen);
-        p.drawLine(QPointF(w * 0.50, h * 0.66), QPointF(w * 0.50, h * 0.86)); // stem
-        p.drawLine(QPointF(w * 0.34, h * 0.88), QPointF(w * 0.66, h * 0.88)); // base
-        p.end();
-        return cached;
+        return cache[(tone >= 0 && tone < 3) ? tone : MicGrey];
     }
 
-    // Paint-only toggle on the permanently-reserved kMuteSlotPx slot. We never
-    // hide the label (setVisible would collapse it out of the layout and re-elide
-    // the name on every toggle); the label always occupies its fixed box. Muted
-    // paints the red microphone mark; unmuted/unknown clears the pixmap. So a
-    // toggle changes only pixels inside the box — the live dot and name never
-    // reflow.
-    static void SetMuteIcon(QLabel* icon, bool muted) {
+    // Resolve a row's mic tone from the shared no-participant check + mute state:
+    // no participant assigned (EffectiveUserId == 0) -> grey; else muted -> red,
+    // unmuted -> green. Same EffectiveUserId == 0 condition the dot uses for its
+    // hollow no-participant ring, so the two indicators agree by construction.
+    static int MicToneForPid(long long pid) {
+        if (EffectiveUserId(pid) == 0) return MicGrey;
+        return MutedForPid(pid) ? MicRed : MicGreen;
+    }
+
+    // Always-on mic indicator: grey (no participant) / red (muted) / green
+    // (unmuted). Painted every rebuild and flipped in place by RecomputeMuteMarks —
+    // never hidden, so its fixed slot never reflows. Only the tone/tooltip changes.
+    static void ApplyMic(QLabel* icon, int tone) {
         if (!icon) return;
-        if (muted) {
-            icon->setPixmap(RedMicPixmap());
-            icon->setToolTip("Muted");
+        icon->setPixmap(MicPixmap(tone));
+        icon->setToolTip(tone == MicGrey ? "No participant"
+                       : tone == MicRed  ? "Muted"
+                                         : "Unmuted");
+    }
+
+    // Warning glyph on a permanently-reserved fixed slot: paint the amber triangle
+    // (+ guidance tooltip) when the source collides with another, paint nothing
+    // when it doesn't. Reserved either way, so a collision appearing/clearing
+    // across a rebuild never shifts the name or the buttons.
+    static void SetWarnIcon(QLabel* icon, bool collides) {
+        if (!icon) return;
+        if (collides) {
+            icon->setPixmap(WarningPixmap());
+            icon->setToolTip(
+                "This selection is also used by another source. To show one "
+                "participant in multiple scenes, use a copy of the source "
+                "(the + button) instead.");
         } else {
             icon->setPixmap(QPixmap());
             icon->setToolTip(QString());
         }
     }
 
-    // Recompute every row's mute mark in place from current UI-thread state
-    // (g_muteByUserId + g_activeSpeakerUserId). Both mute triggers route through
-    // here: a participant_audio_status update (after writing g_muteByUserId) and
-    // an active_speaker_changed (after writing g_activeSpeakerUserId). Resolving
-    // per-row via MutedForPid means an Active-Speaker row (pid 1) re-resolves to
-    // the current speaker automatically, and direct rows update as before. No
-    // Refresh(), no rebuild; O(rows). Public: called via g_participantDock->.
+    // Recompute every row's mic tone in place from current UI-thread state
+    // (g_muteByUserId + g_activeSpeakerUserId). Both triggers route through here: a
+    // participant_audio_status update (after writing g_muteByUserId) and an
+    // active_speaker_changed (after writing g_activeSpeakerUserId). Resolving per
+    // row via MicToneForPid means an Active-Speaker row (pid 1) re-resolves through
+    // the current speaker automatically — including flipping to/from grey as a
+    // speaker appears or clears. No Refresh(), no rebuild; O(rows). Public.
 public:
     void RecomputeMuteMarks() {
         for (auto& kv : m_rowIndicators) {
-            const bool want = MutedForPid(kv.second.pid);
-            if (want != kv.second.muteShown) {
-                SetMuteIcon(kv.second.mute, want);
-                kv.second.muteShown = want;
+            const int tone = MicToneForPid(kv.second.pid);
+            if (tone != kv.second.micTone) {
+                ApplyMic(kv.second.mute, tone);
+                kv.second.micTone = tone;
             }
         }
     }
@@ -3039,114 +3058,118 @@ private:
         boxL->setContentsMargins(8, 6, 8, 8);
         boxL->setSpacing(4);   // tight header <-> combo so the box reads as one unit
 
-        // Collision marker guidance: does this source share its assignment with
-        // another? Conditional — only added when true, so non-colliding rows keep
-        // their width. Placed after the stretched name in both branches, so the
-        // name's left edge never moves (only its width shrinks when present).
+        // Shared header state. collides drives the reserved warning slot; dotCode
+        // and micTone seed the connection dot and the always-on mic. The dot's
+        // no-participant case (dotCode 0) and the grey mic tone both key off the
+        // same EffectiveUserId(pid) == 0 condition, so they read consistently.
         const bool collides = SourceCollides(r.pid, pidCount);
+        const int  dotCode  = ResolveDotCode(r.pid, r.liveNow);
+        const int  micTone  = MicToneForPid(r.pid);
 
-        // Header — a swappable child QLabel (objectName so the later
-        // double-click-to-edit increment can find/replace it), not a frame
-        // decoration. Elides to one line. Name reads in the normal color in every
-        // state (live or non-live/not-connected) — only the dropdown is
-        // unavailable when not connected, not the name. Over-cap rows below the
-        // divider are the only ones with a grey name (a tier-position status, set
-        // there, not here).
+        // Header name — a swappable child QLabel (objectName so rename can
+        // find/replace it). Elides to one line, normal color in every state.
         ElidingLabel* header = new ElidingLabel(QString::fromStdString(r.name));
         header->setObjectName("feedsSourceHeader");
         header->setStyleSheet(
             "QLabel#feedsSourceHeader { background: rgba(128,128,128,0.15);"
             " border-radius: 3px; padding: 3px 6px; font-weight: bold; }");
-        // Double-click the header to rename the underlying OBS source. Wired for
-        // both live and non-live boxes (both are real sources); the over-cap rows
-        // below the divider get the same handler on their own labels. Works in
-        // every state (rename doesn't depend on connection/meeting). The combo/
-        // add-to-scene button are separate siblings, so this can't interfere.
+        // Double-click to rename the underlying OBS source. A separate sibling from
+        // the clusters, so it can't interfere with the buttons/indicators.
         {
             const std::string uuid = r.uuid;
-            header->onDoubleClick = [this, uuid, header]() {
-                BeginRename(uuid, header);
-            };
+            header->onDoubleClick = [this, uuid, header]() { BeginRename(uuid, header); };
         }
 
+        // Two-cluster header row, identical on live and non-live boxes:
+        //   [ dot | mute | warn ]  [ name (stretch, elides) ]  [ + | scenes | filters ]
+        // Left = status indicators (grouped, tight); right = action buttons; name
+        // between. Every left-cluster slot is fixed-size and always present, so the
+        // only thing that ever changes width is the elided name — nothing reflows on
+        // a mute toggle (always shown) or a collision change (reserved warn slot).
+        QWidget*     headerRow = new QWidget();
+        QHBoxLayout* headerL   = new QHBoxLayout(headerRow);
+        headerL->setContentsMargins(0, 0, 0, 0);
+        headerL->setSpacing(8);   // gap between the three clusters
+
+        QWidget*     left  = new QWidget();
+        QHBoxLayout* leftL = new QHBoxLayout(left);
+        leftL->setContentsMargins(0, 0, 0, 0);
+        leftL->setSpacing(5);     // within the status cluster — keep the glyphs distinct
+        QLabel* dot = new QLabel();
+        dot->setFixedSize(10, 10);
+        ApplyDot(dot, dotCode);   // round: green/yellow/red/black/none
+        leftL->addWidget(dot);
+        QLabel* mute = new QLabel();
+        mute->setFixedSize(kMuteSlotPx, kMuteSlotPx);
+        mute->setAlignment(Qt::AlignCenter);
+        ApplyMic(mute, micTone);   // mic: grey none / green unmuted / red muted
+        leftL->addWidget(mute);
+        QLabel* warn = new QLabel();
+        warn->setFixedSize(kMuteSlotPx, kMuteSlotPx);
+        warn->setAlignment(Qt::AlignCenter);
+        SetWarnIcon(warn, collides);   // amber triangle when colliding, else blank
+        leftL->addWidget(warn);
+        headerL->addWidget(left);
+
+        headerL->addWidget(header, 1);          // middle: name takes the stretch
+        AppendHeaderButtons(headerL, r.uuid);   // right: + add-to-scene | scenes | filters
+        boxL->addWidget(headerRow);
+
         if (!live) {
-            // Non-live: normal-color name, no live dot (the whole box already reads
-            // "not active" — a second not-receiving treatment would just stack),
-            // and a muted "Waiting for participants…" line in the combo's slot.
-            // Header sits in a row so the add-to-scene button can ride at its right,
-            // same as the live box (referencing a non-live source is valid — it's a
-            // real source).
-            QWidget*     headerRow = new QWidget();
-            QHBoxLayout* headerL   = new QHBoxLayout(headerRow);
-            headerL->setContentsMargins(0, 0, 0, 0);
-            headerL->setSpacing(6);
-            headerL->addWidget(header, 1);   // header takes the remaining width, elides
-            if (collides) headerL->addWidget(MakeCollisionMarker());
-            AppendHeaderButtons(headerL, r.uuid);
-            boxL->addWidget(headerRow);
-            // Occupies the same slot the combo does, so the box height stays stable
-            // across the non-live/live flip. Accurate in all non-live states (not
-            // logged in, connected-but-alone, not connected): the source is waiting
-            // for participants either way.
+            // Non-live: same header/clusters, but a muted "Waiting…" line in place
+            // of the combo. The dot/mute/warn are painted once (static — the dock
+            // is not in an active meeting state, so nothing updates them in place;
+            // the non-live->live transition rebuilds). Occupies the combo's slot so
+            // the box height stays stable across the flip.
             QLabel* status = new QLabel("Waiting for participants…");
             status->setStyleSheet("QLabel { color: #7a7d80; }");
             boxL->addWidget(status);
             return box;
         }
 
-        // Live box: header row = live dot + name + mute mark. Both indicators
-        // seed from the snapshot / g_muteByUserId (mute resolved via MutedForPid,
-        // which follows the active speaker for a pid==1 row); the poll (live) and
-        // RecomputeMuteMarks (mute) keep them updated in place. The mute mark
-        // holds a permanently-reserved kMuteSlotPx slot after the stretched header
-        // and only repaints on toggle, so muting never reflows the dot or name.
-        // Pointers are recorded in m_rowIndicators (owned by this box) for the
-        // in-place update paths.
-        QWidget*     headerRow = new QWidget();
-        QHBoxLayout* headerL   = new QHBoxLayout(headerRow);
-        headerL->setContentsMargins(0, 0, 0, 0);
-        headerL->setSpacing(6);
-        QLabel* liveDot = new QLabel();
-        liveDot->setFixedSize(10, 10);
-        // Seed the four-case dot from the snapshot (r.liveNow) + current quality/
-        // active-speaker state; the poll keeps it updated in place each tick.
-        const int dotCode = ResolveDotCode(r.pid, r.liveNow);
-        ApplyDot(liveDot, dotCode);
-        headerL->addWidget(liveDot);
-        headerL->addWidget(header, 1);   // header takes the remaining width, elides
-        if (collides) headerL->addWidget(MakeCollisionMarker());
-        QLabel* muteIcon = new QLabel();
-        muteIcon->setFixedSize(kMuteSlotPx, kMuteSlotPx);
-        muteIcon->setAlignment(Qt::AlignCenter);
-        const bool mutedNow = MutedForPid(r.pid);
-        SetMuteIcon(muteIcon, mutedNow);
-        headerL->addWidget(muteIcon);
-        AppendHeaderButtons(headerL, r.uuid);   // + add-to-scene | scenes | filters
-        boxL->addWidget(headerRow);
-        m_rowIndicators[r.uuid] = { liveDot, dotCode, muteIcon, mutedNow, r.pid };
+        // Live box: register the dot + mute for in-place updates (the poll and
+        // RecomputeMuteMarks flip them without a rebuild), then build the combo.
+        m_rowIndicators[r.uuid] = { dot, dotCode, mute, micTone, r.pid };
 
-        // Live: the functional combo (0 unselect / 1 [Active Speaker] / roster-
-        // minus-self by user id), each entry carrying its participant_id as item
-        // data. Built from the roster snapshot — no re-lock. A live row only exists
-        // when others are present, so this never hits the "Waiting..." case.
-        //
-        // Multi-source guidance (Piece 1): selections used by ANOTHER source are
-        // demoted below a non-selectable "Already used" divider and greyed — but
-        // still fully selectable (picking one assigns normally; nothing is blocked).
-        // Unselect is always normal; Active Speaker is treated like a participant;
-        // this source's own current pick is never demoted (stays normal, in place).
+        // Functional combo. Current-selection handling + multi-source guidance:
+        //  - the current pick is NOT a selectable list item (avoids showing the
+        //    assigned participant twice — once as the closed value, once in the
+        //    list). It's shown as the closed value via a hidden index-0 item;
+        //    unassigned/absent shows a greyed "Select participant…" placeholder.
+        //  - "None" is the clear option. Active Speaker is treated like a
+        //    participant. Selections used by ANOTHER source are demoted below a
+        //    non-selectable "── Already used ──" divider and greyed — still fully
+        //    selectable (nothing is ever blocked).
         QComboBox* combo = new QComboBox();
+        const long long ownPid = r.pid;
+
+        // Closed-state display of the current pick (NOT added to the list itself).
+        QString currentText;
+        bool    haveCurrent = (ownPid != 0);
+        if (ownPid == 1) {
+            currentText = "[Active Speaker]";
+        } else if (ownPid > 1) {
+            auto it = roster.find((unsigned int)ownPid);
+            if (it != roster.end()) currentText = QString::fromStdString(it->second);
+            else haveCurrent = false;   // bound but absent -> prompt (as before)
+        }
+        if (haveCurrent)
+            combo->addItem(currentText, QVariant((qulonglong)ownPid));   // index 0, hidden below
+
+        // Selectable list: None + AS (unless it's the current pick) + roster minus
+        // self and minus the current pick, split normal / already-used.
         struct Cand { QString label; qulonglong data; };
         std::vector<Cand> normalC, usedC;
-        normalC.push_back({ "--- Select Participant ---", 0 });   // never "used"
-        {
+        normalC.push_back({ "None", 0 });   // clear option
+        if (ownPid != 1) {
             Cand as{ "[Active Speaker]", 1 };
-            (UsedByOtherSource(1, r.pid, pidCount) ? usedC : normalC).push_back(as);
+            (UsedByOtherSource(1, ownPid, pidCount) ? usedC : normalC).push_back(as);
         }
         for (const auto& kv : roster) {
-            if (myId != 0 && kv.first == myId) continue;   // exclude self
+            if (myId != 0 && kv.first == myId) continue;          // exclude self
+            if ((long long)kv.first == ownPid)  continue;         // exclude current pick
             Cand c{ QString::fromStdString(kv.second), (qulonglong)kv.first };
-            (UsedByOtherSource((long long)kv.first, r.pid, pidCount) ? usedC : normalC)
+            (UsedByOtherSource((long long)kv.first, ownPid, pidCount) ? usedC : normalC)
                 .push_back(c);
         }
         for (const auto& c : normalC)
@@ -3154,33 +3177,30 @@ private:
         if (!usedC.empty()) {
             combo->addItem(QString::fromUtf8("── Already used ──"));
             // Disable the divider so it isn't selectable (keyboard/mouse skip it).
-            if (auto* model = qobject_cast<QStandardItemModel*>(combo->model())) {
-                if (QStandardItem* d = model->item(combo->count() - 1))
-                    d->setEnabled(false);
-            }
+            if (auto* model = qobject_cast<QStandardItemModel*>(combo->model()))
+                if (QStandardItem* d = model->item(combo->count() - 1)) d->setEnabled(false);
             const QBrush grey(QColor(0x7a, 0x7d, 0x80));
             for (const auto& c : usedC) {
                 combo->addItem(c.label, QVariant(c.data));
-                // Grey the text only — the item stays enabled/selectable.
                 combo->setItemData(combo->count() - 1, grey, Qt::ForegroundRole);
             }
         }
 
-        // Initial selection from the committed participant_id. findData == -1
-        // (bound participant not in the current roster) leaves it on index 0,
-        // the "--- Select Participant ---" entry — matching the properties
-        // not-found behavior. Set BEFORE connecting so the programmatic index
-        // can never reach the handler.
-        int idx = combo->findData(QVariant((qulonglong)r.pid));
-        if (idx >= 0) combo->setCurrentIndex(idx);
+        // Closed display: select the hidden current item and hide its row from the
+        // popup (shown closed, omitted from the list), or show the placeholder when
+        // unassigned/absent. Set BEFORE connecting so this can't reach the handler.
+        if (haveCurrent) {
+            combo->setCurrentIndex(0);
+            if (auto* lv = qobject_cast<QListView*>(combo->view()))
+                lv->setRowHidden(0, true);
+        } else {
+            combo->setPlaceholderText(QString::fromUtf8("Select participant…"));
+            combo->setCurrentIndex(-1);
+        }
 
-        // Connect to activated (genuine user interaction only) — NOT
-        // currentIndexChanged. activated never fires on setCurrentIndex /
-        // addItem / any programmatic change, so a full rebuild that recreates
-        // every combo and sets its index can't trigger a write: no
-        // pick -> write -> refresh loop, and an unrelated roster-change refresh
-        // can't silently rewrite a binding. Populate-then-connect is redundant
-        // insurance; activated is the guarantee.
+        // Connect to activated (genuine user interaction only) — never fires on
+        // setCurrentIndex / addItem, so the programmatic setup above is inert. A
+        // rebuild that recreates every combo can't trigger a write.
         const std::string uuid = r.uuid;
         QObject::connect(combo, QOverload<int>::of(&QComboBox::activated),
             [combo, uuid](int) {
