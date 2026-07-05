@@ -64,6 +64,8 @@
 #include <QByteArray>
 #include <QCursor>
 #include <QPalette>
+#include <QBrush>
+#include <QStandardItemModel>
 #include <QMouseEvent>
 #include <QKeyEvent>
 #include <QEnterEvent>
@@ -2347,6 +2349,14 @@ public:
             return;
         }
 
+        // Multi-source guidance: count how many sources are assigned to each
+        // participant / Active Speaker across ALL rows (over-cap included — their
+        // assignment still uses a participant). Drives the dropdown "already used"
+        // treatment and the collision marker; recomputed every refresh.
+        std::map<long long, int> pidCount;
+        for (const auto& r : rows)
+            if (r.pid > 0) pidCount[r.pid]++;
+
         // Enabled (tier-active) sources on top, in vector = creation order,
         // each a self-contained framed box. Logged out, no row is treated as
         // disabled, so all render here. A live source is an interactive box
@@ -2356,7 +2366,7 @@ public:
         // than the box appearing/disappearing.
         for (const auto& r : rows) {
             if (loggedIn && r.disabled) continue;
-            m_root->addWidget(MakeSourceBox(r, live, myId, roster));
+            m_root->addWidget(MakeSourceBox(r, live, myId, roster, pidCount));
         }
 
         if (atOrOverCap) {
@@ -2535,6 +2545,84 @@ private:
             [uuid]() { ShowIncludedScenesMenu(uuid); }));
         headerL->addWidget(MakeIconButton(FiltersIcon(), "Filters",
             [uuid]() { OpenSourceFilters(uuid); }));
+    }
+
+    // --- Multi-source guidance (shared collision computation) ------------------
+    // pidCount maps an assignment (real userId, or Active Speaker sentinel 1) to
+    // the number of sources currently set to it, across ALL sources (live,
+    // non-live, and over-cap — an over-cap source's assignment still "uses" a
+    // participant). Built once per Refresh from the row snapshot and threaded into
+    // each box, so a refresh (which every assignment change already triggers via
+    // zp_update -> PostParticipantDockRefresh) recomputes both guidance pieces
+    // everywhere for free — no separate targeted update.
+
+    // For a dropdown in a source whose current pick is ownPid: is option q
+    // "used by another source"? Unselect (0) never is; the source's OWN current
+    // pick (q == ownPid) is never demoted (it's the current value). Otherwise q is
+    // used elsewhere iff any source is set to it (q != ownPid, so any such source
+    // is a different one). Active Speaker (1) is treated exactly like a participant.
+    static bool UsedByOtherSource(long long q, long long ownPid,
+                                  const std::map<long long, int>& pidCount) {
+        if (q <= 0 || q == ownPid) return false;
+        auto it = pidCount.find(q);
+        return it != pidCount.end() && it->second >= 1;
+    }
+
+    // Does this source's assignment collide with another source's? pid>0 and at
+    // least two sources share it (this one plus another).
+    static bool SourceCollides(long long pid, const std::map<long long, int>& pidCount) {
+        if (pid <= 0) return false;
+        auto it = pidCount.find(pid);
+        return it != pidCount.end() && it->second >= 2;
+    }
+
+    // A quiet amber warning glyph (outline triangle + exclamation), drawn so it's
+    // theme-agnostic and semi-transparent like the other indicators. Cached.
+    static const QPixmap& WarningPixmap() {
+        static QPixmap cached;
+        static bool    built = false;
+        if (built) return cached;
+        built = true;
+        const int sz = 14;
+        qreal dpr = 1.0;
+        if (QScreen* s = (qApp ? qApp->primaryScreen() : nullptr))
+            dpr = s->devicePixelRatio();
+        cached = QPixmap((int)(sz * dpr), (int)(sz * dpr));
+        cached.setDevicePixelRatio(dpr);
+        cached.fill(Qt::transparent);
+        const qreal w = sz;
+        const QColor amber(230, 150, 60, 235);
+        QPainter p(&cached);
+        p.setRenderHint(QPainter::Antialiasing, true);
+        QPen pen(amber);
+        pen.setWidthF(1.3);
+        pen.setJoinStyle(Qt::RoundJoin);
+        pen.setCapStyle(Qt::RoundCap);
+        p.setPen(pen);
+        p.drawLine(QPointF(w * 0.50, w * 0.12), QPointF(w * 0.92, w * 0.86));  // triangle
+        p.drawLine(QPointF(w * 0.92, w * 0.86), QPointF(w * 0.08, w * 0.86));
+        p.drawLine(QPointF(w * 0.08, w * 0.86), QPointF(w * 0.50, w * 0.12));
+        p.drawLine(QPointF(w * 0.50, w * 0.40), QPointF(w * 0.50, w * 0.62));  // "!" stem
+        p.drawPoint(QPointF(w * 0.50, w * 0.74));                              // "!" dot
+        p.end();
+        return cached;
+    }
+
+    // Collision marker for a colliding source's header row. A conditional widget —
+    // only created (and only added) when the source actually collides, so a non-
+    // colliding row spends no width on it. Collision state changes only on an
+    // assignment change, which rebuilds the dock, so appear/disappear happens via
+    // rebuild (not a live in-place toggle) — no reflow of a displayed row.
+    static QLabel* MakeCollisionMarker() {
+        QLabel* m = new QLabel();
+        m->setFixedSize(14, 14);
+        m->setAlignment(Qt::AlignCenter);
+        m->setPixmap(WarningPixmap());
+        m->setToolTip(
+            "This selection is also used by another source. To show one "
+            "participant in multiple scenes, use a copy of the source "
+            "(the + button) instead.");
+        return m;
     }
 
     // Plain-value snapshot of one participant source (no OBS/Qt handles retained).
@@ -2939,7 +3027,8 @@ private:
     // dark and light themes; the non-live frame is dimmed (lower alpha) so a
     // greyed source doesn't read as more prominent than an active one.
     QWidget* MakeSourceBox(const Row& r, bool live, unsigned int myId,
-                           const std::map<unsigned int, std::string>& roster) {
+                           const std::map<unsigned int, std::string>& roster,
+                           const std::map<long long, int>& pidCount) {
         QFrame* box = new QFrame();
         box->setObjectName("feedsSourceBox");
         box->setStyleSheet(QString(
@@ -2949,6 +3038,12 @@ private:
         QVBoxLayout* boxL = new QVBoxLayout(box);
         boxL->setContentsMargins(8, 6, 8, 8);
         boxL->setSpacing(4);   // tight header <-> combo so the box reads as one unit
+
+        // Collision marker guidance: does this source share its assignment with
+        // another? Conditional — only added when true, so non-colliding rows keep
+        // their width. Placed after the stretched name in both branches, so the
+        // name's left edge never moves (only its width shrinks when present).
+        const bool collides = SourceCollides(r.pid, pidCount);
 
         // Header — a swappable child QLabel (objectName so the later
         // double-click-to-edit increment can find/replace it), not a frame
@@ -2986,6 +3081,7 @@ private:
             headerL->setContentsMargins(0, 0, 0, 0);
             headerL->setSpacing(6);
             headerL->addWidget(header, 1);   // header takes the remaining width, elides
+            if (collides) headerL->addWidget(MakeCollisionMarker());
             AppendHeaderButtons(headerL, r.uuid);
             boxL->addWidget(headerRow);
             // Occupies the same slot the combo does, so the box height stays stable
@@ -3018,6 +3114,7 @@ private:
         ApplyDot(liveDot, dotCode);
         headerL->addWidget(liveDot);
         headerL->addWidget(header, 1);   // header takes the remaining width, elides
+        if (collides) headerL->addWidget(MakeCollisionMarker());
         QLabel* muteIcon = new QLabel();
         muteIcon->setFixedSize(kMuteSlotPx, kMuteSlotPx);
         muteIcon->setAlignment(Qt::AlignCenter);
@@ -3028,18 +3125,45 @@ private:
         boxL->addWidget(headerRow);
         m_rowIndicators[r.uuid] = { liveDot, dotCode, muteIcon, mutedNow, r.pid };
 
-        // Live: the functional combo, populated identically to the properties
-        // dropdown (0 unselect / 1 [Active Speaker] / roster-minus-self by user
-        // id), each entry carrying its participant_id as item data. Built from
-        // the roster snapshot — no re-lock. A live row only exists when others
-        // are present, so this never hits the "Waiting for participants..." case.
+        // Live: the functional combo (0 unselect / 1 [Active Speaker] / roster-
+        // minus-self by user id), each entry carrying its participant_id as item
+        // data. Built from the roster snapshot — no re-lock. A live row only exists
+        // when others are present, so this never hits the "Waiting..." case.
+        //
+        // Multi-source guidance (Piece 1): selections used by ANOTHER source are
+        // demoted below a non-selectable "Already used" divider and greyed — but
+        // still fully selectable (picking one assigns normally; nothing is blocked).
+        // Unselect is always normal; Active Speaker is treated like a participant;
+        // this source's own current pick is never demoted (stays normal, in place).
         QComboBox* combo = new QComboBox();
-        combo->addItem("--- Select Participant ---", QVariant((qulonglong)0));
-        combo->addItem("[Active Speaker]",           QVariant((qulonglong)1));
+        struct Cand { QString label; qulonglong data; };
+        std::vector<Cand> normalC, usedC;
+        normalC.push_back({ "--- Select Participant ---", 0 });   // never "used"
+        {
+            Cand as{ "[Active Speaker]", 1 };
+            (UsedByOtherSource(1, r.pid, pidCount) ? usedC : normalC).push_back(as);
+        }
         for (const auto& kv : roster) {
             if (myId != 0 && kv.first == myId) continue;   // exclude self
-            combo->addItem(QString::fromStdString(kv.second),
-                           QVariant((qulonglong)kv.first));
+            Cand c{ QString::fromStdString(kv.second), (qulonglong)kv.first };
+            (UsedByOtherSource((long long)kv.first, r.pid, pidCount) ? usedC : normalC)
+                .push_back(c);
+        }
+        for (const auto& c : normalC)
+            combo->addItem(c.label, QVariant(c.data));
+        if (!usedC.empty()) {
+            combo->addItem(QString::fromUtf8("── Already used ──"));
+            // Disable the divider so it isn't selectable (keyboard/mouse skip it).
+            if (auto* model = qobject_cast<QStandardItemModel*>(combo->model())) {
+                if (QStandardItem* d = model->item(combo->count() - 1))
+                    d->setEnabled(false);
+            }
+            const QBrush grey(QColor(0x7a, 0x7d, 0x80));
+            for (const auto& c : usedC) {
+                combo->addItem(c.label, QVariant(c.data));
+                // Grey the text only — the item stays enabled/selectable.
+                combo->setItemData(combo->count() - 1, grey, Qt::ForegroundRole);
+            }
         }
 
         // Initial selection from the committed participant_id. findData == -1
