@@ -608,7 +608,8 @@ static void ShowUpdatePopup(const std::string& latestVer) {
     dlg->setWindowModality(Qt::ApplicationModal);
 
     QLabel* intro = new QLabel(
-        "A new version of Feeds is available.", dlg);
+        "A new version of Feeds is available. Download and install it to update.",
+        dlg);
 
     QLabel* curLabel = new QLabel(
         QString("<b>Current version:</b> ") + feeds_shared::VERSION, dlg);
@@ -621,8 +622,11 @@ static void ShowUpdatePopup(const std::string& latestVer) {
     latestLabel->setTextFormat(Qt::RichText);
     latestLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
 
-    QPushButton* notesBtn = new QPushButton("View Release Notes", dlg);
-    QObject::connect(notesBtn, &QPushButton::clicked, dlg, [dlg]() {
+    // Opens the GitHub releases page — where the installer download lives — so the
+    // label names the action (download), not "release notes" (which read as done
+    // after reading, leaving the user still on the old version). Same destination.
+    QPushButton* downloadBtn = new QPushButton("Download Update", dlg);
+    QObject::connect(downloadBtn, &QPushButton::clicked, dlg, [dlg]() {
         QDesktopServices::openUrl(
             QUrl("https://github.com/LetsDoVideo/feeds/releases"));
         dlg->accept();
@@ -634,7 +638,7 @@ static void ShowUpdatePopup(const std::string& latestVer) {
                      dlg, &QDialog::accept);
 
     QHBoxLayout* btnRow = new QHBoxLayout();
-    btnRow->addWidget(notesBtn);
+    btnRow->addWidget(downloadBtn);
     btnRow->addStretch();
     btnRow->addWidget(laterBtn);
 
