@@ -243,6 +243,14 @@ static void PostParticipantDockRefresh();
 // Dock combo pick handler — commit a participant reassignment for the source
 // with the given UUID (defined after RecordParticipantBinding; UI thread only).
 static void OnDockParticipantPicked(const std::string& uuid, long long selectedId);
+// Dock create/reference actions (defined with the placement helpers, far below).
+// ResolveCurrentEditScene returns the scene the Source dock edits — preview in
+// Studio Mode, current otherwise — as a ref to release, or null. The two actions
+// operate on OBS's real scene graph; the dock reflects results via existing signals.
+static obs_source_t* ResolveCurrentEditScene();
+static void ApplyFitCenterGeometry(obs_sceneitem_t* item, obs_source_t* source);
+static void CreateParticipantSourceInCurrentScene();
+static void AddSourceReferenceToCurrentScene(const std::string& uuid);
 
 // ---------------------------------------------------------------------------
 // Per-source data
@@ -2310,10 +2318,11 @@ public:
         if (rows.empty()) {
             QLabel* empty = new QLabel(
                 "No Zoom Participant sources yet.\n"
-                "Add one from the Sources dock (+ → Zoom Participant).");
+                "Click “+ Add Participant” below to create one.");
             empty->setWordWrap(true);
             empty->setStyleSheet("QLabel { color: #7a7d80; }");
             m_root->addWidget(empty);
+            AppendCreateButton();
             m_root->addStretch(1);
             return;
         }
@@ -2364,10 +2373,39 @@ public:
             m_root->addWidget(btn);
         }
 
+        AppendCreateButton();
         m_root->addStretch(1);
     }
 
 private:
+    // Full-width "create a Feeds participant source" button, pinned at the bottom
+    // (the top slot is state-driven). Never disabled by the tier cap — it always
+    // creates; an over-cap result is greyed by the identical existing logic. The
+    // create + scene-add + placement + dock-row all ride the existing signal paths.
+    void AppendCreateButton() {
+        QPushButton* addBtn = new QPushButton("+ Add Participant");
+        QObject::connect(addBtn, &QPushButton::clicked, []() {
+            CreateParticipantSourceInCurrentScene();
+        });
+        m_root->addWidget(addBtn);
+    }
+
+    // Small right-aligned per-row button: add THIS source to the current edit
+    // scene as a Paste Reference (new scene-item on the same source). A separate
+    // sibling from the header label, so it doesn't collide with the rename
+    // double-click. Shared by the live and non-live box header rows.
+    QPushButton* MakeAddToSceneButton(const std::string& uuid) {
+        QPushButton* b = new QPushButton("+");
+        b->setFixedSize(18, 18);
+        b->setToolTip("Add to current scene");
+        b->setCursor(Qt::PointingHandCursor);
+        b->setStyleSheet("QPushButton { padding: 0; font-weight: bold; }");
+        QObject::connect(b, &QPushButton::clicked, [uuid]() {
+            AddSourceReferenceToCurrentScene(uuid);
+        });
+        return b;
+    }
+
     // Plain-value snapshot of one participant source (no OBS/Qt handles retained).
     struct Row {
         std::string uuid;        // stable source id — the pick handler resolves
@@ -2730,8 +2768,16 @@ private:
         if (!live) {
             // Non-live: greyed header, no live dot (the whole box already reads
             // "not active" — a second not-receiving treatment would just stack),
-            // and a greyed em-dash status in place of the combo.
-            boxL->addWidget(header);
+            // and a greyed em-dash status in place of the combo. Header sits in a
+            // row so the add-to-scene button can ride at its right, same as the
+            // live box (referencing a non-live source is valid — it's a real source).
+            QWidget*     headerRow = new QWidget();
+            QHBoxLayout* headerL   = new QHBoxLayout(headerRow);
+            headerL->setContentsMargins(0, 0, 0, 0);
+            headerL->setSpacing(6);
+            headerL->addWidget(header, 1);   // header takes the remaining width, elides
+            headerL->addWidget(MakeAddToSceneButton(r.uuid));
+            boxL->addWidget(headerRow);
             QLabel* status = new QLabel(QString::fromUtf8("→  —"));
             status->setStyleSheet("QLabel { color: #7a7d80; }");
             boxL->addWidget(status);
@@ -2761,6 +2807,7 @@ private:
         const bool mutedNow = MutedForPid(r.pid);
         SetMuteIcon(muteIcon, mutedNow);
         headerL->addWidget(muteIcon);
+        headerL->addWidget(MakeAddToSceneButton(r.uuid));  // add-to-scene, far right
         boxL->addWidget(headerRow);
         m_rowIndicators[r.uuid] = { liveDot, r.liveNow, muteIcon, mutedNow, r.pid };
 
@@ -5169,6 +5216,35 @@ static void ApplyFeedsBoundsToSceneItem(obs_source_t* source) {
     obs_enum_scenes(enum_cb, &ctx);
 }
 
+// Fit-center geometry for one participant scene-item: Automatic bounds (no bbox,
+// so Alt-drag crops naturally), center alignment, aspect-preserving fit scale to
+// the canvas (the geometry OBS_BOUNDS_SCALE_INNER yields), centered position. The
+// single definition shared by ApplyParticipantPlacement's initial-placement enum
+// and the dock's add-reference action. No-op if the source has no real
+// dimensions yet (0x0).
+static void ApplyFitCenterGeometry(obs_sceneitem_t* item, obs_source_t* source) {
+    if (!item || !source) return;
+    const uint32_t srcW = obs_source_get_width(source);
+    const uint32_t srcH = obs_source_get_height(source);
+    if (srcW == 0 || srcH == 0) return;
+
+    obs_video_info ovi;
+    uint32_t canvasW = 1920, canvasH = 1080;
+    if (obs_get_video_info(&ovi)) { canvasW = ovi.base_width; canvasH = ovi.base_height; }
+
+    const float scaleW = (float)canvasW / (float)srcW;
+    const float scaleH = (float)canvasH / (float)srcH;
+    const float fit    = (scaleW < scaleH) ? scaleW : scaleH;
+
+    vec2 scaleVec; scaleVec.x = fit; scaleVec.y = fit;
+    vec2 pos;      pos.x = (float)canvasW * 0.5f; pos.y = (float)canvasH * 0.5f;
+
+    obs_sceneitem_set_bounds_type(item, OBS_BOUNDS_NONE);
+    obs_sceneitem_set_alignment(item, OBS_ALIGN_CENTER);
+    obs_sceneitem_set_scale(item, &scaleVec);
+    obs_sceneitem_set_pos(item, &pos);
+}
+
 // Participant-video initial placement (v1.4.0). Unlike screenshare (which
 // keeps the Fit bounds in ApplyFeedsBoundsToSceneItem above), participant
 // video uses Automatic bounds (OBS_BOUNDS_NONE) so the user can crop it
@@ -5205,15 +5281,6 @@ static void ApplyParticipantPlacement(obs_source_t* source) {
         if (alreadyPlaced) return;
     }
 
-    // Canvas size for the fit math + centering.
-    obs_video_info ovi;
-    uint32_t canvasW = 1920;
-    uint32_t canvasH = 1080;
-    if (obs_get_video_info(&ovi)) {
-        canvasW = ovi.base_width;
-        canvasH = ovi.base_height;
-    }
-
     // Wait for the source to report real dimensions (first frame). The
     // engine scaler guarantees these are constant once they appear, so a
     // one-shot placement is correct and survives Zoom resolution drops.
@@ -5231,51 +5298,23 @@ static void ApplyParticipantPlacement(obs_source_t* source) {
     }
     if (srcW == 0 || srcH == 0) return;
 
-    // Aspect-preserving fit (the geometry OBS_BOUNDS_SCALE_INNER yields):
-    // scale so the source lands wholly inside the canvas.
-    const float scaleW = (float)canvasW / (float)srcW;
-    const float scaleH = (float)canvasH / (float)srcH;
-    const float fit    = (scaleW < scaleH) ? scaleW : scaleH;
-
-    vec2 scaleVec;
-    scaleVec.x = fit;
-    scaleVec.y = fit;
-    vec2 pos;
-    pos.x = (float)canvasW * 0.5f;
-    pos.y = (float)canvasH * 0.5f;
-
-    struct SearchContext {
-        obs_source_t* target;
-        vec2          scale;
-        vec2          pos;
-    };
-    SearchContext ctx = { source, scaleVec, pos };
-
+    // Apply the shared fit-center geometry to every scene-item backed by this
+    // source (the add-source flow adds exactly one, but a source already
+    // referenced into several scenes gets all of them placed consistently).
     auto enum_cb = [](void* param, obs_source_t* scene_src) -> bool {
-        SearchContext* c = (SearchContext*)param;
+        obs_source_t* target = (obs_source_t*)param;
         obs_scene_t* scene = obs_scene_from_source(scene_src);
         if (!scene) return true;
-
         auto item_cb = [](obs_scene_t*, obs_sceneitem_t* item, void* p) -> bool {
-            SearchContext* c = (SearchContext*)p;
-            obs_source_t* item_src = obs_sceneitem_get_source(item);
-            if (item_src == c->target) {
-                // Automatic bounds — no bbox constraint, so Alt-drag crops
-                // the source naturally. Center alignment makes our centered
-                // position anchor the source's middle.
-                obs_sceneitem_set_bounds_type(item, OBS_BOUNDS_NONE);
-                obs_sceneitem_set_alignment(item, OBS_ALIGN_CENTER);
-                obs_sceneitem_set_scale(item, &c->scale);
-                obs_sceneitem_set_pos(item, &c->pos);
-            }
+            obs_source_t* target = (obs_source_t*)p;
+            if (obs_sceneitem_get_source(item) == target)
+                ApplyFitCenterGeometry(item, target);
             return true;
         };
-
-        obs_scene_enum_items(scene, item_cb, c);
+        obs_scene_enum_items(scene, item_cb, target);
         return true;
     };
-
-    obs_enum_scenes(enum_cb, &ctx);
+    obs_enum_scenes(enum_cb, source);
 
     // Record that we've done the initial placement so future reloads don't
     // override the user's adjustments. Written after the geometry is set.
@@ -5285,6 +5324,68 @@ static void ApplyParticipantPlacement(obs_source_t* source) {
         obs_source_update(source, settings);
         obs_data_release(settings);
     }
+}
+
+// Resolve the scene the Source dock edits: preview scene in Studio Mode, current
+// scene otherwise. Do NOT use obs_frontend_get_current_scene alone — it returns
+// the PROGRAM scene in Studio Mode, which would drop sources onto live output.
+// Returns a ref the caller must release, or null (no scenes / edge cases).
+static obs_source_t* ResolveCurrentEditScene() {
+    obs_source_t* s = obs_frontend_get_current_preview_scene();  // studio: preview; else null
+    if (!s) s = obs_frontend_get_current_scene();                // normal: current
+    return s;
+}
+
+// Action A: create a new Feeds participant source and add it to the current edit
+// scene, exactly as the OBS add-source flow does — obs_source_create fires
+// zp_create (dock row via PostParticipantDockRefresh) and the source_create
+// signal (deferred fit-center placement, which finds the scene-item we add here).
+// No resolvable scene -> safe no-op (don't leak an orphan source). UI thread.
+static void CreateParticipantSourceInCurrentScene() {
+    obs_source_t* sceneSrc = ResolveCurrentEditScene();
+    if (!sceneSrc) return;
+    obs_scene_t* scene = obs_scene_from_source(sceneSrc);   // borrowed
+    if (!scene) { obs_source_release(sceneSrc); return; }
+
+    // Unique name, OBS's scheme: the display name, then " 2", " 3", ... until free
+    // (obs_source_create does not dedupe).
+    const char* base = "Zoom Participant";
+    std::string name = base;
+    for (int i = 2; ; ++i) {
+        obs_source_t* existing = obs_get_source_by_name(name.c_str());
+        if (!existing) break;
+        obs_source_release(existing);
+        name = std::string(base) + " " + std::to_string(i);
+    }
+
+    obs_source_t* source =
+        obs_source_create("zoom_participant_source", name.c_str(), nullptr, nullptr);
+    if (source) {
+        // Add promptly so the ~100ms-deferred placement thread finds a scene-item.
+        obs_scene_add(scene, source);   // scene-item takes its own ref
+        obs_source_release(source);     // release our create ref
+    }
+    obs_source_release(sceneSrc);
+}
+
+// Action B: add an existing source to the current edit scene as a Paste Reference
+// — a new scene-item pointing at the SAME source (no new source, no new dock row),
+// repeatable. NOT obs_source_duplicate (that is Paste Duplicate). A fresh
+// reference lands at OBS default (top-left, native), so apply fit-center to the
+// new item directly; the source is already live, so its dimensions are known
+// (no polling). No resolvable scene -> safe no-op. UI thread.
+static void AddSourceReferenceToCurrentScene(const std::string& uuid) {
+    obs_source_t* source = obs_get_source_by_uuid(uuid.c_str());
+    if (!source) return;
+    obs_source_t* sceneSrc = ResolveCurrentEditScene();
+    if (!sceneSrc) { obs_source_release(source); return; }
+    obs_scene_t* scene = obs_scene_from_source(sceneSrc);   // borrowed
+    if (scene) {
+        obs_sceneitem_t* item = obs_scene_add(scene, source);  // borrowed (scene owns)
+        ApplyFitCenterGeometry(item, source);
+    }
+    obs_source_release(sceneSrc);
+    obs_source_release(source);
 }
 
 // Place a newly-created popup source at bottom-center of the canvas with
