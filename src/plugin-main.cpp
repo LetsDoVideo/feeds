@@ -2127,6 +2127,19 @@ private:
 // entry = unknown -> no mute mark.
 static std::map<unsigned int, bool> g_muteByUserId;
 
+// Per-userId connection-quality legs, for the dock's connection dot. Levels are
+// Zoom's ConnectionQuality as raw ints (0 Unknown, 1 Very_Bad, 2 Bad, 3 Not_Good,
+// 4 Normal, 5 Good, 6 Excellent) — the plugin doesn't link the SDK, so it works
+// off the int the engine forwards. We keep video + audio, up + down, so the dot
+// can prioritize the video-uplink leg (how well the guest's video reaches us) and
+// fall back if that leg doesn't fire; share/def legs are dropped (not dot-useful).
+// UI-thread-owned like g_muteByUserId: written only in the participant_conn_quality
+// marshalled lambda, read only by the dock's poll. 0 on a leg = no level yet.
+struct ConnQualityLegs {
+    int videoUp = 0, videoDown = 0, audioUp = 0, audioDown = 0;
+};
+static std::map<unsigned int, ConnQualityLegs> g_connQualityByUserId;
+
 // Reserved fixed slot (px) for the mute mark in a source-box header. The slot is
 // always present (paint-only toggle, no reflow); 14px reads the mic glyph clearly.
 static constexpr int kMuteSlotPx = 14;
@@ -2435,8 +2448,8 @@ private:
     // full rebuild. `live` (and, later, a mute icon) are owned by their box —
     // this map only borrows the pointers, so it is cleared, never deleted.
     struct RowIndicators {
-        QLabel*   live      = nullptr; // the live/receiving dot
-        bool      liveShown = false;   // last-applied live state (skip redundant restyle)
+        QLabel*   live      = nullptr; // the connection dot (fixed 10px slot)
+        int       dotCode   = -1;      // last-applied dot render code (-1 = none applied yet)
         QLabel*   mute      = nullptr; // muted-mic mark (fixed 10px slot; painted only when muted)
         bool      muteShown = false;   // last-applied mute state
         long long pid       = 0;       // bound userId, for userId -> row resolution
@@ -2448,21 +2461,93 @@ private:
     // the dot flips off within ~this window plus one poll interval.
     static constexpr uint64_t kLiveThresholdNs = 500000000ULL;
 
-    // Set a live dot's appearance + tooltip. Semi-transparent so both states
-    // read on dark and light OBS themes (matching the box styling); not loud.
-    static void SetLiveDot(QLabel* dot, bool receiving) {
-        if (!dot) return;
-        dot->setStyleSheet(receiving
-            ? "QLabel { background: rgba(64,192,96,0.95); border-radius: 5px; }"
-            : "QLabel { background: rgba(128,128,128,0.30); border-radius: 5px; }");
-        dot->setToolTip(receiving ? "Receiving video" : "Not receiving video");
+    // Resolve a row's effective userId: an Active-Speaker row (pid 1) follows the
+    // current speaker (0 before anyone speaks); pid > 1 is a real userId; pid <= 0
+    // is unbound. 0 means "no participant resolvable". UI thread (reads
+    // g_activeSpeakerUserId, UI-thread-owned).
+    static unsigned int EffectiveUserId(long long pid) {
+        if (pid == 1) return g_activeSpeakerUserId;   // 0 if no speaker yet
+        if (pid > 1)  return (unsigned int)pid;
+        return 0;                                     // unbound / unselected
     }
 
-    // Live-indicator poll (UI thread, ~every 400ms). Reads per-source
+    // Best-known quality level for a userId: prioritize the video-uplink leg (how
+    // well the guest's video reaches us), then fall back to the other legs so a
+    // dot still colors if uplink-video never fires. 0 = no level known yet.
+    static int QualityLevelForUser(unsigned int uid) {
+        auto it = g_connQualityByUserId.find(uid);
+        if (it == g_connQualityByUserId.end()) return 0;
+        const ConnQualityLegs& q = it->second;
+        if (q.videoUp)   return q.videoUp;
+        if (q.videoDown) return q.videoDown;
+        if (q.audioUp)   return q.audioUp;
+        if (q.audioDown) return q.audioDown;
+        return 0;
+    }
+
+    // The four-case dot resolution, as a single render code so one comparison
+    // covers both color and tooltip level (skip redundant restyles):
+    //   0            -> case 1: no participant resolvable -> hide (paint transparent)
+    //   1            -> case 2: participant present but not receiving frames -> black
+    //   2            -> case 3: receiving, no quality level yet -> grey
+    //   10 + level   -> case 4: receiving + known ConnectionQuality (level 1..6)
+    // "Not receiving" (case 2) always beats a stale color, so a source going dark
+    // can't linger red/yellow/green.
+    static int ResolveDotCode(long long pid, bool receiving) {
+        unsigned int uid = EffectiveUserId(pid);
+        if (uid == 0)     return 0;               // case 1
+        if (!receiving)   return 1;               // case 2
+        int level = QualityLevelForUser(uid);
+        if (level <= 0)   return 2;               // case 3
+        return 10 + level;                        // case 4
+    }
+
+    // Paint the dot for a render code. Fixed 10px slot always present (like the
+    // mute mark): the no-dot case paints transparent, never hides/collapses, so
+    // show/hide is paint-only with no row reflow. Colors are semi-transparent so
+    // they read on dark and light OBS themes. Tooltip is word-level only — the
+    // SDK exposes no per-guest numeric telemetry, so we never imply kbps/ms/loss.
+    static void ApplyDot(QLabel* dot, int code) {
+        if (!dot) return;
+        QString css, tip;
+        if (code == 0) {              // case 1: no dot
+            css = "QLabel { background: transparent; border-radius: 5px; }";
+        } else if (code == 1) {       // case 2: present but dark
+            // Dark fill + a thin ring so it still reads on a dark OBS theme
+            // (a pure-black dot would vanish). Border draws inside the fixed
+            // 10px, so no size change vs the other states — no reflow.
+            css = "QLabel { background: rgba(30,30,30,0.90);"
+                  " border: 1px solid rgba(150,150,150,0.55); border-radius: 5px; }";
+            tip = "Camera off";
+        } else if (code == 2) {       // case 3: receiving, quality unknown
+            css = "QLabel { background: rgba(128,128,128,0.55); border-radius: 5px; }";
+            tip = "Receiving video";
+        } else {                      // case 4: known level 1..6
+            const int level = code - 10;
+            const char* color = (level >= 5) ? "rgba(64,192,96,0.95)"    // Good/Excellent
+                              : (level >= 3) ? "rgba(220,180,60,0.95)"   // Not_Good/Normal
+                                             : "rgba(210,70,70,0.95)";   // Very_Bad/Bad
+            css = QString("QLabel { background: %1; border-radius: 5px; }").arg(color);
+            const char* word = level == 6 ? "Excellent"
+                             : level == 5 ? "Good"
+                             : level == 4 ? "Normal"
+                             : level == 3 ? "Fair"
+                             : level == 2 ? "Poor"
+                                          : "Very poor";   // level 1
+            tip = QString("Connection: %1").arg(word);
+        }
+        dot->setStyleSheet(css);
+        dot->setToolTip(tip);
+    }
+
+    // Connection-dot poll (UI thread, ~every 400ms). Reads per-source
     // lastRealFrameTick under g_sourcesMutex (atomics only — no widget work while
-    // holding the lock), then updates each row's dot in place by uuid. Takes ONLY
-    // g_sourcesMutex, briefly, so no lock-ordering interaction with
-    // g_participantsMutex. Skips entirely when the dock is hidden.
+    // holding the lock), then resolves all four dot cases in ONE place per tick,
+    // folding in g_connQualityByUserId (and g_activeSpeakerUserId via the row's
+    // pid). This is the single dot update path — the participant_conn_quality
+    // event only updates the map; the dot picks the change up on the next tick
+    // (quality isn't sub-second-critical). Takes ONLY g_sourcesMutex, briefly, so
+    // no lock-ordering interaction with g_participantsMutex. Skips when hidden.
     void PollLiveIndicators() {
         if (!isVisible() || m_rowIndicators.empty()) return;
 
@@ -2479,10 +2564,11 @@ private:
         }
         for (auto& kv : m_rowIndicators) {
             auto it = liveByUuid.find(kv.first);
-            bool live = (it != liveByUuid.end()) && it->second;
-            if (live != kv.second.liveShown) {
-                SetLiveDot(kv.second.live, live);
-                kv.second.liveShown = live;
+            const bool receiving = (it != liveByUuid.end()) && it->second;
+            const int  code = ResolveDotCode(kv.second.pid, receiving);
+            if (code != kv.second.dotCode) {
+                ApplyDot(kv.second.live, code);
+                kv.second.dotCode = code;
             }
         }
     }
@@ -2821,7 +2907,10 @@ private:
         headerL->setSpacing(6);
         QLabel* liveDot = new QLabel();
         liveDot->setFixedSize(10, 10);
-        SetLiveDot(liveDot, r.liveNow);
+        // Seed the four-case dot from the snapshot (r.liveNow) + current quality/
+        // active-speaker state; the poll keeps it updated in place each tick.
+        const int dotCode = ResolveDotCode(r.pid, r.liveNow);
+        ApplyDot(liveDot, dotCode);
         headerL->addWidget(liveDot);
         headerL->addWidget(header, 1);   // header takes the remaining width, elides
         QLabel* muteIcon = new QLabel();
@@ -2832,7 +2921,7 @@ private:
         headerL->addWidget(muteIcon);
         headerL->addWidget(MakeAddToSceneButton(r.uuid));  // add-to-scene, far right
         boxL->addWidget(headerRow);
-        m_rowIndicators[r.uuid] = { liveDot, r.liveNow, muteIcon, mutedNow, r.pid };
+        m_rowIndicators[r.uuid] = { liveDot, dotCode, muteIcon, mutedNow, r.pid };
 
         // Live: the functional combo, populated identically to the properties
         // dropdown (0 unselect / 1 [Active Speaker] / roster-minus-self by user
@@ -4542,6 +4631,7 @@ static void RegisterEngineHandlers() {
             g_currentMeetingNumber = 0;
             g_activeSharerUserId   = 0;
             g_activeSpeakerUserId  = 0;
+            g_connQualityByUserId.clear();
             g_cachedMyUserId       = 0;
             g_userDisplayName.clear();
             g_userPMI.clear();
@@ -4817,6 +4907,7 @@ static void RegisterEngineHandlers() {
             g_currentMeetingNumber = 0;
             g_activeSharerUserId   = 0;
             g_activeSpeakerUserId  = 0;
+            g_connQualityByUserId.clear();
             g_cachedMyUserId       = 0;
             {
                 std::lock_guard<std::mutex> lock(g_participantsMutex);
@@ -5111,6 +5202,26 @@ static void RegisterEngineHandlers() {
         QTimer::singleShot(0, g_participantDock, [userId, muted]() {
             g_muteByUserId[userId] = muted;
             if (g_participantDock) g_participantDock->RecomputeMuteMarks();
+        });
+    });
+
+    // Per-user connection quality from the engine's onUserNetworkStatusChanged.
+    // Store the leg into the UI-thread-owned g_connQualityByUserId; the dock's
+    // poll resolves it into the dot on its next tick (no direct dot update here —
+    // one update path). component: 1 Audio, 2 Video (0 Def / 3 Share dropped —
+    // not dot-useful). level: ConnectionQuality 0..6.
+    feeds::RegisterMessageHandler("participant_conn_quality",
+    [](const std::string& json) {
+        unsigned int userId = (unsigned int)ExtractJsonNumber(json, "participant_id");
+        if (userId == 0 || !g_participantDock) return;
+        int component = (int)ExtractJsonNumber(json, "component");
+        int uplink    = (int)ExtractJsonNumber(json, "uplink");
+        int level     = (int)ExtractJsonNumber(json, "level");
+        QTimer::singleShot(0, g_participantDock, [userId, component, uplink, level]() {
+            ConnQualityLegs& q = g_connQualityByUserId[userId];
+            if (component == 2)      { if (uplink) q.videoUp = level; else q.videoDown = level; }
+            else if (component == 1) { if (uplink) q.audioUp = level; else q.audioDown = level; }
+            // Def(0)/Share(3) dropped — the dot only uses video/audio legs.
         });
     });
 
