@@ -63,6 +63,7 @@
 #include <QFile>
 #include <QByteArray>
 #include <QCursor>
+#include <QPalette>
 #include <QMouseEvent>
 #include <QKeyEvent>
 #include <QEnterEvent>
@@ -251,6 +252,12 @@ static obs_source_t* ResolveCurrentEditScene();
 static void ApplyFitCenterGeometry(obs_sceneitem_t* item, obs_source_t* source);
 static void CreateParticipantSourceInCurrentScene();
 static void AddSourceReferenceToCurrentScene(const std::string& uuid);
+// Per-source dock header actions (defined with the scene helpers, far below).
+// OpenSourceFilters opens OBS's native Filters dialog; ShowIncludedScenesMenu
+// pops a menu of the scenes the source is in, switching to a clicked one
+// (Studio-Mode-aware). Both use confirmed obs_frontend_* exports.
+static void OpenSourceFilters(const std::string& uuid);
+static void ShowIncludedScenesMenu(const std::string& uuid);
 
 // ---------------------------------------------------------------------------
 // Per-source data
@@ -2432,6 +2439,104 @@ private:
         return b;
     }
 
+    // Small icon button matched to the "+" above (18px slot), for the provisional
+    // header-row cluster. Separate sibling from the header label, so it doesn't
+    // collide with the double-click rename. onClick is a plain functor.
+    static QPushButton* MakeIconButton(const QIcon& icon, const QString& tooltip,
+                                       std::function<void()> onClick) {
+        QPushButton* b = new QPushButton();
+        b->setIcon(icon);
+        b->setIconSize(QSize(12, 12));
+        b->setFixedSize(18, 18);
+        b->setToolTip(tooltip);
+        b->setCursor(Qt::PointingHandCursor);
+        b->setStyleSheet("QPushButton { padding: 0; }");
+        QObject::connect(b, &QPushButton::clicked, onClick);
+        return b;
+    }
+
+    // A theme-adaptive drawn glyph, used only as an icon fallback (palette color,
+    // so it reads on dark and light). painter(p, w) draws in a wxw box.
+    static QIcon DrawnGlyph(std::function<void(QPainter&, int)> painter) {
+        const int sz = 16;
+        const QColor fg = qApp ? qApp->palette().color(QPalette::WindowText)
+                               : QColor(200, 200, 200);
+        QPixmap pm(sz, sz);
+        pm.fill(Qt::transparent);
+        QPainter p(&pm);
+        p.setRenderHint(QPainter::Antialiasing, true);
+        QPen pen(fg);
+        pen.setWidthF(1.6);
+        pen.setCapStyle(Qt::RoundCap);
+        p.setPen(pen);
+        painter(p, sz);
+        p.end();
+        return QIcon(pm);
+    }
+
+    // Scenes-list button icon: OBS's own scene source-type icon, exposed as a
+    // readable Q_PROPERTY on the main window (theme-correct, license-clean). Falls
+    // back to a drawn stacked-frames glyph if the property is ever absent. Cached;
+    // a one-time log records which path was taken.
+    static const QIcon& ScenesIcon() {
+        static QIcon cached;
+        static bool  built = false;
+        if (built) return cached;
+        built = true;
+        if (QWidget* mw = (QWidget*)obs_frontend_get_main_window())
+            cached = qvariant_cast<QIcon>(mw->property("sceneIcon"));
+        const bool fromObs = !cached.isNull();
+        if (!fromObs) {
+            cached = DrawnGlyph([](QPainter& p, int) {
+                p.setBrush(Qt::NoBrush);
+                p.drawRoundedRect(QRectF(2.5, 5.5, 8, 7), 1.5, 1.5);   // front frame
+                p.drawRoundedRect(QRectF(5.5, 2.5, 8, 7), 1.5, 1.5);   // back frame
+            });
+        }
+        blog(LOG_INFO, "[feeds] scenes-button icon: %s",
+             fromObs ? "OBS sceneIcon" : "drawn fallback");
+        return cached;
+    }
+
+    // Filters button icon: OBS's own filter glyph. It's not a main-window
+    // Q_PROPERTY (unlike sceneIcon) — it's the compiled Qt resource the source
+    // toolbar uses — so load it by resource path, checking a rendered pixmap
+    // (QIcon(path).isNull() is unreliable for a missing resource). Falls back to a
+    // drawn funnel. Cached; one-time log records the path.
+    static const QIcon& FiltersIcon() {
+        static QIcon cached;
+        static bool  built = false;
+        if (built) return cached;
+        built = true;
+        QIcon obsIcon(":/res/images/filter.svg");
+        const bool fromObs = !obsIcon.pixmap(16, 16).isNull();
+        if (fromObs) {
+            cached = obsIcon;
+        } else {
+            cached = DrawnGlyph([](QPainter& p, int) {
+                p.drawLine(QPointF(3, 4),  QPointF(13, 4));    // funnel: wide
+                p.drawLine(QPointF(5, 8),  QPointF(11, 8));    //         mid
+                p.drawLine(QPointF(7, 12), QPointF(9, 12));    //         narrow
+            });
+        }
+        blog(LOG_INFO, "[feeds] filters-button icon: %s",
+             fromObs ? "OBS :/res/images/filter.svg" : "drawn fallback");
+        return cached;
+    }
+
+    // The provisional per-source header-row action cluster, shared by the live and
+    // non-live boxes: [ + add-to-scene | scenes-list | filters ]. Placement is
+    // temporary — this crowds the row and the eliding name loses width on a narrow
+    // dock (accepted for now; the row gets redesigned). Each button is a separate
+    // sibling from the header label, so none collides with the double-click rename.
+    void AppendHeaderButtons(QHBoxLayout* headerL, const std::string& uuid) {
+        headerL->addWidget(MakeAddToSceneButton(uuid));
+        headerL->addWidget(MakeIconButton(ScenesIcon(), "Included scenes",
+            [uuid]() { ShowIncludedScenesMenu(uuid); }));
+        headerL->addWidget(MakeIconButton(FiltersIcon(), "Filters",
+            [uuid]() { OpenSourceFilters(uuid); }));
+    }
+
     // Plain-value snapshot of one participant source (no OBS/Qt handles retained).
     struct Row {
         std::string uuid;        // stable source id — the pick handler resolves
@@ -2881,7 +2986,7 @@ private:
             headerL->setContentsMargins(0, 0, 0, 0);
             headerL->setSpacing(6);
             headerL->addWidget(header, 1);   // header takes the remaining width, elides
-            headerL->addWidget(MakeAddToSceneButton(r.uuid));
+            AppendHeaderButtons(headerL, r.uuid);
             boxL->addWidget(headerRow);
             // Occupies the same slot the combo does, so the box height stays stable
             // across the non-live/live flip. Accurate in all non-live states (not
@@ -2919,7 +3024,7 @@ private:
         const bool mutedNow = MutedForPid(r.pid);
         SetMuteIcon(muteIcon, mutedNow);
         headerL->addWidget(muteIcon);
-        headerL->addWidget(MakeAddToSceneButton(r.uuid));  // add-to-scene, far right
+        AppendHeaderButtons(headerL, r.uuid);   // + add-to-scene | scenes | filters
         boxL->addWidget(headerRow);
         m_rowIndicators[r.uuid] = { liveDot, dotCode, muteIcon, mutedNow, r.pid };
 
@@ -5520,6 +5625,74 @@ static void AddSourceReferenceToCurrentScene(const std::string& uuid) {
     }
     obs_source_release(sceneSrc);
     obs_source_release(source);
+}
+
+// Open OBS's native Filters dialog for a source — the same window as right-
+// clicking the source in the Sources dock. obs_frontend_open_source_filters is a
+// confirmed frontend export that marshals to the UI thread itself and holds its
+// own ref, so we just resolve -> call -> release our resolve ref. UI thread.
+static void OpenSourceFilters(const std::string& uuid) {
+    obs_source_t* src = obs_get_source_by_uuid(uuid.c_str());
+    if (!src) return;
+    obs_frontend_open_source_filters(src);
+    obs_source_release(src);
+}
+
+// Pop a menu of the scenes this source appears in; clicking one switches to it
+// (modeled on QAU's "parent scenes"). Each scene is listed once — a source
+// referenced several times in one scene still yields a single entry (we stop at
+// the first matching item per scene, and OBS scene names are unique). The switch
+// is Studio-Mode-aware: preview in Studio Mode (never program/live), current
+// scene otherwise — matching how add-to-scene resolves its target. All three
+// obs_frontend_* calls are confirmed exports. Built fresh each click, so it
+// always reflects the current scene set. UI thread (button click).
+static void ShowIncludedScenesMenu(const std::string& uuid) {
+    obs_source_t* src = obs_get_source_by_uuid(uuid.c_str());
+    if (!src) return;
+
+    struct EnumCtx { obs_source_t* target; std::vector<std::string> scenes; };
+    EnumCtx ctx{ src, {} };
+    obs_enum_scenes(
+        [](void* param, obs_source_t* scene_src) -> bool {
+            EnumCtx* c = (EnumCtx*)param;
+            obs_scene_t* scene = obs_scene_from_source(scene_src);
+            if (!scene) return true;
+            struct ItemCtx { obs_source_t* target; bool found; } ic{ c->target, false };
+            obs_scene_enum_items(scene,
+                [](obs_scene_t*, obs_sceneitem_t* item, void* p) -> bool {
+                    ItemCtx* i = (ItemCtx*)p;
+                    if (obs_sceneitem_get_source(item) == i->target) {
+                        i->found = true;
+                        return false;   // stop: this scene counts once
+                    }
+                    return true;
+                }, &ic);
+            if (ic.found) {
+                const char* nm = obs_source_get_name(scene_src);
+                if (nm && *nm) c->scenes.emplace_back(nm);
+            }
+            return true;
+        }, &ctx);
+    obs_source_release(src);
+
+    QMenu menu;
+    if (ctx.scenes.empty()) {
+        QAction* none = menu.addAction("No scenes");
+        none->setEnabled(false);
+    } else {
+        for (const std::string& name : ctx.scenes) {
+            QAction* act = menu.addAction(QString::fromStdString(name));
+            QObject::connect(act, &QAction::triggered, [name]() {
+                obs_source_t* scene = obs_get_source_by_name(name.c_str());
+                if (obs_frontend_preview_program_mode_active())
+                    obs_frontend_set_current_preview_scene(scene);  // studio: preview only
+                else
+                    obs_frontend_set_current_scene(scene);
+                if (scene) obs_source_release(scene);
+            });
+        }
+    }
+    menu.exec(QCursor::pos());
 }
 
 // Place a newly-created popup source at bottom-center of the canvas with
