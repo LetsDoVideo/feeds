@@ -2330,9 +2330,10 @@ public:
         // Enabled (tier-active) sources on top, in vector = creation order,
         // each a self-contained framed box. Logged out, no row is treated as
         // disabled, so all render here. A live source is an interactive box
-        // (header + functional combo); a non-live one is the same box greyed and
-        // combo-less (header + "→ —") so its identity/position stays stable across
-        // the live/non-live flip rather than the box appearing/disappearing.
+        // (header + functional combo); a non-live one is the same box, frame
+        // dimmed and combo-less (header + "Waiting for participants…") so its
+        // identity/position stays stable across the live/non-live flip rather
+        // than the box appearing/disappearing.
         for (const auto& r : rows) {
             if (loggedIn && r.disabled) continue;
             m_root->addWidget(MakeSourceBox(r, live, myId, roster));
@@ -2344,13 +2345,18 @@ public:
             line->setFrameShadow(QFrame::Sunken);
             m_root->addWidget(line);
 
-            // Over-cap sources: greyed name only, no assignment, no controls.
+            // Over-cap sources: grey name only, no assignment, no controls —
+            // but still renamable. Grey is a tier-position status signal, not a
+            // lock (the Source dock lets you rename a source in any state). An
+            // ElidingLabel with the same double-click handler as the framed-box
+            // headers; BeginRename swaps it in place within this (m_root) layout.
             // Empty at exactly-cap — then only the prompt sits below the divider.
             for (const auto& r : rows) {
                 if (!(loggedIn && r.disabled)) continue;
-                QLabel* lbl = new QLabel(QString::fromStdString(r.name));
+                ElidingLabel* lbl = new ElidingLabel(QString::fromStdString(r.name));
                 lbl->setStyleSheet("QLabel { color: #7a7d80; }");
-                lbl->setWordWrap(true);
+                const std::string uuid = r.uuid;
+                lbl->onDoubleClick = [this, uuid, lbl]() { BeginRename(uuid, lbl); };
                 m_root->addWidget(lbl);
             }
 
@@ -2373,7 +2379,14 @@ public:
             m_root->addWidget(btn);
         }
 
-        AppendCreateButton();
+        // Hide the create button at/over the tier cap so it doesn't compete with
+        // the upgrade prompt (a deliberate divergence from the Source dock, which
+        // still creates above cap). Same count-vs-cap test the greying/divider
+        // uses, so "at cap" means the same thing everywhere; logged out / tier
+        // unknown keeps atOrOverCap false, so the button still shows there. It
+        // returns automatically once a delete drops back under cap (rebuilt here).
+        if (!atOrOverCap)
+            AppendCreateButton();
         m_root->addStretch(1);
     }
 
@@ -2727,7 +2740,8 @@ private:
     }
 
     // Build one enabled source's framed box. Live -> header + functional combo;
-    // non-live -> the same box greyed and combo-less (header + "→ —"). A QFrame
+    // non-live -> the same box, frame dimmed and combo-less (header + "Waiting
+    // for participants…"). A QFrame
     // container (not QGroupBox: that renders inconsistently across OBS themes and
     // its title isn't a swappable widget for the later rename). Frame border and
     // header fill use semi-transparent neutral greys so one rule reads on both
@@ -2747,17 +2761,21 @@ private:
 
         // Header — a swappable child QLabel (objectName so the later
         // double-click-to-edit increment can find/replace it), not a frame
-        // decoration. Elides to one line with the full name in a tooltip.
+        // decoration. Elides to one line. Name reads in the normal color in every
+        // state (live or non-live/not-connected) — only the dropdown is
+        // unavailable when not connected, not the name. Over-cap rows below the
+        // divider are the only ones with a grey name (a tier-position status, set
+        // there, not here).
         ElidingLabel* header = new ElidingLabel(QString::fromStdString(r.name));
         header->setObjectName("feedsSourceHeader");
-        header->setStyleSheet(QString(
+        header->setStyleSheet(
             "QLabel#feedsSourceHeader { background: rgba(128,128,128,0.15);"
-            " border-radius: 3px; padding: 3px 6px; font-weight: bold;%1 }")
-            .arg(live ? "" : " color: #7a7d80;"));
+            " border-radius: 3px; padding: 3px 6px; font-weight: bold; }");
         // Double-click the header to rename the underlying OBS source. Wired for
-        // both live and non-live boxes (both are real sources); over-cap rows are
-        // plain labels below and are intentionally not renamable here. The combo
-        // is a separate sibling, so this can't interfere with dropdown clicks.
+        // both live and non-live boxes (both are real sources); the over-cap rows
+        // below the divider get the same handler on their own labels. Works in
+        // every state (rename doesn't depend on connection/meeting). The combo/
+        // add-to-scene button are separate siblings, so this can't interfere.
         {
             const std::string uuid = r.uuid;
             header->onDoubleClick = [this, uuid, header]() {
@@ -2766,11 +2784,12 @@ private:
         }
 
         if (!live) {
-            // Non-live: greyed header, no live dot (the whole box already reads
+            // Non-live: normal-color name, no live dot (the whole box already reads
             // "not active" — a second not-receiving treatment would just stack),
-            // and a greyed em-dash status in place of the combo. Header sits in a
-            // row so the add-to-scene button can ride at its right, same as the
-            // live box (referencing a non-live source is valid — it's a real source).
+            // and a muted "Waiting for participants…" line in the combo's slot.
+            // Header sits in a row so the add-to-scene button can ride at its right,
+            // same as the live box (referencing a non-live source is valid — it's a
+            // real source).
             QWidget*     headerRow = new QWidget();
             QHBoxLayout* headerL   = new QHBoxLayout(headerRow);
             headerL->setContentsMargins(0, 0, 0, 0);
@@ -2778,7 +2797,11 @@ private:
             headerL->addWidget(header, 1);   // header takes the remaining width, elides
             headerL->addWidget(MakeAddToSceneButton(r.uuid));
             boxL->addWidget(headerRow);
-            QLabel* status = new QLabel(QString::fromUtf8("→  —"));
+            // Occupies the same slot the combo does, so the box height stays stable
+            // across the non-live/live flip. Accurate in all non-live states (not
+            // logged in, connected-but-alone, not connected): the source is waiting
+            // for participants either way.
+            QLabel* status = new QLabel("Waiting for participants…");
             status->setStyleSheet("QLabel { color: #7a7d80; }");
             boxL->addWidget(status);
             return box;
