@@ -2648,6 +2648,23 @@ private:
         return 0;                                     // unbound / unselected
     }
 
+    // The userId this row is LIVE-bound to right now, or 0 if none. Resolves the
+    // effective userId (Active Speaker -> current speaker), then requires it to be
+    // an actually-present participant — otherwise a participant_id persisted from a
+    // prior session (a stale runtime id after an OBS restart) would read as a live
+    // participant when nobody is there. Presence is checked against g_muteByUserId,
+    // which is seeded wholesale from the roster on every participant_list_changed
+    // (and cleared on meeting end/leave), so its keys are exactly the present
+    // participants: empty across a fresh restart, and pruned when a participant
+    // leaves. This is the "no participant" gate shared by the dot and the mic, so
+    // both fall back to their hollow/grey states together, driven off live binding
+    // rather than the persisted setting. UI-thread-owned reads, no lock.
+    static unsigned int BoundUserId(long long pid) {
+        unsigned int uid = EffectiveUserId(pid);
+        if (uid == 0) return 0;
+        return (g_muteByUserId.count(uid) > 0) ? uid : 0;   // 0 if not currently present
+    }
+
     // Best-known quality level for a userId: prioritize the video-uplink leg (how
     // well the guest's video reaches us), then fall back to the other legs so a
     // dot still colors if uplink-video never fires. 0 = no level known yet.
@@ -2664,14 +2681,15 @@ private:
 
     // The four-case dot resolution, as a single render code so one comparison
     // covers both color and tooltip level (skip redundant restyles):
-    //   0            -> case 1: no participant resolvable -> hide (paint transparent)
-    //   1            -> case 2: participant present but not receiving frames -> black
+    //   0            -> case 1: no LIVE participant -> hollow no-participant ring
+    //   1            -> case 2: participant present but not receiving frames -> dark
     //   2            -> case 3: receiving, no quality level yet -> grey
     //   10 + level   -> case 4: receiving + known ConnectionQuality (level 1..6)
     // "Not receiving" (case 2) always beats a stale color, so a source going dark
-    // can't linger red/yellow/green.
+    // can't linger red/yellow/green. BoundUserId gates case 1 on live binding, so a
+    // stale persisted participant_id (no present participant) reads as case 1.
     static int ResolveDotCode(long long pid, bool receiving) {
-        unsigned int uid = EffectiveUserId(pid);
+        unsigned int uid = BoundUserId(pid);
         if (uid == 0)     return 0;               // case 1
         if (!receiving)   return 1;               // case 2
         int level = QualityLevelForUser(uid);
@@ -2847,12 +2865,13 @@ private:
         return cache[(tone >= 0 && tone < 3) ? tone : MicGrey];
     }
 
-    // Resolve a row's mic tone from the shared no-participant check + mute state:
-    // no participant assigned (EffectiveUserId == 0) -> grey; else muted -> red,
-    // unmuted -> green. Same EffectiveUserId == 0 condition the dot uses for its
-    // hollow no-participant ring, so the two indicators agree by construction.
+    // Resolve a row's mic tone from the shared no-participant gate + mute state:
+    // no LIVE participant (BoundUserId == 0) -> grey; else muted -> red, unmuted
+    // -> green. Same BoundUserId gate the dot uses for its hollow no-participant
+    // ring, so the two indicators agree by construction — including reading grey
+    // for a stale persisted participant_id that maps to nobody present.
     static int MicToneForPid(long long pid) {
-        if (EffectiveUserId(pid) == 0) return MicGrey;
+        if (BoundUserId(pid) == 0) return MicGrey;
         return MutedForPid(pid) ? MicRed : MicGreen;
     }
 
@@ -3061,7 +3080,8 @@ private:
         // Shared header state. collides drives the reserved warning slot; dotCode
         // and micTone seed the connection dot and the always-on mic. The dot's
         // no-participant case (dotCode 0) and the grey mic tone both key off the
-        // same EffectiveUserId(pid) == 0 condition, so they read consistently.
+        // same BoundUserId(pid) == 0 gate (live binding, not the persisted
+        // setting), so they read consistently.
         const bool collides = SourceCollides(r.pid, pidCount);
         const int  dotCode  = ResolveDotCode(r.pid, r.liveNow);
         const int  micTone  = MicToneForPid(r.pid);
@@ -4881,6 +4901,7 @@ static void RegisterEngineHandlers() {
             g_activeSharerUserId   = 0;
             g_activeSpeakerUserId  = 0;
             g_connQualityByUserId.clear();
+            g_muteByUserId.clear();   // present-participant set -> empty when out of a meeting
             g_cachedMyUserId       = 0;
             g_userDisplayName.clear();
             g_userPMI.clear();
@@ -5157,6 +5178,7 @@ static void RegisterEngineHandlers() {
             g_activeSharerUserId   = 0;
             g_activeSpeakerUserId  = 0;
             g_connQualityByUserId.clear();
+            g_muteByUserId.clear();   // present-participant set -> empty when out of a meeting
             g_cachedMyUserId       = 0;
             {
                 std::lock_guard<std::mutex> lock(g_participantsMutex);
