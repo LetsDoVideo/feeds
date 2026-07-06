@@ -38,7 +38,7 @@
     },
     "name": "feeds",
     "displayName": "Feeds - Isolated Feeds for OBS",
-    "version": "1.0.0",
+    "version": "1.5.0",
     "author": "David Maldow / Let's Do Video",
     "website": "https://letsdovideo.com/feeds",
     "email": "david@letsdovideo.com"

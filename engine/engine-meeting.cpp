@@ -1169,17 +1169,12 @@ public:
     // Per-user connection quality changed. Forward every leg to the plugin,
     // which keys it by userId for the dock dot (it prioritizes the video-uplink
     // leg, falling back to others). component: 0 Def, 1 Audio, 2 Video, 3 Share.
-    // level: ConnectionQuality (0 Unknown .. 6 Excellent). Also logged to file so
-    // we can see which legs actually fire for remote users ([feeds-rls]).
+    // level: ConnectionQuality (0 Unknown .. 6 Excellent).
     virtual void onUserNetworkStatusChanged(
         ZOOM_SDK_NAMESPACE::MeetingComponentType type,
         ZOOM_SDK_NAMESPACE::ConnectionQuality level,
         unsigned int userId, bool uplink) override {
         if (userId == 0) return;
-        char log[128];
-        sprintf_s(log, "[feeds-rls] netq user=%u component=%d uplink=%d level=%d",
-                  userId, (int)type, uplink ? 1 : 0, (int)level);
-        LogToFile(log);
         char buf[160];
         sprintf_s(buf,
             "{\"type\":\"participant_conn_quality\",\"participant_id\":%u,"

@@ -726,15 +726,6 @@ void FetchAndApplyEntitlement() {
     WinHttpCloseHandle(hConnect);
     WinHttpCloseHandle(hSession);
 
-    // DIAGNOSTIC: dump raw response so we can verify what the backend returns.
-    {
-        char msg[8192];
-        int truncatedLen = (response.size() < 8000) ? (int)response.size() : 8000;
-        sprintf_s(msg, "API: entitlement raw response (%zu bytes): %.*s",
-                  response.size(), truncatedLen, response.c_str());
-        LogToFile(msg);
-    }
-
     if (statusCode == 401) {
         LogWarn("API: tier query auth failed — applying tier=0");
         return;
