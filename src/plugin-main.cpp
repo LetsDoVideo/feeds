@@ -2354,13 +2354,22 @@ public:
             return;
         }
 
-        // Multi-source guidance: count how many sources are assigned to each
-        // participant / Active Speaker across ALL rows (over-cap included — their
-        // assignment still uses a participant). Drives the dropdown "already used"
-        // treatment and the collision marker; recomputed every refresh.
-        std::map<long long, int> pidCount;
-        for (const auto& r : rows)
-            if (r.pid > 0) pidCount[r.pid]++;
+        // Multi-source guidance, two counts, recomputed every refresh:
+        //  - pidCount: raw assignments across ALL rows (live, non-live, over-cap).
+        //    Drives the dropdown "already used" treatment — a persisted assignment
+        //    reserves a participant even while absent, so the guidance must warn off
+        //    picking them elsewhere before they join.
+        //  - livePidCount: only rows whose assignment is LIVE-bound and not self
+        //    (BoundUserId != 0), keyed by the raw pid. Drives the collision warning,
+        //    so two sources warn only when they share a raw assignment AND both are
+        //    actually present — never for stale/absent/self assignments. Keyed by raw
+        //    pid keeps [Active Speaker] (pid 1) from ever colliding with a named
+        //    participant, even when the active speaker currently is that person.
+        std::map<long long, int> pidCount, livePidCount;
+        for (const auto& r : rows) {
+            if (r.pid > 0)                             pidCount[r.pid]++;
+            if (r.pid > 0 && BoundUserId(r.pid) != 0)  livePidCount[r.pid]++;
+        }
 
         // Enabled (tier-active) sources on top, in vector = creation order,
         // each a self-contained framed box. Logged out, no row is treated as
@@ -2371,7 +2380,7 @@ public:
         // than the box appearing/disappearing.
         for (const auto& r : rows) {
             if (loggedIn && r.disabled) continue;
-            m_root->addWidget(MakeSourceBox(r, live, myId, roster, pidCount));
+            m_root->addWidget(MakeSourceBox(r, live, myId, roster, pidCount, livePidCount));
         }
 
         if (atOrOverCap) {
@@ -2553,13 +2562,14 @@ private:
     }
 
     // --- Multi-source guidance (shared collision computation) ------------------
-    // pidCount maps an assignment (real userId, or Active Speaker sentinel 1) to
-    // the number of sources currently set to it, across ALL sources (live,
-    // non-live, and over-cap — an over-cap source's assignment still "uses" a
-    // participant). Built once per Refresh from the row snapshot and threaded into
-    // each box, so a refresh (which every assignment change already triggers via
-    // zp_update -> PostParticipantDockRefresh) recomputes both guidance pieces
-    // everywhere for free — no separate targeted update.
+    // Two maps from an assignment (real userId, or Active Speaker sentinel 1) to a
+    // source count, built once per Refresh from the row snapshot and threaded into
+    // each box: pidCount over ALL sources (live, non-live, over-cap) drives the
+    // dropdown "already used" reservation treatment; livePidCount over only
+    // live-present, non-self sources (BoundUserId != 0) drives the collision
+    // warning. A refresh (which every assignment change already triggers via
+    // zp_update -> PostParticipantDockRefresh) recomputes both everywhere for free
+    // — no separate targeted update.
 
     // For a dropdown in a source whose current pick is ownPid: is option q
     // "used by another source"? Unselect (0) never is; the source's OWN current
@@ -2574,11 +2584,13 @@ private:
     }
 
     // Does this source's assignment collide with another source's? pid>0 and at
-    // least two sources share it (this one plus another).
-    static bool SourceCollides(long long pid, const std::map<long long, int>& pidCount) {
+    // least two LIVE-present, non-self sources share the same raw pid (this one plus
+    // another). Callers pass livePidCount, so stale/absent/self assignments never
+    // count — a source only warns once its participant is actually present.
+    static bool SourceCollides(long long pid, const std::map<long long, int>& livePidCount) {
         if (pid <= 0) return false;
-        auto it = pidCount.find(pid);
-        return it != pidCount.end() && it->second >= 2;
+        auto it = livePidCount.find(pid);
+        return it != livePidCount.end() && it->second >= 2;
     }
 
     // A quiet amber warning glyph (outline triangle + exclamation), drawn so it's
@@ -2660,12 +2672,22 @@ private:
     // which is seeded wholesale from the roster on every participant_list_changed
     // (and cleared on meeting end/leave), so its keys are exactly the present
     // participants: empty across a fresh restart, and pruned when a participant
-    // leaves. This is the "no participant" gate shared by the dot and the mic, so
-    // both fall back to their hollow/grey states together, driven off live binding
-    // rather than the persisted setting. UI-thread-owned reads, no lock.
+    // leaves. This is the "no participant" gate shared by the dot, the mic, and the
+    // collision warning, so all three fall back to their hollow/grey/no-warning
+    // states together, driven off live binding rather than the persisted setting.
+    // Self (g_cachedMyUserId) is also excluded — never a renderable participant feed
+    // — so a source resolving to the local user falls back the same way. UI-thread-
+    // owned reads, no lock.
     static unsigned int BoundUserId(long long pid) {
         unsigned int uid = EffectiveUserId(pid);
         if (uid == 0) return 0;
+        // Self is never a participant feed: a stale persisted participant_id (or an
+        // Active-Speaker row following self) can resolve to the local user, who sits
+        // in the present-set (g_muteByUserId) and would otherwise pass the presence
+        // gate below and light the indicators for a source that renders nothing.
+        // g_cachedMyUserId is UI-thread-read here (same as g_activeSpeakerUserId in
+        // EffectiveUserId, and the value the dropdown filter already excludes on).
+        if (g_cachedMyUserId != 0 && uid == g_cachedMyUserId) return 0;
         return (g_muteByUserId.count(uid) > 0) ? uid : 0;   // 0 if not currently present
     }
 
@@ -2784,9 +2806,10 @@ private:
     // *current* active speaker (g_activeSpeakerUserId) — muted iff that user is
     // muted, and no mark before anyone speaks (id 0). pid <= 0 is a genuinely
     // unbound row -> no mark. pid > 1 is a real userId -> direct lookup. Unknown
-    // (no map entry) reads unmuted -> no mark. (If the local user is the active
-    // speaker, the row shows their own mute state — intentional, consistent with
-    // the row showing whoever is on screen.)
+    // (no map entry) reads unmuted -> no mark. (MicToneForPid gates on BoundUserId
+    // first, which now excludes self, so the mic never reaches here for a self-
+    // resolved Active-Speaker row — it reads grey/no-participant like any other
+    // self binding, consistent with self rendering no feed.)
     static bool MutedForPid(long long pid) {
         if (pid == 1) {                             // Active Speaker
             if (g_activeSpeakerUserId == 0) return false;   // no speaker yet
@@ -2898,10 +2921,12 @@ private:
         if (!icon) return;
         if (collides) {
             icon->setPixmap(WarningPixmap());
-            icon->setToolTip(
-                "This selection is also used by another source. To show one "
+            // Rich text (<qt>…</qt>) so Qt word-wraps the tooltip to a sensible width
+            // instead of rendering one long unwrapped line.
+            icon->setToolTip(QString::fromUtf8(
+                "<qt>This selection is also used by another source. To show one "
                 "participant in multiple scenes, use a copy of the source "
-                "(the + button) instead.");
+                "(the + button) instead.</qt>"));
         } else {
             icon->setPixmap(QPixmap());
             icon->setToolTip(QString());
@@ -3070,7 +3095,8 @@ private:
     // greyed source doesn't read as more prominent than an active one.
     QWidget* MakeSourceBox(const Row& r, bool live, unsigned int myId,
                            const std::map<unsigned int, std::string>& roster,
-                           const std::map<long long, int>& pidCount) {
+                           const std::map<long long, int>& pidCount,
+                           const std::map<long long, int>& livePidCount) {
         QFrame* box = new QFrame();
         box->setObjectName("feedsSourceBox");
         box->setStyleSheet(QString(
@@ -3082,11 +3108,13 @@ private:
         boxL->setSpacing(4);   // tight header <-> combo so the box reads as one unit
 
         // Shared header state. collides drives the reserved warning slot; dotCode
-        // and micTone seed the connection dot and the always-on mic. The dot's
-        // no-participant case (dotCode 0) and the grey mic tone both key off the
-        // same BoundUserId(pid) == 0 gate (live binding, not the persisted
-        // setting), so they read consistently.
-        const bool collides = SourceCollides(r.pid, pidCount);
+        // and micTone seed the connection dot and the always-on mic. All three key
+        // off the same self-excluding live-binding gate: the dot's no-participant
+        // case (dotCode 0) and the grey mic tone via BoundUserId(pid) == 0, and the
+        // warning via livePidCount (which is itself built from BoundUserId != 0), so
+        // the row reads consistently — hollow dot + grey mic + no warning whenever it
+        // isn't live-bound to a present, non-self participant.
+        const bool collides = SourceCollides(r.pid, livePidCount);
         const int  dotCode  = ResolveDotCode(r.pid, r.liveNow);
         const int  micTone  = MicToneForPid(r.pid);
 
@@ -3173,9 +3201,16 @@ private:
         if (ownPid == 1) {
             currentText = "[Active Speaker]";
         } else if (ownPid > 1) {
-            auto it = roster.find((unsigned int)ownPid);
-            if (it != roster.end()) currentText = QString::fromStdString(it->second);
-            else haveCurrent = false;   // bound but absent -> prompt (as before)
+            // A stale persisted id that resolves to self is not a real pick — the
+            // indicators already treat self as unbound (BoundUserId), so prompt here
+            // too rather than showing the local user's own name as the current value.
+            if (myId != 0 && (unsigned int)ownPid == myId) {
+                haveCurrent = false;
+            } else {
+                auto it = roster.find((unsigned int)ownPid);
+                if (it != roster.end()) currentText = QString::fromStdString(it->second);
+                else haveCurrent = false;   // bound but absent -> prompt (as before)
+            }
         }
         if (haveCurrent)
             combo->addItem(currentText, QVariant((qulonglong)ownPid));   // index 0, hidden below
