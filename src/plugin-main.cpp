@@ -2237,19 +2237,31 @@ public:
 
         // Thin border around the whole dock so it reads as a distinct panel (like
         // OBS's own docks / the Feeds chat dock) instead of blending into the app
-        // background. A semi-transparent line — not a hardcoded colour or a
-        // background fill — so it adapts across themes (dark, light, the user's
-        // custom theme) rather than clashing with any of them. Scoped by objectName
-        // so only the dock root gets the border, never its children; the layout's
-        // contents are inset 1px by the stylesheet box model, so the header/scroll
-        // sit inside the line. WA_StyledBackground makes the plain QWidget actually
-        // paint the styled border.
-        setObjectName("feedsParticipantDock");
-        setAttribute(Qt::WA_StyledBackground, true);
-        setStyleSheet("QWidget#feedsParticipantDock {"
-                      " border: 1px solid rgba(128,128,128,0.35); }");
+        // background. The border lives on a real QFrame that wraps ALL the dock
+        // content (header + scroll), NOT on this FeedsParticipantDock (a plain
+        // QWidget subclass): a QWidget subclass does not reliably paint a stylesheet
+        // border even with WA_StyledBackground, whereas QFrame natively paints the
+        // CSS box — the same reason the chat dock's QListWidget shows a frame and our
+        // borderless QScrollArea did not. A semi-transparent line (not a hardcoded
+        // colour or a background fill) so it adapts across themes (dark, light, the
+        // user's custom theme). Scoped by objectName so only this frame gets the
+        // border; the CSS box model insets its children 1px, so the header/scroll sit
+        // inside the line. This frame is the dock's single top-level child and fills
+        // the QDockWidget content rect OBS gives us.
+        QFrame* dockFrame = new QFrame(this);
+        dockFrame->setObjectName("feedsParticipantDock");
+        dockFrame->setStyleSheet("QFrame#feedsParticipantDock {"
+                                 " border: 1px solid rgba(128,128,128,0.35); }");
+        QVBoxLayout* frameLayout = new QVBoxLayout(dockFrame);
+        // 1px inner margin so the header/scroll never paint over the border line,
+        // independent of whether the CSS box model already insets them — the header
+        // has a translucent fill and the scroll viewport an opaque one that would
+        // otherwise cover the edge. Guarantees the 1px ring is always visible.
+        frameLayout->setContentsMargins(1, 1, 1, 1);
+        frameLayout->setSpacing(0);
+        outer->addWidget(dockFrame);
 
-        QScrollArea* scroll = new QScrollArea(this);
+        QScrollArea* scroll = new QScrollArea(dockFrame);
         scroll->setWidgetResizable(true);
         scroll->setFrameShape(QFrame::NoFrame);
         scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
@@ -2275,8 +2287,8 @@ public:
         // UpdateHeaderState() on every Refresh(), riding the existing tier/login/
         // meeting/share refresh path with no separate mechanism.
         m_header = BuildHeaderBar();
-        outer->addWidget(m_header, 0);
-        outer->addWidget(scroll, 1);   // takes the stretch; header stays pinned above
+        frameLayout->addWidget(m_header, 0);
+        frameLayout->addWidget(scroll, 1);   // takes the stretch; header stays pinned above
 
         // Width is derived from the live theme/font in Refresh() (setMinimumWidth
         // on the dock root, propagating to the QDockWidget). Height floor as before.
