@@ -266,7 +266,7 @@ static void CreateParticipantSourceInCurrentScene();
 static void AddSourceReferenceToCurrentScene(const std::string& uuid);
 // Header add-source actions (defined with the scene helpers, far below).
 // CreateSourceOfTypeInCurrentScene mints a fresh source of the given type and
-// adds it (always-new, like "+ Add Participant"); AddOrReferenceSourceInCurrentScene
+// adds it (always-new, like "Create Participant Feed"); AddOrReferenceSourceInCurrentScene
 // references an existing source of that type if one exists, else creates one
 // (reference-or-create) — this is how the screenshare button never trips the
 // zs_create singleton block by trying to create a second instance.
@@ -2108,12 +2108,12 @@ private:
 // A QPushButton that truncates its label with a trailing ellipsis when the label
 // doesn't fit — the OBS dock-tab convention ("Chat O…") — rather than clipping the
 // glyphs hard, shrinking the font, or forcing the dock wider. Used for the header's
-// three equal-thirds add-source buttons: at the full dock width the short labels
-// ("Screenshare", "Chat Overlay", "Chat Popup") normally fit whole; a narrow dock
-// elides instead of overflowing. The un-elided label is kept for re-eliding after a
-// resize or an icon (screenshare status dot) change; minimumSizeHint drops the
-// natural-width floor so the equal-thirds layout may shrink a button below its text
-// width and let it elide.
+// three equal-thirds add-source buttons: with their reduced horizontal padding (see
+// StyleHeaderButton) the short labels ("Screenshare", "Chat Overlay", "Chat Popup")
+// fit whole at or near the min dock width; a narrower dock elides instead of
+// overflowing. The un-elided label is kept for re-eliding on resize; minimumSizeHint
+// drops the natural-width floor so the equal-thirds layout may shrink a button below
+// its text width and let it elide. No icon path: the header buttons carry no icons.
 class ElidingPushButton : public QPushButton {
 public:
     explicit ElidingPushButton(const QString& text, QWidget* parent = nullptr)
@@ -2121,29 +2121,23 @@ public:
         QPushButton::setText(text);   // re-elided on first resizeEvent
     }
     QSize minimumSizeHint() const override {
-        // Keep the style's height; floor the width at just an ellipsis + icon slot
-        // so three buttons can share a narrow dock without overflowing it.
+        // Keep the style's height; floor the width at about an ellipsis so three
+        // buttons can share a narrow dock without overflowing it.
         QSize s = QPushButton::minimumSizeHint();
-        int floor = QFontMetrics(font()).horizontalAdvance(QStringLiteral("…")) + 16;
-        if (!icon().isNull()) floor += iconSize().width() + 4;
+        int floor = QFontMetrics(font()).horizontalAdvance(QStringLiteral("…")) + 12;
         return QSize(qMin(s.width(), floor), s.height());
-    }
-    // Re-elide against the current width. Public so the owner can call it after an
-    // icon change (setIcon fires no resizeEvent, but the icon eats text width).
-    void ReElide() {
-        QStyleOptionButton opt;
-        initStyleOption(&opt);
-        QRect cr = style()->subElementRect(QStyle::SE_PushButtonContents, &opt, this);
-        int avail = cr.width();
-        if (!icon().isNull()) avail -= iconSize().width() + 4;
-        QString shown =
-            QFontMetrics(font()).elidedText(m_full, Qt::ElideRight, qMax(0, avail));
-        if (shown != text()) QPushButton::setText(shown);   // guard: no resize loop
     }
 protected:
     void resizeEvent(QResizeEvent* e) override {
         QPushButton::resizeEvent(e);
-        ReElide();
+        // Elide against the content rect (inside the style's frame + our reduced
+        // horizontal padding). The guarded setText avoids a resize feedback loop.
+        QStyleOptionButton opt;
+        initStyleOption(&opt);
+        QRect cr = style()->subElementRect(QStyle::SE_PushButtonContents, &opt, this);
+        QString shown = QFontMetrics(font()).elidedText(
+            m_full, Qt::ElideRight, qMax(0, cr.width()));
+        if (shown != text()) QPushButton::setText(shown);
     }
 private:
     QString m_full;
@@ -2423,7 +2417,7 @@ public:
         if (rows.empty()) {
             QLabel* empty = new QLabel(
                 "No Zoom Participant sources yet.\n"
-                "Click “+ Add Participant” below to create one.");
+                "Click “Create Participant Feed” below to create one.");
             empty->setWordWrap(true);
             empty->setStyleSheet("QLabel { color: #7a7d80; }");
             m_root->addWidget(empty);
@@ -2517,8 +2511,10 @@ private:
     // (the top slot is state-driven). Never disabled by the tier cap — it always
     // creates; an over-cap result is greyed by the identical existing logic. The
     // create + scene-add + placement + dock-row all ride the existing signal paths.
+    // "Create Participant Feed" (no "+") names what it uniquely does — brings a new
+    // feed into existence — vs. the header buttons that place/reference a source.
     void AppendCreateButton() {
-        QPushButton* addBtn = new QPushButton("+ Add Participant");
+        QPushButton* addBtn = new QPushButton("Create Participant Feed");
         QObject::connect(addBtn, &QPushButton::clicked, []() {
             CreateParticipantSourceInCurrentScene();
         });
@@ -2536,35 +2532,15 @@ private:
     // chat overlay/popup Streamer+ (tier >= 2). g_currentTier is the same value the
     // cap chrome reads, so the header re-locks in the same refresh path.
 
-    // Small colored status dot for the Screenshare button icon: green when someone
-    // is sharing, grey when idle. Tones match the row connection dot.
-    static QPixmap ShareDotPixmap(bool sharing) {
-        const int sz = 10;
-        qreal dpr = 1.0;
-        if (QScreen* s = (qApp ? qApp->primaryScreen() : nullptr))
-            dpr = s->devicePixelRatio();
-        QPixmap pm((int)(sz * dpr), (int)(sz * dpr));
-        pm.setDevicePixelRatio(dpr);
-        pm.fill(Qt::transparent);
-        QPainter p(&pm);
-        p.setRenderHint(QPainter::Antialiasing, true);
-        p.setPen(Qt::NoPen);
-        p.setBrush(sharing ? QColor(64, 192, 96, 235)      // green: sharing
-                           : QColor(150, 150, 150, 170));   // grey: idle
-        p.drawEllipse(0, 0, sz, sz);
-        p.end();
-        return pm;
-    }
-
     // One equal-thirds header button. Tooltip is the constant "Add to Current
     // Scene" in every state, locked or unlocked — the tier explanation lives in the
     // upgrade prompt a locked click opens, so it's set once here and never changed.
     // Eliding (ElidingPushButton) truncates the label with an ellipsis if a narrow
-    // dock can't fit it whole, matching OBS's dock-tab convention.
+    // dock can't fit it whole, matching OBS's dock-tab convention. Per-state cursor,
+    // padding, and label color are applied by StyleHeaderButton on each Refresh.
     static ElidingPushButton* MakeHeaderButton(const QString& label) {
         ElidingPushButton* b = new ElidingPushButton(label);
         b->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-        b->setCursor(Qt::PointingHandCursor);
         b->setToolTip("Add to Current Scene");
         return b;
     }
@@ -2659,17 +2635,34 @@ private:
         return header;
     }
 
-    // Style one header button for its tier-lock state. Kept ENABLED even when
-    // locked: a disabled Qt widget receives no hover events, so its tooltip
+    // Style one header button for its tier-lock and share state. Kept ENABLED even
+    // when locked: a disabled Qt widget receives no hover events, so its tooltip
     // wouldn't show — and the button must still open the upgrade prompt on click.
-    // Locked = greyed text + arrow cursor; the click lambda short-circuits the add
-    // on the tier check and instead opens the upgrade prompt (ShowSourceUpgradePrompt),
-    // so it never performs the source action. The tooltip ("Add to Current Scene")
-    // is constant in both states — set once at creation — so this doesn't touch it.
-    static void ApplyHeaderLock(QPushButton* b, bool locked) {
+    // Locked = greyed text (#7a7d80) + arrow cursor; the click lambda short-circuits
+    // the add on the tier check and instead opens the upgrade prompt
+    // (ShowSourceUpgradePrompt), so it never performs the source action. The tooltip
+    // ("Add to Current Scene") is constant in both states — set once at creation — so
+    // this doesn't touch it.
+    //
+    // Color precedence: tier-locked greying wins over the share-active green. Only
+    // the Screenshare button ever passes sharing=true, and only when within tier, so
+    // a locked button is never green (nor sharing). The green (#40c060, the tone the
+    // old status dot used) is clearly distinct from the locked grey.
+    //
+    // The stylesheet also sets a reduced horizontal padding (~half the themed
+    // default) so the labels reclaim text room and fit at/near the min dock width;
+    // it's the per-button *minimum* — the Expanding buttons still grow the padding by
+    // centering when the dock is widened. Matches the padding-stylesheet pattern the
+    // row buttons already use. Padding lives in the same stylesheet as the color so a
+    // restyle never drops it.
+    static void StyleHeaderButton(QPushButton* b, bool locked, bool sharing) {
         if (!b) return;
+        QString color;
+        if (locked)       color = " color: #7a7d80;";   // greyed: tier-locked (wins)
+        else if (sharing) color = " color: #40c060;";   // green: someone is sharing
         b->setCursor(locked ? Qt::ArrowCursor : Qt::PointingHandCursor);
-        b->setStyleSheet(locked ? "QPushButton { color: #7a7d80; }" : QString());
+        b->setStyleSheet(QString(
+            "QPushButton { padding-left: 4px; padding-right: 4px;%1 }").arg(color));
     }
 
     // Clicking a tier-locked header button opens the shared upgrade dialog
@@ -2679,45 +2672,36 @@ private:
     // name; `tierWord` names the plan it needs (Basic / Streamer).
     static void ShowSourceUpgradePrompt(const QString& feature, const QString& tierWord) {
         if (!ShouldShowTierPopup()) return;
+        // Explanation on one line, then the upgrade link on its own line below it as
+        // a clear call-to-action (the <br><br> break) rather than jammed mid-sentence.
         ShowTierLimitDialog(
             QString("Feeds: %1").arg(feature),
-            QString("%1 is a %2-tier feature. "
+            QString("%1 is a %2-tier feature.<br><br>"
                     "<a href=\"https://letsdovideo.com/feeds-upgrade\">Click here "
-                    "to upgrade your plan</a>.").arg(feature, tierWord));
+                    "to upgrade your plan</a>").arg(feature, tierWord));
     }
 
     // Re-style the header source buttons from current tier + share state. Called
     // from Refresh(), so tier/login/meeting/share changes (which all already route
     // through RefreshAllSourceProperties -> PostParticipantDockRefresh) update them
-    // with no separate mechanism. The buttons are always visible (like "+ Add
-    // Participant"); gating is per-button greying, for discoverability/upgrade.
+    // with no separate mechanism. The buttons are always visible (like "Create
+    // Participant Feed"); gating is per-button greying, for discoverability/upgrade.
     void UpdateHeaderState() {
         if (!m_header) return;
 
         const bool ssLocked   = g_currentTier < 1;   // screenshare: Basic+
         const bool chatLocked = g_currentTier < 2;   // overlay/popup: Streamer+
 
-        ApplyHeaderLock(m_hdrScreenshare, ssLocked);
-        ApplyHeaderLock(m_hdrChatOverlay, chatLocked);
-        ApplyHeaderLock(m_hdrChatPopup,   chatLocked);
+        // Screenshare label turns green while someone in the meeting is sharing and
+        // the button is within tier (never on a tier-locked button — greying wins).
+        // Same signal the old status dot used (g_activeSharerUserId); its
+        // share_status_changed handler already marshals a dock refresh here, so no
+        // new mechanism.
+        const bool sharing = !ssLocked && g_activeSharerUserId != 0;
 
-        // Screenshare live status dot — only when the button is usable (no status
-        // when tier-locked). Green if someone is sharing, grey otherwise. Reads
-        // g_activeSharerUserId, the same signal zs_properties uses; its
-        // share_status_changed handler already marshals a dock refresh here.
-        int shareState = ssLocked ? -1 : (g_activeSharerUserId != 0 ? 1 : 0);
-        if (shareState != m_hdrShareState) {
-            m_hdrShareState = shareState;
-            if (shareState < 0) {
-                m_hdrScreenshare->setIcon(QIcon());          // locked: no dot
-            } else {
-                m_hdrScreenshare->setIcon(QIcon(ShareDotPixmap(shareState == 1)));
-                m_hdrScreenshare->setIconSize(QSize(10, 10));
-            }
-            // The dot claims/releases text width; re-elide so the label fits the
-            // remaining room (setIcon fires no resizeEvent on its own).
-            m_hdrScreenshare->ReElide();
-        }
+        StyleHeaderButton(m_hdrScreenshare, ssLocked,   sharing);
+        StyleHeaderButton(m_hdrChatOverlay, chatLocked, false);
+        StyleHeaderButton(m_hdrChatPopup,   chatLocked, false);
     }
 
     // Small right-aligned per-row button: add THIS source to the current edit
@@ -2727,7 +2711,7 @@ private:
     QPushButton* MakeAddToSceneButton(const std::string& uuid) {
         QPushButton* b = new QPushButton("+");
         b->setFixedSize(18, 18);
-        b->setToolTip("Add to current scene");
+        b->setToolTip("Add to Current Scene");
         b->setCursor(Qt::PointingHandCursor);
         b->setStyleSheet("QPushButton { padding: 0; font-weight: bold; }");
         QObject::connect(b, &QPushButton::clicked, [uuid]() {
@@ -2828,7 +2812,7 @@ private:
     // sibling from the header label, so none collides with the double-click rename.
     void AppendHeaderButtons(QHBoxLayout* headerL, const std::string& uuid) {
         headerL->addWidget(MakeAddToSceneButton(uuid));
-        headerL->addWidget(MakeIconButton(ScenesIcon(), "Included scenes",
+        headerL->addWidget(MakeIconButton(ScenesIcon(), "Included Scenes",
             [uuid]() { ShowIncludedScenesMenu(uuid); }));
         headerL->addWidget(MakeIconButton(FiltersIcon(), "Filters",
             [uuid]() { OpenSourceFilters(uuid); }));
@@ -3624,7 +3608,6 @@ private:
     ElidingPushButton* m_hdrScreenshare  = nullptr;
     ElidingPushButton* m_hdrChatOverlay  = nullptr;
     ElidingPushButton* m_hdrChatPopup    = nullptr;
-    int                m_hdrShareState   = -2;  // last-applied screenshare dot: -2 none/-1 locked/0 grey/1 green
 
     // Inline rename state (UI thread). m_activeEdit != null means an edit is open:
     // Refresh() defers while it is, and m_refreshPending records that a deferred
@@ -3989,6 +3972,11 @@ void ShowTierLimitDialog(const QString& title, const QString& html) {
             dlg->setAttribute(Qt::WA_DeleteOnClose);
             dlg->setWindowTitle(title);
             dlg->setWindowModality(Qt::ApplicationModal);
+            // Wider by default so the body isn't cramped and a call-to-action link on
+            // its own line has room to read as one. Shared by every caller of this
+            // dialog (the header locked-click upgrade prompt and the screenshare
+            // "already exists" notice), so both get the roomier layout.
+            dlg->setMinimumWidth(420);
 
             QLabel* label = new QLabel(html, dlg);
             label->setTextFormat(Qt::RichText);
@@ -6064,7 +6052,7 @@ static obs_source_t* ResolveCurrentEditScene() {
 // sources) and the source_create signal (OnSourceCreated's deferred, per-type
 // placement, which finds the scene-item we add here). No resolvable scene -> safe
 // no-op (don't leak an orphan source). This is the always-new path — used by
-// "+ Add Participant" and the header's Chat Overlay button. UI thread.
+// "Create Participant Feed" and the header's Chat Overlay button. UI thread.
 static void CreateSourceOfTypeInCurrentScene(const char* typeId, const char* baseName) {
     obs_source_t* sceneSrc = ResolveCurrentEditScene();
     if (!sceneSrc) return;
