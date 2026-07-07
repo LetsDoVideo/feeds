@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <functional>
 #include <mutex>
 #include <atomic>
@@ -66,6 +67,7 @@
 #include <QFile>
 #include <QByteArray>
 #include <QCursor>
+#include <QPointer>
 #include <QPalette>
 #include <QBrush>
 #include <QStandardItemModel>
@@ -2233,6 +2235,20 @@ public:
         outer->setContentsMargins(0, 0, 0, 0);
         outer->setSpacing(0);
 
+        // Thin border around the whole dock so it reads as a distinct panel (like
+        // OBS's own docks / the Feeds chat dock) instead of blending into the app
+        // background. A semi-transparent line — not a hardcoded colour or a
+        // background fill — so it adapts across themes (dark, light, the user's
+        // custom theme) rather than clashing with any of them. Scoped by objectName
+        // so only the dock root gets the border, never its children; the layout's
+        // contents are inset 1px by the stylesheet box model, so the header/scroll
+        // sit inside the line. WA_StyledBackground makes the plain QWidget actually
+        // paint the styled border.
+        setObjectName("feedsParticipantDock");
+        setAttribute(Qt::WA_StyledBackground, true);
+        setStyleSheet("QWidget#feedsParticipantDock {"
+                      " border: 1px solid rgba(128,128,128,0.35); }");
+
         QScrollArea* scroll = new QScrollArea(this);
         scroll->setWidgetResizable(true);
         scroll->setFrameShape(QFrame::NoFrame);
@@ -2515,10 +2531,32 @@ private:
     // feed into existence — vs. the header buttons that place/reference a source.
     void AppendCreateButton() {
         QPushButton* addBtn = new QPushButton("Create Participant Feed");
-        QObject::connect(addBtn, &QPushButton::clicked, []() {
+        m_createBtn = addBtn;   // current instance (rebuilt each Refresh) for the cooldown restyle
+        // Creating a feed triggers a dock rebuild (zp_create -> refresh), which
+        // replaces this button — so the cooldown state lives on the dock, not the
+        // widget: re-grey the fresh button here whenever a cooldown is still in
+        // flight across that rebuild.
+        StyleCreateButton(addBtn, m_cdCreateFeed);
+        QObject::connect(addBtn, &QPushButton::clicked, [this]() {
+            if (m_cdCreateFeed) return;   // on add-cooldown: absorb the rapid re-click
             CreateParticipantSourceInCurrentScene();
+            m_cdCreateFeed = true;
+            if (m_createBtn) StyleCreateButton(m_createBtn, true);
+            QTimer::singleShot(kAddCooldownMs, this, [this]() {
+                m_cdCreateFeed = false;
+                if (m_createBtn) StyleCreateButton(m_createBtn, false);
+            });
         });
         m_root->addWidget(addBtn);
+    }
+
+    // Create-button resting style is the theme default (no stylesheet); on the add-
+    // cooldown it greys to the same #7a7d80 as the tier-locked buttons, then reverts.
+    // Colour only — the cursor is left at the button default in both states, so the
+    // resting appearance is unchanged from before the cooldown existed.
+    static void StyleCreateButton(QPushButton* b, bool cooling) {
+        if (!b) return;
+        b->setStyleSheet(cooling ? "QPushButton { color: #7a7d80; }" : QString());
     }
 
     // --- Fixed header bar: add-source buttons for the other three source types ---
@@ -2601,30 +2639,36 @@ private:
         l->setSpacing(6);
 
         m_hdrScreenshare = MakeHeaderButton("Screenshare");
-        QObject::connect(m_hdrScreenshare, &QPushButton::clicked, []() {
+        QObject::connect(m_hdrScreenshare, &QPushButton::clicked, [this]() {
             if (g_currentTier < 1) {   // tier-locked (Basic+): actionable upgrade prompt
                 ShowSourceUpgradePrompt("Zoom Screenshare", "Basic");
-                return;
+                return;   // locked: no add to cool down (upgrade-prompt throttle handles it)
             }
+            if (m_cdScreenshare) return;   // on add-cooldown: absorb the rapid re-click
             AddOrReferenceSourceInCurrentScene("zoom_screenshare_source", "Zoom Screenshare");
+            BeginHeaderCooldown(&m_cdScreenshare);
         });
 
         m_hdrChatOverlay = MakeHeaderButton("Chat Overlay");
-        QObject::connect(m_hdrChatOverlay, &QPushButton::clicked, []() {
+        QObject::connect(m_hdrChatOverlay, &QPushButton::clicked, [this]() {
             if (g_currentTier < 2) {   // tier-locked (Streamer+): actionable upgrade prompt
                 ShowSourceUpgradePrompt("Zoom Chat Overlay", "Streamer");
                 return;
             }
+            if (m_cdChatOverlay) return;   // on add-cooldown: absorb the rapid re-click
             CreateSourceOfTypeInCurrentScene("feeds_chat_overlay", "Zoom Chat Overlay");
+            BeginHeaderCooldown(&m_cdChatOverlay);
         });
 
         m_hdrChatPopup = MakeHeaderButton("Chat Popup");
-        QObject::connect(m_hdrChatPopup, &QPushButton::clicked, []() {
+        QObject::connect(m_hdrChatPopup, &QPushButton::clicked, [this]() {
             if (g_currentTier < 2) {   // tier-locked (Streamer+): actionable upgrade prompt
                 ShowSourceUpgradePrompt("Zoom Chat Popup", "Streamer");
                 return;
             }
+            if (m_cdChatPopup) return;   // on add-cooldown: absorb the rapid re-click
             AddOrReferenceSourceInCurrentScene("feeds_chat_popup", "Zoom Chat Popup");
+            BeginHeaderCooldown(&m_cdChatPopup);
         });
 
         l->addWidget(m_hdrScreenshare, 1);   // equal thirds
@@ -2655,14 +2699,36 @@ private:
     // centering when the dock is widened. Matches the padding-stylesheet pattern the
     // row buttons already use. Padding lives in the same stylesheet as the color so a
     // restyle never drops it.
-    static void StyleHeaderButton(QPushButton* b, bool locked, bool sharing) {
+    // `cooling` is the transient add-cooldown state (see BeginHeaderCooldown): it
+    // greys the button while active and takes visual precedence over the sharing
+    // green, but not over the tier-lock grey (a locked button never performs an add,
+    // so it never cools). Because this recomputes colour from the live lock/share
+    // state every call, the post-cooldown restyle restores the correct resting look
+    // — normal, still-green if sharing, etc. — rather than clobbering it.
+    static void StyleHeaderButton(QPushButton* b, bool locked, bool sharing, bool cooling) {
         if (!b) return;
         QString color;
         if (locked)       color = " color: #7a7d80;";   // greyed: tier-locked (wins)
+        else if (cooling) color = " color: #7a7d80;";   // greyed: on add-cooldown
         else if (sharing) color = " color: #40c060;";   // green: someone is sharing
-        b->setCursor(locked ? Qt::ArrowCursor : Qt::PointingHandCursor);
+        b->setCursor((locked || cooling) ? Qt::ArrowCursor : Qt::PointingHandCursor);
         b->setStyleSheet(QString(
             "QPushButton { padding-left: 4px; padding-right: 4px;%1 }").arg(color));
+    }
+
+    // Begin a 1s add-cooldown on a header button: set its flag, grey it now via the
+    // shared style pass, and schedule the flag-clear + restyle. The single-shot uses
+    // the dock (`this`) as context so it auto-cancels if the dock is destroyed; the
+    // flag is a dock member (pointer captured by value), so the reference stays valid
+    // for the timer's lifetime. Restyle goes through UpdateHeaderState so the resting
+    // style is recomputed, never blindly reset.
+    void BeginHeaderCooldown(bool* flag) {
+        *flag = true;
+        UpdateHeaderState();
+        QTimer::singleShot(kAddCooldownMs, this, [this, flag]() {
+            *flag = false;
+            UpdateHeaderState();
+        });
     }
 
     // Clicking a tier-locked header button opens the shared upgrade dialog
@@ -2699,9 +2765,9 @@ private:
         // new mechanism.
         const bool sharing = !ssLocked && g_activeSharerUserId != 0;
 
-        StyleHeaderButton(m_hdrScreenshare, ssLocked,   sharing);
-        StyleHeaderButton(m_hdrChatOverlay, chatLocked, false);
-        StyleHeaderButton(m_hdrChatPopup,   chatLocked, false);
+        StyleHeaderButton(m_hdrScreenshare, ssLocked,   sharing, m_cdScreenshare);
+        StyleHeaderButton(m_hdrChatOverlay, chatLocked, false,   m_cdChatOverlay);
+        StyleHeaderButton(m_hdrChatPopup,   chatLocked, false,   m_cdChatPopup);
     }
 
     // Small right-aligned per-row button: add THIS source to the current edit
@@ -2713,11 +2779,38 @@ private:
         b->setFixedSize(18, 18);
         b->setToolTip("Add to Current Scene");
         b->setCursor(Qt::PointingHandCursor);
-        b->setStyleSheet("QPushButton { padding: 0; font-weight: bold; }");
-        QObject::connect(b, &QPushButton::clicked, [uuid]() {
+        // Track this row's current "+" by uuid (rebuilt each Refresh) so the
+        // cooldown-expiry restyle reaches whichever button is live, and re-grey a
+        // freshly-built button if its uuid is still cooling across a rebuild. The
+        // cooling set (m_cdRows) is the enforcement — it survives rebuilds; the
+        // greying is just its feedback.
+        m_rowAddButtons[uuid] = b;
+        StyleRowAddButton(b, m_cdRows.count(uuid) != 0);
+        QObject::connect(b, &QPushButton::clicked, [this, uuid]() {
+            if (m_cdRows.count(uuid)) return;   // on add-cooldown: absorb the rapid re-click
             AddSourceReferenceToCurrentScene(uuid);
+            m_cdRows.insert(uuid);
+            if (auto it = m_rowAddButtons.find(uuid);
+                it != m_rowAddButtons.end() && it->second)
+                StyleRowAddButton(it->second, true);
+            QTimer::singleShot(kAddCooldownMs, this, [this, uuid]() {
+                m_cdRows.erase(uuid);
+                auto it = m_rowAddButtons.find(uuid);
+                if (it != m_rowAddButtons.end() && it->second)
+                    StyleRowAddButton(it->second, false);
+            });
         });
         return b;
+    }
+
+    // Row "+" resting style (bold, no padding) vs. cooling (greyed to #7a7d80,
+    // matching the other cooled/locked buttons). One place so the cooldown reverts
+    // to the exact resting look.
+    static void StyleRowAddButton(QPushButton* b, bool cooling) {
+        if (!b) return;
+        b->setStyleSheet(cooling
+            ? "QPushButton { padding: 0; font-weight: bold; color: #7a7d80; }"
+            : "QPushButton { padding: 0; font-weight: bold; }");
     }
 
     // Small icon button matched to the "+" above (18px slot), for the provisional
@@ -3584,6 +3677,14 @@ private:
         // Drop borrowed indicator pointers BEFORE deleting the boxes that own
         // them, so the poll can never touch a freed dot between clear and rebuild.
         m_rowIndicators.clear();
+        // Row "+" pointers are borrowed too (their boxes own them); the cooldown
+        // SET (m_cdRows) is deliberately NOT cleared here, so a row's cooldown
+        // survives an unrelated rebuild and re-applies when the row is rebuilt.
+        m_rowAddButtons.clear();
+        // The create button is about to be deleted; drop the pointer so a pending
+        // cooldown timer can't touch a freed widget if the rebuild omits it (e.g.
+        // hidden at/over the tier cap). AppendCreateButton re-sets it when present.
+        m_createBtn = nullptr;
         QLayoutItem* item;
         while ((item = m_root->takeAt(0)) != nullptr) {
             if (QWidget* w = item->widget()) {
@@ -3608,6 +3709,24 @@ private:
     ElidingPushButton* m_hdrScreenshare  = nullptr;
     ElidingPushButton* m_hdrChatOverlay  = nullptr;
     ElidingPushButton* m_hdrChatPopup    = nullptr;
+
+    // --- Per-button add-cooldowns (1s each) -----------------------------------
+    // After a button performs an add, it greys and no-ops for 1s to absorb
+    // accidental rapid re-clicks. Per-button, so adding different sources in quick
+    // succession stays fully allowed. Enforcement lives in these flags/set (which
+    // survive the content rebuilds that add-actions can trigger), NOT on the
+    // widgets; the greying composes with the existing style paths without
+    // clobbering a button's resting state (tier-lock grey / screenshare green /
+    // normal). Timers are QTimer::singleShot with the dock as context, so they
+    // clean up with the dock.
+    static constexpr int kAddCooldownMs = 1000;
+    bool m_cdScreenshare = false;   // header: Screenshare
+    bool m_cdChatOverlay = false;   // header: Chat Overlay
+    bool m_cdChatPopup   = false;   // header: Chat Popup
+    bool m_cdCreateFeed  = false;   // "Create Participant Feed" (rebuilt each Refresh)
+    QPushButton* m_createBtn = nullptr;            // current Create-Feed button instance
+    std::set<std::string> m_cdRows;                // row uuids currently cooling
+    std::map<std::string, QPointer<QPushButton>> m_rowAddButtons;  // uuid -> current "+"
 
     // Inline rename state (UI thread). m_activeEdit != null means an edit is open:
     // Refresh() defers while it is, and m_refreshPending records that a deferred
