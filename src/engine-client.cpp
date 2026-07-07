@@ -369,12 +369,29 @@ static void PipeReaderThread()
     blog(LOG_INFO, "[feeds] PipeReaderThread: started");
 
     char buffer[4096];
+    // Accumulates one message across reads. The E2P pipe is message-mode, so a
+    // message larger than `buffer` comes back as one or more ReadFile failures
+    // with GetLastError() == ERROR_MORE_DATA (each filling `buffer` with the next
+    // slice), terminated by a successful read carrying the final slice. Those
+    // partials must be concatenated, not treated as fatal — otherwise a large
+    // roster (50+ participant webinar) or a large Events payload would kill the
+    // reader and silently stop ALL engine->plugin traffic for the session. A
+    // message that fits in one read leaves this empty until that read completes.
+    std::string message;
     while (!g_shutdownRequested) {
         DWORD bytesRead = 0;
-        BOOL ok = ReadFile(g_e2pPipe, buffer, sizeof(buffer) - 1, &bytesRead, NULL);
+        BOOL ok = ReadFile(g_e2pPipe, buffer, sizeof(buffer), &bytesRead, NULL);
 
         if (!ok) {
             DWORD err = GetLastError();
+            if (err == ERROR_MORE_DATA) {
+                // Partial message: this read filled `buffer`. Keep the bytes and
+                // loop to read the rest; the message completes on the next read
+                // that returns TRUE. Handles a message several buffers long
+                // (multiple ERROR_MORE_DATA reads before completion).
+                message.append(buffer, bytesRead);
+                continue;
+            }
             // ERROR_OPERATION_ABORTED (995) is expected during shutdown,
             // triggered by CancelIoEx. ERROR_BROKEN_PIPE (109) is expected
             // when the engine exits. Anything else is a real error.
@@ -386,9 +403,11 @@ static void PipeReaderThread()
             break;
         }
 
-        if (bytesRead > 0) {
-            buffer[bytesRead] = '\0';
-            std::string json(buffer, bytesRead);
+        // Successful read: append this final slice, completing the message
+        // (whole, if it fit in one read; or the tail of an ERROR_MORE_DATA run).
+        message.append(buffer, bytesRead);
+        if (!message.empty()) {
+            const std::string& json = message;
             // Redaction: log only the message type, never the payload.
             // Inbound login_succeeded carries the user's name and PMI, and
             // forwarded engine "log" messages are re-emitted by their own
@@ -399,6 +418,7 @@ static void PipeReaderThread()
             blog(LOG_DEBUG, "[feeds] PipeReaderThread: received: %s", rtype.c_str());
             DispatchMessage(json);
         }
+        message.clear();
     }
 
     blog(LOG_INFO, "[feeds] PipeReaderThread: exiting");

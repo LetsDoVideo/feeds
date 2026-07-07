@@ -87,13 +87,18 @@ static std::string JsonExtractNumber(const std::string& json,
 // Credential Manager helpers — save new tokens after a refresh
 // ---------------------------------------------------------------------------
 static void SaveTokensToCredentialManager() {
+    // Persist class must match the OAuth login-flow save
+    // (engine-oauth.cpp: CRED_PERSIST_ENTERPRISE) — otherwise the first silent
+    // token refresh would rewrite the credential with LOCAL_MACHINE, the class
+    // the login path deliberately avoids (ENTERPRISE roams with the profile and
+    // is allowed under stricter enterprise IT policies).
     if (!g_accessToken.empty()) {
         CREDENTIALA cred = {};
         cred.Type               = CRED_TYPE_GENERIC;
         cred.TargetName         = (LPSTR)"Feeds_AccessToken";
         cred.CredentialBlobSize = (DWORD)g_accessToken.size();
         cred.CredentialBlob     = (LPBYTE)g_accessToken.data();
-        cred.Persist            = CRED_PERSIST_LOCAL_MACHINE;
+        cred.Persist            = CRED_PERSIST_ENTERPRISE;
         CredWriteA(&cred, 0);
     }
     if (!g_refreshToken.empty()) {
@@ -102,7 +107,7 @@ static void SaveTokensToCredentialManager() {
         cred.TargetName         = (LPSTR)"Feeds_RefreshToken";
         cred.CredentialBlobSize = (DWORD)g_refreshToken.size();
         cred.CredentialBlob     = (LPBYTE)g_refreshToken.data();
-        cred.Persist            = CRED_PERSIST_LOCAL_MACHINE;
+        cred.Persist            = CRED_PERSIST_ENTERPRISE;
         CredWriteA(&cred, 0);
     }
 }

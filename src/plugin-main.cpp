@@ -5323,29 +5323,21 @@ static void RegisterEngineHandlers() {
 
         std::vector<CachedParticipant> newList;
         std::map<unsigned int, bool>   mutedSnap;  // userId -> muted, dock seed
-        size_t pos = json.find("\"participants\"");
-        if (pos != std::string::npos) {
-            pos = json.find('[', pos);
-            if (pos != std::string::npos) {
-                size_t end = json.find(']', pos);
-                std::string arr = json.substr(pos, end == std::string::npos
-                                                    ? std::string::npos
-                                                    : end - pos);
-                size_t cursor = 0;
-                while ((cursor = arr.find('{', cursor)) != std::string::npos) {
-                    size_t objEnd = arr.find('}', cursor);
-                    if (objEnd == std::string::npos) break;
-                    std::string obj = arr.substr(cursor, objEnd - cursor + 1);
-
-                    CachedParticipant p;
-                    p.id   = (unsigned int)ExtractJsonNumber(obj, "id");
-                    p.name = ExtractJsonString(obj, "name");
-                    if (p.id != 0 && !p.name.empty()) {
-                        newList.push_back(p);
-                        mutedSnap[p.id] = ExtractJsonNumber(obj, "muted") != 0;
-                    }
-                    cursor = objEnd + 1;
-                }
+        // String-aware array/object splitting: a display name can contain '[',
+        // ']', '{' or '}' (e.g. "{TAG} Bob" or "Bob :]"), which a naive
+        // find(']')/find('{')/find('}') scan would treat as structure —
+        // truncating an object or the whole array and dropping every
+        // participant after the offending name (breaking their name-rebind).
+        // Use the same helpers the Events path uses (JsonExtractArrayBody +
+        // SplitJsonObjects), which skip brackets/braces inside quoted strings.
+        for (const std::string& obj :
+             SplitJsonObjects(JsonExtractArrayBody(json, "participants"))) {
+            CachedParticipant p;
+            p.id   = (unsigned int)ExtractJsonNumber(obj, "id");
+            p.name = ExtractJsonString(obj, "name");
+            if (p.id != 0 && !p.name.empty()) {
+                newList.push_back(p);
+                mutedSnap[p.id] = ExtractJsonNumber(obj, "muted") != 0;
             }
         }
 

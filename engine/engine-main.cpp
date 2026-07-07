@@ -149,6 +149,9 @@ static bool ConnectToPipes()
 {
     // Connect to P2E (plugin-to-engine: engine reads)
     for (int i = 0; i < 20; i++) {
+        // Opened GENERIC_READ only. Note this makes the SetNamedPipeHandleState
+        // below fail by spec (see there) — intentional; do not add access
+        // rights or flip modes without reading that comment.
         g_readPipe = CreateFileW(
             P2E_PIPE_NAME,
             GENERIC_READ,
@@ -163,6 +166,17 @@ static bool ConnectToPipes()
             // logged AFTER E2P connects below — LogInfo/LogError forward over E2P,
             // which isn't open yet here, so logging now would be silently dropped
             // (why the earlier check never appeared in the log).
+            //
+            // KNOWN DEBT (by spec, not a bug): this call fails ACCESS_DENIED at
+            // runtime. SetNamedPipeHandleState changes a handle attribute, which
+            // is a write; on a read-only client handle Windows requires
+            // GENERIC_READ | FILE_WRITE_ATTRIBUTES, and we open GENERIC_READ only
+            // above. We deliberately do NOT add FILE_WRITE_ATTRIBUTES or switch to
+            // message mode: the byte-mode, string-aware reader-side splitter in
+            // PipeReaderLoop is authoritative, and flipping the engine's reader to
+            // message mode would re-expose the "message larger than one read"
+            // failure here. The failure is captured (g_p2eModeErr) and we fall
+            // back to reader-side splitting, so behavior is correct as-is.
             DWORD mode = PIPE_READMODE_MESSAGE;
             g_p2eModeOk  = SetNamedPipeHandleState(g_readPipe, &mode, NULL, NULL);
             g_p2eModeErr = g_p2eModeOk ? 0 : GetLastError();
@@ -307,9 +321,15 @@ static void PipeReaderLoop()
 
         // Reassemble: prepend any partial from the previous read, then split into
         // complete top-level {...} objects by brace depth and dispatch each in
-        // order. These P2E messages are flat JSON — no nested braces, no braces
-        // inside string values — so each depth-0 close-brace ends one message.
-        // A trailing unbalanced object is held in `leftover` for the next read.
+        // order. The scan is string-aware — braces inside quoted string values
+        // (honoring \" escapes) are skipped — because P2E carries user-entered
+        // content: chat messages (send_chat_message) and meeting passwords/URLs
+        // (join_meeting) can contain an unbalanced '{' or '}' (e.g. someone
+        // typing ":}" in chat), which a naive brace count would treat as a
+        // boundary, truncating that message and corrupting the next. A trailing
+        // unbalanced object is held in `leftover` for the next read; it always
+        // begins at a top-level '{' (outside any string), so restarting the
+        // string state each chunk is correct.
         std::string chunk;
         chunk.reserve(leftover.size() + bytesRead);
         chunk.assign(leftover);
@@ -318,9 +338,19 @@ static void PipeReaderLoop()
 
         size_t objStart = 0;
         int    depth    = 0;
+        bool   inStr    = false;
+        bool   esc      = false;
         for (size_t p = 0; p < chunk.size(); ++p) {
             const char c = chunk[p];
-            if (c == '{') {
+            if (inStr) {
+                if (esc) esc = false;
+                else if (c == '\\') esc = true;
+                else if (c == '"') inStr = false;
+                continue;
+            }
+            if (c == '"') {
+                inStr = true;
+            } else if (c == '{') {
                 if (depth == 0) objStart = p;   // start of a new top-level object
                 ++depth;
             } else if (c == '}') {
