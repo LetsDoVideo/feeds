@@ -4677,6 +4677,23 @@ struct ZsSourceData {
     HANDLE            pumpWakeEvent = nullptr;
     uint32_t          lastReadIndex = 0;
 
+    // Visibility gate + show-redeliver for the stale-frame-on-reshow fix.
+    // Flipped by the .show/.hide source callbacks (graphics/tick thread) and
+    // read by the pump (its own thread) — hence atomic. Per-source: several
+    // screenshare sources can read the same ring, each with its own gate.
+    //   showing          — false while the source is hidden; the pump skips ALL
+    //                       delivery then, so OBS never caches a frame into a
+    //                       source nobody sees (which is what re-arms
+    //                       async_active and reintroduces the stale paint). The
+    //                       source starts not-showing; OBS fires .show on first
+    //                       display.
+    //   redeliverPending — set by .show so the pump re-emits the newest ring
+    //                       slot once on re-show (even with no new write),
+    //                       overwriting OBS's stale async texture with current
+    //                       content within ~1 tick.
+    std::atomic<bool> showing{false};
+    std::atomic<bool> redeliverPending{false};
+
     // Same role as ZpSourceData::lifecycleMutex. Held across Open/Close
     // ShareSharedMemory bodies (which call ZsStart/ZsStopPumpThread).
     // Lock ordering: g_screenshareSourcesMutex (outer) →
@@ -4698,8 +4715,26 @@ static void ZsPumpThreadFunc(ZsSourceData* data) {
         if (data->pumpShouldExit) break;
         if (!data->header || !data->frameSlots) continue;
 
+        // Visibility gate: deliver nothing while the source is hidden. This is
+        // what makes the .hide NULL-clear robust — without it, a mid-hide
+        // content change would re-arm OBS's async_active and reintroduce the
+        // stale paint on re-show — and it avoids copying frames into a source
+        // nobody can see. The newest ring slot stays available for the
+        // show-redeliver below. Per-source flag; other screenshare sources on
+        // the same ring gate independently.
+        if (!data->showing.load(std::memory_order_acquire)) continue;
+
         uint32_t currentWrite = data->header->write_index;
-        if (currentWrite == data->lastReadIndex) continue;
+
+        // Show-redeliver: on re-show, re-emit the newest ring slot once even if
+        // the write index hasn't advanced, so re-show overwrites OBS's stale
+        // async texture with Zoom's current content. Guard on a real frame
+        // existing (write_index > 0) so a never-written region isn't read
+        // (avoids the (currentWrite - 1) underflow below).
+        bool redeliver = data->redeliverPending.exchange(false, std::memory_order_acq_rel);
+        if (redeliver && currentWrite == 0) redeliver = false;
+
+        if (!redeliver && currentWrite == data->lastReadIndex) continue;
 
         uint32_t slotIdx = (currentWrite - 1) % feeds_shared::RING_SLOTS;
         feeds_shared::FrameSlot* slot = &data->frameSlots[slotIdx];
@@ -4981,6 +5016,36 @@ static void zs_destroy(void* vdata) {
         blog(LOG_ERROR, "[feeds] zs_destroy unknown exception");
     }
     delete data;
+}
+
+// Source became visible (added to preview/program — the eye-toggle "showing"
+// transition, NOT program-only "active"). Open the visibility gate, then request
+// a one-shot redeliver of the newest ring frame so re-show paints Zoom's current
+// content instead of OBS's stale async texture. Order matters: set showing FIRST
+// so the pump's gate is already open when it services the redeliver wake;
+// otherwise the gate would swallow it. Fires on the graphics/tick thread. The
+// wake is best-effort — the pump also polls every 8ms, so the flags are
+// authoritative even if pumpWakeEvent isn't up yet (source shown before a share
+// started). Screenshare only; participants get no show/hide callbacks.
+static void zs_show(void* vdata) {
+    if (!vdata) return;
+    ZsSourceData* data = static_cast<ZsSourceData*>(vdata);
+    data->showing.store(true, std::memory_order_release);
+    data->redeliverPending.store(true, std::memory_order_release);
+    if (data->pumpWakeEvent) SetEvent(data->pumpWakeEvent);
+}
+
+// Source became hidden. Close the visibility gate FIRST, then clear the async
+// output — ordering so a pump delivery can't race in between the two and re-arm
+// async_active after we've cleared it. obs_source_output_video(NULL) deactivates
+// the async output (nothing paints) so no stale frame can show in the residual
+// window before the next redeliver. Same NULL-clear pattern the pump teardown
+// uses. Fires on the graphics/tick thread.
+static void zs_hide(void* vdata) {
+    if (!vdata) return;
+    ZsSourceData* data = static_cast<ZsSourceData*>(vdata);
+    data->showing.store(false, std::memory_order_release);
+    if (data->source) obs_source_output_video(data->source, nullptr);
 }
 
 static obs_properties_t* zs_properties(void* data) {
@@ -6530,6 +6595,12 @@ bool obs_module_load(void) {
     zoom_screenshare_info.create         = zs_create;
     zoom_screenshare_info.destroy        = zs_destroy;
     zoom_screenshare_info.get_properties = zs_properties;
+    // Show/hide (not activate/deactivate — we want the eye-toggle "showing"
+    // transition, not program-only) drive the stale-frame-on-reshow fix:
+    // visibility-gate the pump + redeliver the newest ring frame on re-show.
+    // Screenshare only; participants deliver continuously and show no symptom.
+    zoom_screenshare_info.show           = zs_show;
+    zoom_screenshare_info.hide           = zs_hide;
     zoom_screenshare_info.icon_type      = OBS_ICON_TYPE_DESKTOP_CAPTURE;
     obs_register_source(&zoom_screenshare_info);
 
