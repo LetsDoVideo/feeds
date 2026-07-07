@@ -4190,17 +4190,46 @@ static void* zp_create(obs_data_t* settings, obs_source_t* source) {
     // source during scene load (Failed to create source -> Tried to add a
     // removed source -> dropped), and the next auto-save bakes in the loss —
     // so opening OBS while logged out used to permanently delete the user's
-    // participant sources. nullptr is now reserved for genuine
-    // allocation/exception failures only. A source that can't pull a live
-    // feed yet (not logged in, engine not ready, no participant bound, or
-    // over the tier's active limit) is created in a dormant state instead:
-    // its properties panel explains why (logged-out branch / upgrade prompt),
-    // and selecting a participant once live brings it up like any other.
+    // participant sources. nullptr is reserved for genuine allocation/exception
+    // failures and the hard-cap refusal below — which is gated on NOT loading a
+    // scene collection, so it can never drop a saved source. A source that can't
+    // pull a live feed yet (not logged in, engine not ready, no participant
+    // bound, or over the tier's active limit) is created in a dormant state
+    // instead: its properties panel explains why (logged-out branch / upgrade
+    // prompt), and selecting a participant once live brings it up like any other.
     //
     // C++ exceptions must not escape into libobs C frames, so the body stays
     // wrapped; on a real failure nullptr + OnSourceCreated's husk cleanup is
     // still far cheaper than a process-wide crash.
   try {
+    // Hard cap: refuse an interactive attempt to create a 9th participant source
+    // (see kMaxParticipantSourcesEver) up front — immediate dialog, no source, no
+    // OBS name/properties ceremony — mirroring how zs_create refuses a second
+    // screenshare. This replaces the clunky create-then-remove UX for the common
+    // case (the OnSourceCreated block still backstops any path where this count
+    // is stale). Gated on !g_sceneCollectionLoading: returning null during a
+    // scene load is the husk/data-loss bug (OBS drops the saved source, auto-save
+    // bakes it in), so during load we fall through and construct untouched. Count
+    // is read here BEFORE this source registers, so the test is >= (vs. the > the
+    // OnSourceCreated block uses after zp_create has pushed the new source).
+    if (!g_sceneCollectionLoading.load()) {
+        size_t count;
+        {
+            std::lock_guard<std::mutex> lock(g_sourcesMutex);
+            count = g_allParticipantSources.size();
+        }
+        if (count >= (size_t)kMaxParticipantSourcesEver) {
+            if (ShouldShowTierPopup()) {
+                ShowTierLimitDialog(
+                    "Feeds: Participant feed limit",
+                    QString("%1 is the maximum supported number of participant "
+                            "feeds, so this source can't be added.")
+                        .arg(kMaxParticipantSourcesEver));
+            }
+            return nullptr;
+        }
+    }
+
     obs_source_set_async_unbuffered(source, true);
 
     ZpSourceData* data = new ZpSourceData();
