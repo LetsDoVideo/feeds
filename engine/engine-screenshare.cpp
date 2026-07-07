@@ -25,6 +25,7 @@
 #include <windows.h>
 #include <string>
 #include <mutex>
+#include <memory>
 #include <cstdio>
 
 #include "zoom_sdk.h"
@@ -33,6 +34,7 @@
 #include "rawdata/zoom_rawdata_api.h"
 
 #include "shared-frame.h"
+#include "engine-frame-scaler.h"
 
 // Defined in engine-main.cpp
 extern void LogToFile(const char* msg);  // forwards at DEBUG
@@ -59,6 +61,17 @@ static ZOOM_SDK_NAMESPACE::ZoomSDKResolution GetShareResolution() {
     return (GetCurrentTier() >= 1)
         ? ZOOM_SDK_NAMESPACE::ZoomSDKResolution_1080P
         : ZOOM_SDK_NAMESPACE::ZoomSDKResolution_720P;
+}
+
+// Fixed frame-scaler output size for the current tier. Deliberately mirrors
+// engine-video.cpp's GetScalerTargetForCurrentTier (the participant path) and
+// the tier split in GetShareResolution above: tier 0 -> 720p, tiers 1+ -> 1080p.
+// Kept local (rather than sharing the participant one) so screenshare can diverge
+// here if it ever becomes its own higher-tier 1080p feature — the same spot the
+// GetShareResolution comment flags.
+static void GetShareScalerTarget(int& w, int& h) {
+    if (GetCurrentTier() >= 1) { w = 1920; h = 1080; }
+    else                        { w = 1280; h = 720;  }
 }
 
 // ---------------------------------------------------------------------------
@@ -188,16 +201,29 @@ static unsigned int                           g_currentSubscribeId = 0;  // what
 // ---------------------------------------------------------------------------
 class ShareRenderer : public ZOOM_SDK_NAMESPACE::IZoomSDKRendererDelegate {
 public:
-    void SetWriter(ShareMemoryWriter* w) { m_writer = w; }
+    // The delegate now feeds the frame scaler worker (which fits each frame to a
+    // constant per-tier size and letterboxes, then forwards to the writer) rather
+    // than writing native-size frames straight to shared memory — matching the
+    // participant path. Set/cleared around the renderer lifecycle (see
+    // EnsureShareInfrastructure / TearDownScreenShare); the worker outlives every
+    // SDK callback because teardown destroys the renderer before stopping it.
+    void SetWorker(FrameScalerWorker* w) { m_worker = w; }
 
     virtual void onRawDataFrameReceived(YUVRawDataI420* data) override {
-        if (!m_writer || !data) return;
-        m_writer->WriteFrame(
-            (const uint8_t*)data->GetYBuffer(),
-            (const uint8_t*)data->GetUBuffer(),
-            (const uint8_t*)data->GetVBuffer(),
-            data->GetStreamWidth(),
-            data->GetStreamHeight());
+        if (!m_worker || !data) return;
+
+        const uint8_t* y = (const uint8_t*)data->GetYBuffer();
+        const uint8_t* u = (const uint8_t*)data->GetUBuffer();
+        const uint8_t* v = (const uint8_t*)data->GetVBuffer();
+        const int      w = (int)data->GetStreamWidth();
+        const int      h = (int)data->GetStreamHeight();
+
+        // Defensive validation before staging — the scaler assumes non-null planes
+        // and positive dimensions (odd/even is handled inside it). Mirrors the
+        // participant delegate's checks; a bad frame is dropped, not forwarded.
+        if (w <= 0 || h <= 0 || !y || !u || !v) return;
+
+        m_worker->StageFrame(y, u, v, w, h);
     }
 
     virtual void onRawDataStatusChanged(RawDataStatus status) override {
@@ -217,7 +243,7 @@ public:
     }
 
 private:
-    ShareMemoryWriter* m_writer = nullptr;
+    FrameScalerWorker* m_worker = nullptr;
 };
 
 // ---------------------------------------------------------------------------
@@ -228,6 +254,9 @@ private:
 static std::mutex                             g_shareMutex;
 static ShareMemoryWriter                      g_shareWriter;
 static ShareRenderer                          g_shareDelegate;
+// One scaler worker for the singleton share region (vs. N per-source workers on
+// the participant side). Created with the renderer, stopped/reset in teardown.
+static std::unique_ptr<FrameScalerWorker>     g_shareWorker;
 
 // ---------------------------------------------------------------------------
 // Lazily create renderer + writer the first time we need them. Caller
@@ -240,7 +269,6 @@ static bool EnsureShareInfrastructure() {
         LogError("Share: failed to open shared memory region");
         return false;
     }
-    g_shareDelegate.SetWriter(&g_shareWriter);
 
     ZOOM_SDK_NAMESPACE::SDKError err =
         ZOOM_SDK_NAMESPACE::createRenderer(&g_shareRenderer, &g_shareDelegate);
@@ -254,7 +282,27 @@ static bool EnsureShareInfrastructure() {
     }
 
     g_shareRenderer->setRawDataResolution(GetShareResolution());
-    LogToFile("Share: renderer + shared memory ready");
+
+    // Frame scaler worker: fits each variable-size share frame into a constant
+    // per-tier target (aspect-preserving, letterboxed) and forwards the result to
+    // the shared-memory writer — so OBS sees a stable get_width/get_height (which
+    // makes the source's Automatic bounds behave and is expected to kill the
+    // stale-last-frame flash on re-show, same as participants). Recreated here with
+    // the renderer; the make_unique reassignment stops/joins any prior worker (e.g.
+    // after the SDK destroyed the renderer out from under us). Output lambda writes
+    // on the worker thread; teardown joins it before closing the writer.
+    int tgtW, tgtH;
+    GetShareScalerTarget(tgtW, tgtH);
+    g_shareWorker = std::make_unique<FrameScalerWorker>(
+        tgtW, tgtH,
+        [](const uint8_t* y, const uint8_t* u, const uint8_t* v, int w, int h) {
+            g_shareWriter.WriteFrame(y, u, v, (uint32_t)w, (uint32_t)h);
+        },
+        "screenshare");
+    g_shareWorker->Start();
+    g_shareDelegate.SetWorker(g_shareWorker.get());
+
+    LogToFile("Share: renderer + scaler + shared memory ready");
     return true;
 }
 
@@ -345,7 +393,16 @@ void TearDownScreenShare() {
         LogToFile("Share: tore down renderer");
     }
 
-    g_shareDelegate.SetWriter(nullptr);
+    // Stop the worker AFTER the renderer is gone: destroyRenderer guarantees no
+    // further onRawDataFrameReceived (so nothing can StageFrame into a stopping
+    // worker), and stopping BEFORE closing the writer guarantees no in-flight
+    // scaled frame writes into a closed region. Same ordering as engine-video.cpp.
+    g_shareDelegate.SetWorker(nullptr);
+    if (g_shareWorker) {
+        g_shareWorker->Stop();
+        g_shareWorker.reset();
+    }
+
     g_shareWriter.Close();
 }
 
