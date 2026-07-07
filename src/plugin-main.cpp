@@ -241,6 +241,13 @@ void OnLoginClick();
 void OnLogoutClick();
 void OnConnectClick();
 static void UpdateLoginLogoutMenuItem();
+// Shared tier-upgrade prompt (defined far below, with the other tier chrome).
+// ShowTierLimitDialog is the reusable modal upgrade dialog (rich-text label with a
+// clickable upgrade link); ShouldShowTierPopup throttles it to one per few seconds
+// so rapid clicks don't stack dialogs. Used by the screenshare/chat create paths
+// and, now, the footer's locked-button clicks.
+bool ShouldShowTierPopup();
+void ShowTierLimitDialog(const QString& title, const QString& html);
 // Marshal a read-only participant-dock rebuild onto the Qt UI thread. Safe to
 // call from any thread (defined after the dock class + g_participantDock).
 static void PostParticipantDockRefresh();
@@ -255,6 +262,14 @@ static obs_source_t* ResolveCurrentEditScene();
 static void ApplyFitCenterGeometry(obs_sceneitem_t* item, obs_source_t* source);
 static void CreateParticipantSourceInCurrentScene();
 static void AddSourceReferenceToCurrentScene(const std::string& uuid);
+// Footer add-source actions (defined with the scene helpers, far below).
+// CreateSourceOfTypeInCurrentScene mints a fresh source of the given type and
+// adds it (always-new, like "+ Add Participant"); AddOrReferenceSourceInCurrentScene
+// references an existing source of that type if one exists, else creates one
+// (reference-or-create) — this is how the screenshare button never trips the
+// zs_create singleton block by trying to create a second instance.
+static void CreateSourceOfTypeInCurrentScene(const char* typeId, const char* baseName);
+static void AddOrReferenceSourceInCurrentScene(const char* typeId, const char* baseName);
 // Per-source dock header actions (defined with the scene helpers, far below).
 // OpenSourceFilters opens OBS's native Filters dialog; ShowIncludedScenesMenu
 // pops a menu of the scenes the source is in, switching to a clicked one
@@ -2191,7 +2206,16 @@ public:
         m_root->setAlignment(Qt::AlignTop);
 
         scroll->setWidget(content);
-        outer->addWidget(scroll);
+        outer->addWidget(scroll, 1);   // takes the stretch; footer stays pinned below
+
+        // Fixed footer chrome pinned to the true dock bottom — added to the OUTER
+        // layout (below the scroll area), so it never scrolls with the source list
+        // and never floats after the content with a gap. Built once here; its
+        // per-button state (tier lock + screenshare live dot) is updated in place
+        // by UpdateFooterState() on every Refresh(), so it rides the existing
+        // tier/login/meeting/share refresh path with no separate mechanism.
+        m_footer = BuildFooterBar();
+        outer->addWidget(m_footer, 0);
 
         // Width is derived from the live theme/font in Refresh() (setMinimumWidth
         // on the dock root, propagating to the QDockWidget). Height floor as before.
@@ -2223,6 +2247,12 @@ public:
     // PostParticipantDockRefresh. The gather half takes the two mutexes; the
     // build half touches Qt only after both are released.
     void Refresh() {
+        // Footer chrome first: it's persistent (outer layout, not m_root) and
+        // independent of the inline-rename editor, so update it unconditionally —
+        // even on the deferred-rename and empty-rows early returns below — so a
+        // tier/login/share change always re-styles the footer.
+        UpdateFooterState();
+
         // An inline rename is in progress — don't tear the box (and the edit
         // field) out from under the user. Coalesce: remember a refresh is due and
         // run it once the edit commits or cancels (EndRenameUi flushes it). Every
@@ -2445,6 +2475,155 @@ private:
             CreateParticipantSourceInCurrentScene();
         });
         m_root->addWidget(addBtn);
+    }
+
+    // --- Fixed footer bar: add-source buttons for the other three source types ---
+    // A toolbar-style bar pinned to the dock bottom (built once, in the outer
+    // layout), completing "all four Feeds source types addable from the dock".
+    // Three equal-width buttons; each honors its type's multiplicity rule:
+    //   Screenshare  — reference-or-create (hard singleton; zs_create refuses a 2nd)
+    //   Chat Overlay — ALWAYS create new (per-scene width/rows/count differ)
+    //   Chat Popup   — reference-or-create (no reason for duplicates)
+    // Tier gates match the source types themselves: screenshare Basic+ (tier >= 1),
+    // chat overlay/popup Streamer+ (tier >= 2). g_currentTier is the same value the
+    // cap chrome reads, so the footer re-locks in the same refresh path.
+
+    // Small colored status dot for the Screenshare button icon: green when someone
+    // is sharing, grey when idle. Tones match the row connection dot.
+    static QPixmap ShareDotPixmap(bool sharing) {
+        const int sz = 10;
+        qreal dpr = 1.0;
+        if (QScreen* s = (qApp ? qApp->primaryScreen() : nullptr))
+            dpr = s->devicePixelRatio();
+        QPixmap pm((int)(sz * dpr), (int)(sz * dpr));
+        pm.setDevicePixelRatio(dpr);
+        pm.fill(Qt::transparent);
+        QPainter p(&pm);
+        p.setRenderHint(QPainter::Antialiasing, true);
+        p.setPen(Qt::NoPen);
+        p.setBrush(sharing ? QColor(64, 192, 96, 235)      // green: sharing
+                           : QColor(150, 150, 150, 170));   // grey: idle
+        p.drawEllipse(0, 0, sz, sz);
+        p.end();
+        return pm;
+    }
+
+    static QPushButton* MakeFooterButton(const QString& label, const QString& tip) {
+        QPushButton* b = new QPushButton(label);
+        b->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        b->setCursor(Qt::PointingHandCursor);
+        b->setToolTip(tip);
+        return b;
+    }
+
+    QWidget* BuildFooterBar() {
+        QFrame* bar = new QFrame();
+        bar->setObjectName("feedsFooterBar");
+        // Toolbar chrome: a top divider + faint fill so it reads as part of the
+        // dock frame, distinct from the scrolling rows above.
+        bar->setStyleSheet(
+            "QFrame#feedsFooterBar { border-top: 1px solid rgba(128,128,128,0.35);"
+            " background: rgba(128,128,128,0.06); }");
+
+        QHBoxLayout* l = new QHBoxLayout(bar);
+        l->setContentsMargins(8, 6, 8, 6);
+        l->setSpacing(6);
+
+        m_footScreenshare = MakeFooterButton("Screenshare", QString());
+        QObject::connect(m_footScreenshare, &QPushButton::clicked, []() {
+            if (g_currentTier < 1) {   // tier-locked (Basic+): actionable upgrade prompt
+                ShowFooterUpgradePrompt("Zoom Screenshare", "Basic");
+                return;
+            }
+            AddOrReferenceSourceInCurrentScene("zoom_screenshare_source", "Zoom Screenshare");
+        });
+
+        m_footChatOverlay = MakeFooterButton("Chat Overlay", QString());
+        QObject::connect(m_footChatOverlay, &QPushButton::clicked, []() {
+            if (g_currentTier < 2) {   // tier-locked (Streamer+): actionable upgrade prompt
+                ShowFooterUpgradePrompt("Zoom Chat Overlay", "Streamer");
+                return;
+            }
+            CreateSourceOfTypeInCurrentScene("feeds_chat_overlay", "Zoom Chat Overlay");
+        });
+
+        m_footChatPopup = MakeFooterButton("Chat Popup", QString());
+        QObject::connect(m_footChatPopup, &QPushButton::clicked, []() {
+            if (g_currentTier < 2) {   // tier-locked (Streamer+): actionable upgrade prompt
+                ShowFooterUpgradePrompt("Zoom Chat Popup", "Streamer");
+                return;
+            }
+            AddOrReferenceSourceInCurrentScene("feeds_chat_popup", "Zoom Chat Popup");
+        });
+
+        l->addWidget(m_footScreenshare, 1);   // equal thirds
+        l->addWidget(m_footChatOverlay, 1);
+        l->addWidget(m_footChatPopup, 1);
+        return bar;
+    }
+
+    // Style one footer button for its tier-lock state. Kept ENABLED even when
+    // locked: a disabled Qt widget receives no hover events, so its tooltip
+    // wouldn't show — and the upgrade hint is the discoverability point. Locked =
+    // greyed text + arrow cursor + upgrade tooltip; the click lambda short-circuits
+    // the add on the tier check and instead opens the upgrade prompt
+    // (ShowFooterUpgradePrompt), so it never performs the source action.
+    static void ApplyFooterLock(QPushButton* b, bool locked, const QString& tip) {
+        if (!b) return;
+        b->setToolTip(tip);
+        b->setCursor(locked ? Qt::ArrowCursor : Qt::PointingHandCursor);
+        b->setStyleSheet(locked ? "QPushButton { color: #7a7d80; }" : QString());
+    }
+
+    // Clicking a tier-locked footer button opens the shared upgrade dialog
+    // (ShowTierLimitDialog + the ShouldShowTierPopup throttle) — the same modal
+    // used by the screenshare/chat create paths, with a clickable link to the
+    // same upgrade URL as the dock cap chrome. `feature` is the source display
+    // name; `tierWord` names the plan it needs (Basic / Streamer).
+    static void ShowFooterUpgradePrompt(const QString& feature, const QString& tierWord) {
+        if (!ShouldShowTierPopup()) return;
+        ShowTierLimitDialog(
+            QString("Feeds: %1").arg(feature),
+            QString("%1 is a %2-tier feature. "
+                    "<a href=\"https://letsdovideo.com/feeds-upgrade\">Click here "
+                    "to upgrade your plan</a>.").arg(feature, tierWord));
+    }
+
+    // Re-style the footer from current tier + share state. Called from Refresh(),
+    // so tier/login/meeting/share changes (which all already route through
+    // RefreshAllSourceProperties -> PostParticipantDockRefresh) update it with no
+    // separate mechanism. The footer itself is always visible (like "+ Add
+    // Participant"); gating is per-button greying, for discoverability/upgrade.
+    void UpdateFooterState() {
+        if (!m_footer) return;
+
+        const bool ssLocked   = g_currentTier < 1;   // screenshare: Basic+
+        const bool chatLocked = g_currentTier < 2;   // overlay/popup: Streamer+
+
+        ApplyFooterLock(m_footScreenshare, ssLocked, ssLocked
+            ? "Screenshare needs the Basic plan or higher — upgrade to enable."
+            : "Add the Zoom Screenshare source to the current scene");
+        ApplyFooterLock(m_footChatOverlay, chatLocked, chatLocked
+            ? "Zoom Chat Overlay is a Streamer-tier feature — upgrade to enable."
+            : "Add a new Zoom Chat Overlay source to the current scene");
+        ApplyFooterLock(m_footChatPopup, chatLocked, chatLocked
+            ? "Zoom Chat Popup is a Streamer-tier feature — upgrade to enable."
+            : "Add the Zoom Chat Popup source to the current scene");
+
+        // Screenshare live status dot — only when the button is usable (no status
+        // when tier-locked). Green if someone is sharing, grey otherwise. Reads
+        // g_activeSharerUserId, the same signal zs_properties uses; its
+        // share_status_changed handler already marshals a dock refresh here.
+        int shareState = ssLocked ? -1 : (g_activeSharerUserId != 0 ? 1 : 0);
+        if (shareState != m_footShareState) {
+            m_footShareState = shareState;
+            if (shareState < 0) {
+                m_footScreenshare->setIcon(QIcon());          // locked: no dot
+            } else {
+                m_footScreenshare->setIcon(QIcon(ShareDotPixmap(shareState == 1)));
+                m_footScreenshare->setIconSize(QSize(10, 10));
+            }
+        }
     }
 
     // Small right-aligned per-row button: add THIS source to the current edit
@@ -3339,6 +3518,14 @@ private:
     QVBoxLayout* m_root = nullptr;   // inner (scrolled) content layout; boxes live here
     int          m_minWidth = 0;     // last-applied theme-derived dock min width
     QTimer*      m_liveTimer = nullptr;  // live-indicator poll (parented to dock)
+
+    // Fixed footer bar (outer layout, pinned to the dock bottom — does not scroll).
+    // Built once in the ctor; UpdateFooterState() re-styles the buttons in place.
+    QWidget*     m_footer          = nullptr;
+    QPushButton* m_footScreenshare = nullptr;
+    QPushButton* m_footChatOverlay = nullptr;
+    QPushButton* m_footChatPopup   = nullptr;
+    int          m_footShareState  = -2;  // last-applied screenshare dot: -2 none/-1 locked/0 grey/1 green
 
     // Inline rename state (UI thread). m_activeEdit != null means an edit is open:
     // Refresh() defers while it is, and m_refreshPending records that a deferred
@@ -5772,12 +5959,14 @@ static obs_source_t* ResolveCurrentEditScene() {
     return s;
 }
 
-// Action A: create a new Feeds participant source and add it to the current edit
-// scene, exactly as the OBS add-source flow does — obs_source_create fires
-// zp_create (dock row via PostParticipantDockRefresh) and the source_create
-// signal (deferred fit-center placement, which finds the scene-item we add here).
-// No resolvable scene -> safe no-op (don't leak an orphan source). UI thread.
-static void CreateParticipantSourceInCurrentScene() {
+// Action A: create a new Feeds source of `typeId` and add it to the current edit
+// scene, exactly as the OBS add-source flow does — obs_source_create fires the
+// type's create callback (dock row via PostParticipantDockRefresh for participant
+// sources) and the source_create signal (OnSourceCreated's deferred, per-type
+// placement, which finds the scene-item we add here). No resolvable scene -> safe
+// no-op (don't leak an orphan source). This is the always-new path — used by
+// "+ Add Participant" and the footer's Chat Overlay button. UI thread.
+static void CreateSourceOfTypeInCurrentScene(const char* typeId, const char* baseName) {
     obs_source_t* sceneSrc = ResolveCurrentEditScene();
     if (!sceneSrc) return;
     obs_scene_t* scene = obs_scene_from_source(sceneSrc);   // borrowed
@@ -5785,23 +5974,70 @@ static void CreateParticipantSourceInCurrentScene() {
 
     // Unique name, OBS's scheme: the display name, then " 2", " 3", ... until free
     // (obs_source_create does not dedupe).
-    const char* base = "Zoom Participant";
-    std::string name = base;
+    std::string name = baseName;
     for (int i = 2; ; ++i) {
         obs_source_t* existing = obs_get_source_by_name(name.c_str());
         if (!existing) break;
         obs_source_release(existing);
-        name = std::string(base) + " " + std::to_string(i);
+        name = std::string(baseName) + " " + std::to_string(i);
     }
 
-    obs_source_t* source =
-        obs_source_create("zoom_participant_source", name.c_str(), nullptr, nullptr);
+    obs_source_t* source = obs_source_create(typeId, name.c_str(), nullptr, nullptr);
     if (source) {
         // Add promptly so the ~100ms-deferred placement thread finds a scene-item.
         obs_scene_add(scene, source);   // scene-item takes its own ref
         obs_source_release(source);     // release our create ref
     }
     obs_source_release(sceneSrc);
+}
+
+static void CreateParticipantSourceInCurrentScene() {
+    CreateSourceOfTypeInCurrentScene("zoom_participant_source", "Zoom Participant");
+}
+
+// Find the first live (non-removed) source of the given type, returning an owned
+// ref (caller releases) or null. Skips OnSourceCreated "husks" (removed flag set)
+// and any source mid-destroy (obs_source_get_ref returns null). Used by the
+// reference-or-create footer buttons to decide reference vs. create. UI thread.
+static obs_source_t* FindFirstSourceOfType(const char* typeId) {
+    struct Ctx { const char* id; obs_source_t* found; } ctx{ typeId, nullptr };
+    obs_enum_sources([](void* p, obs_source_t* s) -> bool {
+        Ctx* c = (Ctx*)p;
+        if (obs_source_removed(s)) return true;          // skip husks / pending-remove
+        const char* sid = obs_source_get_id(s);
+        if (sid && strcmp(sid, c->id) == 0) {
+            c->found = obs_source_get_ref(s);            // strong ref (null if invalid)
+            if (c->found) return false;                  // stop at first valid match
+        }
+        return true;
+    }, &ctx);
+    return ctx.found;
+}
+
+// Reference-or-create: if a source of `typeId` already exists, add a Paste
+// Reference of it to the current edit scene (Action B semantics); otherwise
+// create one (Action A). This is the screenshare / chat-popup footer path: it
+// NEVER creates a second instance of a type that already exists, so the
+// screenshare singleton block in zs_create is never reached. UI thread.
+static void AddOrReferenceSourceInCurrentScene(const char* typeId, const char* baseName) {
+    obs_source_t* existing = FindFirstSourceOfType(typeId);
+    if (existing) {
+        obs_source_t* sceneSrc = ResolveCurrentEditScene();
+        if (sceneSrc) {
+            obs_scene_t* scene = obs_scene_from_source(sceneSrc);   // borrowed
+            if (scene) {
+                obs_sceneitem_t* item = obs_scene_add(scene, existing);
+                // Live source -> dims known -> fit-center; a dormant source
+                // (0x0, e.g. screenshare with nobody sharing) lands at OBS
+                // default, which ApplyFitCenterGeometry safely skips.
+                ApplyFitCenterGeometry(item, existing);
+            }
+            obs_source_release(sceneSrc);
+        }
+        obs_source_release(existing);
+        return;
+    }
+    CreateSourceOfTypeInCurrentScene(typeId, baseName);
 }
 
 // Action B: add an existing source to the current edit scene as a Paste Reference
