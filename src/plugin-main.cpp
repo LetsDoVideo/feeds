@@ -241,6 +241,22 @@ static int GetMaxFeedsForTier() {
     }
 }
 
+// Product-wide hard maximum for participant sources — equal to the Broadcaster
+// (top tier) cap. There is no tier above Broadcaster, so a source beyond this
+// can never be activated by anyone; more than this is unsupported. Both the
+// ceiling messaging (a tier whose cap IS this max gets "maximum supported"
+// wording with no upgrade CTA) and the 9th-source hard block key off it.
+static constexpr int kMaxParticipantSourcesEver = 8;
+
+// True while OBS is loading a scene collection (initial startup load or a
+// collection switch). The 9th-source hard block (OnSourceCreated) skips removal
+// while this is set, so a legacy scene saved with >8 participant sources isn't
+// silently pruned — auto-save would bake in the loss — and instead loads its
+// extras as dormant/over-cap. Starts true because source_create is connected at
+// module-load, before OBS's startup scene load fires; cleared on
+// FINISHED_LOADING / SCENE_COLLECTION_CHANGED.
+static std::atomic<bool> g_sceneCollectionLoading{true};
+
 void OnLoginClick();
 void OnLogoutClick();
 void OnConnectClick();
@@ -2504,23 +2520,32 @@ public:
                 m_root->addWidget(lbl);
             }
 
-            // One shared, group-level upgrade prompt pinned at the bottom.
+            // One shared, group-level prompt pinned at the bottom. At the product
+            // ceiling (a tier whose cap is the hard max — Broadcaster at 8) there's
+            // nothing to upgrade to, so the message says so and no upgrade button is
+            // shown. Lower tiers keep the upgrade CTA.
+            const bool atCeiling = (maxFeeds >= kMaxParticipantSourcesEver);
             QLabel* msg = new QLabel(
-                QString("Your current plan allows %1 participant source%2. "
-                        "Upgrade to activate more feeds.")
-                    .arg(maxFeeds)
-                    .arg(maxFeeds == 1 ? "" : "s"));
+                atCeiling
+                  ? QString("%1 is the maximum supported number of participant "
+                            "feeds.").arg(maxFeeds)
+                  : QString("Your current plan allows %1 participant source%2. "
+                            "Upgrade to activate more feeds.")
+                        .arg(maxFeeds)
+                        .arg(maxFeeds == 1 ? "" : "s"));
             msg->setWordWrap(true);
             m_root->addWidget(msg);
 
-            QPushButton* btn =
-                new QPushButton("Upgrade your plan to activate more feeds");
-            // Same upgrade destination as the properties-dialog upgrade button.
-            QObject::connect(btn, &QPushButton::clicked, []() {
-                QDesktopServices::openUrl(
-                    QUrl("https://letsdovideo.com/feeds-upgrade"));
-            });
-            m_root->addWidget(btn);
+            if (!atCeiling) {
+                QPushButton* btn =
+                    new QPushButton("Upgrade your plan to activate more feeds");
+                // Same upgrade destination as the properties-dialog upgrade button.
+                QObject::connect(btn, &QPushButton::clicked, []() {
+                    QDesktopServices::openUrl(
+                        QUrl("https://letsdovideo.com/feeds-upgrade"));
+                });
+                m_root->addWidget(btn);
+            }
         }
 
         // Hide the create button at/over the tier cap so it doesn't compete with
@@ -4545,20 +4570,34 @@ static obs_properties_t* zp_properties(void* data) {
 
         int maxFeeds = GetMaxFeedsForTier();
         int pos      = d->source_position;
+        // A source beyond the product max (position > the hard cap) can never be
+        // activated by ANY upgrade — no tier goes higher — so it gets the
+        // "maximum supported" wording with no upgrade button, regardless of the
+        // user's current tier. A lower tier's over-cap-but-within-max source
+        // (e.g. a Streamer's 6th-8th) keeps the upgrade path, since upgrading to
+        // Broadcaster would activate it.
+        const bool atCeiling = (pos > kMaxParticipantSourcesEver);
         std::string msg =
-            "Your current tier only allows " + std::to_string(maxFeeds) +
-            " participant source" + (maxFeeds == 1 ? "" : "s") +
-            ". This is your " + std::to_string(pos) + OrdinalSuffix(pos) +
-            " participant source. Please upgrade to activate this feed.";
+            atCeiling
+              ? (std::to_string(maxFeeds) +
+                 " is the maximum supported number of participant feeds. This is "
+                 "your " + std::to_string(pos) + OrdinalSuffix(pos) +
+                 " participant source, so it can't be activated.")
+              : ("Your current tier only allows " + std::to_string(maxFeeds) +
+                 " participant source" + (maxFeeds == 1 ? "" : "s") +
+                 ". This is your " + std::to_string(pos) + OrdinalSuffix(pos) +
+                 " participant source. Please upgrade to activate this feed.");
         obs_properties_add_text(props, "tier_disabled_msg", msg.c_str(),
                                 OBS_TEXT_INFO);
-        obs_properties_add_button(props, "upgrade_btn",
-            "Upgrade your plan to activate more feeds",
-            [](obs_properties_t*, obs_property_t*, void*) -> bool {
-                QDesktopServices::openUrl(
-                    QUrl("https://letsdovideo.com/feeds-upgrade"));
-                return true;
-            });
+        if (!atCeiling) {
+            obs_properties_add_button(props, "upgrade_btn",
+                "Upgrade your plan to activate more feeds",
+                [](obs_properties_t*, obs_property_t*, void*) -> bool {
+                    QDesktopServices::openUrl(
+                        QUrl("https://letsdovideo.com/feeds-upgrade"));
+                    return true;
+                });
+        }
         return props;
     }
 
@@ -6532,6 +6571,39 @@ static void OnSourceCreated(void* /*data*/, calldata_t* cd) {
         return;
     }
 
+    // Hard cap: at most kMaxParticipantSourcesEver (8) participant sources may
+    // ever exist. 8 is the product maximum at any tier, so a 9th could never be
+    // activated by anyone (unlike a lower tier's over-cap sources 6-8, which are
+    // a genuine upgrade incentive). Block interactive creation of a 9th — OBS
+    // Sources "+", paste, duplicate — by removing it the instant it's created:
+    // source_create fires before the source is added to any scene, so
+    // obs_source_remove drops it cleanly, the same mechanism the husk path above
+    // uses. zp_create already pushed it, so the count includes this new source.
+    //
+    // Skip while a scene collection is loading: a legacy scene saved with >8
+    // participant sources must NOT be pruned (auto-save would bake in the loss);
+    // those load as dormant/over-cap and surface the ceiling messaging instead.
+    // The dock's Create button is already hidden at the tier cap, so this is the
+    // backstop for the OBS-native paths it can't gate.
+    if (isParticipant && !g_sceneCollectionLoading.load()) {
+        size_t count;
+        {
+            std::lock_guard<std::mutex> lock(g_sourcesMutex);
+            count = g_allParticipantSources.size();
+        }
+        if (count > (size_t)kMaxParticipantSourcesEver) {
+            if (ShouldShowTierPopup()) {
+                ShowTierLimitDialog(
+                    "Feeds: Participant feed limit",
+                    QString("%1 is the maximum supported number of participant "
+                            "feeds, so this source can't be added.")
+                        .arg(kMaxParticipantSourcesEver));
+            }
+            obs_source_remove(source);
+            return;
+        }
+    }
+
     // Hold a weak reference; promote to strong reference inside the
     // deferred callback. This avoids holding the source alive if the user
     // (or OBS during shutdown) removes it in the interim.
@@ -6640,11 +6712,24 @@ bool obs_module_load(void) {
     SetupParticipantDock();
 
     obs_frontend_add_event_callback([](enum obs_frontend_event event, void*) {
-        if (event == OBS_FRONTEND_EVENT_FINISHED_LOADING) {
+        switch (event) {
+        // Gate the 9th-source hard block off during scene-collection loads so a
+        // legacy scene with >8 participant sources isn't pruned on load.
+        case OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGING:
+            g_sceneCollectionLoading.store(true);
+            break;
+        case OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED:
+            g_sceneCollectionLoading.store(false);
+            break;
+        case OBS_FRONTEND_EVENT_FINISHED_LOADING:
+            g_sceneCollectionLoading.store(false);   // startup load done
             SetupPluginMenu();
             QTimer::singleShot(5000,
                 (QObject*)obs_frontend_get_main_window(),
                 []() { CheckForUpdateAsync(); });
+            break;
+        default:
+            break;
         }
     }, nullptr);
 
