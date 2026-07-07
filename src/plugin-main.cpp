@@ -6006,57 +6006,6 @@ static void RegisterEngineHandlers() {
     });
 }
 
-// Find the scene item(s) for a given source across all scenes and apply
-// our default Fit bounds at the current OBS canvas resolution. Called
-// deferred after source_create, because at source_create time the source
-// has not yet been added to any scene.
-static void ApplyFeedsBoundsToSceneItem(obs_source_t* source) {
-    if (!source) return;
-
-    // Determine bounds dimensions from the current OBS canvas. This makes
-    // the fix adaptive to unusual canvas sizes (vertical, 4K, 720p, etc.)
-    // rather than hardcoding 1920x1080.
-    obs_video_info ovi;
-    uint32_t boundsW = 1920;
-    uint32_t boundsH = 1080;
-    if (obs_get_video_info(&ovi)) {
-        boundsW = ovi.base_width;
-        boundsH = ovi.base_height;
-    }
-
-    struct SearchContext {
-        obs_source_t* target;
-        uint32_t w;
-        uint32_t h;
-    };
-    SearchContext ctx = { source, boundsW, boundsH };
-
-    auto enum_cb = [](void* param, obs_source_t* scene_src) -> bool {
-        SearchContext* c = (SearchContext*)param;
-        obs_scene_t* scene = obs_scene_from_source(scene_src);
-        if (!scene) return true;
-
-        auto item_cb = [](obs_scene_t*, obs_sceneitem_t* item, void* p) -> bool {
-            SearchContext* c = (SearchContext*)p;
-            obs_source_t* item_src = obs_sceneitem_get_source(item);
-            if (item_src == c->target) {
-                vec2 bounds;
-                bounds.x = (float)c->w;
-                bounds.y = (float)c->h;
-                obs_sceneitem_set_bounds_type(item, OBS_BOUNDS_SCALE_INNER);
-                obs_sceneitem_set_bounds(item, &bounds);
-                obs_sceneitem_set_bounds_alignment(item, OBS_ALIGN_CENTER);
-            }
-            return true;
-        };
-
-        obs_scene_enum_items(scene, item_cb, c);
-        return true;
-    };
-
-    obs_enum_scenes(enum_cb, &ctx);
-}
-
 // Fit-center geometry for one participant scene-item: Automatic bounds (no bbox,
 // so Alt-drag crops naturally), center alignment, aspect-preserving fit scale to
 // the canvas (the geometry OBS_BOUNDS_SCALE_INNER yields), centered position. The
@@ -6086,15 +6035,21 @@ static void ApplyFitCenterGeometry(obs_sceneitem_t* item, obs_source_t* source) 
     obs_sceneitem_set_pos(item, &pos);
 }
 
-// Participant-video initial placement (v1.4.0). Unlike screenshare (which
-// keeps the Fit bounds in ApplyFeedsBoundsToSceneItem above), participant
-// video uses Automatic bounds (OBS_BOUNDS_NONE) so the user can crop it
-// naturally with Alt-drag. The engine frame scaler already normalizes
-// participant frames to a constant per-tier size before OBS sees them, so
-// Fit is no longer needed to absorb Zoom's resolution drops — see the
-// resolution-change investigation. Screenshare is variable-size and MUST
-// stay on Fit; that's why the OnSourceCreated dispatch routes the two types
-// to different functions.
+// Initial placement for participant video and screenshare — both use Automatic
+// bounds (OBS_BOUNDS_NONE) so the user can crop naturally with Alt-drag, rather
+// than the old Fit (SCALE_INNER) box. Participant video was moved to Automatic in
+// v1.4.0 (the engine scaler already held its size constant); screenshare joins the
+// same path now that its frames are likewise scaled to a constant per-tier size in
+// the engine (see engine-screenshare.cpp's FrameScalerWorker). With a constant
+// output size, Fit is no longer needed to absorb Zoom's resolution/content-size
+// changes, so OnSourceCreated routes both types here (chat overlay/popup keep
+// their own placement helpers).
+//
+// NOTE: if the engine scaler is ever reverted for screenshare (see the text-
+// quality gate), this Automatic placement still applies to screenshare on the
+// plugin side — the two changes are independent. Screenshare would then be
+// variable-size under Automatic, which is acceptable but less stable than with
+// the scaler holding its size constant.
 //
 // To preserve today's "drop it in and it fills the screen" default we set
 // an initial scale that aspect-fits the source inside the canvas (the same
@@ -6358,10 +6313,8 @@ static void ShowIncludedScenesMenu(const std::string& uuid) {
 // trail past the canvas edge; with bottom-center it grows upward and the
 // 50px gap from the bottom stays constant.
 //
-// Shares the deferred-enumeration scaffolding with
-// ApplyFeedsBoundsToSceneItem — sets position + alignment rather than
-// bounds, since the popup is meant to keep its natural size, not fit
-// the canvas.
+// Sets position + alignment rather than bounds, since the popup is meant to
+// keep its natural size, not fit the canvas.
 static void ApplyChatPopupDefaultPosition(obs_source_t* source) {
     if (!source) return;
 
@@ -6490,10 +6443,9 @@ static void OnSourceCreated(void* /*data*/, calldata_t* cd) {
     const char* id = obs_source_get_id(source);
     if (!id) return;
 
-    // Only apply to Feeds source types. Participant and screenshare are
-    // split deliberately: participant video gets Automatic bounds (the
-    // engine scaler holds its size constant), screenshare keeps Fit bounds
-    // (its frames are variable-size and Fit absorbs content-size changes).
+    // Only apply to Feeds source types. Participant video and screenshare share
+    // the same Automatic-bounds placement (the engine scaler holds both at a
+    // constant per-tier size); the chat overlay/popup types have their own.
     const bool isParticipant = strcmp(id, "zoom_participant_source") == 0;
     const bool isScreenshare = strcmp(id, "zoom_screenshare_source") == 0;
     const bool isChatPopup   = strcmp(id, "feeds_chat_popup")   == 0;
@@ -6521,7 +6473,7 @@ static void OnSourceCreated(void* /*data*/, calldata_t* cd) {
     obs_weak_source_t* weak = obs_source_get_weak_source(source);
     if (!weak) return;
 
-    std::thread([weak, isParticipant, isChatPopup, isChatOverlay]() {
+    std::thread([weak, isChatPopup, isChatOverlay]() {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
         obs_source_t* strong = obs_weak_source_get_source(weak);
@@ -6530,12 +6482,12 @@ static void OnSourceCreated(void* /*data*/, calldata_t* cd) {
                 ApplyChatPopupDefaultPosition(strong);
             } else if (isChatOverlay) {
                 ApplyChatOverlayDefaults(strong);
-            } else if (isParticipant) {
-                // Automatic bounds + fill-canvas-centered initial placement.
-                ApplyParticipantPlacement(strong);
             } else {
-                // Screenshare: keep the existing Fit bounds path, unchanged.
-                ApplyFeedsBoundsToSceneItem(strong);
+                // Participant OR screenshare: Automatic bounds + fill-canvas-
+                // centered initial placement (screenshare joined this path with
+                // the engine scaler change; see ApplyParticipantPlacement). No
+                // other Feeds type reaches here — the guard above filtered them.
+                ApplyParticipantPlacement(strong);
             }
             obs_source_release(strong);
         }
