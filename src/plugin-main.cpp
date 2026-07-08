@@ -280,8 +280,17 @@ static void OnDockParticipantPicked(const std::string& uuid, long long selectedI
 // operate on OBS's real scene graph; the dock reflects results via existing signals.
 static obs_source_t* ResolveCurrentEditScene();
 static void ApplyFitCenterGeometry(obs_sceneitem_t* item, obs_source_t* source);
+static void ApplyChatPopupPlacementToItem(obs_sceneitem_t* item);
 static void CreateParticipantSourceInCurrentScene();
 static void AddSourceReferenceToCurrentScene(const std::string& uuid);
+
+// Placement applied to the newly-added scene-item on a reference-add. The
+// reference path fires no source_create, so it must place the item itself (the
+// deferred ApplyChat*/ApplyParticipantPlacement hooks only run on create) — and
+// the right default differs per type: screenshare fills the canvas (fit-center),
+// the chat popup sits bottom-center at natural size.
+enum class RefAddPlacement { FitCenter, PopupDefault };
+
 // Header add-source actions (defined with the scene helpers, far below).
 // CreateSourceOfTypeInCurrentScene mints a fresh source of the given type and
 // adds it (always-new, like "Create Participant Feed"); AddOrReferenceSourceInCurrentScene
@@ -289,7 +298,8 @@ static void AddSourceReferenceToCurrentScene(const std::string& uuid);
 // (reference-or-create) — this is how the screenshare button never trips the
 // zs_create singleton block by trying to create a second instance.
 static void CreateSourceOfTypeInCurrentScene(const char* typeId, const char* baseName);
-static void AddOrReferenceSourceInCurrentScene(const char* typeId, const char* baseName);
+static void AddOrReferenceSourceInCurrentScene(const char* typeId, const char* baseName,
+                                               RefAddPlacement placement);
 // Per-source dock header actions (defined with the scene helpers, far below).
 // OpenSourceFilters opens OBS's native Filters dialog; ShowIncludedScenesMenu
 // pops a menu of the scenes the source is in, switching to a clicked one
@@ -2829,7 +2839,8 @@ private:
                 return;   // locked: no add to cool down (upgrade-prompt throttle handles it)
             }
             if (m_cdScreenshare) return;   // on add-cooldown: absorb the rapid re-click
-            AddOrReferenceSourceInCurrentScene("zoom_screenshare_source", "Zoom Screenshare");
+            AddOrReferenceSourceInCurrentScene("zoom_screenshare_source", "Zoom Screenshare",
+                                               RefAddPlacement::FitCenter);
             BeginHeaderCooldown(&m_cdScreenshare);
         });
 
@@ -2851,7 +2862,8 @@ private:
                 return;
             }
             if (m_cdChatPopup) return;   // on add-cooldown: absorb the rapid re-click
-            AddOrReferenceSourceInCurrentScene("feeds_chat_popup", "Feeds Chat Popup");
+            AddOrReferenceSourceInCurrentScene("feeds_chat_popup", "Feeds Chat Popup",
+                                               RefAddPlacement::PopupDefault);
             BeginHeaderCooldown(&m_cdChatPopup);
         });
 
@@ -4339,10 +4351,11 @@ static bool YtHttpRequest(const std::wstring& host, const wchar_t* method,
 // worker (never the UI thread); one attempt per channel id per session (chat is
 // bursty from few authors); a cached null QImage records a failed/absent avatar
 // so we neither re-fetch nor block — the popup falls back to a neutral circle.
-// The dock click handler resolves the QImage from here and hands it to the popup
-// (the popup stays cache-agnostic), so these stay static to this TU.
-static std::mutex                            g_ytAvatarCacheMutex;
-static std::map<std::string, QImage>         g_ytAvatarCacheByChannel;  // channelId -> avatar (null = tried, none)
+// The dock click handler resolves the QImage from here for the popup; the chat
+// overlay reads it directly at render time (extern), the way it reads the Zoom
+// g_avatarCache — so these two have external linkage (not static).
+std::mutex                                   g_ytAvatarCacheMutex;
+std::map<std::string, QImage>                g_ytAvatarCacheByChannel;  // channelId -> avatar (null = tried, none)
 static std::set<std::string>                 g_ytAvatarInFlight;
 static constexpr size_t                      kYtAvatarCacheCap = 512;
 
@@ -4708,6 +4721,18 @@ static void YtDeliverToDock(const YtMsg& m) {
         });
 }
 
+// Push a YouTube message into the chat overlay's centralised history (Streamer+,
+// matching the Zoom path's overlay gate). Tagged YouTube so each overlay
+// instance's platform filter includes/excludes it; the avatar is resolved at
+// render time from the YT cache by channel id. Thread-safe append — no marshaling
+// (the overlay reads its history under its own mutex on the graphics thread).
+static void YtDeliverToOverlay(const YtMsg& m) {
+    if (g_currentTier < 2) return;
+    feeds::AppendChatMessageToOverlay(
+        feeds::ChatMsgOrigin::YouTube, 0 /*no Zoom id*/, m.channelId,
+        m.author, m.text, 0 /*timestamp unused for ordering*/);
+}
+
 // Deletion fan-out to the dock (Qt main thread). The dock removes matching rows
 // and clears the popup if it's showing one of them. YT-scope only.
 static void YtDeliverDeletionById(const std::string& id) {
@@ -4777,6 +4802,7 @@ static void YtChatPollLoop() {
                     // shown messages — the skipped backlog isn't downloaded.
                     YtRequestAvatar(m.channelId, m.avatarUrl);
                     YtDeliverToDock(m);
+                    YtDeliverToOverlay(m);   // overlay honors per-instance filter
                 }
                 for (const auto& id : pg.deletedMsgIds)      YtDeliverDeletionById(id);
                 for (const auto& cid : pg.deletedChannelIds)  YtDeliverDeletionByChannel(cid);
@@ -6799,13 +6825,14 @@ static void RegisterEngineHandlers() {
         // ToggleChatPopup runs. Return value unused here.
         (void)GetAvatarForSender(senderId, avatarPath);
 
-        // Push into the overlay's centralised history (Streamer+ only).
-        // Thread-safe; no need to marshal to the Qt main thread — the
-        // overlay source reads under its own mutex on the graphics
-        // thread.
+        // Push into the overlay's centralised history (Streamer+ only), tagged
+        // as Zoom so per-instance platform filters can include/exclude it.
+        // Thread-safe; no need to marshal to the Qt main thread — the overlay
+        // source reads under its own mutex on the graphics thread.
         if (g_currentTier >= 2) {
-            feeds::AppendChatMessageToOverlay(senderId, senderName, content,
-                                              timestamp);
+            feeds::AppendChatMessageToOverlay(
+                feeds::ChatMsgOrigin::Zoom, senderId, std::string(),
+                senderName, content, timestamp);
         }
 
         QString qSender  = QString::fromStdString(senderName);
@@ -7151,7 +7178,8 @@ static obs_source_t* FindFirstSourceOfType(const char* typeId) {
 // create one (Action A). This is the screenshare / chat-popup header path: it
 // NEVER creates a second instance of a type that already exists, so the
 // screenshare singleton block in zs_create is never reached. UI thread.
-static void AddOrReferenceSourceInCurrentScene(const char* typeId, const char* baseName) {
+static void AddOrReferenceSourceInCurrentScene(const char* typeId, const char* baseName,
+                                               RefAddPlacement placement) {
     obs_source_t* existing = FindFirstSourceOfType(typeId);
     if (existing) {
         obs_source_t* sceneSrc = ResolveCurrentEditScene();
@@ -7159,10 +7187,16 @@ static void AddOrReferenceSourceInCurrentScene(const char* typeId, const char* b
             obs_scene_t* scene = obs_scene_from_source(sceneSrc);   // borrowed
             if (scene) {
                 obs_sceneitem_t* item = obs_scene_add(scene, existing);
-                // Live source -> dims known -> fit-center; a dormant source
-                // (0x0, e.g. screenshare with nobody sharing) lands at OBS
-                // default, which ApplyFitCenterGeometry safely skips.
-                ApplyFitCenterGeometry(item, existing);
+                // Place the newly-added item per the type's default — the
+                // reference path fires no source_create, so without this a
+                // second+ add lands at OBS's raw default. Screenshare fills the
+                // canvas (fit-center; a dormant 0x0 source safely skips it);
+                // the popup sits bottom-center at natural size (matching what
+                // ApplyChatPopupDefaultPosition gives the first, created instance).
+                if (placement == RefAddPlacement::PopupDefault)
+                    ApplyChatPopupPlacementToItem(item);
+                else
+                    ApplyFitCenterGeometry(item, existing);
             }
             obs_source_release(sceneSrc);
         }
@@ -7274,8 +7308,14 @@ static void ShowIncludedScenesMenu(const std::string& uuid) {
 //
 // Sets position + alignment rather than bounds, since the popup is meant to
 // keep its natural size, not fit the canvas.
-static void ApplyChatPopupDefaultPosition(obs_source_t* source) {
-    if (!source) return;
+// Place one popup scene-item at the canonical default: bottom-center, 4% of
+// canvas height off the bottom edge, with bottom-center alignment so a taller
+// (wrapped) bubble grows upward and the bottom gap stays constant. Natural size
+// (position + alignment only, no bounds). Shared by the deferred create hook
+// (ApplyChatPopupDefaultPosition) and the reference-add path — the item is in
+// hand in both, so no source-dimension arithmetic is needed.
+static void ApplyChatPopupPlacementToItem(obs_sceneitem_t* item) {
+    if (!item) return;
 
     obs_video_info ovi;
     uint32_t canvasW = 1920;
@@ -7285,46 +7325,40 @@ static void ApplyChatPopupDefaultPosition(obs_source_t* source) {
         canvasH = ovi.base_height;
     }
 
-    // With OBS_ALIGN_BOTTOM | OBS_ALIGN_CENTER alignment the position is
-    // the anchor point — the bottom-center of the scene-item's bbox
-    // lands here, no source-dimension arithmetic needed. Margin from
-    // the bottom edge is 4% of canvas height (~43px at 1080p, ~86px at
-    // 4K) so the visual gap scales with the streamer's resolution.
     const int marginFromBottom = (int)((float)canvasH * 0.04f);
     vec2 pos;
     pos.x = (float)canvasW * 0.5f;
     pos.y = (float)canvasH - (float)marginFromBottom;
 
-    struct SearchContext {
-        obs_source_t* target;
-        vec2          pos;
-    };
-    SearchContext ctx = { source, pos };
+    // OBS_ALIGN_CENTER is the zero value (horizontal centre is the default when
+    // neither LEFT nor RIGHT is set); OR'ing it in is self-documentation.
+    obs_sceneitem_set_pos(item, &pos);
+    obs_sceneitem_set_alignment(item, OBS_ALIGN_BOTTOM | OBS_ALIGN_CENTER);
+}
 
+static void ApplyChatPopupDefaultPosition(obs_source_t* source) {
+    if (!source) return;
+
+    // Deferred create hook: place every scene-item currently backed by this
+    // source. (The add flow adds one at a time, but a source referenced into
+    // several scenes gets them all placed consistently.)
     auto enum_cb = [](void* param, obs_source_t* scene_src) -> bool {
-        SearchContext* c = (SearchContext*)param;
+        obs_source_t* target = (obs_source_t*)param;
         obs_scene_t* scene = obs_scene_from_source(scene_src);
         if (!scene) return true;
 
         auto item_cb = [](obs_scene_t*, obs_sceneitem_t* item, void* p) -> bool {
-            SearchContext* c = (SearchContext*)p;
-            obs_source_t* item_src = obs_sceneitem_get_source(item);
-            if (item_src == c->target) {
-                // OBS_ALIGN_CENTER is the zero value (horizontal centre
-                // is the default when neither LEFT nor RIGHT is set);
-                // OR'ing it in is self-documentation.
-                obs_sceneitem_set_pos(item, &c->pos);
-                obs_sceneitem_set_alignment(
-                    item, OBS_ALIGN_BOTTOM | OBS_ALIGN_CENTER);
-            }
+            obs_source_t* target = (obs_source_t*)p;
+            if (obs_sceneitem_get_source(item) == target)
+                ApplyChatPopupPlacementToItem(item);
             return true;
         };
 
-        obs_scene_enum_items(scene, item_cb, c);
+        obs_scene_enum_items(scene, item_cb, target);
         return true;
     };
 
-    obs_enum_scenes(enum_cb, &ctx);
+    obs_enum_scenes(enum_cb, source);
 }
 
 // Apply the overlay's per-canvas defaults: a Width setting (35% of canvas

@@ -36,12 +36,15 @@
 #include <mutex>
 #include <vector>
 
-// Avatar cache lives in plugin-main.cpp — externally linked so both the
-// popup and the overlay sources can consume it. Same lookup-by-sender-id
-// pattern the popup uses.
+// Avatar caches live in plugin-main.cpp — externally linked so the overlay can
+// consume them at render time. Zoom messages look up by uint sender id (falls
+// back to the bundled Feeds logo); YouTube messages look up by string channel id
+// in the parallel YT cache (a miss / null entry renders the neutral grey circle).
 extern std::mutex                       g_avatarCacheMutex;
 extern std::map<unsigned int, QImage>   g_avatarCache;
 extern QImage                           g_fallbackAvatar;
+extern std::mutex                       g_ytAvatarCacheMutex;
+extern std::map<std::string, QImage>    g_ytAvatarCacheByChannel;
 
 // Tier state from plugin-main.cpp. Overlay is gated at Streamer (>= 2),
 // enforced by ReconcileChatOverlaySources via the tier_disabled flag.
@@ -68,6 +71,13 @@ namespace {
 // Settings keys used in obs_data_t blobs and properties UI.
 static constexpr const char* S_WIDTH            = "width";
 static constexpr const char* S_VISIBLE_MESSAGES = "visible_messages";
+static constexpr const char* S_PLATFORM_FILTER  = "platform_filter";
+
+// Per-instance platform filter values. BOTH is 0 (also the default an absent
+// setting reads back as, so existing overlays default to Both). ZOOM/YOUTUBE
+// equal feeds::ChatMsgOrigin's Zoom/YouTube so a non-Both filter is just
+// "keep if (int)origin == filter".
+enum { PLAT_BOTH = 0, PLAT_ZOOM = 1, PLAT_YOUTUBE = 2 };
 
 // Width range and step. WIDTH_DEFAULT_PX is the property-system default
 // (35% of 1920 ≈ 672 px) — a baseline for sources loaded from saves
@@ -101,7 +111,9 @@ static constexpr int MSG_FONT_PIXEL_SIZE  = 24;
 // O2/O3 ordering and trimming.
 // ---------------------------------------------------------------------------
 struct OverlayMessage {
-    unsigned int sender_id   = 0;
+    feeds::ChatMsgOrigin origin = feeds::ChatMsgOrigin::Zoom;
+    unsigned int sender_id   = 0;   // Zoom avatar key (0 for YouTube)
+    std::string  channel_id;        // YouTube avatar key ("" for Zoom)
     QString      sender_name;
     QString      content;
     qint64       timestamp   = 0;
@@ -143,6 +155,7 @@ struct FeedsChatOverlayData {
     // fcr_get_height return something sensible before fcr_update runs.
     uint32_t        width             = (uint32_t)WIDTH_DEFAULT_PX;
     int             visible_messages  = VISIBLE_DEFAULT;
+    int             platform_filter   = PLAT_BOTH;   // Zoom / YouTube / Both
     uint32_t        height            = (uint32_t)(
                                             VISIBLE_DEFAULT * AVATAR_SIZE +
                                             (VISIBLE_DEFAULT - 1) * ROW_SPACING +
@@ -198,7 +211,18 @@ static void RenderOverlayToImage(FeedsChatOverlayData* d,
     QRect bgRect(0, 0, (int)d->width, (int)d->height);
     p.drawRoundedRect(bgRect, BG_CORNER_RADIUS, BG_CORNER_RADIUS);
 
-    const size_t take = std::min<size_t>(messages.size(),
+    // Apply this instance's platform filter to the shared history (BOTH keeps
+    // everything; otherwise keep only the matching origin), preserving order so
+    // the newest kept messages are still at the end.
+    std::vector<const OverlayMessage*> filtered;
+    filtered.reserve(messages.size());
+    for (const OverlayMessage& m : messages) {
+        if (d->platform_filter == PLAT_BOTH ||
+            (int)m.origin == d->platform_filter)
+            filtered.push_back(&m);
+    }
+
+    const size_t take = std::min<size_t>(filtered.size(),
                                           (size_t)visible);
 
     const int rowX     = BG_PADDING;
@@ -206,12 +230,12 @@ static void RenderOverlayToImage(FeedsChatOverlayData* d,
     const int textWidth = rowWidth - AVATAR_SIZE - ROW_INNER_SPACING;
     int       curY     = (int)d->height - BG_PADDING;
 
-    // Iterate newest → oldest over the tail of the list, stacking upward
-    // from the bottom-inside-padding edge.
-    for (auto it = messages.rbegin();
-         it != messages.rbegin() + (std::ptrdiff_t)take; ++it) {
+    // Iterate newest → oldest over the tail of the filtered list, stacking
+    // upward from the bottom-inside-padding edge.
+    for (auto it = filtered.rbegin();
+         it != filtered.rbegin() + (std::ptrdiff_t)take; ++it) {
 
-        const OverlayMessage& m = *it;
+        const OverlayMessage& m = **it;
 
         // Lay out "<bold orange username> <plain white message>" as a
         // single wrapped HTML paragraph so the username styling stays
@@ -239,9 +263,17 @@ static void RenderOverlayToImage(FeedsChatOverlayData* d,
         const int rowY       = curY - rowHeight;
         if (rowY < BG_PADDING) break;  // would clip above top — stop.
 
-        // Circular avatar at the row's left edge.
+        // Circular avatar at the row's left edge — resolved from the origin-
+        // appropriate cache. YouTube: channel-id cache (a miss or null entry
+        // leaves `avatar` null -> neutral circle). Zoom: sender-id cache, falling
+        // back to the bundled Feeds logo.
         QImage avatar;
-        {
+        if (m.origin == feeds::ChatMsgOrigin::YouTube) {
+            std::lock_guard<std::mutex> lock(g_ytAvatarCacheMutex);
+            auto cacheIt = g_ytAvatarCacheByChannel.find(m.channel_id);
+            if (cacheIt != g_ytAvatarCacheByChannel.end())
+                avatar = cacheIt->second;
+        } else {
             std::lock_guard<std::mutex> lock(g_avatarCacheMutex);
             auto cacheIt = g_avatarCache.find(m.sender_id);
             avatar = (cacheIt != g_avatarCache.end())
@@ -347,6 +379,7 @@ static const char* fcr_get_name(void*) {
 static void fcr_get_defaults(obs_data_t* settings) {
     obs_data_set_default_int(settings, S_WIDTH,            WIDTH_DEFAULT_PX);
     obs_data_set_default_int(settings, S_VISIBLE_MESSAGES, VISIBLE_DEFAULT);
+    obs_data_set_default_int(settings, S_PLATFORM_FILTER,  PLAT_BOTH);
 }
 
 // Pull the configured dimensions out of settings, clamp to ranges,
@@ -360,15 +393,18 @@ static void fcr_update(void* data, obs_data_t* settings) {
 
     int w = (int)obs_data_get_int(settings, S_WIDTH);
     int v = (int)obs_data_get_int(settings, S_VISIBLE_MESSAGES);
+    int f = (int)obs_data_get_int(settings, S_PLATFORM_FILTER);
     if (w < WIDTH_MIN_PX) w = WIDTH_MIN_PX;
     if (w > WIDTH_MAX_PX) w = WIDTH_MAX_PX;
     if (v < VISIBLE_MIN)  v = VISIBLE_MIN;
     if (v > VISIBLE_MAX)  v = VISIBLE_MAX;
+    if (f != PLAT_ZOOM && f != PLAT_YOUTUBE) f = PLAT_BOTH;  // unknown -> Both
 
     std::lock_guard<std::mutex> lock(g_overlayInstancesMutex);
     bool changed = false;
     if (d->width != (uint32_t)w) { d->width = (uint32_t)w; changed = true; }
     if (d->visible_messages != v) { d->visible_messages = v; changed = true; }
+    if (d->platform_filter != f) { d->platform_filter = f; changed = true; }
     if (changed) d->texture_dirty = true;
 }
 
@@ -472,6 +508,14 @@ static obs_properties_t* fcr_get_properties(void* data) {
     obs_properties_add_int(props, S_VISIBLE_MESSAGES,
                            "Visible Messages",
                            VISIBLE_MIN, VISIBLE_MAX, 1);
+    // Which platform's chat this overlay instance shows. Must-select (no None);
+    // defaults to Both. Values match PLAT_* / ChatMsgOrigin.
+    obs_property_t* plat = obs_properties_add_list(
+        props, S_PLATFORM_FILTER, "Chat Source",
+        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    obs_property_list_add_int(plat, "Both",         PLAT_BOTH);
+    obs_property_list_add_int(plat, "Zoom Chat",    PLAT_ZOOM);
+    obs_property_list_add_int(plat, "YouTube Chat", PLAT_YOUTUBE);
     return props;
 }
 
@@ -586,14 +630,18 @@ void RegisterChatOverlaySource() {
     obs_register_source(&feeds_chat_overlay_info);
 }
 
-void AppendChatMessageToOverlay(unsigned int       senderId,
+void AppendChatMessageToOverlay(ChatMsgOrigin      origin,
+                                unsigned int       senderId,
+                                const std::string& channelId,
                                 const std::string& senderName,
                                 const std::string& content,
                                 qint64             timestamp) {
     {
         std::lock_guard<std::mutex> lock(g_overlayHistoryMutex);
         OverlayMessage msg;
+        msg.origin      = origin;
         msg.sender_id   = senderId;
+        msg.channel_id  = channelId;
         msg.sender_name = QString::fromStdString(senderName);
         msg.content     = QString::fromStdString(content);
         msg.timestamp   = timestamp;

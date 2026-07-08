@@ -12,17 +12,27 @@
 
 namespace feeds {
 
+// Platform a chat message came from — tags each overlay-history entry so a
+// per-instance filter (Zoom / YouTube / Both) can show or drop it. Values are
+// deliberately 1/2 so they equal the non-"Both" dropdown filter values.
+enum class ChatMsgOrigin { Zoom = 1, YouTube = 2 };
+
 void RegisterChatOverlaySource();
 
-// Push a new message into the centralised overlay history. Called from
-// the chat IPC handler in plugin-main alongside the existing dock append
-// and avatar-cache warming. Thread-safe — the underlying history is
-// guarded by a mutex, and all overlay source instances are marked
-// texture_dirty after the append so they re-render on next frame.
+// Push a new message into the centralised overlay history. Called from the chat
+// IPC handler (Zoom) and the YouTube poll loop, off the graphics thread.
+// Thread-safe — the underlying history is guarded by a mutex, and all overlay
+// source instances are marked texture_dirty after the append so they re-render
+// on next frame. Each instance's platform filter decides at render time whether
+// to show the message. The avatar is resolved at render time from the origin-
+// appropriate cache (Zoom: senderId; YouTube: channelId), so senderId is 0 /
+// channelId "" for the platform that doesn't apply.
 //
 // The overlay keeps the most recent ~50 messages; only the last few are
 // typically visible. Cap is internal — caller doesn't need to trim.
-void AppendChatMessageToOverlay(unsigned int       senderId,
+void AppendChatMessageToOverlay(ChatMsgOrigin      origin,
+                                unsigned int       senderId,
+                                const std::string& channelId,
                                 const std::string& senderName,
                                 const std::string& content,
                                 qint64             timestamp);
