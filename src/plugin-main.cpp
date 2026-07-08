@@ -1834,6 +1834,26 @@ struct YtTarget {
 static YtTarget    NormalizeYouTubeTarget(std::string s);
 static std::string YtSetTargetFromInput(const std::string& input);
 
+// Format a Zoom meeting number the way Zoom does: 3-3-4 groups ("5106269156" ->
+// "510 626 9156"). Non-10-digit lengths group in threes/threes/four and let any
+// remainder trail as a final group.
+static QString FormatMeetingNumber(unsigned long long n) {
+    const QString d = QString::number(n);
+    const int len = (int)d.size();
+    static const int cuts[] = { 3, 3, 4 };
+    QString out;
+    int pos = 0;
+    for (int c : cuts) {
+        if (pos >= len) break;
+        int take = (len - pos < c) ? (len - pos) : c;
+        if (!out.isEmpty()) out += ' ';
+        out += d.mid(pos, take);
+        pos += take;
+    }
+    if (pos < len) { out += ' '; out += d.mid(pos); }  // remainder trails
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // Item delegate for the chat dock's QListWidget. setWordWrap(true) alone
 // handles soft-wrapping at whitespace but breaks down on long unbreakable
@@ -2005,7 +2025,6 @@ public:
         setMinimumSize(200, 300);
 
         UpdateYouTubeStatus(kYtStatusOff, QString());
-        UpdateYouTubePlaceholder();
         UpdateChatHeaderState();
     }
 
@@ -2211,7 +2230,6 @@ public:
         if (m_ytField->text() == disp) return;
         QSignalBlocker block(m_ytField);
         m_ytField->setText(disp);
-        m_ytLastTarget = disp;
     }
 
     // Populate the field from persisted config at startup (FINISHED_LOADING).
@@ -2223,8 +2241,6 @@ public:
             : (handle.empty() ? QString() : QString::fromStdString("@" + handle));
         QSignalBlocker block(m_ytField);
         m_ytField->setText(disp);
-        if (!disp.isEmpty()) m_ytLastTarget = disp;
-        UpdateYouTubePlaceholder();
     }
 
 private:
@@ -2247,6 +2263,10 @@ private:
         zoomGlyph->setFixedSize(kChatGlyphSize, kChatGlyphSize);
         zoomGlyph->setToolTip("Zoom chat");
         m_zoomStatus = new QLabel(header);
+        // Clickable (not restyled as a button) — routes to the shared
+        // click-to-connect flow, same as the message-list placeholder. Cursor is
+        // set per meeting-state in UpdateChatHeaderState.
+        m_zoomStatus->installEventFilter(this);
         zoomRow->addWidget(zoomGlyph);
         zoomRow->addWidget(m_zoomStatus, 1);
         hv->addLayout(zoomRow);
@@ -2259,11 +2279,7 @@ private:
         ytGlyph->setFixedSize(kChatGlyphSize, kChatGlyphSize);
         ytGlyph->setToolTip("YouTube chat");
         m_ytField = new QLineEdit(header);
-        m_ytField->setPlaceholderText("YouTube channel or stream URL");
-        m_ytField->setToolTip(
-            "Enter a YouTube channel handle (@name) to follow its live chat, or "
-            "paste a specific stream's URL / video ID to pin that exact stream. "
-            "Clear the field to turn YouTube chat off.");
+        m_ytField->setPlaceholderText("Enter YouTube Channel or Link");
         m_ytDot = new QLabel(header);
         m_ytDot->setFixedSize(10, 10);
         m_ytWord = new QLabel(header);
@@ -2278,20 +2294,45 @@ private:
         return header;
     }
 
-    // Refresh the Zoom status text + apply tier presentation. A tier-locked dock
-    // hides the whole header (no live editable field for a locked dock).
+    // Refresh the Zoom status text + tier presentation. The header is ALWAYS
+    // visible (a visible "Waiting" row honestly says "configured, works once
+    // connected/upgraded" — hiding it reintroduced the discoverability problem
+    // this redesign solves, and tier-hiding didn't reliably track logout anyway).
     void UpdateChatHeaderState() {
         if (!m_chatHeader) return;
-        if (m_tierDisabled) { m_chatHeader->setVisible(false); return; }
-        m_chatHeader->setVisible(true);
         if (m_zoomStatus) {
-            m_zoomStatus->setText(
-                g_isInMeeting
-                    ? (g_currentMeetingNumber
-                           ? QString("In meeting (#%1)").arg(g_currentMeetingNumber)
-                           : QString("In meeting"))
-                    : QString("Not connected"));
+            // Label + click stay in lockstep with TriggerConnectFlow's precedence,
+            // so what the row says always matches what clicking it does:
+            //   tier-locked      -> "Upgrade Required" (click: upgrade URL) — the
+            //                       upgrade is the real blocker, so it wins over
+            //                       the login/connect labels.
+            //   in a meeting     -> "In Meeting (number)" (click: inert)
+            //   logged in        -> "Not Connected"       (click: connect)
+            //   logged out       -> "Not Logged In"       (click: login)
+            QString z;
+            bool actionable;
+            if (m_tierDisabled) {
+                z = "Upgrade Required"; actionable = true;
+            } else if (g_isInMeeting) {
+                z = g_currentMeetingNumber
+                        ? QString("In Meeting (%1)")
+                              .arg(FormatMeetingNumber(g_currentMeetingNumber))
+                        : QString("In Meeting");
+                actionable = false;
+            } else if (g_isLoggedIn) {
+                z = "Not Connected"; actionable = true;
+            } else {
+                z = "Not Logged In"; actionable = true;
+            }
+            m_zoomStatus->setText(z);
+            m_zoomStatus->setCursor(actionable ? Qt::PointingHandCursor
+                                               : Qt::ArrowCursor);
         }
+        // Grey (but readable) the YouTube field while tier-locked so the user sees
+        // their configured target but understands it's inactive. Enable transitions
+        // (upgrade -> reconcile -> SetTierDisabled) fire reliably; a disabled field
+        // fires no editingFinished, and setText still updates it for display.
+        if (m_ytField) m_ytField->setEnabled(!m_tierDisabled);
     }
 
     // Commit the YouTube field on Enter / focus-out: hand the raw text to the
@@ -2305,18 +2346,28 @@ private:
             QSignalBlocker block(m_ytField);   // don't re-fire editingFinished
             m_ytField->setText(disp);
         }
-        if (!disp.isEmpty()) m_ytLastTarget = disp;
-        UpdateYouTubePlaceholder();
     }
 
-    // Empty-field placeholder: normally a hint, or "off — was @X" if a target was
-    // cleared this session (last value remembered in memory only, not config).
-    void UpdateYouTubePlaceholder() {
-        if (!m_ytField || !m_ytField->text().isEmpty()) return;
-        m_ytField->setPlaceholderText(
-            m_ytLastTarget.isEmpty()
-                ? QString("YouTube channel or stream URL")
-                : QString("off \xE2\x80\x94 was %1").arg(m_ytLastTarget));
+    // Shared click-to-connect entry point: the message-list placeholder and the
+    // header's Zoom status label both route here. Tier-locked -> upgrade URL;
+    // already in a meeting -> inert; logged out -> login; logged in -> connect.
+    void TriggerConnectFlow() {
+        if (m_tierDisabled) {
+            QDesktopServices::openUrl(QUrl("https://letsdovideo.com/feeds-upgrade"));
+            return;
+        }
+        if (g_isInMeeting) return;   // inert while connected
+        if (!g_isLoggedIn) OnLoginClick();
+        else               OnConnectClick();
+    }
+
+    // Route a click on the (unstyled) Zoom status label to the connect flow.
+    bool eventFilter(QObject* obj, QEvent* ev) override {
+        if (obj == m_zoomStatus && ev->type() == QEvent::MouseButtonRelease) {
+            TriggerConnectFlow();
+            return true;
+        }
+        return QWidget::eventFilter(obj, ev);
     }
 
     void SetPlaceholder(const QString& text) {
@@ -2347,35 +2398,13 @@ private:
             return;
         }
 
-        // Placeholders carry no sender_id data. Use that as the signal to
-        // route the click through the same login / connect flows the menu
-        // and source properties already drive — gives the dock its own
-        // call-to-action entry point.
+        // Placeholders carry no sender_id data — route the click through the
+        // shared connect flow (also used by the header's Zoom status label). The
+        // flow handles the tier-locked (upgrade), already-in-meeting (inert),
+        // logged-out (login) and logged-in (connect) cases.
         QVariant idVar = item->data(RoleSenderId);
         if (!idVar.isValid()) {
-            // Tier-locked placeholder routes to the upgrade URL instead
-            // of the login/connect flows. Free users can't use the dock
-            // at all, so the only useful action is "go upgrade."
-            if (m_tierDisabled) {
-                QDesktopServices::openUrl(
-                    QUrl("https://letsdovideo.com/feeds-upgrade"));
-                return;
-            }
-
-            // Bail on the "Connected" placeholder — already in a meeting,
-            // the dock click shouldn't re-enter the connect flow (which
-            // would hit the defensive Already-Connected MessageBox in
-            // OnConnectClick that's correct for menu/properties callers
-            // but noise here). g_isInMeeting is the truthful state;
-            // m_messagesStarted only flips on first chat message and
-            // would miss the "joined, no chat yet" window.
-            if (g_isInMeeting) return;
-
-            if (!g_isLoggedIn) {
-                OnLoginClick();
-            } else {
-                OnConnectClick();
-            }
+            TriggerConnectFlow();
             return;
         }
 
@@ -2434,7 +2463,6 @@ private:
     QLineEdit*   m_ytField          = nullptr;
     QLabel*      m_ytDot            = nullptr;
     QLabel*      m_ytWord           = nullptr;
-    QString      m_ytLastTarget;   // last non-empty target this session (placeholder only)
     // True iff the current logged-in tier is Free (< 1). Dock starts
     // false (pre-login state is identical to a normal Basic+ session)
     // and toggles via SetTierDisabled from ReconcileSourcesToTier.
