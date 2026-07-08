@@ -1745,6 +1745,49 @@ static void ShowSessionPickerDialog(const std::string& json) {
     if (g_connectAction) g_connectAction->setEnabled(false);
 }
 
+// Chat-message origin, stored per row as kRoleChatOrigin so the delegate can
+// draw a platform glyph and OnMessageClicked can gate platform-specific actions
+// (Phase 1: YouTube rows open no popup). File-scope (not inside FeedsChatDock)
+// because ChatMessageDelegate — defined below, before the dock — reads the role.
+// Placeholder rows carry no origin (role absent) and get no glyph/indent.
+static constexpr int kRoleChatOrigin  = Qt::UserRole + 10;  // int: kChatOrigin*
+static constexpr int kRoleChatMsgId   = Qt::UserRole + 11;  // YouTube message id (Phase 2 deletion)
+static constexpr int kRoleChatChannel = Qt::UserRole + 12;  // YouTube author channel id (Phase 2)
+static constexpr int kRoleChatAvatar  = Qt::UserRole + 13;  // YouTube avatar URL (Phase 2 download)
+enum ChatOrigin { kChatOriginZoom = 1, kChatOriginYouTube = 2 };
+
+// Draw a small, code-rendered origin glyph in `box` (no embedded brand logos —
+// trademark): YouTube = red rounded rect + white play triangle; Zoom = blue
+// rounded rect + white dot. Both platforms are marked, consistently.
+static void DrawChatOriginGlyph(QPainter* p, const QRectF& box, int origin) {
+    p->save();
+    p->setRenderHint(QPainter::Antialiasing, true);
+    p->setPen(Qt::NoPen);
+    if (origin == kChatOriginYouTube) {
+        p->setBrush(QColor(0xE6, 0x2b, 0x1e));               // YouTube-ish red
+        p->drawRoundedRect(box, box.height() * 0.28, box.height() * 0.28);
+        const qreal w = box.width(), h = box.height();
+        const QPointF tri[3] = {
+            QPointF(box.left() + w * 0.40, box.top() + h * 0.30),
+            QPointF(box.left() + w * 0.40, box.top() + h * 0.70),
+            QPointF(box.left() + w * 0.68, box.top() + h * 0.50),
+        };
+        p->setBrush(Qt::white);
+        p->drawPolygon(tri, 3);
+    } else {  // Zoom (and any other non-YouTube marked origin)
+        p->setBrush(QColor(0x2D, 0x8C, 0xFF));               // Zoom-ish blue
+        p->drawRoundedRect(box, box.height() * 0.28, box.height() * 0.28);
+        p->setBrush(Qt::white);
+        const qreal d = box.height() * 0.34;
+        p->drawEllipse(box.center(), d * 0.5, d * 0.5);
+    }
+    p->restore();
+}
+
+// Horizontal space (glyph + gap) reserved at the left of a marked row.
+static constexpr int kChatGlyphSize   = 14;
+static constexpr int kChatGlyphIndent = kChatGlyphSize + 6;
+
 // ---------------------------------------------------------------------------
 // Item delegate for the chat dock's QListWidget. setWordWrap(true) alone
 // handles soft-wrapping at whitespace but breaks down on long unbreakable
@@ -1775,11 +1818,16 @@ public:
             return QStyledItemDelegate::sizeHint(option, index);
         }
 
+        // Marked rows (Zoom/YouTube) reserve a left indent for the origin glyph;
+        // placeholder rows (no origin) use the full width.
+        const bool marked = index.data(kRoleChatOrigin).isValid();
+        const int textW = marked ? (width - kChatGlyphIndent) : width;
+
         QString text = index.data(Qt::DisplayRole).toString();
         QTextLayout layout(text, option.font);
         layout.setTextOption(MakeTextOption());
 
-        qreal y = LayoutLines(layout, width);
+        qreal y = LayoutLines(layout, textW > 0 ? textW : width);
         // +2 px so adjacent items aren't visually flush.
         return QSize(width, static_cast<int>(y) + 2);
     }
@@ -1796,12 +1844,24 @@ public:
             painter->setPen(option.palette.text().color());
         }
 
+        // Origin glyph + text indent for marked rows; placeholders draw flush.
+        const QVariant originVar = index.data(kRoleChatOrigin);
+        QPointF textOrigin = option.rect.topLeft();
+        int textW = option.rect.width();
+        if (originVar.isValid()) {
+            QRectF glyphBox(option.rect.left() + 2, option.rect.top() + 2.0,
+                            kChatGlyphSize, kChatGlyphSize);
+            DrawChatOriginGlyph(painter, glyphBox, originVar.toInt());
+            textOrigin.setX(textOrigin.x() + kChatGlyphIndent);
+            textW -= kChatGlyphIndent;
+        }
+
         QString text = index.data(Qt::DisplayRole).toString();
         QTextLayout layout(text, option.font);
         layout.setTextOption(MakeTextOption());
 
-        LayoutLines(layout, option.rect.width());
-        layout.draw(painter, option.rect.topLeft());
+        LayoutLines(layout, textW > 0 ? textW : option.rect.width());
+        layout.draw(painter, textOrigin);
 
         painter->restore();
     }
@@ -1929,6 +1989,36 @@ public:
         item->setData(RoleSenderId,   senderId);
         item->setData(RoleSenderName, senderName);
         item->setData(RoleContent,    content);
+        item->setData(kRoleChatOrigin, kChatOriginZoom);   // blue Zoom glyph
+        m_list->addItem(item);
+        m_list->scrollToBottom();
+    }
+
+    // Inject a YouTube live-chat message into the dock. Phase 1 is dock-only:
+    // this deliberately does NOT touch the overlay/popup surfaces (the poller
+    // never calls AppendChatMessageToOverlay, and OnMessageClicked opens no
+    // popup for a YouTube row). Tier gating mirrors the Zoom path exactly —
+    // the poller skips on tier < 1, and m_tierDisabled is the belt-and-braces
+    // guard here. msgId / channelId / avatarUrl are stored for Phase 2
+    // (deletion needs the ids, avatar download needs the URL) but unused now.
+    void AppendYouTubeMessage(const QString& author,
+                              const QString& content,
+                              const QString& msgId,
+                              const QString& channelId,
+                              const QString& avatarUrl) {
+        if (m_tierDisabled) return;
+        if (!m_messagesStarted) { m_list->clear(); m_messagesStarted = true; }
+
+        QListWidgetItem* item =
+            new QListWidgetItem(QString("%1: %2").arg(author, content));
+        item->setData(RoleSenderName,  author);
+        item->setData(RoleContent,     content);
+        item->setData(kRoleChatOrigin, kChatOriginYouTube);  // red YouTube glyph
+        item->setData(kRoleChatMsgId,  msgId);
+        item->setData(kRoleChatChannel, channelId);
+        item->setData(kRoleChatAvatar, avatarUrl);
+        // Note: no RoleSenderId — YouTube has no Zoom uint id; OnMessageClicked
+        // keys off kRoleChatOrigin, not the presence of RoleSenderId.
         m_list->addItem(item);
         m_list->scrollToBottom();
     }
@@ -2000,6 +2090,14 @@ private:
     void OnMessageClicked(QListWidgetItem* item) {
         if (!item) return;
 
+        // Phase 1 scope guard: YouTube rows are dock-display-only — no popup
+        // surface until Phase 2. They also carry no RoleSenderId, so this check
+        // must precede the placeholder detection below (which keys off that
+        // absence) to avoid a YouTube click being read as a placeholder click.
+        const QVariant originVar = item->data(kRoleChatOrigin);
+        if (originVar.isValid() && originVar.toInt() == kChatOriginYouTube)
+            return;
+
         // Placeholders carry no sender_id data. Use that as the signal to
         // route the click through the same login / connect flows the menu
         // and source properties already drive — gives the dock its own
@@ -2043,7 +2141,7 @@ private:
 
     QString CurrentPlaceholderText() const {
         if (m_tierDisabled) {
-            return "Zoom Chat is a paid feature. Click to upgrade your plan.";
+            return "Feeds Chat is a paid feature. Click to upgrade your plan.";
         }
         return g_isLoggedIn
             ? "Logged in. Click to Connect to Zoom Meeting."
@@ -3862,8 +3960,12 @@ static void SetupChatDock() {
     // Stable id — never change this across versions; OBS uses it as the
     // key for the user's saved dock visibility/position state.
     g_chatDock = new FeedsChatDock();
+    // Title is display-only; the id ("feeds_chat_dock") is the persistence key
+    // for saved layout/visibility and MUST stay stable — so renaming the visible
+    // title from "Zoom Chat" to "Feeds Chat" (now that it also carries YouTube
+    // chat) does not disturb existing saved layouts.
     obs_frontend_add_dock_by_id(
-        "feeds_chat_dock", "Zoom Chat", g_chatDock);
+        "feeds_chat_dock", "Feeds Chat", g_chatDock);
     blog(LOG_INFO, "[feeds] chat dock registered");
 }
 
@@ -4014,6 +4116,8 @@ static void ShowAboutDialog() {
 // new one. This is Feeds' first persisted non-source preference.
 static const char* kFeedsConfigSection      = "Feeds";
 static const char* kCfgConnectOnStartup      = "ConnectOnStartup";
+static const char* kCfgYouTubeChatEnabled    = "YouTubeChatEnabled";
+static const char* kCfgYouTubeHandle         = "YouTubeChannelHandle";
 
 static bool LoadConnectOnStartupSetting() {
     config_t* cfg = obs_frontend_get_user_config();
@@ -4027,6 +4131,484 @@ static void SaveConnectOnStartupSetting(bool enabled) {
     if (!cfg) return;
     config_set_bool(cfg, kFeedsConfigSection, kCfgConnectOnStartup, enabled);
     config_save(cfg);
+}
+
+static bool LoadYouTubeChatEnabledSetting() {
+    config_t* cfg = obs_frontend_get_user_config();
+    if (!cfg) return false;
+    return config_get_bool(cfg, kFeedsConfigSection, kCfgYouTubeChatEnabled);
+}
+
+static void SaveYouTubeChatEnabledSetting(bool enabled) {
+    config_t* cfg = obs_frontend_get_user_config();
+    if (!cfg) return;
+    config_set_bool(cfg, kFeedsConfigSection, kCfgYouTubeChatEnabled, enabled);
+    config_save(cfg);
+}
+
+static std::string LoadYouTubeHandleSetting() {
+    config_t* cfg = obs_frontend_get_user_config();
+    if (!cfg) return "";
+    const char* s = config_get_string(cfg, kFeedsConfigSection, kCfgYouTubeHandle);
+    return s ? s : "";
+}
+
+static void SaveYouTubeHandleSetting(const std::string& handle) {
+    config_t* cfg = obs_frontend_get_user_config();
+    if (!cfg) return;
+    config_set_string(cfg, kFeedsConfigSection, kCfgYouTubeHandle, handle.c_str());
+    config_save(cfg);
+}
+
+// ===========================================================================
+// YouTube live-chat poller (Phase 1: receive -> Feeds chat dock only)
+// ===========================================================================
+// Plugin-side, engine-uninvolved. Runs whenever OBS runs (meeting or not).
+// A single thread for the plugin's lifetime, gated internally on the enable
+// flag + a configured @handle; when idle it blocks on the wake event. Protocol
+// (verified in the investigation round, notes in C:\Dev\Greps\): GET /@handle/
+// live -> scrape InnerTube config (clientVersion is date-stamped, scraped every
+// bootstrap, never hardcoded) + the initial reload continuation -> POST
+// get_live_chat -> take the ALL-messages "Live chat" token from the response's
+// viewSelector -> loop honoring the returned continuation + timeoutMs. Any
+// failure logs one [feeds] line, backs off, and re-bootstraps from /live —
+// chat problems never affect anything else in Feeds (fail-soft, forever).
+// Responses are parsed with obs_data_create_from_json (not the flat engine-IPC
+// extractors, which can't traverse nested arrays).
+
+static std::atomic<bool> g_ytChatEnabled{false};
+static std::mutex        g_ytStateMutex;      // guards g_ytHandle
+static std::string       g_ytHandle;          // normalized (no leading @); "" = unset
+static std::thread       g_ytThread;
+static std::atomic<bool> g_ytShouldExit{false};
+static HANDLE            g_ytWakeEvent = nullptr;  // auto-reset; wakes on enable/handle-change/stream-start/exit
+
+// Wait up to `ms`, returning early if the wake event fires (config change, stream
+// start, or shutdown). Keeps the poller responsive without busy-waiting.
+static void YtInterruptibleWait(DWORD ms) {
+    if (g_ytWakeEvent) WaitForSingleObject(g_ytWakeEvent, ms);
+    else               Sleep(ms == INFINITE ? 1000 : ms);
+}
+static void YtWakePoller() { if (g_ytWakeEvent) SetEvent(g_ytWakeEvent); }
+
+// Normalize whatever the user typed/pasted into a bare handle (no '@'): accepts
+// "@Name", "Name", or a pasted "https://youtube.com/@Name/live" URL.
+static std::string NormalizeYouTubeHandle(std::string s) {
+    auto trim = [](std::string& x) {
+        size_t a = x.find_first_not_of(" \t\r\n");
+        size_t b = x.find_last_not_of(" \t\r\n");
+        x = (a == std::string::npos) ? "" : x.substr(a, b - a + 1);
+    };
+    trim(s);
+    size_t at = s.rfind('@');
+    if (at != std::string::npos) s = s.substr(at + 1);   // drop URL prefix + '@'
+    size_t sl = s.find('/');
+    if (sl != std::string::npos) s = s.substr(0, sl);     // drop "/live" etc.
+    trim(s);
+    return s;
+}
+
+// Is OBS currently streaming to YouTube? Detection only — used as an accelerator,
+// never a gate. The service pointer is borrowed (frontend-owned; do NOT release).
+static bool IsStreamingToYouTube() {
+    if (!obs_frontend_streaming_active()) return false;
+    obs_service_t* svc = obs_frontend_get_streaming_service();
+    if (!svc) return false;
+    const char* name = obs_service_get_name(svc);
+    if (name && strstr(name, "YouTube")) return true;
+    const char* url = obs_service_get_connect_info(
+        svc, OBS_SERVICE_CONNECT_INFO_SERVER_URL);
+    return url && strstr(url, "youtube.com/live2");
+}
+
+// --- WinHTTP one-shot to www.youtube.com (GET or POST) --------------------
+// Follows redirects (default). Sends a preemptive consent cookie so an EU
+// consent interstitial doesn't block the scrape. Returns true if a response was
+// received (any status); fills status + body. Timeouts bound worst-case unload.
+static bool YtHttpRequest(const wchar_t* method, const std::wstring& path,
+                          const std::string* body, DWORD& status,
+                          std::string& respBody) {
+    status = 0;
+    respBody.clear();
+    HINTERNET hSession = WinHttpOpen(
+        L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) FeedsOBS",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return false;
+    WinHttpSetTimeouts(hSession, 8000, 8000, 10000, 15000);
+
+    HINTERNET hConnect = WinHttpConnect(hSession, L"www.youtube.com",
+                                        INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); return false; }
+
+    HINTERNET hRequest = WinHttpOpenRequest(
+        hConnect, method, path.c_str(), nullptr, WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (!hRequest) {
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    WinHttpAddRequestHeaders(hRequest,
+        L"Cookie: SOCS=CAI; CONSENT=YES+cb\r\n"
+        L"Accept-Language: en-US,en;q=0.9\r\n",
+        (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
+    if (body)
+        WinHttpAddRequestHeaders(hRequest, L"Content-Type: application/json\r\n",
+                                 (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
+
+    BOOL sentOk = WinHttpSendRequest(
+        hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+        body ? (LPVOID)body->data() : WINHTTP_NO_REQUEST_DATA,
+        body ? (DWORD)body->size() : 0,
+        body ? (DWORD)body->size() : 0, 0);
+
+    bool ok = false;
+    if (sentOk && WinHttpReceiveResponse(hRequest, nullptr)) {
+        DWORD st = 0, stSize = sizeof(st);
+        WinHttpQueryHeaders(hRequest,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &st, &stSize, WINHTTP_NO_HEADER_INDEX);
+        status = st;
+        char buf[16384];
+        DWORD n = 0;
+        while (WinHttpReadData(hRequest, buf, sizeof(buf), &n) && n > 0)
+            respBody.append(buf, n);
+        ok = true;
+    }
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+    return ok;
+}
+
+// --- HTML scrape helpers (flat literals in the watch page; NOT the JSON API) --
+static std::string YtScrapeString(const std::string& s, const std::string& key) {
+    std::string pat = "\"" + key + "\":\"";
+    size_t p = s.find(pat);
+    if (p == std::string::npos) return "";
+    p += pat.size();
+    size_t e = s.find('"', p);
+    return e == std::string::npos ? "" : s.substr(p, e - p);
+}
+
+// Extract a balanced {...} object following `marker`, string/escape aware so
+// braces inside strings don't unbalance the depth count.
+static std::string YtExtractJsonObject(const std::string& s,
+                                       const std::string& marker) {
+    size_t m = s.find(marker);
+    if (m == std::string::npos) return "";
+    size_t start = s.find('{', m);
+    if (start == std::string::npos) return "";
+    int depth = 0;
+    bool inStr = false, esc = false;
+    for (size_t i = start; i < s.size(); ++i) {
+        char c = s[i];
+        if (inStr) {
+            if (esc)            esc = false;
+            else if (c == '\\') esc = true;
+            else if (c == '"')  inStr = false;
+        } else if (c == '"')    inStr = true;
+        else if (c == '{')      depth++;
+        else if (c == '}') { if (--depth == 0) return s.substr(start, i - start + 1); }
+    }
+    return "";
+}
+
+// --- Minimal leak-free obs_data traversal wrappers ------------------------
+struct YtObj {
+    obs_data_t* d = nullptr;
+    YtObj() = default;
+    explicit YtObj(obs_data_t* p) : d(p) {}
+    ~YtObj() { if (d) obs_data_release(d); }
+    YtObj(const YtObj&) = delete;
+    YtObj& operator=(const YtObj&) = delete;
+    YtObj(YtObj&& o) noexcept : d(o.d) { o.d = nullptr; }
+    YtObj& operator=(YtObj&& o) noexcept {
+        if (this != &o) { if (d) obs_data_release(d); d = o.d; o.d = nullptr; }
+        return *this;
+    }
+    explicit operator bool() const { return d != nullptr; }
+    bool has(const char* k) const { return d && obs_data_has_user_value(d, k); }
+    YtObj obj(const char* k) const {
+        if (!has(k)) return YtObj();
+        return YtObj(obs_data_get_obj(d, k));   // addref'd (or null); released by dtor
+    }
+    std::string str(const char* k) const {
+        if (!d) return "";
+        const char* s = obs_data_get_string(d, k);
+        return s ? s : "";
+    }
+    long long num(const char* k) const { return d ? obs_data_get_int(d, k) : 0; }
+};
+struct YtArr {
+    obs_data_array_t* a = nullptr;
+    YtArr() = default;
+    explicit YtArr(obs_data_array_t* p) : a(p) {}
+    ~YtArr() { if (a) obs_data_array_release(a); }
+    YtArr(const YtArr&) = delete;
+    YtArr& operator=(const YtArr&) = delete;
+    YtArr(YtArr&& o) noexcept : a(o.a) { o.a = nullptr; }
+    size_t count() const { return a ? obs_data_array_count(a) : 0; }
+    YtObj  at(size_t i) const { return a ? YtObj(obs_data_array_item(a, i)) : YtObj(); }
+};
+static YtArr YtArrayOf(const YtObj& o, const char* k) {
+    if (!o.d || !obs_data_has_user_value(o.d, k)) return YtArr();
+    return YtArr(obs_data_get_array(o.d, k));
+}
+
+struct YtMsg {
+    std::string id, author, channelId, avatarUrl, text;
+};
+
+// Pull the display fields out of one liveChatTextMessageRenderer. Returns false
+// if there's nothing worth showing. (Badges are parsed structurally elsewhere;
+// Phase 1 renders name + text + glyph only.)
+static bool YtParseTextMessage(const YtObj& r, YtMsg& out) {
+    out = YtMsg();
+    out.id        = r.str("id");
+    out.channelId = r.str("authorExternalChannelId");
+    { YtObj an = r.obj("authorName"); out.author = an.str("simpleText"); }
+    {   // avatar URL = largest (last) thumbnail — stored for Phase 2 download
+        YtObj ap = r.obj("authorPhoto");
+        YtArr th = YtArrayOf(ap, "thumbnails");
+        if (th.count()) { YtObj t = th.at(th.count() - 1); out.avatarUrl = t.str("url"); }
+    }
+    {   // message runs: concat text; render emoji as its accessibility label
+        YtObj msg = r.obj("message");
+        YtArr runs = YtArrayOf(msg, "runs");
+        std::string text;
+        for (size_t i = 0; i < runs.count(); ++i) {
+            YtObj run = runs.at(i);
+            if (run.has("text")) {
+                text += run.str("text");
+            } else if (run.has("emoji")) {
+                YtObj em  = run.obj("emoji");
+                YtObj img = em.obj("image");
+                YtObj acc = img.obj("accessibility");
+                YtObj ad  = acc.obj("accessibilityData");
+                std::string label = ad.str("label");
+                if (!label.empty()) text += label;
+            }
+        }
+        out.text = text;
+    }
+    return !(out.author.empty() && out.text.empty());
+}
+
+static std::string YtBuildBody(const std::string& clientVer,
+                               const std::string& visitor,
+                               const std::string& cont) {
+    std::string b = "{\"context\":{\"client\":{\"clientName\":\"WEB\","
+                    "\"clientVersion\":\"" + JsonEscape(clientVer) + "\"";
+    if (!visitor.empty())
+        b += ",\"visitorData\":\"" + JsonEscape(visitor) + "\"";
+    b += "}},\"continuation\":\"" + JsonEscape(cont) + "\"}";
+    return b;
+}
+
+static bool YtPostLiveChat(const std::string& apiKey, const std::string& body,
+                           std::string& respBody) {
+    std::wstring path =
+        L"/youtubei/v1/live_chat/get_live_chat?prettyPrint=false&key=" +
+        std::wstring(apiKey.begin(), apiKey.end());   // apiKey is ASCII
+    DWORD status = 0;
+    if (!YtHttpRequest(L"POST", path, &body, status, respBody)) return false;
+    return status == 200 && !respBody.empty();
+}
+
+struct YtChatPage {
+    std::vector<YtMsg> messages;
+    std::string nextContinuation;
+    DWORD       timeoutMs = 0;
+    std::string allMessagesToken;   // from viewSelector; only in the first response
+    bool        ok = false;
+};
+
+static YtChatPage YtParseLiveChat(const std::string& json) {
+    YtChatPage pg;
+    obs_data_t* root = obs_data_create_from_json(json.c_str());
+    if (!root) return pg;
+    YtObj rootO(root);
+
+    YtObj lc = rootO.obj("continuationContents").obj("liveChatContinuation");
+    if (!lc) return pg;   // error response / not a chat payload -> caller retries
+
+    YtArr actions = YtArrayOf(lc, "actions");
+    for (size_t i = 0; i < actions.count(); ++i) {
+        YtObj a = actions.at(i);
+        // Phase 1: only addChatItemAction + liveChatTextMessageRenderer. Every
+        // other action/renderer (system, banner, ticker, paid, membership,
+        // deletions) is skipped defensively — never crash/stall on the unknown.
+        YtObj r = a.obj("addChatItemAction").obj("item").obj("liveChatTextMessageRenderer");
+        if (!r) continue;
+        YtMsg m;
+        if (YtParseTextMessage(r, m)) pg.messages.push_back(std::move(m));
+    }
+
+    YtArr conts = YtArrayOf(lc, "continuations");
+    if (conts.count()) {
+        YtObj c0 = conts.at(0);
+        for (const char* t : {"invalidationContinuationData",
+                              "timedContinuationData",
+                              "reloadContinuationData"}) {
+            YtObj cd = c0.obj(t);
+            if (cd) { pg.nextContinuation = cd.str("continuation");
+                      pg.timeoutMs = (DWORD)cd.num("timeoutMs"); break; }
+        }
+    }
+
+    // ALL-messages ("Live chat") token from the header viewSelector — present in
+    // the first (bootstrap) response; used to switch off the default Top-chat feed.
+    YtArr items = YtArrayOf(
+        lc.obj("header").obj("liveChatHeaderRenderer").obj("viewSelector")
+          .obj("sortFilterSubMenuRenderer"), "subMenuItems");
+    for (size_t i = 0; i < items.count(); ++i) {
+        YtObj it = items.at(i);
+        std::string title = it.str("title");
+        if (title.find("Live chat") != std::string::npos ||
+            title.find("Live Chat") != std::string::npos) {
+            pg.allMessagesToken =
+                it.obj("continuation").obj("reloadContinuationData").str("continuation");
+            break;
+        }
+    }
+    pg.ok = true;
+    return pg;
+}
+
+struct YtBootstrap {
+    std::string apiKey, clientVer, visitor, initialContinuation;
+    bool ok = false;
+};
+
+// GET /@handle/live and scrape config + initial continuation. Not-live (or a
+// transient failure) -> ok=false, caller retries on the slow cadence.
+static YtBootstrap YtFetchBootstrap(const std::string& handle) {
+    YtBootstrap bs;
+    std::string pathU = "/@" + handle + "/live";
+    std::wstring path(pathU.begin(), pathU.end());   // handle chars are ASCII
+    DWORD status = 0;
+    std::string html;
+    if (!YtHttpRequest(L"GET", path, nullptr, status, html)) return bs;
+    if (status != 200 || html.find("ytInitialData") == std::string::npos) return bs;
+
+    bs.apiKey    = YtScrapeString(html, "INNERTUBE_API_KEY");
+    bs.clientVer = YtScrapeString(html, "INNERTUBE_CONTEXT_CLIENT_VERSION");
+    bs.visitor   = YtScrapeString(html, "VISITOR_DATA");
+    if (bs.apiKey.empty() || bs.clientVer.empty()) return bs;
+
+    std::string blob = YtExtractJsonObject(html, "ytInitialData");
+    if (blob.empty()) return bs;
+    obs_data_t* root = obs_data_create_from_json(blob.c_str());
+    if (!root) return bs;
+    YtObj rootO(root);
+    YtObj lcr = rootO.obj("contents").obj("twoColumnWatchNextResults")
+                     .obj("conversationBar").obj("liveChatRenderer");
+    YtArr conts = YtArrayOf(lcr, "continuations");
+    if (conts.count())
+        bs.initialContinuation =
+            conts.at(0).obj("reloadContinuationData").str("continuation");
+    // Empty continuation => channel not currently live (no chat renderer).
+    bs.ok = !bs.initialContinuation.empty();
+    return bs;
+}
+
+// Marshal one message onto the Qt main thread into the dock. Tier gate mirrors
+// the Zoom chat_message handler exactly (dock chat is Basic+); the dock also
+// re-checks m_tierDisabled. YouTube never reaches the overlay/popup (Phase 1).
+static void YtDeliverToDock(const YtMsg& m) {
+    if (g_currentTier < 1) return;
+    QString author = QString::fromStdString(m.author);
+    QString content = QString::fromStdString(m.text);
+    QString id = QString::fromStdString(m.id);
+    QString ch = QString::fromStdString(m.channelId);
+    QString av = QString::fromStdString(m.avatarUrl);
+    QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
+        [author, content, id, ch, av]() {
+            if (g_chatDock)
+                g_chatDock->AppendYouTubeMessage(author, content, id, ch, av);
+        });
+}
+
+static void YtChatPollLoop() {
+    blog(LOG_INFO, "[feeds] youtube chat poller thread started");
+    while (!g_ytShouldExit.load()) {
+        // Idle gate: nothing to do until enabled with a handle. Block on the wake.
+        if (!g_ytChatEnabled.load()) { YtInterruptibleWait(INFINITE); continue; }
+        std::string handle;
+        { std::lock_guard<std::mutex> l(g_ytStateMutex); handle = g_ytHandle; }
+        if (handle.empty()) { YtInterruptibleWait(INFINITE); continue; }
+        // Inherit the chat dock's Basic+ gating exactly: don't even poll YouTube
+        // for a Free user. Bounded re-check (not INFINITE) so a login/upgrade is
+        // picked up without wiring a wake into the tier path.
+        if (g_currentTier < 1) { YtInterruptibleWait(30000); continue; }
+
+        // Bootstrap: resolve /live until it serves a live watch page (~60s cadence).
+        YtBootstrap bs = YtFetchBootstrap(handle);
+        if (g_ytShouldExit.load()) break;
+        if (!bs.ok) { YtInterruptibleWait(60000); continue; }
+        blog(LOG_INFO, "[feeds] youtube chat: connected to @%s live", handle.c_str());
+
+        // Initial get_live_chat (Top-chat default) -> ALL-messages token from resp.
+        std::string resp;
+        if (!YtPostLiveChat(bs.apiKey,
+                YtBuildBody(bs.clientVer, bs.visitor, bs.initialContinuation), resp)) {
+            blog(LOG_INFO, "[feeds] youtube chat: initial poll failed; re-bootstrapping");
+            YtInterruptibleWait(15000); continue;
+        }
+        YtChatPage first = YtParseLiveChat(resp);
+        std::string token = !first.allMessagesToken.empty()
+                              ? first.allMessagesToken : first.nextContinuation;
+        if (token.empty()) { YtInterruptibleWait(15000); continue; }
+
+        // Steady-state loop on the ALL-messages feed. The first page after the
+        // switch is a backlog (70+); skip it (prime the continuation) so the dock
+        // fills with messages from connect-time onward rather than a history dump.
+        bool primed = false;
+        while (!g_ytShouldExit.load() && g_ytChatEnabled.load() && g_currentTier >= 1) {
+            { std::lock_guard<std::mutex> l(g_ytStateMutex);
+              if (g_ytHandle != handle) break; }   // handle changed -> re-bootstrap
+
+            std::string r;
+            if (!YtPostLiveChat(bs.apiKey, YtBuildBody(bs.clientVer, bs.visitor, token), r)) {
+                blog(LOG_INFO, "[feeds] youtube chat: poll failed; re-bootstrapping");
+                break;
+            }
+            YtChatPage pg = YtParseLiveChat(r);
+            if (!pg.ok || pg.nextContinuation.empty()) {
+                blog(LOG_INFO, "[feeds] youtube chat: dead continuation; re-bootstrapping");
+                break;
+            }
+            if (primed) { for (const auto& m : pg.messages) YtDeliverToDock(m); }
+            primed = true;
+            token = pg.nextContinuation;
+            DWORD wait = pg.timeoutMs ? pg.timeoutMs : 5000;
+            if (wait < 1000)  wait = 1000;
+            if (wait > 15000) wait = 15000;
+            YtInterruptibleWait(wait);
+        }
+        // Fell out: stream end / error / config change. Brief backoff, then the
+        // outer loop re-bootstraps from /live (self-healing, forever).
+        if (!g_ytShouldExit.load()) YtInterruptibleWait(5000);
+    }
+    blog(LOG_INFO, "[feeds] youtube chat poller thread exiting");
+}
+
+static void YtStartPollerThread() {
+    if (g_ytThread.joinable()) return;
+    g_ytShouldExit = false;
+    if (!g_ytWakeEvent)
+        g_ytWakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);  // auto-reset
+    g_ytThread = std::thread(YtChatPollLoop);
+}
+
+static void YtStopPollerThread() {
+    g_ytShouldExit = true;
+    if (g_ytWakeEvent) SetEvent(g_ytWakeEvent);
+    if (g_ytThread.joinable()) g_ytThread.join();
+    if (g_ytWakeEvent) { CloseHandle(g_ytWakeEvent); g_ytWakeEvent = nullptr; }
 }
 
 void SetupPluginMenu() {
@@ -4045,6 +4627,20 @@ void SetupPluginMenu() {
     g_connectOnStartupAction->setCheckable(true);
     g_connectOnStartupEnabled = LoadConnectOnStartupSetting();
     g_connectOnStartupAction->setChecked(g_connectOnStartupEnabled);
+
+    // YouTube live chat (Phase 1: receive into the Feeds chat dock only). The
+    // only user config: an enable toggle + the channel @handle. Load persisted
+    // values into the poller globals here (FINISHED_LOADING — user config is
+    // ready) and wake the poller so it acts on them immediately.
+    feedsMenu->addSeparator();
+    QAction* ytChatAction = feedsMenu->addAction("YouTube Chat in Feeds Dock");
+    ytChatAction->setCheckable(true);
+    g_ytChatEnabled = LoadYouTubeChatEnabledSetting();
+    ytChatAction->setChecked(g_ytChatEnabled.load());
+    { std::lock_guard<std::mutex> l(g_ytStateMutex); g_ytHandle = LoadYouTubeHandleSetting(); }
+    QAction* ytHandleAction = feedsMenu->addAction("Set YouTube Channel Handle…");
+    YtWakePoller();
+
     feedsMenu->addSeparator();
     QAction* aboutAction = feedsMenu->addAction("About / Tier Status");
 
@@ -4082,6 +4678,27 @@ void SetupPluginMenu() {
     QObject::connect(g_connectOnStartupAction, &QAction::toggled, [](bool checked) {
         g_connectOnStartupEnabled = checked;
         SaveConnectOnStartupSetting(checked);
+    });
+    QObject::connect(ytChatAction, &QAction::toggled, [](bool checked) {
+        g_ytChatEnabled = checked;
+        SaveYouTubeChatEnabledSetting(checked);
+        YtWakePoller();   // start/stop the chat loop promptly
+    });
+    QObject::connect(ytHandleAction, &QAction::triggered, []() {
+        std::string cur;
+        { std::lock_guard<std::mutex> l(g_ytStateMutex); cur = g_ytHandle; }
+        bool ok = false;
+        QString text = QInputDialog::getText(
+            (QWidget*)obs_frontend_get_main_window(),
+            "Feeds \xE2\x80\x94 YouTube Channel",
+            "YouTube channel handle (e.g. @YourChannel):",
+            QLineEdit::Normal,
+            QString::fromStdString(cur.empty() ? std::string() : "@" + cur), &ok);
+        if (!ok) return;
+        std::string norm = NormalizeYouTubeHandle(text.toStdString());
+        { std::lock_guard<std::mutex> l(g_ytStateMutex); g_ytHandle = norm; }
+        SaveYouTubeHandleSetting(norm);
+        YtWakePoller();
     });
     QObject::connect(aboutAction, &QAction::triggered, []() {
         ShowAboutDialog();
@@ -6740,6 +7357,11 @@ bool obs_module_load(void) {
     SetupChatDock();
     SetupParticipantDock();
 
+    // YouTube chat poller. Starts here (idle/gated) and picks up the persisted
+    // enable+handle once SetupPluginMenu loads them at FINISHED_LOADING; runs for
+    // the plugin's lifetime, engine-independent.
+    YtStartPollerThread();
+
     obs_frontend_add_event_callback([](enum obs_frontend_event event, void*) {
         switch (event) {
         // Gate the 9th-source hard block off during scene-collection loads so a
@@ -6756,6 +7378,11 @@ bool obs_module_load(void) {
             QTimer::singleShot(5000,
                 (QObject*)obs_frontend_get_main_window(),
                 []() { CheckForUpdateAsync(); });
+            break;
+        // Accelerator (not a gate): when OBS starts streaming to YouTube, re-check
+        // /live immediately instead of waiting out the slow bootstrap cadence.
+        case OBS_FRONTEND_EVENT_STREAMING_STARTED:
+            if (g_ytChatEnabled.load() && IsStreamingToYouTube()) YtWakePoller();
             break;
         default:
             break;
@@ -6776,6 +7403,10 @@ void obs_module_unload(void) {
         signal_handler_disconnect(sh, "source_rename", OnSourceRenamed, nullptr);
     }
     if (g_updateCheckThread.joinable()) g_updateCheckThread.join();
+
+    // Stop the YouTube chat poller (signals exit, wakes it, joins). Worst case it
+    // waits out one in-flight HTTP request (bounded by the WinHTTP timeouts).
+    YtStopPollerThread();
 
     // Remove the ISO recorder's frontend callback and drain any leftovers
     // before the engine + Qt teardown below.
