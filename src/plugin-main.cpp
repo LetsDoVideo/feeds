@@ -1804,6 +1804,36 @@ static void DrawChatOriginGlyph(QPainter* p, const QRectF& box, int origin) {
 static constexpr int kChatGlyphSize   = 14;
 static constexpr int kChatGlyphIndent = kChatGlyphSize + 6;
 
+// Render a chat-origin glyph to a transparent pixmap for use as a QLabel icon in
+// the dock header (reuses the same code-drawn glyph the message rows use).
+static QPixmap MakeChatOriginPixmap(int origin, int size) {
+    QPixmap pm(size, size);
+    pm.fill(Qt::transparent);
+    QPainter p(&pm);
+    p.setRenderHint(QPainter::Antialiasing, true);
+    DrawChatOriginGlyph(&p, QRectF(0, 0, size, size), origin);
+    p.end();
+    return pm;
+}
+
+// YouTube connection status shown in the chat dock header, reported by the poller.
+// Off = no target; Waiting = target set but not connected (not-live / backoff /
+// transient failure — the self-healing loop makes failures indistinguishable, so
+// there's no separate "Error"); Live = connected.
+enum { kYtStatusOff = 0, kYtStatusWaiting = 1, kYtStatusLive = 2 };
+
+// YouTube target: a channel handle (resolve via /@handle/live) or a pinned video
+// id (bootstrap /watch?v=<id> directly). Declared here — the chat dock's header
+// (below) parses field input via NormalizeYouTubeTarget and commits it via
+// YtSetTargetFromInput; both are defined with the poller further down, keeping
+// the dock free of the poller's globals/config.
+struct YtTarget {
+    bool        isVideo = false;
+    std::string value;            // bare handle (no '@') or 11-char video id
+};
+static YtTarget    NormalizeYouTubeTarget(std::string s);
+static std::string YtSetTargetFromInput(const std::string& input);
+
 // ---------------------------------------------------------------------------
 // Item delegate for the chat dock's QListWidget. setWordWrap(true) alone
 // handles soft-wrapping at whitespace but breaks down on long unbreakable
@@ -1966,10 +1996,17 @@ public:
 
         QVBoxLayout* layout = new QVBoxLayout(this);
         layout->setContentsMargins(0, 0, 0, 0);
-        layout->addWidget(m_list);
+        layout->setSpacing(0);
+        m_chatHeader = BuildChatHeader();   // platform config/status, pinned on top
+        layout->addWidget(m_chatHeader);
+        layout->addWidget(m_list, 1);
         layout->addLayout(inputRow);
 
         setMinimumSize(200, 300);
+
+        UpdateYouTubeStatus(kYtStatusOff, QString());
+        UpdateYouTubePlaceholder();
+        UpdateChatHeaderState();
     }
 
     // All methods below must run on the Qt main thread. The IPC
@@ -2081,11 +2118,13 @@ public:
         SetPlaceholder("Connected");
         m_input->setEnabled(true);
         m_sendBtn->setEnabled(true);
+        UpdateChatHeaderState();   // Zoom row -> "In meeting (#N)"
     }
     void OnMeetingLeft() {
         SetPlaceholder(CurrentPlaceholderText());
         m_input->setEnabled(false);
         m_sendBtn->setEnabled(false);
+        UpdateChatHeaderState();   // Zoom row -> "Not connected"
         // Hide any active popup and drop the overlay history so stale
         // messages don't carry into the next meeting.
         feeds::ClearChatPopup();
@@ -2097,6 +2136,7 @@ public:
     // the user transitions between states without needing to leave a
     // meeting first. No-op once chat history is showing.
     void RefreshPlaceholder() {
+        UpdateChatHeaderState();   // login/meeting state changed -> refresh Zoom row
         if (m_messagesStarted) return;
         SetPlaceholder(CurrentPlaceholderText());
     }
@@ -2120,11 +2160,165 @@ public:
             m_sendBtn->setEnabled(false);
         }
         SetPlaceholder(CurrentPlaceholderText());
+        UpdateChatHeaderState();   // show/hide header per tier lock
     }
 
     bool IsTierDisabled() const { return m_tierDisabled; }
 
+    // --- YouTube header, driven by the poller (all called on the UI thread) ----
+
+    // Status dot + word for the YouTube row. Marshaled from YtReportStatus.
+    void UpdateYouTubeStatus(int status, const QString& videoId) {
+        const char* color; const char* word; QString tip;
+        switch (status) {
+        case kYtStatusLive:
+            color = "#40c060"; word = "Live";
+            tip = videoId.isEmpty() ? QString("Connected")
+                                    : QString("Connected \xE2\x80\x94 video %1").arg(videoId);
+            break;
+        case kYtStatusWaiting:
+            color = "#e0a020"; word = "Waiting";
+            tip = "Target set \xE2\x80\x94 waiting for a live stream";
+            break;
+        default:
+            color = "#7a7d80"; word = "Off";
+            tip = "No YouTube target set";
+            break;
+        }
+        if (m_ytDot) {
+            m_ytDot->setStyleSheet(
+                QString("background:%1; border-radius:5px;").arg(color));
+            m_ytDot->setToolTip(tip);
+        }
+        if (m_ytWord) {
+            m_ytWord->setText(word);
+            m_ytWord->setStyleSheet(QString("color:%1;").arg(color));
+            m_ytWord->setToolTip(tip);
+        }
+    }
+
+    // Correct the field to the canonical owner handle casing on connect (display
+    // only — NOT the poller's working handle, whose change would spuriously
+    // re-bootstrap). Skips if the user is editing or has since changed the target.
+    void UpdateYouTubeHandleText(const QString& canonicalHandle) {
+        if (!m_ytField || m_ytField->hasFocus()) return;
+        YtTarget t = NormalizeYouTubeTarget(m_ytField->text().toStdString());
+        if (t.isVideo) return;
+        if (QString::fromStdString(t.value).compare(canonicalHandle,
+                                                    Qt::CaseInsensitive) != 0)
+            return;
+        QString disp = "@" + canonicalHandle;
+        if (m_ytField->text() == disp) return;
+        QSignalBlocker block(m_ytField);
+        m_ytField->setText(disp);
+        m_ytLastTarget = disp;
+    }
+
+    // Populate the field from persisted config at startup (FINISHED_LOADING).
+    void SetYouTubeTargetDisplay(const std::string& handle,
+                                 const std::string& videoId) {
+        if (!m_ytField) return;
+        QString disp = !videoId.empty()
+            ? QString::fromStdString(videoId)
+            : (handle.empty() ? QString() : QString::fromStdString("@" + handle));
+        QSignalBlocker block(m_ytField);
+        m_ytField->setText(disp);
+        if (!disp.isEmpty()) m_ytLastTarget = disp;
+        UpdateYouTubePlaceholder();
+    }
+
 private:
+    // Build the fixed platform header: a read-only Zoom status row and an
+    // editable YouTube row (glyph + field + status dot + word). Compact — a
+    // couple of chat lines tall. Row glyphs reuse DrawChatOriginGlyph (icon
+    // labels; no text labels needed). Twitch/TikTok rows are intentionally not
+    // built until those platforms ship.
+    QWidget* BuildChatHeader() {
+        QWidget* header = new QWidget(this);
+        QVBoxLayout* hv = new QVBoxLayout(header);
+        hv->setContentsMargins(8, 6, 8, 6);
+        hv->setSpacing(4);
+
+        // Zoom row — read-only status (connect flows stay in the list placeholder).
+        QHBoxLayout* zoomRow = new QHBoxLayout();
+        zoomRow->setSpacing(6);
+        QLabel* zoomGlyph = new QLabel(header);
+        zoomGlyph->setPixmap(MakeChatOriginPixmap(kChatOriginZoom, kChatGlyphSize));
+        zoomGlyph->setFixedSize(kChatGlyphSize, kChatGlyphSize);
+        zoomGlyph->setToolTip("Zoom chat");
+        m_zoomStatus = new QLabel(header);
+        zoomRow->addWidget(zoomGlyph);
+        zoomRow->addWidget(m_zoomStatus, 1);
+        hv->addLayout(zoomRow);
+
+        // YouTube row — editable target + live status.
+        QHBoxLayout* ytRow = new QHBoxLayout();
+        ytRow->setSpacing(6);
+        QLabel* ytGlyph = new QLabel(header);
+        ytGlyph->setPixmap(MakeChatOriginPixmap(kChatOriginYouTube, kChatGlyphSize));
+        ytGlyph->setFixedSize(kChatGlyphSize, kChatGlyphSize);
+        ytGlyph->setToolTip("YouTube chat");
+        m_ytField = new QLineEdit(header);
+        m_ytField->setPlaceholderText("YouTube channel or stream URL");
+        m_ytField->setToolTip(
+            "Enter a YouTube channel handle (@name) to follow its live chat, or "
+            "paste a specific stream's URL / video ID to pin that exact stream. "
+            "Clear the field to turn YouTube chat off.");
+        m_ytDot = new QLabel(header);
+        m_ytDot->setFixedSize(10, 10);
+        m_ytWord = new QLabel(header);
+        ytRow->addWidget(ytGlyph);
+        ytRow->addWidget(m_ytField, 1);
+        ytRow->addWidget(m_ytDot);
+        ytRow->addWidget(m_ytWord);
+        hv->addLayout(ytRow);
+
+        QObject::connect(m_ytField, &QLineEdit::editingFinished, this,
+                         [this]() { CommitYouTubeField(); });
+        return header;
+    }
+
+    // Refresh the Zoom status text + apply tier presentation. A tier-locked dock
+    // hides the whole header (no live editable field for a locked dock).
+    void UpdateChatHeaderState() {
+        if (!m_chatHeader) return;
+        if (m_tierDisabled) { m_chatHeader->setVisible(false); return; }
+        m_chatHeader->setVisible(true);
+        if (m_zoomStatus) {
+            m_zoomStatus->setText(
+                g_isInMeeting
+                    ? (g_currentMeetingNumber
+                           ? QString("In meeting (#%1)").arg(g_currentMeetingNumber)
+                           : QString("In meeting"))
+                    : QString("Not connected"));
+        }
+    }
+
+    // Commit the YouTube field on Enter / focus-out: hand the raw text to the
+    // poller side (normalize + persist + wake, deduped there) and rewrite the
+    // field to the returned display form (@handle or bare id).
+    void CommitYouTubeField() {
+        if (!m_ytField) return;
+        QString disp = QString::fromStdString(
+            YtSetTargetFromInput(m_ytField->text().toStdString()));
+        if (m_ytField->text() != disp) {
+            QSignalBlocker block(m_ytField);   // don't re-fire editingFinished
+            m_ytField->setText(disp);
+        }
+        if (!disp.isEmpty()) m_ytLastTarget = disp;
+        UpdateYouTubePlaceholder();
+    }
+
+    // Empty-field placeholder: normally a hint, or "off — was @X" if a target was
+    // cleared this session (last value remembered in memory only, not config).
+    void UpdateYouTubePlaceholder() {
+        if (!m_ytField || !m_ytField->text().isEmpty()) return;
+        m_ytField->setPlaceholderText(
+            m_ytLastTarget.isEmpty()
+                ? QString("YouTube channel or stream URL")
+                : QString("off \xE2\x80\x94 was %1").arg(m_ytLastTarget));
+    }
+
     void SetPlaceholder(const QString& text) {
         // Once real messages have arrived, the placeholder is permanently
         // off for the rest of the OBS session — joining/leaving meetings
@@ -2233,6 +2427,14 @@ private:
     QLineEdit*   m_input            = nullptr;
     QPushButton* m_sendBtn          = nullptr;
     bool         m_messagesStarted  = false;
+
+    // Platform header widgets (see BuildChatHeader).
+    QWidget*     m_chatHeader       = nullptr;
+    QLabel*      m_zoomStatus       = nullptr;
+    QLineEdit*   m_ytField          = nullptr;
+    QLabel*      m_ytDot            = nullptr;
+    QLabel*      m_ytWord           = nullptr;
+    QString      m_ytLastTarget;   // last non-empty target this session (placeholder only)
     // True iff the current logged-in tier is Free (< 1). Dock starts
     // false (pre-login state is identical to a normal Basic+ session)
     // and toggles via SetTierDisabled from ReconcileSourcesToTier.
@@ -4177,7 +4379,6 @@ static void ShowAboutDialog() {
 // new one. This is Feeds' first persisted non-source preference.
 static const char* kFeedsConfigSection      = "Feeds";
 static const char* kCfgConnectOnStartup      = "ConnectOnStartup";
-static const char* kCfgYouTubeChatEnabled    = "YouTubeChatEnabled";
 static const char* kCfgYouTubeHandle         = "YouTubeChannelHandle";
 static const char* kCfgYouTubeVideoId        = "YouTubeVideoId";  // pinned stream (exclusive with handle)
 
@@ -4192,19 +4393,6 @@ static void SaveConnectOnStartupSetting(bool enabled) {
     config_t* cfg = obs_frontend_get_user_config();
     if (!cfg) return;
     config_set_bool(cfg, kFeedsConfigSection, kCfgConnectOnStartup, enabled);
-    config_save(cfg);
-}
-
-static bool LoadYouTubeChatEnabledSetting() {
-    config_t* cfg = obs_frontend_get_user_config();
-    if (!cfg) return false;
-    return config_get_bool(cfg, kFeedsConfigSection, kCfgYouTubeChatEnabled);
-}
-
-static void SaveYouTubeChatEnabledSetting(bool enabled) {
-    config_t* cfg = obs_frontend_get_user_config();
-    if (!cfg) return;
-    config_set_bool(cfg, kFeedsConfigSection, kCfgYouTubeChatEnabled, enabled);
     config_save(cfg);
 }
 
@@ -4252,21 +4440,30 @@ static void SaveYouTubeVideoIdSetting(const std::string& videoId) {
 // Responses are parsed with obs_data_create_from_json (not the flat engine-IPC
 // extractors, which can't traverse nested arrays).
 
-static std::atomic<bool> g_ytChatEnabled{false};
+// The poller is "enabled" purely by having a target configured — the dock's
+// YouTube field drives the handle/video-id settings directly (no separate enable
+// flag). Empty target = off.
 static std::mutex        g_ytStateMutex;      // guards g_ytHandle + g_ytVideoId
 static std::string       g_ytHandle;          // normalized (no leading @); "" = unset
 static std::string       g_ytVideoId;         // pinned 11-char video id; non-empty => skip /live resolution
 static std::thread       g_ytThread;
 static std::atomic<bool> g_ytShouldExit{false};
-static HANDLE            g_ytWakeEvent = nullptr;  // auto-reset; wakes on enable/handle-change/stream-start/exit
+static HANDLE            g_ytWakeEvent = nullptr;  // auto-reset; wakes on target-change/stream-start/exit
 
-// Wait up to `ms`, returning early if the wake event fires (config change, stream
+// Wait up to `ms`, returning early if the wake event fires (target change, stream
 // start, or shutdown). Keeps the poller responsive without busy-waiting.
 static void YtInterruptibleWait(DWORD ms) {
     if (g_ytWakeEvent) WaitForSingleObject(g_ytWakeEvent, ms);
     else               Sleep(ms == INFINITE ? 1000 : ms);
 }
 static void YtWakePoller() { if (g_ytWakeEvent) SetEvent(g_ytWakeEvent); }
+
+// (kYtStatus* enum is defined up near the chat dock, which consumes it.)
+
+static bool YtHasTarget() {
+    std::lock_guard<std::mutex> l(g_ytStateMutex);
+    return !g_ytHandle.empty() || !g_ytVideoId.empty();
+}
 
 // A YouTube video id is exactly 11 chars from [A-Za-z0-9_-].
 static bool IsYouTubeVideoId(const std::string& s) {
@@ -4279,14 +4476,9 @@ static bool IsYouTubeVideoId(const std::string& s) {
     return true;
 }
 
-// The configured target: either a channel handle (resolve via /@handle/live) or
-// a pinned video id (bootstrap /watch?v=<id> directly — the fix for channels
-// running several concurrent livestreams). Exactly one of the two applies.
-struct YtTarget {
-    bool        isVideo = false;
-    std::string value;            // bare handle (no '@') or 11-char video id
-};
-
+// YtTarget (handle vs pinned video id) is declared above the chat dock, which
+// consumes it; the definitions here are the implementation.
+//
 // Detect + normalize whatever the user typed/pasted:
 //   "@Name" / "Name" / ".../@Name/live"      -> handle mode
 //   ".../watch?v=<id>" / "youtu.be/<id>"     -> video mode
@@ -4329,6 +4521,34 @@ static YtTarget NormalizeYouTubeTarget(std::string s) {
     t.isVideo = false;
     t.value = s;
     return t;
+}
+
+// Apply a dock-field input as the poller target: normalize, store exclusively
+// (handle XOR video id), persist, and wake the poller if it actually changed.
+// Returns the normalized display form (@handle / bare id / "") for the field.
+// The chat dock routes its field commits through here so it never touches the
+// poller's globals/config directly.
+static std::string YtSetTargetFromInput(const std::string& input) {
+    YtTarget t = NormalizeYouTubeTarget(input);
+    const std::string newH = t.isVideo ? std::string() : t.value;
+    const std::string newV = t.isVideo ? t.value : std::string();
+    const std::string disp = t.value.empty()
+        ? std::string()
+        : (t.isVideo ? t.value : "@" + t.value);
+
+    bool changed;
+    {
+        std::lock_guard<std::mutex> l(g_ytStateMutex);
+        changed = (newH != g_ytHandle || newV != g_ytVideoId);
+        g_ytHandle = newH;
+        g_ytVideoId = newV;
+    }
+    if (changed) {
+        SaveYouTubeHandleSetting(newH);
+        SaveYouTubeVideoIdSetting(newV);
+        YtWakePoller();
+    }
+    return disp;
 }
 
 // Is OBS currently streaming to YouTube? Detection only — used as an accelerator,
@@ -4519,6 +4739,22 @@ static std::string YtScrapeString(const std::string& s, const std::string& key,
     p += pat.size();
     size_t e = s.find('"', p);
     return e == std::string::npos ? "" : s.substr(p, e - p);
+}
+
+// Scrape the owner channel's handle (bare, no '@') from a watch page for the
+// dock's canonical-casing correction. The page has many "canonicalBaseUrl"
+// literals (owner + related channels, and the owner's own /channel/UC.. form),
+// so we anchor on the "videoSecondaryInfoRenderer" marker (the owner block) and
+// take the first "/@<handle>" after it — verified to resolve to the owner. ""
+// if the owner has no @-handle (only a /channel/ URL) or the marker is absent.
+static std::string YtScrapeCanonicalHandle(const std::string& html) {
+    size_t anchor = html.find("videoSecondaryInfoRenderer");
+    const std::string pat = "\"canonicalBaseUrl\":\"/@";
+    size_t p = html.find(pat, anchor == std::string::npos ? 0 : anchor);
+    if (p == std::string::npos) return "";
+    p += pat.size();
+    size_t e = html.find('"', p);
+    return e == std::string::npos ? "" : html.substr(p, e - p);
 }
 
 // Extract a balanced {...} object following `marker`, string/escape aware so
@@ -4734,6 +4970,7 @@ static YtChatPage YtParseLiveChat(const std::string& json) {
 struct YtBootstrap {
     std::string apiKey, clientVer, visitor, initialContinuation;
     std::string videoId;          // resolved stream video id (for the connected log)
+    std::string canonicalHandle;  // owner handle (bare), handle mode only, for casing correction
     bool ok = false;
 };
 
@@ -4765,6 +5002,9 @@ static YtBootstrap YtFetchBootstrap(const std::string& pathU,
         size_t vd = html.find("\"videoDetails\"");
         bs.videoId = YtScrapeString(html, "videoId",
                                     vd == std::string::npos ? 0 : vd);
+        // Canonical owner handle for the dock's casing correction (handle mode
+        // only — a pinned video needs no handle).
+        bs.canonicalHandle = YtScrapeCanonicalHandle(html);
     }
 
     std::string blob = YtExtractJsonObject(html, "ytInitialData");
@@ -4825,18 +5065,46 @@ static void YtDeliverDeletionByChannel(const std::string& channelId) {
         [qc]() { if (g_chatDock) g_chatDock->RemoveYouTubeMessagesByChannel(qc); });
 }
 
+// Marshal the YouTube connection status to the dock header. Deduped against the
+// last report (poller-thread-only state) so a repeated-failure loop doesn't spam
+// the UI queue. videoId is the resolved id for the Live tooltip.
+static int         g_ytStatusLast = -1;
+static std::string g_ytStatusLastVid;
+static void YtReportStatus(int status, const std::string& videoId) {
+    if (status == g_ytStatusLast && videoId == g_ytStatusLastVid) return;
+    g_ytStatusLast = status;
+    g_ytStatusLastVid = videoId;
+    QString vid = QString::fromStdString(videoId);
+    QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
+        [status, vid]() { if (g_chatDock) g_chatDock->UpdateYouTubeStatus(status, vid); });
+}
+
+// Marshal the canonical owner handle to the dock so the field's casing is
+// corrected on connect (display only — see FeedsChatDock::UpdateYouTubeHandleText).
+static void YtReportCanonicalHandle(const std::string& handle) {
+    if (handle.empty()) return;
+    QString h = QString::fromStdString(handle);
+    QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
+        [h]() { if (g_chatDock) g_chatDock->UpdateYouTubeHandleText(h); });
+}
+
 static void YtChatPollLoop() {
     blog(LOG_INFO, "[feeds] youtube chat poller thread started");
     while (!g_ytShouldExit.load()) {
-        // Idle gate: nothing to do until enabled with a target. Block on the wake.
-        if (!g_ytChatEnabled.load()) { YtInterruptibleWait(INFINITE); continue; }
+        // Idle gate: enabled == has a target. Empty -> Off, block on the wake.
         std::string handle, videoId;
         { std::lock_guard<std::mutex> l(g_ytStateMutex);
           handle = g_ytHandle; videoId = g_ytVideoId; }
-        if (handle.empty() && videoId.empty()) { YtInterruptibleWait(INFINITE); continue; }
+        if (handle.empty() && videoId.empty()) {
+            YtReportStatus(kYtStatusOff, "");
+            YtInterruptibleWait(INFINITE); continue;
+        }
+        // Target set but not yet connected -> Waiting (covers the tier-locked and
+        // not-live cases below).
+        YtReportStatus(kYtStatusWaiting, "");
         // Inherit the chat dock's Basic+ gating exactly: don't even poll YouTube
-        // for a Free user. Bounded re-check (not INFINITE) so a login/upgrade is
-        // picked up without wiring a wake into the tier path.
+        // for a Free user (the header is hidden while tier-locked anyway). Bounded
+        // re-check so a login/upgrade is picked up without wiring a wake.
         if (g_currentTier < 1) { YtInterruptibleWait(30000); continue; }
 
         // Bootstrap the watch page. Video mode pins /watch?v=<id> (skips /live
@@ -4874,6 +5142,12 @@ static void YtChatPollLoop() {
             YtInterruptibleWait(15000); continue;
         }
 
+        // Connected. Report Live (with resolved video id) and, in handle mode,
+        // the canonical owner handle so the dock corrects the field's casing.
+        YtReportStatus(kYtStatusLive, bs.videoId);
+        if (videoId.empty() && !bs.canonicalHandle.empty())
+            YtReportCanonicalHandle(bs.canonicalHandle);
+
         // Steady-state loop on the ALL-messages feed. The first page after the
         // switch is a backlog (70+); skip it (prime the continuation) so the dock
         // fills with messages from connect-time onward rather than a history dump.
@@ -4884,10 +5158,6 @@ static void YtChatPollLoop() {
         for (;;) {
             if (g_ytShouldExit.load()) {
                 blog(LOG_INFO, "[feeds] youtube chat: shutdown; stopping loop");
-                break;
-            }
-            if (!g_ytChatEnabled.load()) {
-                blog(LOG_INFO, "[feeds] youtube chat: disabled; stopping loop");
                 break;
             }
             if (g_currentTier < 1) {
@@ -5005,19 +5275,16 @@ void SetupPluginMenu() {
     g_connectOnStartupEnabled = LoadConnectOnStartupSetting();
     g_connectOnStartupAction->setChecked(g_connectOnStartupEnabled);
 
-    // YouTube live chat (Phase 1: receive into the Feeds chat dock only). The
-    // only user config: an enable toggle + the channel @handle. Load persisted
-    // values into the poller globals here (FINISHED_LOADING — user config is
-    // ready) and wake the poller so it acts on them immediately.
-    feedsMenu->addSeparator();
-    QAction* ytChatAction = feedsMenu->addAction("YouTube Chat in Feeds Dock");
-    ytChatAction->setCheckable(true);
-    g_ytChatEnabled = LoadYouTubeChatEnabledSetting();
-    ytChatAction->setChecked(g_ytChatEnabled.load());
+    // YouTube live chat is configured from the Feeds Chat dock header now (no
+    // menu items). Load the persisted target into the poller globals here
+    // (FINISHED_LOADING — user config is ready), populate the dock field, and
+    // wake the poller so it connects immediately if a target was saved.
+    std::string ytHandle, ytVideoId;
     { std::lock_guard<std::mutex> l(g_ytStateMutex);
       g_ytHandle  = LoadYouTubeHandleSetting();
-      g_ytVideoId = LoadYouTubeVideoIdSetting(); }
-    QAction* ytHandleAction = feedsMenu->addAction("Set YouTube Channel Handle…");
+      g_ytVideoId = LoadYouTubeVideoIdSetting();
+      ytHandle = g_ytHandle; ytVideoId = g_ytVideoId; }
+    if (g_chatDock) g_chatDock->SetYouTubeTargetDisplay(ytHandle, ytVideoId);
     YtWakePoller();
 
     feedsMenu->addSeparator();
@@ -5057,39 +5324,6 @@ void SetupPluginMenu() {
     QObject::connect(g_connectOnStartupAction, &QAction::toggled, [](bool checked) {
         g_connectOnStartupEnabled = checked;
         SaveConnectOnStartupSetting(checked);
-    });
-    QObject::connect(ytChatAction, &QAction::toggled, [](bool checked) {
-        g_ytChatEnabled = checked;
-        SaveYouTubeChatEnabledSetting(checked);
-        YtWakePoller();   // start/stop the chat loop promptly
-    });
-    QObject::connect(ytHandleAction, &QAction::triggered, []() {
-        std::string curHandle, curVideo;
-        { std::lock_guard<std::mutex> l(g_ytStateMutex);
-          curHandle = g_ytHandle; curVideo = g_ytVideoId; }
-        // Prefill with whichever target is currently set.
-        QString prefill = !curVideo.empty()
-            ? QString::fromStdString(curVideo)
-            : (curHandle.empty() ? QString()
-                                 : QString::fromStdString("@" + curHandle));
-        bool ok = false;
-        QString text = QInputDialog::getText(
-            (QWidget*)obs_frontend_get_main_window(),
-            "Feeds \xE2\x80\x94 YouTube Channel",
-            "Channel handle (e.g. @YourChannel), or a stream URL / video id\n"
-            "(e.g. youtube.com/watch?v=XXXXXXXXXXX) to pin one specific stream:",
-            QLineEdit::Normal, prefill, &ok);
-        if (!ok) return;
-        // Detect handle vs pinned-video and store exclusively (the other clears).
-        YtTarget t = NormalizeYouTubeTarget(text.toStdString());
-        {
-            std::lock_guard<std::mutex> l(g_ytStateMutex);
-            if (t.isVideo) { g_ytVideoId = t.value; g_ytHandle.clear(); }
-            else           { g_ytHandle  = t.value; g_ytVideoId.clear(); }
-        }
-        SaveYouTubeHandleSetting(t.isVideo ? std::string() : t.value);
-        SaveYouTubeVideoIdSetting(t.isVideo ? t.value : std::string());
-        YtWakePoller();
     });
     QObject::connect(aboutAction, &QAction::triggered, []() {
         ShowAboutDialog();
@@ -7781,7 +8015,7 @@ bool obs_module_load(void) {
         // Accelerator (not a gate): when OBS starts streaming to YouTube, re-check
         // /live immediately instead of waiting out the slow bootstrap cadence.
         case OBS_FRONTEND_EVENT_STREAMING_STARTED:
-            if (g_ytChatEnabled.load() && IsStreamingToYouTube()) YtWakePoller();
+            if (YtHasTarget() && IsStreamingToYouTube()) YtWakePoller();
             break;
         default:
             break;
