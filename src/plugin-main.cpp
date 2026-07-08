@@ -4179,6 +4179,7 @@ static const char* kFeedsConfigSection      = "Feeds";
 static const char* kCfgConnectOnStartup      = "ConnectOnStartup";
 static const char* kCfgYouTubeChatEnabled    = "YouTubeChatEnabled";
 static const char* kCfgYouTubeHandle         = "YouTubeChannelHandle";
+static const char* kCfgYouTubeVideoId        = "YouTubeVideoId";  // pinned stream (exclusive with handle)
 
 static bool LoadConnectOnStartupSetting() {
     config_t* cfg = obs_frontend_get_user_config();
@@ -4221,6 +4222,20 @@ static void SaveYouTubeHandleSetting(const std::string& handle) {
     config_save(cfg);
 }
 
+static std::string LoadYouTubeVideoIdSetting() {
+    config_t* cfg = obs_frontend_get_user_config();
+    if (!cfg) return "";
+    const char* s = config_get_string(cfg, kFeedsConfigSection, kCfgYouTubeVideoId);
+    return s ? s : "";
+}
+
+static void SaveYouTubeVideoIdSetting(const std::string& videoId) {
+    config_t* cfg = obs_frontend_get_user_config();
+    if (!cfg) return;
+    config_set_string(cfg, kFeedsConfigSection, kCfgYouTubeVideoId, videoId.c_str());
+    config_save(cfg);
+}
+
 // ===========================================================================
 // YouTube live-chat poller (Phase 1: receive -> Feeds chat dock only)
 // ===========================================================================
@@ -4238,8 +4253,9 @@ static void SaveYouTubeHandleSetting(const std::string& handle) {
 // extractors, which can't traverse nested arrays).
 
 static std::atomic<bool> g_ytChatEnabled{false};
-static std::mutex        g_ytStateMutex;      // guards g_ytHandle
+static std::mutex        g_ytStateMutex;      // guards g_ytHandle + g_ytVideoId
 static std::string       g_ytHandle;          // normalized (no leading @); "" = unset
+static std::string       g_ytVideoId;         // pinned 11-char video id; non-empty => skip /live resolution
 static std::thread       g_ytThread;
 static std::atomic<bool> g_ytShouldExit{false};
 static HANDLE            g_ytWakeEvent = nullptr;  // auto-reset; wakes on enable/handle-change/stream-start/exit
@@ -4252,21 +4268,67 @@ static void YtInterruptibleWait(DWORD ms) {
 }
 static void YtWakePoller() { if (g_ytWakeEvent) SetEvent(g_ytWakeEvent); }
 
-// Normalize whatever the user typed/pasted into a bare handle (no '@'): accepts
-// "@Name", "Name", or a pasted "https://youtube.com/@Name/live" URL.
-static std::string NormalizeYouTubeHandle(std::string s) {
+// A YouTube video id is exactly 11 chars from [A-Za-z0-9_-].
+static bool IsYouTubeVideoId(const std::string& s) {
+    if (s.size() != 11) return false;
+    for (char c : s) {
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                        (c >= '0' && c <= '9') || c == '_' || c == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+// The configured target: either a channel handle (resolve via /@handle/live) or
+// a pinned video id (bootstrap /watch?v=<id> directly — the fix for channels
+// running several concurrent livestreams). Exactly one of the two applies.
+struct YtTarget {
+    bool        isVideo = false;
+    std::string value;            // bare handle (no '@') or 11-char video id
+};
+
+// Detect + normalize whatever the user typed/pasted:
+//   "@Name" / "Name" / ".../@Name/live"      -> handle mode
+//   ".../watch?v=<id>" / "youtu.be/<id>"     -> video mode
+//   bare 11-char id (no '@')                 -> video mode
+// The '@' is the handle signal, so a channel name is never mistaken for a video
+// id; a bare 11-char name typed without '@' is the only ambiguous case (rare,
+// and a failed bootstrap just retries — the prompt tells users to '@'-prefix
+// handles). Empty input clears the target.
+static YtTarget NormalizeYouTubeTarget(std::string s) {
     auto trim = [](std::string& x) {
         size_t a = x.find_first_not_of(" \t\r\n");
         size_t b = x.find_last_not_of(" \t\r\n");
         x = (a == std::string::npos) ? "" : x.substr(a, b - a + 1);
     };
     trim(s);
+    YtTarget t;
+    if (s.empty()) return t;
+
+    // No '@' -> look for a video id (watch URL, youtu.be, or bare id).
+    if (s.find('@') == std::string::npos) {
+        std::string id;
+        size_t vp = s.find("v=");
+        if (vp != std::string::npos && s.size() >= vp + 2 + 11)
+            id = s.substr(vp + 2, 11);
+        if (id.empty()) {
+            size_t yb = s.find("youtu.be/");
+            if (yb != std::string::npos && s.size() >= yb + 9 + 11)
+                id = s.substr(yb + 9, 11);
+        }
+        if (id.empty() && IsYouTubeVideoId(s)) id = s;
+        if (IsYouTubeVideoId(id)) { t.isVideo = true; t.value = id; return t; }
+    }
+
+    // Handle mode: strip a leading '@' / URL prefix and any trailing path.
     size_t at = s.rfind('@');
-    if (at != std::string::npos) s = s.substr(at + 1);   // drop URL prefix + '@'
+    if (at != std::string::npos) s = s.substr(at + 1);
     size_t sl = s.find('/');
-    if (sl != std::string::npos) s = s.substr(0, sl);     // drop "/live" etc.
+    if (sl != std::string::npos) s = s.substr(0, sl);
     trim(s);
-    return s;
+    t.isVideo = false;
+    t.value = s;
+    return t;
 }
 
 // Is OBS currently streaming to YouTube? Detection only — used as an accelerator,
@@ -4449,9 +4511,10 @@ static void YtAvatarWorkerLoop() {
 }
 
 // --- HTML scrape helpers (flat literals in the watch page; NOT the JSON API) --
-static std::string YtScrapeString(const std::string& s, const std::string& key) {
+static std::string YtScrapeString(const std::string& s, const std::string& key,
+                                  size_t from = 0) {
     std::string pat = "\"" + key + "\":\"";
-    size_t p = s.find(pat);
+    size_t p = s.find(pat, from);
     if (p == std::string::npos) return "";
     p += pat.size();
     size_t e = s.find('"', p);
@@ -4583,15 +4646,17 @@ static std::string YtBuildBody(const std::string& clientVer,
     return b;
 }
 
+// Outputs the HTTP status (0 = transport failure) so the caller can log it on a
+// failed poll. Returns true only on a 200 with a non-empty body.
 static bool YtPostLiveChat(const std::string& apiKey, const std::string& body,
-                           std::string& respBody) {
+                           std::string& respBody, DWORD& httpStatus) {
     std::wstring path =
         L"/youtubei/v1/live_chat/get_live_chat?prettyPrint=false&key=" +
         std::wstring(apiKey.begin(), apiKey.end());   // apiKey is ASCII
-    DWORD status = 0;
-    if (!YtHttpRequest(L"www.youtube.com", L"POST", path, &body, status, respBody))
+    httpStatus = 0;
+    if (!YtHttpRequest(L"www.youtube.com", L"POST", path, &body, httpStatus, respBody))
         return false;
-    return status == 200 && !respBody.empty();
+    return httpStatus == 200 && !respBody.empty();
 }
 
 struct YtChatPage {
@@ -4668,15 +4733,18 @@ static YtChatPage YtParseLiveChat(const std::string& json) {
 
 struct YtBootstrap {
     std::string apiKey, clientVer, visitor, initialContinuation;
+    std::string videoId;          // resolved stream video id (for the connected log)
     bool ok = false;
 };
 
-// GET /@handle/live and scrape config + initial continuation. Not-live (or a
-// transient failure) -> ok=false, caller retries on the slow cadence.
-static YtBootstrap YtFetchBootstrap(const std::string& handle) {
+// GET the watch page at `pathU` (either "/@handle/live" or "/watch?v=<id>") and
+// scrape config + initial continuation. `knownVideoId` is set for a pinned
+// stream (used verbatim); for handle mode it's "" and we scrape the resolved id
+// from the page. Not-live (or a transient failure) -> ok=false, caller retries.
+static YtBootstrap YtFetchBootstrap(const std::string& pathU,
+                                    const std::string& knownVideoId) {
     YtBootstrap bs;
-    std::string pathU = "/@" + handle + "/live";
-    std::wstring path(pathU.begin(), pathU.end());   // handle chars are ASCII
+    std::wstring path(pathU.begin(), pathU.end());   // handle/id/path chars are ASCII
     DWORD status = 0;
     std::string html;
     if (!YtHttpRequest(L"www.youtube.com", L"GET", path, nullptr, status, html))
@@ -4687,6 +4755,17 @@ static YtBootstrap YtFetchBootstrap(const std::string& handle) {
     bs.clientVer = YtScrapeString(html, "INNERTUBE_CONTEXT_CLIENT_VERSION");
     bs.visitor   = YtScrapeString(html, "VISITOR_DATA");
     if (bs.apiKey.empty() || bs.clientVer.empty()) return bs;
+
+    // Resolved video id for diagnostics: the pinned id if given, else scrape the
+    // page's own video (videoDetails.videoId, biased past the videoDetails marker
+    // so related-video ids don't win).
+    if (!knownVideoId.empty()) {
+        bs.videoId = knownVideoId;
+    } else {
+        size_t vd = html.find("\"videoDetails\"");
+        bs.videoId = YtScrapeString(html, "videoId",
+                                    vd == std::string::npos ? 0 : vd);
+    }
 
     std::string blob = YtExtractJsonObject(html, "ytInitialData");
     if (blob.empty()) return bs;
@@ -4699,7 +4778,7 @@ static YtBootstrap YtFetchBootstrap(const std::string& handle) {
     if (conts.count())
         bs.initialContinuation =
             conts.at(0).obj("reloadContinuationData").str("continuation");
-    // Empty continuation => channel not currently live (no chat renderer).
+    // Empty continuation => not currently live (no chat renderer).
     bs.ok = !bs.initialContinuation.empty();
     return bs;
 }
@@ -4749,50 +4828,98 @@ static void YtDeliverDeletionByChannel(const std::string& channelId) {
 static void YtChatPollLoop() {
     blog(LOG_INFO, "[feeds] youtube chat poller thread started");
     while (!g_ytShouldExit.load()) {
-        // Idle gate: nothing to do until enabled with a handle. Block on the wake.
+        // Idle gate: nothing to do until enabled with a target. Block on the wake.
         if (!g_ytChatEnabled.load()) { YtInterruptibleWait(INFINITE); continue; }
-        std::string handle;
-        { std::lock_guard<std::mutex> l(g_ytStateMutex); handle = g_ytHandle; }
-        if (handle.empty()) { YtInterruptibleWait(INFINITE); continue; }
+        std::string handle, videoId;
+        { std::lock_guard<std::mutex> l(g_ytStateMutex);
+          handle = g_ytHandle; videoId = g_ytVideoId; }
+        if (handle.empty() && videoId.empty()) { YtInterruptibleWait(INFINITE); continue; }
         // Inherit the chat dock's Basic+ gating exactly: don't even poll YouTube
         // for a Free user. Bounded re-check (not INFINITE) so a login/upgrade is
         // picked up without wiring a wake into the tier path.
         if (g_currentTier < 1) { YtInterruptibleWait(30000); continue; }
 
-        // Bootstrap: resolve /live until it serves a live watch page (~60s cadence).
-        YtBootstrap bs = YtFetchBootstrap(handle);
+        // Bootstrap the watch page. Video mode pins /watch?v=<id> (skips /live
+        // resolution — the fix for channels running several concurrent streams);
+        // handle mode resolves /@handle/live. Retries on the ~60s slow cadence if
+        // not live yet.
+        std::string pathU = !videoId.empty()
+                              ? ("/watch?v=" + videoId)
+                              : ("/@" + handle + "/live");
+        std::string targetDesc = !videoId.empty()
+                              ? ("video " + videoId) : ("@" + handle);
+        YtBootstrap bs = YtFetchBootstrap(pathU, videoId);
         if (g_ytShouldExit.load()) break;
         if (!bs.ok) { YtInterruptibleWait(60000); continue; }
-        blog(LOG_INFO, "[feeds] youtube chat: connected to @%s live", handle.c_str());
+        blog(LOG_INFO, "[feeds] youtube chat: connected to %s live (video=%s)",
+             targetDesc.c_str(), bs.videoId.c_str());
 
         // Initial get_live_chat (Top-chat default) -> ALL-messages token from resp.
         std::string resp;
+        DWORD initStatus = 0;
         if (!YtPostLiveChat(bs.apiKey,
-                YtBuildBody(bs.clientVer, bs.visitor, bs.initialContinuation), resp)) {
-            blog(LOG_INFO, "[feeds] youtube chat: initial poll failed; re-bootstrapping");
+                YtBuildBody(bs.clientVer, bs.visitor, bs.initialContinuation),
+                resp, initStatus)) {
+            blog(LOG_INFO, "[feeds] youtube chat: initial poll failed "
+                 "(status=%lu, %lu bytes); re-bootstrapping",
+                 (unsigned long)initStatus, (unsigned long)resp.size());
             YtInterruptibleWait(15000); continue;
         }
         YtChatPage first = YtParseLiveChat(resp);
         std::string token = !first.allMessagesToken.empty()
                               ? first.allMessagesToken : first.nextContinuation;
-        if (token.empty()) { YtInterruptibleWait(15000); continue; }
+        if (token.empty()) {
+            blog(LOG_INFO, "[feeds] youtube chat: no continuation in initial "
+                 "response (%lu bytes); re-bootstrapping", (unsigned long)resp.size());
+            YtInterruptibleWait(15000); continue;
+        }
 
         // Steady-state loop on the ALL-messages feed. The first page after the
         // switch is a backlog (70+); skip it (prime the continuation) so the dock
         // fills with messages from connect-time onward rather than a history dump.
+        // EVERY exit path below logs a distinct [feeds] line — the loop must never
+        // die mute (that's the bug this rework targets).
         bool primed = false;
-        while (!g_ytShouldExit.load() && g_ytChatEnabled.load() && g_currentTier >= 1) {
+        int  cycle  = 0;
+        for (;;) {
+            if (g_ytShouldExit.load()) {
+                blog(LOG_INFO, "[feeds] youtube chat: shutdown; stopping loop");
+                break;
+            }
+            if (!g_ytChatEnabled.load()) {
+                blog(LOG_INFO, "[feeds] youtube chat: disabled; stopping loop");
+                break;
+            }
+            if (g_currentTier < 1) {
+                blog(LOG_INFO, "[feeds] youtube chat: tier dropped below Basic; stopping loop");
+                break;
+            }
             { std::lock_guard<std::mutex> l(g_ytStateMutex);
-              if (g_ytHandle != handle) break; }   // handle changed -> re-bootstrap
+              if (g_ytHandle != handle || g_ytVideoId != videoId) {
+                  blog(LOG_INFO, "[feeds] youtube chat: target changed; re-bootstrapping");
+                  break;
+              } }
 
             std::string r;
-            if (!YtPostLiveChat(bs.apiKey, YtBuildBody(bs.clientVer, bs.visitor, token), r)) {
-                blog(LOG_INFO, "[feeds] youtube chat: poll failed; re-bootstrapping");
+            DWORD st = 0;
+            if (!YtPostLiveChat(bs.apiKey, YtBuildBody(bs.clientVer, bs.visitor, token), r, st)) {
+                blog(LOG_INFO, "[feeds] youtube chat: poll HTTP failed "
+                     "(status=%lu, %lu bytes); re-bootstrapping",
+                     (unsigned long)st, (unsigned long)r.size());
                 break;
             }
             YtChatPage pg = YtParseLiveChat(r);
-            if (!pg.ok || pg.nextContinuation.empty()) {
-                blog(LOG_INFO, "[feeds] youtube chat: dead continuation; re-bootstrapping");
+            if (!pg.ok) {
+                blog(LOG_INFO, "[feeds] youtube chat: parse failure "
+                     "(%lu bytes); re-bootstrapping", (unsigned long)r.size());
+                break;
+            }
+            if (pg.nextContinuation.empty()) {
+                blog(LOG_INFO, "[feeds] youtube chat: empty next continuation "
+                     "(%lu bytes, %zu actions); re-bootstrapping",
+                     (unsigned long)r.size(),
+                     pg.messages.size() + pg.deletedMsgIds.size()
+                         + pg.deletedChannelIds.size());
                 break;
             }
             if (primed) {
@@ -4808,14 +4935,29 @@ static void YtChatPollLoop() {
                 for (const auto& cid : pg.deletedChannelIds)  YtDeliverDeletionByChannel(cid);
             }
             primed = true;
+
+            // Coarse proof-of-life + big-chat visibility: every ~20 cycles
+            // (~60s at the 3s cap) log the cycle count and last response size /
+            // message count, so a busy channel's cadence and payload sizes are
+            // visible without per-cycle spam.
+            if (++cycle % 20 == 0) {
+                blog(LOG_INFO, "[feeds] youtube chat: polling ok "
+                     "(cycle %d, last %lu bytes, %zu msgs)",
+                     cycle, (unsigned long)r.size(), pg.messages.size());
+            }
+
             token = pg.nextContinuation;
-            DWORD wait = pg.timeoutMs ? pg.timeoutMs : 5000;
-            if (wait < 1000)  wait = 1000;
-            if (wait > 15000) wait = 15000;
+            // Cap the wait at ~3s regardless of the server's (usually ~10s)
+            // timeoutMs — invalidation continuations are safe to poll early and
+            // return whatever's new (often empty), turning 10s batches into a
+            // near-live feel. 1s floor.
+            DWORD wait = pg.timeoutMs ? pg.timeoutMs : 3000;
+            if (wait < 1000) wait = 1000;
+            if (wait > 3000) wait = 3000;
             YtInterruptibleWait(wait);
         }
-        // Fell out: stream end / error / config change. Brief backoff, then the
-        // outer loop re-bootstraps from /live (self-healing, forever).
+        // Fell out (a distinct line was logged above). Brief backoff, then the
+        // outer loop re-bootstraps (self-healing, forever).
         if (!g_ytShouldExit.load()) YtInterruptibleWait(5000);
     }
     blog(LOG_INFO, "[feeds] youtube chat poller thread exiting");
@@ -4872,7 +5014,9 @@ void SetupPluginMenu() {
     ytChatAction->setCheckable(true);
     g_ytChatEnabled = LoadYouTubeChatEnabledSetting();
     ytChatAction->setChecked(g_ytChatEnabled.load());
-    { std::lock_guard<std::mutex> l(g_ytStateMutex); g_ytHandle = LoadYouTubeHandleSetting(); }
+    { std::lock_guard<std::mutex> l(g_ytStateMutex);
+      g_ytHandle  = LoadYouTubeHandleSetting();
+      g_ytVideoId = LoadYouTubeVideoIdSetting(); }
     QAction* ytHandleAction = feedsMenu->addAction("Set YouTube Channel Handle…");
     YtWakePoller();
 
@@ -4920,19 +5064,31 @@ void SetupPluginMenu() {
         YtWakePoller();   // start/stop the chat loop promptly
     });
     QObject::connect(ytHandleAction, &QAction::triggered, []() {
-        std::string cur;
-        { std::lock_guard<std::mutex> l(g_ytStateMutex); cur = g_ytHandle; }
+        std::string curHandle, curVideo;
+        { std::lock_guard<std::mutex> l(g_ytStateMutex);
+          curHandle = g_ytHandle; curVideo = g_ytVideoId; }
+        // Prefill with whichever target is currently set.
+        QString prefill = !curVideo.empty()
+            ? QString::fromStdString(curVideo)
+            : (curHandle.empty() ? QString()
+                                 : QString::fromStdString("@" + curHandle));
         bool ok = false;
         QString text = QInputDialog::getText(
             (QWidget*)obs_frontend_get_main_window(),
             "Feeds \xE2\x80\x94 YouTube Channel",
-            "YouTube channel handle (e.g. @YourChannel):",
-            QLineEdit::Normal,
-            QString::fromStdString(cur.empty() ? std::string() : "@" + cur), &ok);
+            "Channel handle (e.g. @YourChannel), or a stream URL / video id\n"
+            "(e.g. youtube.com/watch?v=XXXXXXXXXXX) to pin one specific stream:",
+            QLineEdit::Normal, prefill, &ok);
         if (!ok) return;
-        std::string norm = NormalizeYouTubeHandle(text.toStdString());
-        { std::lock_guard<std::mutex> l(g_ytStateMutex); g_ytHandle = norm; }
-        SaveYouTubeHandleSetting(norm);
+        // Detect handle vs pinned-video and store exclusively (the other clears).
+        YtTarget t = NormalizeYouTubeTarget(text.toStdString());
+        {
+            std::lock_guard<std::mutex> l(g_ytStateMutex);
+            if (t.isVideo) { g_ytVideoId = t.value; g_ytHandle.clear(); }
+            else           { g_ytHandle  = t.value; g_ytVideoId.clear(); }
+        }
+        SaveYouTubeHandleSetting(t.isVideo ? std::string() : t.value);
+        SaveYouTubeVideoIdSetting(t.isVideo ? t.value : std::string());
         YtWakePoller();
     });
     QObject::connect(aboutAction, &QAction::triggered, []() {
