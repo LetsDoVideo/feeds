@@ -1756,6 +1756,12 @@ static constexpr int kRoleChatChannel = Qt::UserRole + 12;  // YouTube author ch
 static constexpr int kRoleChatAvatar  = Qt::UserRole + 13;  // YouTube avatar URL (Phase 2 download)
 enum ChatOrigin { kChatOriginZoom = 1, kChatOriginYouTube = 2 };
 
+// Avatar resolvers (defined further down: Zoom's uint-keyed cache / YouTube's
+// channel-id-keyed cache). Forward-declared here because the dock's click
+// handler — above their definitions — resolves an avatar to hand to the popup.
+static QImage GetAvatarForSender(unsigned int senderId, const std::string& avatarPath);
+static QImage YtResolveAvatar(const std::string& channelId);
+
 // Draw a small, code-rendered origin glyph in `box` (no embedded brand logos —
 // trademark): YouTube = red rounded rect + white play triangle; Zoom = blue
 // rounded rect + white dot. Both platforms are marked, consistently.
@@ -2023,6 +2029,37 @@ public:
         m_list->scrollToBottom();
     }
 
+    // Moderator deletion of a single YouTube message (by message id). Removes the
+    // matching row(s) and pulls the message off the popup if it's showing. Zoom
+    // rows are never matched (origin + YT-only roles).
+    void RemoveYouTubeMessageById(const QString& msgId) {
+        if (msgId.isEmpty()) return;
+        for (int i = m_list->count() - 1; i >= 0; --i) {
+            QListWidgetItem* it = m_list->item(i);
+            if (!it || it->data(kRoleChatOrigin).toInt() != kChatOriginYouTube)
+                continue;
+            if (it->data(kRoleChatMsgId).toString() != msgId) continue;
+            const std::string content = it->data(RoleContent).toString().toStdString();
+            delete m_list->takeItem(i);
+            feeds::ClearChatPopupIfMatches(0, content);
+        }
+    }
+
+    // Moderator ban / author deletion (by channel id) — remove all of that
+    // author's YouTube rows and clear any of them from the popup.
+    void RemoveYouTubeMessagesByChannel(const QString& channelId) {
+        if (channelId.isEmpty()) return;
+        for (int i = m_list->count() - 1; i >= 0; --i) {
+            QListWidgetItem* it = m_list->item(i);
+            if (!it || it->data(kRoleChatOrigin).toInt() != kChatOriginYouTube)
+                continue;
+            if (it->data(kRoleChatChannel).toString() != channelId) continue;
+            const std::string content = it->data(RoleContent).toString().toStdString();
+            delete m_list->takeItem(i);
+            feeds::ClearChatPopupIfMatches(0, content);
+        }
+    }
+
     void OnMeetingJoined() {
         // Free tier: the dock stays locked even after a meeting connects.
         // Leave the upgrade-prompt placeholder in place and keep the input
@@ -2090,13 +2127,21 @@ private:
     void OnMessageClicked(QListWidgetItem* item) {
         if (!item) return;
 
-        // Phase 1 scope guard: YouTube rows are dock-display-only — no popup
-        // surface until Phase 2. They also carry no RoleSenderId, so this check
-        // must precede the placeholder detection below (which keys off that
-        // absence) to avoid a YouTube click being read as a placeholder click.
+        // YouTube row -> popup (Phase 2). Resolve the avatar from the YT cache by
+        // channel id (null => neutral circle) and toggle the popup with senderId
+        // 0 (YouTube has no Zoom uint id). This branch MUST precede the
+        // placeholder detection below: a YouTube row carries no RoleSenderId, so
+        // without this it would be misread as a placeholder/login click.
         const QVariant originVar = item->data(kRoleChatOrigin);
-        if (originVar.isValid() && originVar.toInt() == kChatOriginYouTube)
+        if (originVar.isValid() && originVar.toInt() == kChatOriginYouTube) {
+            QString name    = item->data(RoleSenderName).toString();
+            QString content = item->data(RoleContent).toString();
+            std::string channelId =
+                item->data(kRoleChatChannel).toString().toStdString();
+            feeds::ToggleChatPopup(0, name.toStdString(), content.toStdString(),
+                                   YtResolveAvatar(channelId));
             return;
+        }
 
         // Placeholders carry no sender_id data. Use that as the signal to
         // route the click through the same login / connect flows the menu
@@ -2134,9 +2179,13 @@ private:
         QString      sender   = item->data(RoleSenderName).toString();
         QString      content  = item->data(RoleContent).toString();
 
+        // Resolve the Zoom avatar from the uint-keyed cache (warmed on message
+        // arrival; falls back to the Feeds logo). The popup renders whatever
+        // image it's handed — same handoff the YouTube path uses.
         feeds::ToggleChatPopup(senderId,
                                sender.toStdString(),
-                               content.toStdString());
+                               content.toStdString(),
+                               GetAvatarForSender(senderId, std::string()));
     }
 
     QString CurrentPlaceholderText() const {
@@ -2798,11 +2847,11 @@ private:
         m_hdrChatPopup = MakeHeaderButton("Chat Popup");
         QObject::connect(m_hdrChatPopup, &QPushButton::clicked, [this]() {
             if (g_currentTier < 2) {   // tier-locked (Streamer+): actionable upgrade prompt
-                ShowSourceUpgradePrompt("Zoom Chat Popup", "Streamer");
+                ShowSourceUpgradePrompt("Feeds Chat Popup", "Streamer");
                 return;
             }
             if (m_cdChatPopup) return;   // on add-cooldown: absorb the rapid re-click
-            AddOrReferenceSourceInCurrentScene("feeds_chat_popup", "Zoom Chat Popup");
+            AddOrReferenceSourceInCurrentScene("feeds_chat_popup", "Feeds Chat Popup");
             BeginHeaderCooldown(&m_cdChatPopup);
         });
 
@@ -4225,9 +4274,9 @@ static bool IsStreamingToYouTube() {
 // Follows redirects (default). Sends a preemptive consent cookie so an EU
 // consent interstitial doesn't block the scrape. Returns true if a response was
 // received (any status); fills status + body. Timeouts bound worst-case unload.
-static bool YtHttpRequest(const wchar_t* method, const std::wstring& path,
-                          const std::string* body, DWORD& status,
-                          std::string& respBody) {
+static bool YtHttpRequest(const std::wstring& host, const wchar_t* method,
+                          const std::wstring& path, const std::string* body,
+                          DWORD& status, std::string& respBody) {
     status = 0;
     respBody.clear();
     HINTERNET hSession = WinHttpOpen(
@@ -4237,7 +4286,7 @@ static bool YtHttpRequest(const wchar_t* method, const std::wstring& path,
     if (!hSession) return false;
     WinHttpSetTimeouts(hSession, 8000, 8000, 10000, 15000);
 
-    HINTERNET hConnect = WinHttpConnect(hSession, L"www.youtube.com",
+    HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(),
                                         INTERNET_DEFAULT_HTTPS_PORT, 0);
     if (!hConnect) { WinHttpCloseHandle(hSession); return false; }
 
@@ -4281,6 +4330,109 @@ static bool YtHttpRequest(const wchar_t* method, const std::wstring& path,
     WinHttpCloseHandle(hConnect);
     WinHttpCloseHandle(hSession);
     return ok;
+}
+
+// --- YT avatar cache + download worker (Phase 2) --------------------------
+// Parallel to the Zoom avatar cache (g_avatarCache): that one is keyed by uint
+// senderId and fed by engine-written files; YT authors have string channel ids
+// and ggpht URLs, so they need their own cache. Downloads run on a dedicated
+// worker (never the UI thread); one attempt per channel id per session (chat is
+// bursty from few authors); a cached null QImage records a failed/absent avatar
+// so we neither re-fetch nor block — the popup falls back to a neutral circle.
+// The dock click handler resolves the QImage from here and hands it to the popup
+// (the popup stays cache-agnostic), so these stay static to this TU.
+static std::mutex                            g_ytAvatarCacheMutex;
+static std::map<std::string, QImage>         g_ytAvatarCacheByChannel;  // channelId -> avatar (null = tried, none)
+static std::set<std::string>                 g_ytAvatarInFlight;
+static constexpr size_t                      kYtAvatarCacheCap = 512;
+
+static std::mutex                            g_ytAvatarQueueMutex;
+static std::vector<std::pair<std::string, std::string>> g_ytAvatarQueue;  // (channelId, url)
+static std::thread                           g_ytAvatarThread;
+static std::atomic<bool>                     g_ytAvatarExit{false};
+static HANDLE                                g_ytAvatarEvent = nullptr;  // auto-reset wake
+
+// Resolve a channel's avatar from the cache (UI thread, at click time). Returns
+// a null QImage if not downloaded yet or the download failed — the popup renders
+// its neutral placeholder circle for a null avatar.
+static QImage YtResolveAvatar(const std::string& channelId) {
+    if (channelId.empty()) return QImage();
+    std::lock_guard<std::mutex> l(g_ytAvatarCacheMutex);
+    auto it = g_ytAvatarCacheByChannel.find(channelId);
+    return it != g_ytAvatarCacheByChannel.end() ? it->second : QImage();
+}
+
+// Split "https://host/path" into wide host + path. Avatar hosts/paths are ASCII.
+static bool YtSplitHttpsUrl(const std::string& url, std::wstring& host,
+                            std::wstring& path) {
+    const std::string pfx = "https://";
+    if (url.compare(0, pfx.size(), pfx) != 0) return false;
+    size_t hostStart = pfx.size();
+    size_t slash = url.find('/', hostStart);
+    std::string h = (slash == std::string::npos)
+                        ? url.substr(hostStart) : url.substr(hostStart, slash - hostStart);
+    std::string p = (slash == std::string::npos) ? "/" : url.substr(slash);
+    if (h.empty()) return false;
+    host.assign(h.begin(), h.end());
+    path.assign(p.begin(), p.end());
+    return true;
+}
+
+// Download + decode one avatar. Null QImage on any failure (bad URL, non-200,
+// or a format Qt can't decode — ggpht usually serves JPEG/PNG; WebP would need
+// Qt's webp image plugin, and a decode miss just fails soft to the circle).
+static QImage YtDownloadAvatarImage(const std::string& url) {
+    std::wstring host, path;
+    if (!YtSplitHttpsUrl(url, host, path)) return QImage();
+    DWORD status = 0;
+    std::string body;
+    if (!YtHttpRequest(host, L"GET", path, nullptr, status, body)) return QImage();
+    if (status != 200 || body.empty()) return QImage();
+    QImage img;
+    img.loadFromData(reinterpret_cast<const uchar*>(body.data()), (int)body.size());
+    return img;  // null if decode failed
+}
+
+// Queue an avatar download for `channelId` from `url` if we don't already have
+// it (or one in flight), and the cache isn't at cap. Called from the poll loop
+// (poller thread) as messages arrive — warms the cache before the user clicks.
+static void YtRequestAvatar(const std::string& channelId, const std::string& url) {
+    if (channelId.empty() || url.empty()) return;
+    {
+        std::lock_guard<std::mutex> l(g_ytAvatarCacheMutex);
+        if (g_ytAvatarCacheByChannel.count(channelId)) return;   // already have (or tried)
+        if (g_ytAvatarInFlight.count(channelId))        return;   // already downloading
+        if (g_ytAvatarCacheByChannel.size() >= kYtAvatarCacheCap) return;  // bounded
+        g_ytAvatarInFlight.insert(channelId);
+    }
+    {
+        std::lock_guard<std::mutex> l(g_ytAvatarQueueMutex);
+        g_ytAvatarQueue.emplace_back(channelId, url);
+    }
+    if (g_ytAvatarEvent) SetEvent(g_ytAvatarEvent);
+}
+
+static void YtAvatarWorkerLoop() {
+    while (!g_ytAvatarExit.load()) {
+        std::pair<std::string, std::string> job;
+        bool have = false;
+        {
+            std::lock_guard<std::mutex> l(g_ytAvatarQueueMutex);
+            if (!g_ytAvatarQueue.empty()) {
+                job = g_ytAvatarQueue.front();
+                g_ytAvatarQueue.erase(g_ytAvatarQueue.begin());
+                have = true;
+            }
+        }
+        if (!have) {
+            if (g_ytAvatarEvent) WaitForSingleObject(g_ytAvatarEvent, INFINITE);
+            continue;
+        }
+        QImage img = YtDownloadAvatarImage(job.second);   // null on failure
+        std::lock_guard<std::mutex> l(g_ytAvatarCacheMutex);
+        g_ytAvatarCacheByChannel[job.first] = img;         // cache result (even null: one try/session)
+        g_ytAvatarInFlight.erase(job.first);
+    }
 }
 
 // --- HTML scrape helpers (flat literals in the watch page; NOT the JSON API) --
@@ -4375,21 +4527,31 @@ static bool YtParseTextMessage(const YtObj& r, YtMsg& out) {
         YtArr th = YtArrayOf(ap, "thumbnails");
         if (th.count()) { YtObj t = th.at(th.count() - 1); out.avatarUrl = t.str("url"); }
     }
-    {   // message runs: concat text; render emoji as its accessibility label
+    {   // message runs: concat text; render each emoji run as :label: with a
+        // space inserted where it's adjacent to another run (Slack/Discord
+        // text-emote convention) so consecutive emotes don't smush into
+        // "waving-handpink-heart". Real emoji images are out of scope. Assembled
+        // once here, so both the dock and the popup get the same rendered text.
         YtObj msg = r.obj("message");
         YtArr runs = YtArrayOf(msg, "runs");
         std::string text;
+        bool lastWasEmoji = false;
+        auto append = [&](const std::string& tok, bool isEmoji) {
+            if (tok.empty()) return;
+            if (!text.empty() && (isEmoji || lastWasEmoji) &&
+                text.back() != ' ' && tok.front() != ' ')
+                text += ' ';
+            text += tok;
+            lastWasEmoji = isEmoji;
+        };
         for (size_t i = 0; i < runs.count(); ++i) {
             YtObj run = runs.at(i);
             if (run.has("text")) {
-                text += run.str("text");
+                append(run.str("text"), false);
             } else if (run.has("emoji")) {
-                YtObj em  = run.obj("emoji");
-                YtObj img = em.obj("image");
-                YtObj acc = img.obj("accessibility");
-                YtObj ad  = acc.obj("accessibilityData");
-                std::string label = ad.str("label");
-                if (!label.empty()) text += label;
+                std::string label = run.obj("emoji").obj("image")
+                    .obj("accessibility").obj("accessibilityData").str("label");
+                if (!label.empty()) append(":" + label + ":", true);
             }
         }
         out.text = text;
@@ -4414,12 +4576,15 @@ static bool YtPostLiveChat(const std::string& apiKey, const std::string& body,
         L"/youtubei/v1/live_chat/get_live_chat?prettyPrint=false&key=" +
         std::wstring(apiKey.begin(), apiKey.end());   // apiKey is ASCII
     DWORD status = 0;
-    if (!YtHttpRequest(L"POST", path, &body, status, respBody)) return false;
+    if (!YtHttpRequest(L"www.youtube.com", L"POST", path, &body, status, respBody))
+        return false;
     return status == 200 && !respBody.empty();
 }
 
 struct YtChatPage {
     std::vector<YtMsg> messages;
+    std::vector<std::string> deletedMsgIds;      // markChatItemAsDeletedAction
+    std::vector<std::string> deletedChannelIds;  // markChatItemsByAuthorAsDeletedAction
     std::string nextContinuation;
     DWORD       timeoutMs = 0;
     std::string allMessagesToken;   // from viewSelector; only in the first response
@@ -4438,9 +4603,19 @@ static YtChatPage YtParseLiveChat(const std::string& json) {
     YtArr actions = YtArrayOf(lc, "actions");
     for (size_t i = 0; i < actions.count(); ++i) {
         YtObj a = actions.at(i);
-        // Phase 1: only addChatItemAction + liveChatTextMessageRenderer. Every
-        // other action/renderer (system, banner, ticker, paid, membership,
-        // deletions) is skipped defensively — never crash/stall on the unknown.
+        // Moderation (Phase 2, YT-scope): a single message removed by id, or all
+        // of an author's messages removed by channel id. Field paths per the
+        // investigation notes — parsed defensively (real mod samples weren't
+        // captured on the quiet stream; str() on a non-deletion action is "").
+        { std::string tid = a.obj("markChatItemAsDeletedAction").str("targetItemId");
+          if (!tid.empty()) { pg.deletedMsgIds.push_back(tid); continue; } }
+        { std::string cid = a.obj("markChatItemsByAuthorAsDeletedAction")
+                             .str("externalChannelId");
+          if (!cid.empty()) { pg.deletedChannelIds.push_back(cid); continue; } }
+
+        // Adds: only addChatItemAction + liveChatTextMessageRenderer. Every other
+        // action/renderer (system, banner, ticker, paid, membership) is skipped
+        // defensively — never crash/stall on the unknown.
         YtObj r = a.obj("addChatItemAction").obj("item").obj("liveChatTextMessageRenderer");
         if (!r) continue;
         YtMsg m;
@@ -4491,7 +4666,8 @@ static YtBootstrap YtFetchBootstrap(const std::string& handle) {
     std::wstring path(pathU.begin(), pathU.end());   // handle chars are ASCII
     DWORD status = 0;
     std::string html;
-    if (!YtHttpRequest(L"GET", path, nullptr, status, html)) return bs;
+    if (!YtHttpRequest(L"www.youtube.com", L"GET", path, nullptr, status, html))
+        return bs;
     if (status != 200 || html.find("ytInitialData") == std::string::npos) return bs;
 
     bs.apiKey    = YtScrapeString(html, "INNERTUBE_API_KEY");
@@ -4530,6 +4706,19 @@ static void YtDeliverToDock(const YtMsg& m) {
             if (g_chatDock)
                 g_chatDock->AppendYouTubeMessage(author, content, id, ch, av);
         });
+}
+
+// Deletion fan-out to the dock (Qt main thread). The dock removes matching rows
+// and clears the popup if it's showing one of them. YT-scope only.
+static void YtDeliverDeletionById(const std::string& id) {
+    QString qid = QString::fromStdString(id);
+    QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
+        [qid]() { if (g_chatDock) g_chatDock->RemoveYouTubeMessageById(qid); });
+}
+static void YtDeliverDeletionByChannel(const std::string& channelId) {
+    QString qc = QString::fromStdString(channelId);
+    QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
+        [qc]() { if (g_chatDock) g_chatDock->RemoveYouTubeMessagesByChannel(qc); });
 }
 
 static void YtChatPollLoop() {
@@ -4581,7 +4770,17 @@ static void YtChatPollLoop() {
                 blog(LOG_INFO, "[feeds] youtube chat: dead continuation; re-bootstrapping");
                 break;
             }
-            if (primed) { for (const auto& m : pg.messages) YtDeliverToDock(m); }
+            if (primed) {
+                for (const auto& m : pg.messages) {
+                    // Warm the avatar as the message is shown, so it's cached
+                    // before the user can click it into the popup. Scoped to
+                    // shown messages — the skipped backlog isn't downloaded.
+                    YtRequestAvatar(m.channelId, m.avatarUrl);
+                    YtDeliverToDock(m);
+                }
+                for (const auto& id : pg.deletedMsgIds)      YtDeliverDeletionById(id);
+                for (const auto& cid : pg.deletedChannelIds)  YtDeliverDeletionByChannel(cid);
+            }
             primed = true;
             token = pg.nextContinuation;
             DWORD wait = pg.timeoutMs ? pg.timeoutMs : 5000;
@@ -4601,6 +4800,11 @@ static void YtStartPollerThread() {
     g_ytShouldExit = false;
     if (!g_ytWakeEvent)
         g_ytWakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);  // auto-reset
+    // Avatar download worker (Phase 2) — shares the poller's lifetime.
+    g_ytAvatarExit = false;
+    if (!g_ytAvatarEvent)
+        g_ytAvatarEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_ytAvatarThread = std::thread(YtAvatarWorkerLoop);
     g_ytThread = std::thread(YtChatPollLoop);
 }
 
@@ -4609,6 +4813,11 @@ static void YtStopPollerThread() {
     if (g_ytWakeEvent) SetEvent(g_ytWakeEvent);
     if (g_ytThread.joinable()) g_ytThread.join();
     if (g_ytWakeEvent) { CloseHandle(g_ytWakeEvent); g_ytWakeEvent = nullptr; }
+
+    g_ytAvatarExit = true;
+    if (g_ytAvatarEvent) SetEvent(g_ytAvatarEvent);
+    if (g_ytAvatarThread.joinable()) g_ytAvatarThread.join();
+    if (g_ytAvatarEvent) { CloseHandle(g_ytAvatarEvent); g_ytAvatarEvent = nullptr; }
 }
 
 void SetupPluginMenu() {

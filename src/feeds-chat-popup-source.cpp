@@ -33,13 +33,12 @@
 #include <mutex>
 #include <vector>
 
-// Avatar cache lives in plugin-main.cpp — declared with external linkage
-// there specifically so this TU can read it. The popup is a pure consumer:
-// the chat IPC handler populates the cache on receive, and we look up by
-// sender_id when rendering.
-extern std::mutex                       g_avatarCacheMutex;
-extern std::map<unsigned int, QImage>   g_avatarCache;
-extern QImage                           g_fallbackAvatar;
+// Avatars are resolved by the caller (plugin-main's dock click handler, which
+// knows the message origin and the right cache) and handed in via ToggleChatPopup
+// as a QImage. The popup is cache-agnostic — it just draws what it's given, or a
+// neutral circle for a null image. (Was: an extern read of the uint-keyed Zoom
+// g_avatarCache; that couldn't hold YouTube's channel-id/URL avatars, so 1.6.0
+// moved resolution to the caller and unified both platforms behind a QImage.)
 
 // Tier state from plugin-main.cpp. Popup is gated at Streamer (>= 2),
 // enforced by ReconcileChatPopupSources via the tier_disabled flag.
@@ -124,6 +123,7 @@ struct FeedsChatPopupData {
     unsigned int  sender_id  = 0;
     QString       sender_name;
     QString       content;
+    QImage        avatar;      // resolved by the caller; null -> neutral circle
 };
 
 // ---------------------------------------------------------------------------
@@ -144,6 +144,7 @@ bool           g_popupVisible      = false;
 unsigned int   g_popupSenderId     = 0;
 QString        g_popupSenderName;
 QString        g_popupContent;
+QImage         g_popupAvatar;      // resolved avatar for the current message
 
 // ---------------------------------------------------------------------------
 // Slide-animation state. Global so every popup instance animates in lockstep,
@@ -172,6 +173,7 @@ bool           g_popupPending         = false;
 unsigned int   g_popupPendingSenderId = 0;
 QString        g_popupPendingSenderName;
 QString        g_popupPendingContent;
+QImage         g_popupPendingAvatar;
 
 static void RenderPopupToImage(FeedsChatPopupData* d,
                                const QString& senderName,
@@ -339,23 +341,11 @@ static void RenderPopupToImage(FeedsChatPopupData* d,
 // UpdateInstanceFromGlobal) while the slow paint is happening.
 // ---------------------------------------------------------------------------
 static void RegenerateTexture(FeedsChatPopupData* d,
-                              unsigned int   senderId,
                               const QString& senderName,
-                              const QString& content) {
-    QImage avatar;
-    {
-        std::lock_guard<std::mutex> lock(g_avatarCacheMutex);
-        auto it = g_avatarCache.find(senderId);
-        if (it != g_avatarCache.end()) {
-            avatar = it->second;
-        } else {
-            // Not in cache (rare — IPC handler usually warms it on
-            // arrival). Use the bundled fallback so we still draw a
-            // recognisable popup.
-            avatar = g_fallbackAvatar;
-        }
-    }
-
+                              const QString& content,
+                              const QImage&  avatar) {
+    // Avatar is resolved by the caller and passed through the popup state; a
+    // null image renders the neutral circle (see RenderPopupToImage).
     RenderPopupToImage(d, senderName, content, avatar);
 
     // QImage rows are 4-byte aligned for RGBA8888 with a width divisible
@@ -404,6 +394,10 @@ static void UpdateInstanceFromGlobal(FeedsChatPopupData* d) {
     d->sender_id   = g_popupSenderId;
     d->sender_name = g_popupSenderName;
     d->content     = g_popupContent;
+    // Avatar mirrored unconditionally (cheap COW assign); not part of the
+    // change test — a new message already changes sender/content and marks
+    // dirty, and same-message re-renders would reuse the same avatar anyway.
+    d->avatar      = g_popupAvatar;
 
     if (changed) d->texture_dirty = true;
 }
@@ -477,11 +471,13 @@ static void AdvanceAnimation(float seconds) {
             g_popupSenderId          = g_popupPendingSenderId;
             g_popupSenderName        = g_popupPendingSenderName;
             g_popupContent           = g_popupPendingContent;
+            g_popupAvatar            = g_popupPendingAvatar;
             g_popupVisible           = true;
             g_popupPending           = false;
             g_popupPendingSenderId   = 0;
             g_popupPendingSenderName.clear();
             g_popupPendingContent.clear();
+            g_popupPendingAvatar     = QImage();
             g_popupAnimState         = PopupAnimState::AnimatingIn;
             g_popupAnimElapsed       = 0.0f;
             g_popupAnimFrom          = 1.0f;
@@ -491,6 +487,7 @@ static void AdvanceAnimation(float seconds) {
             g_popupSenderId   = 0;
             g_popupSenderName.clear();
             g_popupContent.clear();
+            g_popupAvatar      = QImage();
             g_popupAnimState   = PopupAnimState::Hidden;
             g_popupAnimElapsed = 0.0f;
             g_popupAnimFrom    = 1.0f;
@@ -507,9 +504,10 @@ static void AdvanceAnimation(float seconds) {
 static const char* fcp_get_name(void*) {
     // Display name only — source ID ("feeds_chat_popup", in the
     // registration struct below) is the stable key OBS uses in saved
-    // scene collections and must never change. The Z-prefix sorts the
-    // popup next to Zoom Participant / Zoom Screenshare in the picker.
-    return "Zoom Chat Popup";
+    // scene collections and must never change. Renamed from "Zoom Chat Popup"
+    // in 1.6.0: it now serves both Zoom and YouTube chat. Existing saved
+    // sources are unaffected (they key off the id, not this name).
+    return "Feeds Chat Popup";
 }
 
 static void* fcp_create(obs_data_t* /*settings*/, obs_source_t* source) {
@@ -599,12 +597,12 @@ static obs_properties_t* fcp_get_properties(void* data) {
 
         const char* tierName = (g_currentTier == 0) ? "Free" : "Basic";
         std::string msg = std::string(
-            "Zoom Chat Popup is a Streamer-tier feature. ") +
+            "Feeds Chat Popup is a Streamer-tier feature. ") +
             "Your current tier is " + tierName + ".";
         obs_properties_add_text(props, "tier_disabled_msg", msg.c_str(),
                                 OBS_TEXT_INFO);
         obs_properties_add_button(props, "upgrade_btn",
-            "Upgrade your plan to enable Zoom Chat Popup",
+            "Upgrade your plan to enable Feeds Chat Popup",
             [](obs_properties_t*, obs_property_t*, void*) -> bool {
                 QDesktopServices::openUrl(
                     QUrl("https://letsdovideo.com/feeds-upgrade"));
@@ -647,17 +645,17 @@ static void fcp_video_render(void* data, gs_effect_t* /*effect*/) {
     // it'll set dirty=true again and the next frame catches up.
     bool         visible;
     bool         dirty;
-    unsigned int senderId;
     QString      senderName;
     QString      content;
+    QImage       avatar;
     float        animFraction;
     {
         std::lock_guard<std::mutex> lock(g_popupStateMutex);
         visible      = d->visible;
         dirty        = d->texture_dirty;
-        senderId     = d->sender_id;
         senderName   = d->sender_name;
         content      = d->content;
+        avatar       = d->avatar;
         if (dirty) d->texture_dirty = false;
         animFraction = ComputeCurrentFraction_locked();
     }
@@ -665,7 +663,7 @@ static void fcp_video_render(void* data, gs_effect_t* /*effect*/) {
     if (!visible) return;
 
     if (dirty || !d->texture) {
-        RegenerateTexture(d, senderId, senderName, content);
+        RegenerateTexture(d, senderName, content, avatar);
     }
     if (!d->texture) return;
 
@@ -798,7 +796,8 @@ void RegisterChatPopupSource() {
 // ComputeCurrentFraction_locked() and used as the new `from`.
 void ToggleChatPopup(unsigned int senderId,
                      const std::string& senderName,
-                     const std::string& content) {
+                     const std::string& content,
+                     const QImage& avatar) {
     bool needsRefresh = false;
     {
         std::lock_guard<std::mutex> lock(g_popupStateMutex);
@@ -819,6 +818,7 @@ void ToggleChatPopup(unsigned int senderId,
             g_popupSenderId     = senderId;
             g_popupSenderName   = qName;
             g_popupContent      = qContent;
+            g_popupAvatar       = avatar;
             g_popupAnimState    = PopupAnimState::AnimatingIn;
             g_popupAnimElapsed  = 0.0f;
             g_popupAnimFrom     = 1.0f;
@@ -843,6 +843,7 @@ void ToggleChatPopup(unsigned int senderId,
                 g_popupPendingSenderId   = senderId;
                 g_popupPendingSenderName = qName;
                 g_popupPendingContent    = qContent;
+                g_popupPendingAvatar     = avatar;
             }
             break;
 
@@ -864,6 +865,7 @@ void ToggleChatPopup(unsigned int senderId,
                 g_popupPendingSenderId   = senderId;
                 g_popupPendingSenderName = qName;
                 g_popupPendingContent    = qContent;
+                g_popupPendingAvatar     = avatar;
             }
             break;
         }
@@ -879,6 +881,7 @@ void ToggleChatPopup(unsigned int senderId,
                 g_popupPendingSenderId   = senderId;
                 g_popupPendingSenderName = qName;
                 g_popupPendingContent    = qContent;
+                g_popupPendingAvatar     = avatar;
             }
             break;
         }
@@ -901,6 +904,51 @@ void ClearChatPopup() {
     g_popupPendingSenderId = 0;
     g_popupPendingSenderName.clear();
     g_popupPendingContent.clear();
+    g_popupPendingAvatar = QImage();
+
+    switch (g_popupAnimState) {
+    case PopupAnimState::Hidden:
+    case PopupAnimState::AnimatingOut:
+        return;
+    case PopupAnimState::Shown:
+        g_popupAnimState   = PopupAnimState::AnimatingOut;
+        g_popupAnimElapsed = 0.0f;
+        g_popupAnimFrom    = 0.0f;
+        g_popupAnimTo      = 1.0f;
+        return;
+    case PopupAnimState::AnimatingIn: {
+        float cur          = ComputeCurrentFraction_locked();
+        g_popupAnimState   = PopupAnimState::AnimatingOut;
+        g_popupAnimElapsed = 0.0f;
+        g_popupAnimFrom    = cur;
+        g_popupAnimTo      = 1.0f;
+        return;
+    }
+    }
+}
+
+// Pull a specific message off the popup (moderator deletion). Clears a matching
+// queued message, and slides the current one out if it's the match — leaving any
+// different pending message to slide in next. No-op if the popup isn't showing
+// this message. Same transitions as ClearChatPopup, gated on identity.
+void ClearChatPopupIfMatches(unsigned int senderId, const std::string& content) {
+    QString qc = QString::fromStdString(content);
+    std::lock_guard<std::mutex> lock(g_popupStateMutex);
+
+    if (g_popupPending &&
+        g_popupPendingSenderId == senderId &&
+        g_popupPendingContent  == qc) {
+        g_popupPending = false;
+        g_popupPendingSenderId = 0;
+        g_popupPendingSenderName.clear();
+        g_popupPendingContent.clear();
+        g_popupPendingAvatar = QImage();
+    }
+
+    const bool currentMatches = g_popupVisible &&
+                                g_popupSenderId == senderId &&
+                                g_popupContent  == qc;
+    if (!currentMatches) return;
 
     switch (g_popupAnimState) {
     case PopupAnimState::Hidden:

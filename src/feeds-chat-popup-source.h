@@ -2,6 +2,8 @@
 
 #include <string>
 
+#include <QImage>
+
 // Public interface for the feeds_chat_popup OBS source. Registration is
 // called once from obs_module_load. ToggleChatPopup / ClearChatPopup are
 // called from the dock click handler and meeting-left handler to drive
@@ -14,13 +16,25 @@ void RegisterChatPopupSource();
 // Show the given message in every active popup source instance. If the
 // same message (matched by sender_id + content) is currently showing,
 // hide instead — gives the dock a single click-to-toggle affordance.
+//
+// The avatar is resolved by the caller and passed in (the popup is cache-
+// agnostic): Zoom messages resolve from the uint-keyed g_avatarCache, YouTube
+// messages from the channel-id-keyed YT cache. A null QImage renders the
+// neutral placeholder circle. YouTube messages pass senderId 0 (no Zoom id) —
+// origin gating lives in the caller, not here.
 void ToggleChatPopup(unsigned int senderId,
                      const std::string& senderName,
-                     const std::string& content);
+                     const std::string& content,
+                     const QImage& avatar);
 
 // Hide any active popup and clear the stored message. Called on
 // meeting-left so stale state doesn't carry into the next meeting.
 void ClearChatPopup();
+
+// Hide the popup only if it is currently showing (or has queued) the given
+// message (matched by sender_id + content) — used to pull a moderator-deleted
+// YouTube message off the popup. No-op otherwise.
+void ClearChatPopupIfMatches(unsigned int senderId, const std::string& content);
 
 // Re-evaluate every popup source instance's tier_disabled flag against
 // the current g_currentTier (popup is a Streamer-tier feature, gated at
