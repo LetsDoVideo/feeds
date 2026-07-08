@@ -28,6 +28,8 @@
 #include <thread>
 #include <chrono>
 #include <cstring>
+#include <cctype>
+#include <cstdio>
 #include <windows.h>
 #include <winhttp.h>
 
@@ -1761,10 +1763,10 @@ static void ShowSessionPickerDialog(const std::string& json) {
 // because ChatMessageDelegate — defined below, before the dock — reads the role.
 // Placeholder rows carry no origin (role absent) and get no glyph/indent.
 static constexpr int kRoleChatOrigin  = Qt::UserRole + 10;  // int: kChatOrigin*
-static constexpr int kRoleChatMsgId   = Qt::UserRole + 11;  // YouTube message id (Phase 2 deletion)
-static constexpr int kRoleChatChannel = Qt::UserRole + 12;  // YouTube author channel id (Phase 2)
-static constexpr int kRoleChatAvatar  = Qt::UserRole + 13;  // YouTube avatar URL (Phase 2 download)
-enum ChatOrigin { kChatOriginZoom = 1, kChatOriginYouTube = 2 };
+static constexpr int kRoleChatMsgId   = Qt::UserRole + 11;  // platform message id (deletion): YT id / Twitch id tag
+static constexpr int kRoleChatChannel = Qt::UserRole + 12;  // by-author id: YT channel id / Twitch user-id
+static constexpr int kRoleChatAvatar  = Qt::UserRole + 13;  // avatar URL (YouTube only; Twitch has none)
+enum ChatOrigin { kChatOriginZoom = 1, kChatOriginYouTube = 2, kChatOriginTwitch = 3 };
 
 // Avatar resolvers (defined further down: Zoom's uint-keyed cache / YouTube's
 // channel-id-keyed cache). Forward-declared here because the dock's click
@@ -1773,8 +1775,9 @@ static QImage GetAvatarForSender(unsigned int senderId, const std::string& avata
 static QImage YtResolveAvatar(const std::string& channelId);
 
 // Draw a small, code-rendered origin glyph in `box` (no embedded brand logos —
-// trademark): YouTube = red rounded rect + white play triangle; Zoom = blue
-// rounded rect + white dot. Both platforms are marked, consistently.
+// trademark): YouTube = red rounded rect + white play triangle; Twitch = purple
+// rounded rect + white speech bubble; Zoom = blue rounded rect + white dot. Each
+// platform is marked with a generic shape in its brand colour, consistently.
 static void DrawChatOriginGlyph(QPainter* p, const QRectF& box, int origin) {
     p->save();
     p->setRenderHint(QPainter::Antialiasing, true);
@@ -1790,7 +1793,23 @@ static void DrawChatOriginGlyph(QPainter* p, const QRectF& box, int origin) {
         };
         p->setBrush(Qt::white);
         p->drawPolygon(tri, 3);
-    } else {  // Zoom (and any other non-YouTube marked origin)
+    } else if (origin == kChatOriginTwitch) {
+        p->setBrush(QColor(0x91, 0x46, 0xFF));               // Twitch-ish purple
+        p->drawRoundedRect(box, box.height() * 0.28, box.height() * 0.28);
+        // Generic white speech bubble (rounded body + a small tail at lower-left)
+        // — no real logo, same trademark rule as YouTube/Zoom.
+        const qreal w = box.width(), h = box.height();
+        QRectF body(box.left() + w * 0.24, box.top() + h * 0.26,
+                    w * 0.52, h * 0.38);
+        p->setBrush(Qt::white);
+        p->drawRoundedRect(body, h * 0.10, h * 0.10);
+        const QPointF tail[3] = {
+            QPointF(box.left() + w * 0.38, box.top() + h * 0.60),
+            QPointF(box.left() + w * 0.38, box.top() + h * 0.78),
+            QPointF(box.left() + w * 0.54, box.top() + h * 0.62),
+        };
+        p->drawPolygon(tail, 3);
+    } else {  // Zoom (and any other non-marked origin)
         p->setBrush(QColor(0x2D, 0x8C, 0xFF));               // Zoom-ish blue
         p->drawRoundedRect(box, box.height() * 0.28, box.height() * 0.28);
         p->setBrush(Qt::white);
@@ -1816,11 +1835,13 @@ static QPixmap MakeChatOriginPixmap(int origin, int size) {
     return pm;
 }
 
-// YouTube connection status shown in the chat dock header, reported by the poller.
-// Off = no target; Waiting = target set but not connected (not-live / backoff /
-// transient failure — the self-healing loop makes failures indistinguishable, so
-// there's no separate "Error"); Live = connected.
-enum { kYtStatusOff = 0, kYtStatusWaiting = 1, kYtStatusLive = 2 };
+// A platform poller's raw connection state, reported to the chat dock header.
+// Off = no target; Waiting = target set but not connected (not-live / connecting
+// / backoff / transient failure — the self-healing loops make failures
+// indistinguishable, so there's no separate "Error"); Live = connected. Shared by
+// the YouTube and Twitch rows; the header's ResolveRowStatus turns this plus the
+// account state into the final label (Off / Log In / Upgrade / Waiting / Live).
+enum { kChatConnOff = 0, kChatConnWaiting = 1, kChatConnLive = 2 };
 
 // YouTube target: a channel handle (resolve via /@handle/live) or a pinned video
 // id (bootstrap /watch?v=<id> directly). Declared here — the chat dock's header
@@ -1833,6 +1854,13 @@ struct YtTarget {
 };
 static YtTarget    NormalizeYouTubeTarget(std::string s);
 static std::string YtSetTargetFromInput(const std::string& input);
+
+// Twitch target: a bare lowercase login name. The chat dock's header commits its
+// field input via TwSetTargetFromInput (normalize + persist + wake), defined with
+// the Twitch poller further down; NormalizeTwitchChannel is exposed so the header
+// can preview the normalized form. Empty = off (same model as YouTube).
+static std::string NormalizeTwitchChannel(std::string s);
+static std::string TwSetTargetFromInput(const std::string& input);
 
 // Format a Zoom meeting number the way Zoom does: 3-3-4 groups ("5106269156" ->
 // "510 626 9156"). Non-10-digit lengths group in threes/threes/four and let any
@@ -2024,7 +2052,8 @@ public:
 
         setMinimumSize(200, 300);
 
-        UpdateYouTubeStatus(kYtStatusOff, QString());
+        UpdateYouTubeStatus(kChatConnOff, QString());
+        UpdateTwitchStatus(kChatConnOff);
         UpdateChatHeaderState();
     }
 
@@ -2099,27 +2128,57 @@ public:
     // matching row(s) and pulls the message off the popup if it's showing. Zoom
     // rows are never matched (origin + YT-only roles).
     void RemoveYouTubeMessageById(const QString& msgId) {
-        if (msgId.isEmpty()) return;
-        for (int i = m_list->count() - 1; i >= 0; --i) {
-            QListWidgetItem* it = m_list->item(i);
-            if (!it || it->data(kRoleChatOrigin).toInt() != kChatOriginYouTube)
-                continue;
-            if (it->data(kRoleChatMsgId).toString() != msgId) continue;
-            const std::string content = it->data(RoleContent).toString().toStdString();
-            delete m_list->takeItem(i);
-            feeds::ClearChatPopupIfMatches(0, content);
-        }
+        RemoveRowsMatching(kChatOriginYouTube, kRoleChatMsgId, msgId);
     }
 
     // Moderator ban / author deletion (by channel id) — remove all of that
     // author's YouTube rows and clear any of them from the popup.
     void RemoveYouTubeMessagesByChannel(const QString& channelId) {
-        if (channelId.isEmpty()) return;
+        RemoveRowsMatching(kChatOriginYouTube, kRoleChatChannel, channelId);
+    }
+
+    // Inject a Twitch IRC message into the dock. Mirrors AppendYouTubeMessage:
+    // dock is Basic+ (m_tierDisabled belt-and-braces), stores the same roles so
+    // deletion (CLEARMSG by msg id / CLEARCHAT by user id) and the click-to-popup
+    // path work the platform-generic way. No avatar (Twitch IRC carries none), so
+    // no kRoleChatAvatar; the popup renders its neutral circle. userId goes in the
+    // by-author role so a CLEARCHAT purge can find all of a user's rows.
+    void AppendTwitchMessage(const QString& author,
+                             const QString& content,
+                             const QString& msgId,
+                             const QString& userId) {
+        if (m_tierDisabled) return;
+        if (!m_messagesStarted) { m_list->clear(); m_messagesStarted = true; }
+
+        QListWidgetItem* item =
+            new QListWidgetItem(QString("%1: %2").arg(author, content));
+        item->setData(RoleSenderName,  author);
+        item->setData(RoleContent,     content);
+        item->setData(kRoleChatOrigin, kChatOriginTwitch);  // purple Twitch glyph
+        item->setData(kRoleChatMsgId,  msgId);
+        item->setData(kRoleChatChannel, userId);
+        m_list->addItem(item);
+        m_list->scrollToBottom();
+    }
+
+    // Twitch CLEARMSG (single message removed by id).
+    void RemoveTwitchMessageById(const QString& msgId) {
+        RemoveRowsMatching(kChatOriginTwitch, kRoleChatMsgId, msgId);
+    }
+
+    // Twitch CLEARCHAT for one user (timeout/ban) — remove all of that user's rows.
+    void RemoveTwitchMessagesByUser(const QString& userId) {
+        RemoveRowsMatching(kChatOriginTwitch, kRoleChatChannel, userId);
+    }
+
+    // Twitch CLEARCHAT with no target user — the whole chat was cleared. Drop every
+    // Twitch row (leaving Zoom/YouTube history intact) and clear any Twitch message
+    // showing in the popup.
+    void RemoveAllTwitchMessages() {
         for (int i = m_list->count() - 1; i >= 0; --i) {
             QListWidgetItem* it = m_list->item(i);
-            if (!it || it->data(kRoleChatOrigin).toInt() != kChatOriginYouTube)
+            if (!it || it->data(kRoleChatOrigin).toInt() != kChatOriginTwitch)
                 continue;
-            if (it->data(kRoleChatChannel).toString() != channelId) continue;
             const std::string content = it->data(RoleContent).toString().toStdString();
             delete m_list->takeItem(i);
             feeds::ClearChatPopupIfMatches(0, content);
@@ -2186,34 +2245,22 @@ public:
 
     // --- YouTube header, driven by the poller (all called on the UI thread) ----
 
-    // Status dot + word for the YouTube row. Marshaled from YtReportStatus.
+    // YouTube row status: store the poller's reported connection state (+ the Live
+    // video-id detail) and re-resolve the row against the current account state.
+    // Marshaled from YtReportStatus.
     void UpdateYouTubeStatus(int status, const QString& videoId) {
-        const char* color; const char* word; QString tip;
-        switch (status) {
-        case kYtStatusLive:
-            color = "#40c060"; word = "Live";
-            tip = videoId.isEmpty() ? QString("Connected")
-                                    : QString("Connected \xE2\x80\x94 video %1").arg(videoId);
-            break;
-        case kYtStatusWaiting:
-            color = "#e0a020"; word = "Waiting";
-            tip = "Target set \xE2\x80\x94 waiting for a live stream";
-            break;
-        default:
-            color = "#7a7d80"; word = "Off";
-            tip = "No YouTube target set";
-            break;
-        }
-        if (m_ytDot) {
-            m_ytDot->setStyleSheet(
-                QString("background:%1; border-radius:5px;").arg(color));
-            m_ytDot->setToolTip(tip);
-        }
-        if (m_ytWord) {
-            m_ytWord->setText(word);
-            m_ytWord->setStyleSheet(QString("color:%1;").arg(color));
-            m_ytWord->setToolTip(tip);
-        }
+        m_ytConn = status;
+        m_ytLiveDetail = videoId.isEmpty()
+            ? QString("Connected")
+            : QString("Connected \xE2\x80\x94 video %1").arg(videoId);
+        RefreshYouTubeRowStatus();
+    }
+
+    // Twitch row status: store the poller's reported connection state and
+    // re-resolve. Marshaled from TwReportStatus.
+    void UpdateTwitchStatus(int status) {
+        m_twConn = status;
+        RefreshTwitchRowStatus();
     }
 
     // Correct the field to the canonical owner handle casing on connect (display
@@ -2241,6 +2288,14 @@ public:
             : (handle.empty() ? QString() : QString::fromStdString("@" + handle));
         QSignalBlocker block(m_ytField);
         m_ytField->setText(disp);
+    }
+
+    // Populate the Twitch field from persisted config at startup. Login names are
+    // already canonical lowercase, so no casing-correction path is needed.
+    void SetTwitchTargetDisplay(const std::string& channel) {
+        if (!m_twField) return;
+        QSignalBlocker block(m_twField);
+        m_twField->setText(QString::fromStdString(channel));
     }
 
 private:
@@ -2283,6 +2338,10 @@ private:
         m_ytDot = new QLabel(header);
         m_ytDot->setFixedSize(10, 10);
         m_ytWord = new QLabel(header);
+        // Clickable status word (Log In / Upgrade states) — routes to the shared
+        // connect flow, same unstyled-label pattern as the Zoom row. The cursor +
+        // whether a click acts is driven by ResolveRowStatus via m_ytWordClickable.
+        m_ytWord->installEventFilter(this);
         ytRow->addWidget(ytGlyph);
         ytRow->addWidget(m_ytField, 1);
         ytRow->addWidget(m_ytDot);
@@ -2291,6 +2350,28 @@ private:
 
         QObject::connect(m_ytField, &QLineEdit::editingFinished, this,
                          [this]() { CommitYouTubeField(); });
+
+        // Twitch row — editable channel login + live status (mirrors YouTube).
+        QHBoxLayout* twRow = new QHBoxLayout();
+        twRow->setSpacing(6);
+        QLabel* twGlyph = new QLabel(header);
+        twGlyph->setPixmap(MakeChatOriginPixmap(kChatOriginTwitch, kChatGlyphSize));
+        twGlyph->setFixedSize(kChatGlyphSize, kChatGlyphSize);
+        twGlyph->setToolTip("Twitch chat");
+        m_twField = new QLineEdit(header);
+        m_twField->setPlaceholderText("Enter Twitch Channel");
+        m_twDot = new QLabel(header);
+        m_twDot->setFixedSize(10, 10);
+        m_twWord = new QLabel(header);
+        m_twWord->installEventFilter(this);
+        twRow->addWidget(twGlyph);
+        twRow->addWidget(m_twField, 1);
+        twRow->addWidget(m_twDot);
+        twRow->addWidget(m_twWord);
+        hv->addLayout(twRow);
+
+        QObject::connect(m_twField, &QLineEdit::editingFinished, this,
+                         [this]() { CommitTwitchField(); });
         return header;
     }
 
@@ -2328,11 +2409,18 @@ private:
             m_zoomStatus->setCursor(actionable ? Qt::PointingHandCursor
                                                : Qt::ArrowCursor);
         }
-        // Grey (but readable) the YouTube field while tier-locked so the user sees
+        // Grey (but readable) the platform fields while tier-locked so the user sees
         // their configured target but understands it's inactive. Enable transitions
         // (upgrade -> reconcile -> SetTierDisabled) fire reliably; a disabled field
         // fires no editingFinished, and setText still updates it for display.
         if (m_ytField) m_ytField->setEnabled(!m_tierDisabled);
+        if (m_twField) m_twField->setEnabled(!m_tierDisabled);
+
+        // Login/tier state just changed — re-resolve both platform rows from their
+        // stored connection state so an account-side block (Log In / Upgrade)
+        // updates without waiting for the poller to report again.
+        RefreshYouTubeRowStatus();
+        RefreshTwitchRowStatus();
     }
 
     // Commit the YouTube field on Enter / focus-out: hand the raw text to the
@@ -2345,6 +2433,86 @@ private:
         if (m_ytField->text() != disp) {
             QSignalBlocker block(m_ytField);   // don't re-fire editingFinished
             m_ytField->setText(disp);
+        }
+    }
+
+    // Commit the Twitch field on Enter / focus-out: normalize to a bare login,
+    // persist + wake (deduped in TwSetTargetFromInput), rewrite the field.
+    void CommitTwitchField() {
+        if (!m_twField) return;
+        QString disp = QString::fromStdString(
+            TwSetTargetFromInput(m_twField->text().toStdString()));
+        if (m_twField->text() != disp) {
+            QSignalBlocker block(m_twField);
+            m_twField->setText(disp);
+        }
+    }
+
+    // --- Shared per-row status resolver (item 5) -------------------------------
+    // Turn a platform's raw connection state (kChatConn*) plus the current account
+    // state into the row's presentation. The account-side blocks win over the raw
+    // connecting/live states so the row reads honestly: you can't know the tier
+    // until logged in, so logged-out shows "Log In" (the actionable first step)
+    // ahead of any Upgrade/Waiting. Used by both the YouTube and Twitch rows.
+    struct RowStatus { const char* color; const char* word; QString tip; bool clickable; };
+    RowStatus ResolveRowStatus(int conn, const char* platform,
+                               const QString& liveDetail) const {
+        if (conn == kChatConnOff)
+            return { "#7a7d80", "Off",
+                     QString("No %1 target set").arg(platform), false };
+        if (!g_isLoggedIn)
+            return { "#e0a020", "Log In",
+                     QString("Log in to enable Feeds Chat"), true };
+        if (m_tierDisabled || g_currentTier < 1)
+            return { "#e0a020", "Upgrade",
+                     QString("Upgrade your plan to enable Feeds Chat"), true };
+        if (conn == kChatConnLive)
+            return { "#40c060", "Live", liveDetail, false };
+        return { "#e0a020", "Waiting",
+                 QString("Target set \xE2\x80\x94 connecting"), false };
+    }
+
+    // Apply a resolved status to a row's dot + word widgets, and record whether the
+    // word is a clickable call-to-action (drives the cursor + eventFilter routing).
+    void ApplyRowStatus(QLabel* dot, QLabel* word, bool& clickableOut,
+                        const RowStatus& s) {
+        clickableOut = s.clickable;
+        if (dot) {
+            dot->setStyleSheet(
+                QString("background:%1; border-radius:5px;").arg(s.color));
+            dot->setToolTip(s.tip);
+        }
+        if (word) {
+            word->setText(s.word);
+            word->setStyleSheet(QString("color:%1;").arg(s.color));
+            word->setToolTip(s.tip);
+            word->setCursor(s.clickable ? Qt::PointingHandCursor
+                                        : Qt::ArrowCursor);
+        }
+    }
+
+    void RefreshYouTubeRowStatus() {
+        ApplyRowStatus(m_ytDot, m_ytWord, m_ytWordClickable,
+                       ResolveRowStatus(m_ytConn, "YouTube", m_ytLiveDetail));
+    }
+    void RefreshTwitchRowStatus() {
+        ApplyRowStatus(m_twDot, m_twWord, m_twWordClickable,
+                       ResolveRowStatus(m_twConn, "Twitch", QString("Connected")));
+    }
+
+    // Remove every row of `origin` whose `role` data equals `value`, clearing any
+    // of them from the popup. Backs the YouTube (by msg-id / channel-id) and Twitch
+    // (by msg-id / user-id) deletion paths; matching on origin keeps a value
+    // collision across platforms from touching the wrong rows.
+    void RemoveRowsMatching(int origin, int role, const QString& value) {
+        if (value.isEmpty()) return;
+        for (int i = m_list->count() - 1; i >= 0; --i) {
+            QListWidgetItem* it = m_list->item(i);
+            if (!it || it->data(kRoleChatOrigin).toInt() != origin) continue;
+            if (it->data(role).toString() != value) continue;
+            const std::string content = it->data(RoleContent).toString().toStdString();
+            delete m_list->takeItem(i);
+            feeds::ClearChatPopupIfMatches(0, content);
         }
     }
 
@@ -2361,9 +2529,16 @@ private:
         else               OnConnectClick();
     }
 
-    // Route a click on the (unstyled) Zoom status label to the connect flow.
+    // Route a click on an (unstyled) status label to the shared connect flow. The
+    // Zoom row is always actionable; the YouTube/Twitch status words act only in
+    // their clickable states (Log In / Upgrade) — TriggerConnectFlow resolves to
+    // login when logged out and the upgrade URL when tier-locked, matching what
+    // ResolveRowStatus rendered.
     bool eventFilter(QObject* obj, QEvent* ev) override {
-        if (obj == m_zoomStatus && ev->type() == QEvent::MouseButtonRelease) {
+        if (ev->type() == QEvent::MouseButtonRelease &&
+            (obj == m_zoomStatus ||
+             (obj == m_ytWord && m_ytWordClickable) ||
+             (obj == m_twWord && m_twWordClickable))) {
             TriggerConnectFlow();
             return true;
         }
@@ -2395,6 +2570,17 @@ private:
                 item->data(kRoleChatChannel).toString().toStdString();
             feeds::ToggleChatPopup(0, name.toStdString(), content.toStdString(),
                                    YtResolveAvatar(channelId));
+            return;
+        }
+
+        // Twitch row -> popup with senderId 0 and a null avatar (Twitch IRC carries
+        // no profile image; the popup draws its neutral circle). Same precede-the-
+        // placeholder rule as YouTube: a Twitch row has no RoleSenderId.
+        if (originVar.isValid() && originVar.toInt() == kChatOriginTwitch) {
+            QString name    = item->data(RoleSenderName).toString();
+            QString content = item->data(RoleContent).toString();
+            feeds::ToggleChatPopup(0, name.toStdString(), content.toStdString(),
+                                   QImage());
             return;
         }
 
@@ -2463,6 +2649,18 @@ private:
     QLineEdit*   m_ytField          = nullptr;
     QLabel*      m_ytDot            = nullptr;
     QLabel*      m_ytWord           = nullptr;
+    QLineEdit*   m_twField          = nullptr;
+    QLabel*      m_twDot            = nullptr;
+    QLabel*      m_twWord           = nullptr;
+    // Last connection state each poller reported (kChatConn*), retained so the row
+    // can be re-resolved on an account-state change without a fresh poller report.
+    int          m_ytConn           = kChatConnOff;
+    int          m_twConn           = kChatConnOff;
+    QString      m_ytLiveDetail     = QString("Connected");  // YT Live tooltip (video id)
+    // Whether each platform's status word is currently a clickable CTA (Log In /
+    // Upgrade) — gates the eventFilter routing and the pointing-hand cursor.
+    bool         m_ytWordClickable  = false;
+    bool         m_twWordClickable  = false;
     // True iff the current logged-in tier is Free (< 1). Dock starts
     // false (pre-login state is identical to a normal Basic+ session)
     // and toggles via SetTierDisabled from ReconcileSourcesToTier.
@@ -4409,6 +4607,7 @@ static const char* kFeedsConfigSection      = "Feeds";
 static const char* kCfgConnectOnStartup      = "ConnectOnStartup";
 static const char* kCfgYouTubeHandle         = "YouTubeChannelHandle";
 static const char* kCfgYouTubeVideoId        = "YouTubeVideoId";  // pinned stream (exclusive with handle)
+static const char* kCfgTwitchChannel         = "TwitchChannel";   // bare lowercase login
 
 static bool LoadConnectOnStartupSetting() {
     config_t* cfg = obs_frontend_get_user_config();
@@ -4452,6 +4651,20 @@ static void SaveYouTubeVideoIdSetting(const std::string& videoId) {
     config_save(cfg);
 }
 
+static std::string LoadTwitchChannelSetting() {
+    config_t* cfg = obs_frontend_get_user_config();
+    if (!cfg) return "";
+    const char* s = config_get_string(cfg, kFeedsConfigSection, kCfgTwitchChannel);
+    return s ? s : "";
+}
+
+static void SaveTwitchChannelSetting(const std::string& channel) {
+    config_t* cfg = obs_frontend_get_user_config();
+    if (!cfg) return;
+    config_set_string(cfg, kFeedsConfigSection, kCfgTwitchChannel, channel.c_str());
+    config_save(cfg);
+}
+
 // ===========================================================================
 // YouTube live-chat poller (Phase 1: receive -> Feeds chat dock only)
 // ===========================================================================
@@ -4486,7 +4699,7 @@ static void YtInterruptibleWait(DWORD ms) {
 }
 static void YtWakePoller() { if (g_ytWakeEvent) SetEvent(g_ytWakeEvent); }
 
-// (kYtStatus* enum is defined up near the chat dock, which consumes it.)
+// (kChatConn* enum is defined up near the chat dock, which consumes it.)
 
 static bool YtHasTarget() {
     std::lock_guard<std::mutex> l(g_ytStateMutex);
@@ -5124,12 +5337,12 @@ static void YtChatPollLoop() {
         { std::lock_guard<std::mutex> l(g_ytStateMutex);
           handle = g_ytHandle; videoId = g_ytVideoId; }
         if (handle.empty() && videoId.empty()) {
-            YtReportStatus(kYtStatusOff, "");
+            YtReportStatus(kChatConnOff, "");
             YtInterruptibleWait(INFINITE); continue;
         }
         // Target set but not yet connected -> Waiting (covers the tier-locked and
         // not-live cases below).
-        YtReportStatus(kYtStatusWaiting, "");
+        YtReportStatus(kChatConnWaiting, "");
         // Inherit the chat dock's Basic+ gating exactly: don't even poll YouTube
         // for a Free user (the header is hidden while tier-locked anyway). Bounded
         // re-check so a login/upgrade is picked up without wiring a wake.
@@ -5172,7 +5385,7 @@ static void YtChatPollLoop() {
 
         // Connected. Report Live (with resolved video id) and, in handle mode,
         // the canonical owner handle so the dock corrects the field's casing.
-        YtReportStatus(kYtStatusLive, bs.videoId);
+        YtReportStatus(kChatConnLive, bs.videoId);
         if (videoId.empty() && !bs.canonicalHandle.empty())
             YtReportCanonicalHandle(bs.canonicalHandle);
 
@@ -5286,6 +5499,423 @@ static void YtStopPollerThread() {
     if (g_ytAvatarEvent) { CloseHandle(g_ytAvatarEvent); g_ytAvatarEvent = nullptr; }
 }
 
+// ===========================================================================
+// Twitch live-chat reader (receive only)
+// ===========================================================================
+// Plugin-side, engine-uninvolved — mirrors the YouTube poller's shape and
+// lifecycle, but the transport is a persistent connection, not a poll loop:
+// Twitch chat is the sanctioned anonymous IRC interface, read over a secure
+// WebSocket (wss://irc-ws.chat.twitch.tv:443) via WinHTTP — the same session
+// idiom as YtHttpRequest, no new TLS stack. The anonymous handshake needs no
+// OAuth/token (verified against current Twitch docs + tmi.js):
+//   PASS SCHMOOPIIE            (any dummy value; no token)
+//   NICK justinfan<random>     (the anonymous-justinfan convention)
+//   CAP REQ :twitch.tv/tags twitch.tv/commands
+//       tags   -> PRIVMSG metadata (display-name, id, user-id, color, ...)
+//       commands -> the CLEARMSG/CLEARCHAT moderation messages we honor.
+//       membership is deliberately NOT requested (only JOIN/PART member lists).
+//   JOIN #<login>
+// Server PING :tmi.twitch.tv is answered with PONG :tmi.twitch.tv to stay
+// connected. Whispers can't reach an anonymous connection at all (needs an
+// authed account + whisper cap), so there is no whisper path to guard. Any
+// socket drop/error logs one distinct [feeds] line, backs off, and reconnects
+// forever — fail-soft, exactly like YouTube; Twitch breaking never touches the
+// stream or other surfaces. Twitch IRC carries no avatar (that needs the Helix
+// API + a client-id/token — a known backburner), so Twitch messages get the
+// popup's neutral circle and no overlay avatar.
+
+// Enabled purely by having a channel configured (empty = off), same model as
+// YouTube. The WebSocket handle is guarded so a shutdown or target change can
+// abort a blocked WinHttpWebSocketReceive by closing it (the sanctioned cancel
+// for a synchronous WinHTTP call); the receive timeout is left at its 0/infinite
+// default so an idle channel never drops on a timeout.
+static std::mutex        g_twStateMutex;    // guards g_twChannel
+static std::string       g_twChannel;       // normalized login; "" = unset/off
+static std::thread       g_twThread;
+static std::atomic<bool> g_twShouldExit{false};
+static HANDLE            g_twWakeEvent = nullptr;  // auto-reset; wakes on target-change/shutdown
+static std::mutex        g_twSockMutex;     // guards g_twWebSocket
+static HINTERNET         g_twWebSocket = nullptr;  // live WS handle (null when not connected)
+
+static void TwInterruptibleWait(DWORD ms) {
+    if (g_twWakeEvent) WaitForSingleObject(g_twWakeEvent, ms);
+    else               Sleep(ms == INFINITE ? 1000 : ms);
+}
+
+// Close the live WebSocket if any (atomically taking ownership so a concurrent
+// caller no-ops). Called from the read loop's normal cleanup AND cross-thread
+// from the wake/stop path to abort a blocked receive — a null-check under the
+// lock guarantees the handle is closed exactly once.
+static void TwCloseSocket() {
+    HINTERNET h = nullptr;
+    { std::lock_guard<std::mutex> l(g_twSockMutex); h = g_twWebSocket; g_twWebSocket = nullptr; }
+    if (h) WinHttpCloseHandle(h);
+}
+
+// Wake the poller: signal the wait AND abort any blocked receive so a target
+// change / shutdown is picked up immediately (not on the next server message).
+static void TwWakePoller() {
+    if (g_twWakeEvent) SetEvent(g_twWakeEvent);
+    TwCloseSocket();
+}
+
+// Normalize whatever the user typed/pasted to a bare lowercase login: strip a
+// scheme, a twitch.tv/ host, a leading '@' or '#', any trailing path/query, and
+// keep only login-legal chars ([a-z0-9_]). Twitch logins are already canonical
+// lowercase, so there's no casing-correction round trip (unlike YouTube).
+static std::string NormalizeTwitchChannel(std::string s) {
+    auto trim = [](std::string& x) {
+        size_t a = x.find_first_not_of(" \t\r\n");
+        size_t b = x.find_last_not_of(" \t\r\n");
+        x = (a == std::string::npos) ? "" : x.substr(a, b - a + 1);
+    };
+    trim(s);
+    if (s.empty()) return "";
+    for (char& c : s) c = (char)tolower((unsigned char)c);
+    auto stripPrefix = [&](const char* pfx) {
+        size_t n = strlen(pfx);
+        if (s.compare(0, n, pfx) == 0) s = s.substr(n);
+    };
+    stripPrefix("https://");
+    stripPrefix("http://");
+    stripPrefix("www.twitch.tv/");
+    stripPrefix("m.twitch.tv/");
+    stripPrefix("twitch.tv/");
+    while (!s.empty() && (s.front() == '@' || s.front() == '#')) s.erase(0, 1);
+    size_t cut = s.find_first_of("/?#");
+    if (cut != std::string::npos) s = s.substr(0, cut);
+    std::string out;
+    for (char c : s) {
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
+        if (ok) out += c;
+    }
+    return out;
+}
+
+// Apply a dock-field input as the poller target: normalize, store, persist, and
+// wake if it changed. Returns the normalized login for the field. The dock routes
+// its Twitch field commits through here (never touches the poller globals).
+static std::string TwSetTargetFromInput(const std::string& input) {
+    std::string ch = NormalizeTwitchChannel(input);
+    bool changed;
+    {
+        std::lock_guard<std::mutex> l(g_twStateMutex);
+        changed = (ch != g_twChannel);
+        g_twChannel = ch;
+    }
+    if (changed) {
+        SaveTwitchChannelSetting(ch);
+        TwWakePoller();
+    }
+    return ch;
+}
+
+// Marshal the Twitch connection status to the dock header (deduped, poller-thread
+// state only — mirrors YtReportStatus).
+static int g_twStatusLast = -1;
+static void TwReportStatus(int status) {
+    if (status == g_twStatusLast) return;
+    g_twStatusLast = status;
+    QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
+        [status]() { if (g_chatDock) g_chatDock->UpdateTwitchStatus(status); });
+}
+
+// --- Message / deletion fan-out (mirrors the Yt* delivery helpers) ---------
+static void TwDeliverToDock(const std::string& author, const std::string& text,
+                            const std::string& msgId, const std::string& userId) {
+    if (g_currentTier < 1) return;
+    QString a = QString::fromStdString(author);
+    QString t = QString::fromStdString(text);
+    QString id = QString::fromStdString(msgId);
+    QString uid = QString::fromStdString(userId);
+    QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
+        [a, t, id, uid]() {
+            if (g_chatDock) g_chatDock->AppendTwitchMessage(a, t, id, uid);
+        });
+}
+static void TwDeliverToOverlay(const std::string& author, const std::string& text) {
+    if (g_currentTier < 2) return;
+    feeds::AppendChatMessageToOverlay(
+        feeds::ChatMsgOrigin::Twitch, 0 /*no Zoom id*/, std::string() /*no avatar*/,
+        author, text, 0);
+}
+static void TwDeliverDeletionById(const std::string& msgId) {
+    QString id = QString::fromStdString(msgId);
+    QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
+        [id]() { if (g_chatDock) g_chatDock->RemoveTwitchMessageById(id); });
+}
+static void TwDeliverDeletionByUser(const std::string& userId) {
+    QString uid = QString::fromStdString(userId);
+    QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
+        [uid]() { if (g_chatDock) g_chatDock->RemoveTwitchMessagesByUser(uid); });
+}
+static void TwDeliverClearAll() {
+    QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
+        []() { if (g_chatDock) g_chatDock->RemoveAllTwitchMessages(); });
+}
+
+// --- WebSocket transport ---------------------------------------------------
+// Open the secure WebSocket to Twitch IRC. On success all three handles are open
+// and hWs is returned to the caller (which publishes it under g_twSockMutex);
+// on any failure everything opened here is closed and false is returned.
+static bool TwWsConnect(HINTERNET& hSession, HINTERNET& hConnect, HINTERNET& hWs) {
+    hSession = hConnect = hWs = nullptr;
+    hSession = WinHttpOpen(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) FeedsOBS",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return false;
+    // Bound connect/send; leave receive at 0 (infinite) — the read loop blocks and
+    // is unblocked by TwCloseSocket, not by a timeout (which would drop idle chats).
+    WinHttpSetTimeouts(hSession, 8000, 8000, 10000, 0);
+    hConnect = WinHttpConnect(hSession, L"irc-ws.chat.twitch.tv",
+                              INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); hSession = nullptr; return false; }
+    HINTERNET hReq = WinHttpOpenRequest(hConnect, L"GET", L"/", nullptr,
+        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (hReq &&
+        WinHttpSetOption(hReq, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, nullptr, 0) &&
+        WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                           WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+        WinHttpReceiveResponse(hReq, nullptr)) {
+        hWs = WinHttpWebSocketCompleteUpgrade(hReq, 0);
+    }
+    if (hReq) WinHttpCloseHandle(hReq);   // request handle unneeded post-upgrade
+    if (!hWs) {
+        WinHttpCloseHandle(hConnect); hConnect = nullptr;
+        WinHttpCloseHandle(hSession); hSession = nullptr;
+        return false;
+    }
+    return true;
+}
+
+// Send one IRC line (CRLF appended) as a UTF-8 WebSocket message.
+static bool TwWsSendLine(HINTERNET hWs, const std::string& line) {
+    std::string wire = line + "\r\n";
+    return WinHttpWebSocketSend(hWs, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
+                                (PVOID)wire.data(), (DWORD)wire.size()) == NO_ERROR;
+}
+
+// --- IRC line parsing ------------------------------------------------------
+struct TwIrcLine {
+    std::map<std::string, std::string> tags;
+    std::string nick;
+    std::string command;
+    std::string trailing;
+};
+
+// Unescape an IRCv3 tag value (\s -> space, \: -> ';', \\ -> '\', \r/\n).
+static std::string TwUnescapeTag(const std::string& v) {
+    std::string out;
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (v[i] == '\\' && i + 1 < v.size()) {
+            char n = v[++i];
+            switch (n) {
+            case 's': out += ' ';  break;
+            case ':': out += ';';  break;
+            case 'r': out += '\r'; break;
+            case 'n': out += '\n'; break;
+            case '\\': out += '\\'; break;
+            default:  out += n;    break;
+            }
+        } else {
+            out += v[i];
+        }
+    }
+    return out;
+}
+
+static TwIrcLine TwParseIrcLine(const std::string& raw) {
+    TwIrcLine ln;
+    size_t pos = 0;
+    // Tags: "@k=v;k2=v2 "
+    if (pos < raw.size() && raw[pos] == '@') {
+        size_t sp = raw.find(' ', pos);
+        std::string tagstr = raw.substr(1, (sp == std::string::npos ? raw.size() : sp) - 1);
+        size_t start = 0;
+        while (start <= tagstr.size()) {
+            size_t semi = tagstr.find(';', start);
+            std::string kv = tagstr.substr(start, (semi == std::string::npos ? tagstr.size() : semi) - start);
+            size_t eq = kv.find('=');
+            if (!kv.empty()) {
+                if (eq == std::string::npos) ln.tags[kv] = "";
+                else ln.tags[kv.substr(0, eq)] = TwUnescapeTag(kv.substr(eq + 1));
+            }
+            if (semi == std::string::npos) break;
+            start = semi + 1;
+        }
+        pos = (sp == std::string::npos) ? raw.size() : sp + 1;
+    }
+    while (pos < raw.size() && raw[pos] == ' ') ++pos;
+    // Prefix: ":nick!user@host "
+    if (pos < raw.size() && raw[pos] == ':') {
+        size_t sp = raw.find(' ', pos);
+        std::string prefix = raw.substr(pos + 1, (sp == std::string::npos ? raw.size() : sp) - pos - 1);
+        size_t bang = prefix.find('!');
+        ln.nick = (bang == std::string::npos) ? prefix : prefix.substr(0, bang);
+        pos = (sp == std::string::npos) ? raw.size() : sp + 1;
+    }
+    while (pos < raw.size() && raw[pos] == ' ') ++pos;
+    // Command
+    { size_t sp = raw.find(' ', pos);
+      ln.command = raw.substr(pos, (sp == std::string::npos ? raw.size() : sp) - pos);
+      pos = (sp == std::string::npos) ? raw.size() : sp + 1; }
+    // Params: scan for the trailing param (" :rest"); middle params are ignored
+    // (we key off tags + command + trailing only).
+    while (pos < raw.size()) {
+        while (pos < raw.size() && raw[pos] == ' ') ++pos;
+        if (pos >= raw.size()) break;
+        if (raw[pos] == ':') { ln.trailing = raw.substr(pos + 1); break; }
+        size_t sp = raw.find(' ', pos);
+        pos = (sp == std::string::npos) ? raw.size() : sp + 1;
+    }
+    return ln;
+}
+
+// Handle one complete IRC line: PING keepalive, welcome (-> Live), a chat message,
+// or a moderation clear. Unknown commands are skipped defensively. Returns via
+// hWs for the PONG reply.
+static void TwHandleIrcLine(HINTERNET hWs, const std::string& raw) {
+    if (raw.empty()) return;
+    // PING can arrive with no tags/prefix — check it before the full parse.
+    if (raw.compare(0, 4, "PING") == 0) {
+        std::string token = (raw.size() > 5) ? raw.substr(5) : std::string(":tmi.twitch.tv");
+        TwWsSendLine(hWs, "PONG " + token);
+        return;
+    }
+    TwIrcLine ln = TwParseIrcLine(raw);
+    if (ln.command == "PRIVMSG") {
+        auto dn = ln.tags.find("display-name");
+        std::string author = (dn != ln.tags.end() && !dn->second.empty()) ? dn->second : ln.nick;
+        std::string id     = ln.tags.count("id") ? ln.tags["id"] : "";
+        std::string userId = ln.tags.count("user-id") ? ln.tags["user-id"] : "";
+        std::string text   = ln.trailing;
+        if (author.empty() && text.empty()) return;
+        TwDeliverToDock(author, text, id, userId);
+        TwDeliverToOverlay(author, text);   // overlay honors per-instance filter
+    } else if (ln.command == "CLEARMSG") {
+        std::string tmid = ln.tags.count("target-msg-id") ? ln.tags["target-msg-id"] : "";
+        if (!tmid.empty()) TwDeliverDeletionById(tmid);
+    } else if (ln.command == "CLEARCHAT") {
+        std::string tuid = ln.tags.count("target-user-id") ? ln.tags["target-user-id"] : "";
+        if (!tuid.empty()) TwDeliverDeletionByUser(tuid);   // one user timed out/banned
+        else               TwDeliverClearAll();             // whole chat cleared
+    } else if (ln.command == "001") {
+        // Welcome (anonymous auth accepted) — we're connected; JOIN follows.
+        TwReportStatus(kChatConnLive);
+    }
+    // Everything else (CAP/002-004/353/366/JOIN/PART/ROOMSTATE/USERSTATE/
+    // USERNOTICE/NOTICE/HOSTTARGET/RECONNECT/...) is intentionally ignored.
+}
+
+static void TwChatLoop() {
+    blog(LOG_INFO, "[feeds] twitch chat reader thread started");
+    while (!g_twShouldExit.load()) {
+        std::string channel;
+        { std::lock_guard<std::mutex> l(g_twStateMutex); channel = g_twChannel; }
+        if (channel.empty()) {
+            TwReportStatus(kChatConnOff);
+            TwInterruptibleWait(INFINITE); continue;
+        }
+        TwReportStatus(kChatConnWaiting);
+        // Inherit the dock's Basic+ gate exactly — don't even connect for a Free
+        // user. Bounded re-check so a login/upgrade is picked up without a wake.
+        if (g_currentTier < 1) { TwInterruptibleWait(30000); continue; }
+
+        HINTERNET hSession, hConnect, hWs;
+        if (!TwWsConnect(hSession, hConnect, hWs)) {
+            blog(LOG_INFO, "[feeds] twitch chat: connect failed (#%s); retrying",
+                 channel.c_str());
+            if (!g_twShouldExit.load()) TwInterruptibleWait(5000);
+            continue;
+        }
+        // Publish the handle so a shutdown / target change can abort the blocked
+        // receive below. If we were told to stop meanwhile, drop it immediately.
+        { std::lock_guard<std::mutex> l(g_twSockMutex);
+          if (g_twShouldExit.load()) { WinHttpCloseHandle(hWs); hWs = nullptr; }
+          else g_twWebSocket = hWs; }
+        if (!hWs) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); break; }
+
+        // Anonymous handshake. justinfan<random> avoids collisions across instances;
+        // GetTickCount is monotonic-enough for a nonce (no PRNG seeding needed).
+        char nick[32];
+        snprintf(nick, sizeof(nick), "justinfan%lu",
+                 (unsigned long)(GetTickCount() % 1000000u));
+        bool sent =
+            TwWsSendLine(hWs, "PASS SCHMOOPIIE") &&
+            TwWsSendLine(hWs, std::string("NICK ") + nick) &&
+            TwWsSendLine(hWs, "CAP REQ :twitch.tv/tags twitch.tv/commands") &&
+            TwWsSendLine(hWs, "JOIN #" + channel);
+        if (!sent) {
+            blog(LOG_INFO, "[feeds] twitch chat: handshake send failed (#%s); reconnecting",
+                 channel.c_str());
+            TwCloseSocket();
+            WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+            if (!g_twShouldExit.load()) TwInterruptibleWait(5000);
+            continue;
+        }
+        blog(LOG_INFO, "[feeds] twitch chat: connected to #%s", channel.c_str());
+
+        // Read loop: accumulate bytes, split on CRLF (Twitch batches lines and can
+        // fragment WebSocket frames), handle each complete line. Any receive error
+        // (including a cross-thread TwCloseSocket abort) or a CLOSE frame drops out
+        // to reconnect / exit.
+        std::string rx;
+        for (;;) {
+            if (g_twShouldExit.load()) break;
+            { std::lock_guard<std::mutex> l(g_twStateMutex);
+              if (g_twChannel != channel) break; }   // target changed -> reconnect
+            if (g_currentTier < 1) {
+                blog(LOG_INFO, "[feeds] twitch chat: tier dropped below Basic; disconnecting");
+                break;
+            }
+            BYTE buf[4096];
+            DWORD read = 0;
+            WINHTTP_WEB_SOCKET_BUFFER_TYPE bt = WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE;
+            DWORD rc = WinHttpWebSocketReceive(hWs, buf, sizeof(buf), &read, &bt);
+            if (rc != NO_ERROR) {
+                blog(LOG_INFO, "[feeds] twitch chat: receive ended (rc=%lu, #%s); reconnecting",
+                     (unsigned long)rc, channel.c_str());
+                break;
+            }
+            if (bt == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE) {
+                blog(LOG_INFO, "[feeds] twitch chat: server closed (#%s); reconnecting",
+                     channel.c_str());
+                break;
+            }
+            rx.append((const char*)buf, read);
+            size_t nl;
+            while ((nl = rx.find('\n')) != std::string::npos) {
+                std::string line = rx.substr(0, nl);
+                rx.erase(0, nl + 1);
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (!line.empty()) TwHandleIrcLine(hWs, line);
+            }
+        }
+
+        TwCloseSocket();   // closes hWs once (no-op if an abort already did)
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        if (!g_twShouldExit.load()) TwInterruptibleWait(5000);   // backoff, then reconnect
+    }
+    blog(LOG_INFO, "[feeds] twitch chat reader thread exiting");
+}
+
+static void TwStartReaderThread() {
+    if (g_twThread.joinable()) return;
+    g_twShouldExit = false;
+    if (!g_twWakeEvent)
+        g_twWakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);  // auto-reset
+    g_twThread = std::thread(TwChatLoop);
+}
+
+static void TwStopReaderThread() {
+    g_twShouldExit = true;
+    if (g_twWakeEvent) SetEvent(g_twWakeEvent);
+    TwCloseSocket();   // abort a blocked receive so the join returns promptly
+    if (g_twThread.joinable()) g_twThread.join();
+    if (g_twWakeEvent) { CloseHandle(g_twWakeEvent); g_twWakeEvent = nullptr; }
+}
+
 void SetupPluginMenu() {
     QMainWindow* mainWindow = (QMainWindow*)obs_frontend_get_main_window();
     QMenuBar*    menuBar    = mainWindow->menuBar();
@@ -5314,6 +5944,14 @@ void SetupPluginMenu() {
       ytHandle = g_ytHandle; ytVideoId = g_ytVideoId; }
     if (g_chatDock) g_chatDock->SetYouTubeTargetDisplay(ytHandle, ytVideoId);
     YtWakePoller();
+
+    // Same for the Twitch channel (also configured from the dock header).
+    std::string twChannel;
+    { std::lock_guard<std::mutex> l(g_twStateMutex);
+      g_twChannel = LoadTwitchChannelSetting();
+      twChannel = g_twChannel; }
+    if (g_chatDock) g_chatDock->SetTwitchTargetDisplay(twChannel);
+    TwWakePoller();
 
     feedsMenu->addSeparator();
     QAction* aboutAction = feedsMenu->addAction("About / Tier Status");
@@ -8023,6 +8661,10 @@ bool obs_module_load(void) {
     // the plugin's lifetime, engine-independent.
     YtStartPollerThread();
 
+    // Twitch chat reader — same lifecycle: starts idle, picks up the persisted
+    // channel at FINISHED_LOADING, runs for the plugin's lifetime.
+    TwStartReaderThread();
+
     obs_frontend_add_event_callback([](enum obs_frontend_event event, void*) {
         switch (event) {
         // Gate the 9th-source hard block off during scene-collection loads so a
@@ -8068,6 +8710,10 @@ void obs_module_unload(void) {
     // Stop the YouTube chat poller (signals exit, wakes it, joins). Worst case it
     // waits out one in-flight HTTP request (bounded by the WinHTTP timeouts).
     YtStopPollerThread();
+
+    // Stop the Twitch chat reader (signals exit, closes the socket to abort a
+    // blocked receive, joins).
+    TwStopReaderThread();
 
     // Remove the ISO recorder's frontend callback and drain any leftovers
     // before the engine + Qt teardown below.

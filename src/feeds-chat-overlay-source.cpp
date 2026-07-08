@@ -74,10 +74,10 @@ static constexpr const char* S_VISIBLE_MESSAGES = "visible_messages";
 static constexpr const char* S_PLATFORM_FILTER  = "platform_filter";
 
 // Per-instance platform filter values. BOTH is 0 (also the default an absent
-// setting reads back as, so existing overlays default to Both). ZOOM/YOUTUBE
-// equal feeds::ChatMsgOrigin's Zoom/YouTube so a non-Both filter is just
+// setting reads back as, so existing overlays default to Both). ZOOM/YOUTUBE/
+// TWITCH equal feeds::ChatMsgOrigin's values so a non-Both filter is just
 // "keep if (int)origin == filter".
-enum { PLAT_BOTH = 0, PLAT_ZOOM = 1, PLAT_YOUTUBE = 2 };
+enum { PLAT_BOTH = 0, PLAT_ZOOM = 1, PLAT_YOUTUBE = 2, PLAT_TWITCH = 3 };
 
 // Width range and step. WIDTH_DEFAULT_PX is the property-system default
 // (35% of 1920 ≈ 672 px) — a baseline for sources loaded from saves
@@ -265,14 +265,17 @@ static void RenderOverlayToImage(FeedsChatOverlayData* d,
 
         // Circular avatar at the row's left edge — resolved from the origin-
         // appropriate cache. YouTube: channel-id cache (a miss or null entry
-        // leaves `avatar` null -> neutral circle). Zoom: sender-id cache, falling
-        // back to the bundled Feeds logo.
+        // leaves `avatar` null -> neutral circle). Twitch: none (IRC carries no
+        // avatar; Helix is a backburner) -> null -> neutral circle. Zoom: sender-id
+        // cache, falling back to the bundled Feeds logo.
         QImage avatar;
         if (m.origin == feeds::ChatMsgOrigin::YouTube) {
             std::lock_guard<std::mutex> lock(g_ytAvatarCacheMutex);
             auto cacheIt = g_ytAvatarCacheByChannel.find(m.channel_id);
             if (cacheIt != g_ytAvatarCacheByChannel.end())
                 avatar = cacheIt->second;
+        } else if (m.origin == feeds::ChatMsgOrigin::Twitch) {
+            // Leave `avatar` null — the neutral grey circle is drawn below.
         } else {
             std::lock_guard<std::mutex> lock(g_avatarCacheMutex);
             auto cacheIt = g_avatarCache.find(m.sender_id);
@@ -398,7 +401,8 @@ static void fcr_update(void* data, obs_data_t* settings) {
     if (w > WIDTH_MAX_PX) w = WIDTH_MAX_PX;
     if (v < VISIBLE_MIN)  v = VISIBLE_MIN;
     if (v > VISIBLE_MAX)  v = VISIBLE_MAX;
-    if (f != PLAT_ZOOM && f != PLAT_YOUTUBE) f = PLAT_BOTH;  // unknown -> Both
+    if (f != PLAT_ZOOM && f != PLAT_YOUTUBE && f != PLAT_TWITCH)
+        f = PLAT_BOTH;  // unknown -> Both
 
     std::lock_guard<std::mutex> lock(g_overlayInstancesMutex);
     bool changed = false;
@@ -516,6 +520,7 @@ static obs_properties_t* fcr_get_properties(void* data) {
     obs_property_list_add_int(plat, "Both",         PLAT_BOTH);
     obs_property_list_add_int(plat, "Zoom Chat",    PLAT_ZOOM);
     obs_property_list_add_int(plat, "YouTube Chat", PLAT_YOUTUBE);
+    obs_property_list_add_int(plat, "Twitch Chat",  PLAT_TWITCH);
     return props;
 }
 
