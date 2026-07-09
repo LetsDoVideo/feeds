@@ -4968,9 +4968,17 @@ static void YtAvatarWorkerLoop() {
             continue;
         }
         QImage img = YtDownloadAvatarImage(job.second);   // null on failure
-        std::lock_guard<std::mutex> l(g_ytAvatarCacheMutex);
-        g_ytAvatarCacheByChannel[job.first] = img;         // cache result (even null: one try/session)
-        g_ytAvatarInFlight.erase(job.first);
+        {
+            std::lock_guard<std::mutex> l(g_ytAvatarCacheMutex);
+            g_ytAvatarCacheByChannel[job.first] = img;     // cache result (even null: one try/session)
+            g_ytAvatarInFlight.erase(job.first);
+        }
+        // A resolved avatar can land after its row already rendered with the
+        // neutral circle — repaint the overlay now (which resolves avatars at
+        // render time) instead of waiting for incidental chat to force it. Skip a
+        // cached miss (null): nothing would change. Mark is thread-safe (instances
+        // mutex + bool writes only), so it's safe from this worker thread.
+        if (!img.isNull()) feeds::MarkChatOverlayDirty();
     }
 }
 
@@ -5758,9 +5766,16 @@ static void TwAvatarWorkerLoop() {
         // the YouTube CDN image path (the URL host is static-cdn.jtvnw.net).
         std::string url = TwGqlFetchAvatarUrl(job.second);
         QImage img = url.empty() ? QImage() : YtDownloadAvatarImage(url);
-        std::lock_guard<std::mutex> l(g_twAvatarCacheMutex);
-        g_twAvatarCacheByUser[job.first] = img;   // cache result (even null: one try/session)
-        g_twAvatarInFlight.erase(job.first);
+        {
+            std::lock_guard<std::mutex> l(g_twAvatarCacheMutex);
+            g_twAvatarCacheByUser[job.first] = img;   // cache result (even null: one try/session)
+            g_twAvatarInFlight.erase(job.first);
+        }
+        // Repaint the overlay so this just-resolved avatar replaces the neutral
+        // circle immediately (see YtAvatarWorkerLoop for the rationale). Twitch is
+        // where this is most visible — the GQL discovery hop widens the window
+        // between row-render and avatar-ready. Skip a cached miss (null).
+        if (!img.isNull()) feeds::MarkChatOverlayDirty();
     }
 }
 

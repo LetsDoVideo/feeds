@@ -42,6 +42,15 @@ void AppendChatMessageToOverlay(ChatMsgOrigin      origin,
 // so stale messages don't carry into the next meeting.
 void ClearChatOverlay();
 
+// Mark every overlay instance dirty so it re-renders on the next frame.
+// Called from the avatar download workers when a late-arriving avatar lands
+// in its cache after the row already rendered with the neutral circle —
+// without this the row keeps its stale texture until incidental chat
+// activity forces a repaint. Thread-safe (guards only the instances mutex +
+// bool writes, touches no Qt/graphics objects), so the off-thread workers
+// call it directly, the same way the IPC thread does on a new message.
+void MarkChatOverlayDirty();
+
 // Re-evaluate every overlay source instance's tier_disabled flag against
 // the current g_currentTier (overlay is a Streamer-tier feature, gated
 // at >= 2). Called from plugin-main's ReconcileSourcesToTier on

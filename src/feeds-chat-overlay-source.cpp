@@ -677,6 +677,13 @@ void ClearChatOverlay() {
     MarkAllOverlayInstancesDirty();
 }
 
+// Public wrapper over MarkAllOverlayInstancesDirty for the avatar workers (see
+// the header). No history mutation — a late avatar changed a cache the render
+// path reads, so the existing textures just need to be rebuilt.
+void MarkChatOverlayDirty() {
+    MarkAllOverlayInstancesDirty();
+}
+
 void ReconcileChatOverlaySources() {
     const bool shouldDisable = (g_currentTier < OVERLAY_MIN_TIER);
     std::lock_guard<std::mutex> lock(g_overlayInstancesMutex);
