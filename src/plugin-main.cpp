@@ -1773,6 +1773,7 @@ enum ChatOrigin { kChatOriginZoom = 1, kChatOriginYouTube = 2, kChatOriginTwitch
 // handler — above their definitions — resolves an avatar to hand to the popup.
 static QImage GetAvatarForSender(unsigned int senderId, const std::string& avatarPath);
 static QImage YtResolveAvatar(const std::string& channelId);
+static QImage TwResolveAvatar(const std::string& userId);
 
 // Draw a small, code-rendered origin glyph in `box` (no embedded brand logos —
 // trademark): YouTube = red rounded rect + white play triangle; Twitch = purple
@@ -2573,14 +2574,16 @@ private:
             return;
         }
 
-        // Twitch row -> popup with senderId 0 and a null avatar (Twitch IRC carries
-        // no profile image; the popup draws its neutral circle). Same precede-the-
-        // placeholder rule as YouTube: a Twitch row has no RoleSenderId.
+        // Twitch row -> popup with senderId 0. Resolve the avatar from the Twitch
+        // cache by user-id (stored in the by-author role); a miss/null renders the
+        // popup's neutral circle. Same precede-the-placeholder rule as YouTube: a
+        // Twitch row has no RoleSenderId.
         if (originVar.isValid() && originVar.toInt() == kChatOriginTwitch) {
             QString name    = item->data(RoleSenderName).toString();
             QString content = item->data(RoleContent).toString();
+            std::string userId = item->data(kRoleChatChannel).toString().toStdString();
             feeds::ToggleChatPopup(0, name.toStdString(), content.toStdString(),
-                                   QImage());
+                                   TwResolveAvatar(userId));
             return;
         }
 
@@ -5620,6 +5623,147 @@ static void TwReportStatus(int status) {
         [status]() { if (g_chatDock) g_chatDock->UpdateTwitchStatus(status); });
 }
 
+// --- Twitch avatar cache + GraphQL resolver + download worker --------------
+// Twitch IRC carries no avatar, so (parallel to the YouTube cache) resolving one
+// takes an extra hop: query Twitch's unofficial GraphQL endpoint by login to get
+// the profile-image URL, then download it from the CDN. Same posture as YouTube's
+// InnerTube — undocumented, uses Twitch's PUBLIC web Client-ID (ships in every
+// browser; NOT a secret, no OAuth, no registration). Keyed by user-id (already
+// the row's by-author identity + what the overlay carries); the login is only
+// needed transiently for the GQL query. One attempt per user per session; a
+// cached null QImage records a miss so we neither refetch nor block — the popup/
+// overlay fall back to the neutral circle. Cache mutex/map are external-linkage
+// (like the YT cache) so the overlay can read them at render time.
+std::mutex                    g_twAvatarCacheMutex;
+std::map<std::string, QImage> g_twAvatarCacheByUser;   // userId -> avatar (null = tried, none)
+static std::set<std::string>  g_twAvatarInFlight;
+static constexpr size_t       kTwAvatarCacheCap = 512;
+
+static std::mutex             g_twAvatarQueueMutex;
+static std::vector<std::pair<std::string, std::string>> g_twAvatarQueue;  // (userId, login)
+static std::thread            g_twAvatarThread;
+static std::atomic<bool>      g_twAvatarExit{false};
+static HANDLE                 g_twAvatarEvent = nullptr;  // auto-reset wake
+
+// The well-known PUBLIC Twitch web Client-ID (the value the twitch.tv site and
+// OSS libraries send). Not a secret — safe to embed, like the YouTube InnerTube
+// key. Verified live 2026-07-08 (see C:\Dev\Greps\twitch_gql_avatar.json).
+static const wchar_t* kTwitchGqlHeaders =
+    L"Client-ID: kimne78kx3ncx6brgo4mv6wki5h1ko\r\n"
+    L"Content-Type: application/json\r\n";
+
+// Resolve a user's avatar from the cache (UI thread, at popup-click time). Null
+// QImage if not resolved yet or resolution failed -> popup draws its neutral circle.
+static QImage TwResolveAvatar(const std::string& userId) {
+    if (userId.empty()) return QImage();
+    std::lock_guard<std::mutex> l(g_twAvatarCacheMutex);
+    auto it = g_twAvatarCacheByUser.find(userId);
+    return it != g_twAvatarCacheByUser.end() ? it->second : QImage();
+}
+
+// POST a GraphQL query to gql.twitch.tv with the public Client-ID header. Returns
+// true on a 200 with a non-empty body. Dedicated (not YtHttpRequest) because GQL
+// needs the Client-ID header and not YouTube's consent cookie.
+static bool TwGqlPost(const std::string& body, std::string& respBody) {
+    respBody.clear();
+    HINTERNET hSession = WinHttpOpen(
+        L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) FeedsOBS",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return false;
+    WinHttpSetTimeouts(hSession, 8000, 8000, 10000, 15000);
+    HINTERNET hConnect = WinHttpConnect(hSession, L"gql.twitch.tv",
+                                        INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConnect) { WinHttpCloseHandle(hSession); return false; }
+    HINTERNET hRequest = WinHttpOpenRequest(
+        hConnect, L"POST", L"/gql", nullptr, WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+    if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return false; }
+    WinHttpAddRequestHeaders(hRequest, kTwitchGqlHeaders, (DWORD)-1,
+                             WINHTTP_ADDREQ_FLAG_ADD);
+    BOOL sentOk = WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                     (LPVOID)body.data(), (DWORD)body.size(),
+                                     (DWORD)body.size(), 0);
+    bool ok = false;
+    if (sentOk && WinHttpReceiveResponse(hRequest, nullptr)) {
+        DWORD st = 0, stSize = sizeof(st);
+        WinHttpQueryHeaders(hRequest,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &st, &stSize, WINHTTP_NO_HEADER_INDEX);
+        char buf[8192]; DWORD n = 0;
+        while (WinHttpReadData(hRequest, buf, sizeof(buf), &n) && n > 0)
+            respBody.append(buf, n);
+        ok = (st == 200 && !respBody.empty());
+    }
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+    return ok;
+}
+
+// Query GQL for a login's profile-image URL (small 70px variant). "" on any
+// failure or a nonexistent login (data.user = null).
+static std::string TwGqlFetchAvatarUrl(const std::string& login) {
+    if (login.empty()) return "";
+    std::string body =
+        "{\"query\":\"query{user(login:\\\"" + JsonEscape(login) +
+        "\\\"){profileImageURL(width:70)}}\"}";
+    std::string resp;
+    if (!TwGqlPost(body, resp)) return "";
+    obs_data_t* root = obs_data_create_from_json(resp.c_str());
+    if (!root) return "";
+    YtObj rootO(root);
+    return rootO.obj("data").obj("user").str("profileImageURL");
+}
+
+// Queue an avatar resolution for `userId` (query by `login`) if we don't already
+// have it / one isn't in flight / the cache isn't at cap. Called from the reader
+// thread as messages arrive. Gated at Streamer tier: only the popup/overlay show
+// avatars, and Twitch resolution costs an extra GQL round trip (unlike YouTube,
+// whose URL rides in the message) — no point warming for a dock-only Basic user.
+static void TwRequestAvatar(const std::string& userId, const std::string& login) {
+    if (userId.empty() || login.empty()) return;
+    if (g_currentTier < 2) return;
+    {
+        std::lock_guard<std::mutex> l(g_twAvatarCacheMutex);
+        if (g_twAvatarCacheByUser.count(userId)) return;   // already have (or tried)
+        if (g_twAvatarInFlight.count(userId))     return;   // already resolving
+        if (g_twAvatarCacheByUser.size() >= kTwAvatarCacheCap) return;  // bounded
+        g_twAvatarInFlight.insert(userId);
+    }
+    {
+        std::lock_guard<std::mutex> l(g_twAvatarQueueMutex);
+        g_twAvatarQueue.emplace_back(userId, login);
+    }
+    if (g_twAvatarEvent) SetEvent(g_twAvatarEvent);
+}
+
+static void TwAvatarWorkerLoop() {
+    while (!g_twAvatarExit.load()) {
+        std::pair<std::string, std::string> job;
+        bool have = false;
+        {
+            std::lock_guard<std::mutex> l(g_twAvatarQueueMutex);
+            if (!g_twAvatarQueue.empty()) {
+                job = g_twAvatarQueue.front();
+                g_twAvatarQueue.erase(g_twAvatarQueue.begin());
+                have = true;
+            }
+        }
+        if (!have) {
+            if (g_twAvatarEvent) WaitForSingleObject(g_twAvatarEvent, INFINITE);
+            continue;
+        }
+        // job.first = userId, job.second = login. GQL -> URL -> download, reusing
+        // the YouTube CDN image path (the URL host is static-cdn.jtvnw.net).
+        std::string url = TwGqlFetchAvatarUrl(job.second);
+        QImage img = url.empty() ? QImage() : YtDownloadAvatarImage(url);
+        std::lock_guard<std::mutex> l(g_twAvatarCacheMutex);
+        g_twAvatarCacheByUser[job.first] = img;   // cache result (even null: one try/session)
+        g_twAvatarInFlight.erase(job.first);
+    }
+}
+
 // --- Message / deletion fan-out (mirrors the Yt* delivery helpers) ---------
 static void TwDeliverToDock(const std::string& author, const std::string& text,
                             const std::string& msgId, const std::string& userId) {
@@ -5633,11 +5777,13 @@ static void TwDeliverToDock(const std::string& author, const std::string& text,
             if (g_chatDock) g_chatDock->AppendTwitchMessage(a, t, id, uid);
         });
 }
-static void TwDeliverToOverlay(const std::string& author, const std::string& text) {
+static void TwDeliverToOverlay(const std::string& author, const std::string& text,
+                               const std::string& userId) {
     if (g_currentTier < 2) return;
+    // userId is the overlay's string avatar key (Twitch branch resolves the QImage
+    // from g_twAvatarCacheByUser at render time, the way YouTube uses channel id).
     feeds::AppendChatMessageToOverlay(
-        feeds::ChatMsgOrigin::Twitch, 0 /*no Zoom id*/, std::string() /*no avatar*/,
-        author, text, 0);
+        feeds::ChatMsgOrigin::Twitch, 0 /*no Zoom id*/, userId, author, text, 0);
 }
 static void TwDeliverDeletionById(const std::string& msgId) {
     QString id = QString::fromStdString(msgId);
@@ -5788,10 +5934,12 @@ static void TwHandleIrcLine(HINTERNET hWs, const std::string& raw) {
         std::string author = (dn != ln.tags.end() && !dn->second.empty()) ? dn->second : ln.nick;
         std::string id     = ln.tags.count("id") ? ln.tags["id"] : "";
         std::string userId = ln.tags.count("user-id") ? ln.tags["user-id"] : "";
+        std::string login  = ln.nick;   // IRC nick == lowercase login (GQL query key)
         std::string text   = ln.trailing;
         if (author.empty() && text.empty()) return;
+        TwRequestAvatar(userId, login);   // warm the avatar cache (Streamer-gated)
         TwDeliverToDock(author, text, id, userId);
-        TwDeliverToOverlay(author, text);   // overlay honors per-instance filter
+        TwDeliverToOverlay(author, text, userId);   // overlay honors per-instance filter
     } else if (ln.command == "CLEARMSG") {
         std::string tmid = ln.tags.count("target-msg-id") ? ln.tags["target-msg-id"] : "";
         if (!tmid.empty()) TwDeliverDeletionById(tmid);
@@ -5905,6 +6053,11 @@ static void TwStartReaderThread() {
     g_twShouldExit = false;
     if (!g_twWakeEvent)
         g_twWakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);  // auto-reset
+    // Avatar resolver worker — shares the reader's lifetime (like the YT worker).
+    g_twAvatarExit = false;
+    if (!g_twAvatarEvent)
+        g_twAvatarEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_twAvatarThread = std::thread(TwAvatarWorkerLoop);
     g_twThread = std::thread(TwChatLoop);
 }
 
@@ -5914,6 +6067,11 @@ static void TwStopReaderThread() {
     TwCloseSocket();   // abort a blocked receive so the join returns promptly
     if (g_twThread.joinable()) g_twThread.join();
     if (g_twWakeEvent) { CloseHandle(g_twWakeEvent); g_twWakeEvent = nullptr; }
+
+    g_twAvatarExit = true;
+    if (g_twAvatarEvent) SetEvent(g_twAvatarEvent);
+    if (g_twAvatarThread.joinable()) g_twAvatarThread.join();
+    if (g_twAvatarEvent) { CloseHandle(g_twAvatarEvent); g_twAvatarEvent = nullptr; }
 }
 
 void SetupPluginMenu() {

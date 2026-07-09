@@ -45,6 +45,10 @@ extern std::map<unsigned int, QImage>   g_avatarCache;
 extern QImage                           g_fallbackAvatar;
 extern std::mutex                       g_ytAvatarCacheMutex;
 extern std::map<std::string, QImage>    g_ytAvatarCacheByChannel;
+// Twitch avatar cache (keyed by user-id) — resolved via unofficial GraphQL in
+// plugin-main; a miss / null entry renders the neutral grey circle.
+extern std::mutex                       g_twAvatarCacheMutex;
+extern std::map<std::string, QImage>    g_twAvatarCacheByUser;
 
 // Tier state from plugin-main.cpp. Overlay is gated at Streamer (>= 2),
 // enforced by ReconcileChatOverlaySources via the tier_disabled flag.
@@ -264,10 +268,9 @@ static void RenderOverlayToImage(FeedsChatOverlayData* d,
         if (rowY < BG_PADDING) break;  // would clip above top — stop.
 
         // Circular avatar at the row's left edge — resolved from the origin-
-        // appropriate cache. YouTube: channel-id cache (a miss or null entry
-        // leaves `avatar` null -> neutral circle). Twitch: none (IRC carries no
-        // avatar; Helix is a backburner) -> null -> neutral circle. Zoom: sender-id
-        // cache, falling back to the bundled Feeds logo.
+        // appropriate cache. YouTube: channel-id cache. Twitch: user-id cache
+        // (resolved via unofficial GraphQL). Either miss/null leaves `avatar` null
+        // -> neutral circle. Zoom: sender-id cache, falling back to the Feeds logo.
         QImage avatar;
         if (m.origin == feeds::ChatMsgOrigin::YouTube) {
             std::lock_guard<std::mutex> lock(g_ytAvatarCacheMutex);
@@ -275,7 +278,10 @@ static void RenderOverlayToImage(FeedsChatOverlayData* d,
             if (cacheIt != g_ytAvatarCacheByChannel.end())
                 avatar = cacheIt->second;
         } else if (m.origin == feeds::ChatMsgOrigin::Twitch) {
-            // Leave `avatar` null — the neutral grey circle is drawn below.
+            std::lock_guard<std::mutex> lock(g_twAvatarCacheMutex);
+            auto cacheIt = g_twAvatarCacheByUser.find(m.channel_id);
+            if (cacheIt != g_twAvatarCacheByUser.end())
+                avatar = cacheIt->second;
         } else {
             std::lock_guard<std::mutex> lock(g_avatarCacheMutex);
             auto cacheIt = g_avatarCache.find(m.sender_id);
