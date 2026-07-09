@@ -375,9 +375,10 @@ static void RegenerateTexture(FeedsChatOverlayData* d) {
 // the popup's `fcp_` and the overlay's `fcr_` visibly distinct in tracebacks.
 // ---------------------------------------------------------------------------
 static const char* fcr_get_name(void*) {
-    // Z-prefix sorts the overlay next to Zoom Participant / Zoom
-    // Screenshare / Zoom Chat Popup in the picker.
-    return "Zoom Chat Overlay";
+    // "Feeds" prefix groups the overlay with Feeds Participant /
+    // Feeds Screenshare / Feeds Chat Popup in the picker. Display name
+    // only — the source ID ("feeds_chat_overlay") is the stable key.
+    return "Feeds Chat Overlay";
 }
 
 // Populate baseline defaults into the settings blob before the source's
@@ -497,12 +498,12 @@ static obs_properties_t* fcr_get_properties(void* data) {
 
         const char* tierName = (g_currentTier == 0) ? "Free" : "Basic";
         std::string msg = std::string(
-            "Zoom Chat Overlay is a Streamer-tier feature. ") +
+            "Feeds Chat Overlay is a Streamer-tier feature. ") +
             "Your current tier is " + tierName + ".";
         obs_properties_add_text(props, "tier_disabled_msg", msg.c_str(),
                                 OBS_TEXT_INFO);
         obs_properties_add_button(props, "upgrade_btn",
-            "Upgrade your plan to enable Zoom Chat Overlay",
+            "Upgrade your plan to enable Feeds Chat Overlay",
             [](obs_properties_t*, obs_property_t*, void*) -> bool {
                 QDesktopServices::openUrl(
                     QUrl("https://letsdovideo.com/feeds-upgrade"));

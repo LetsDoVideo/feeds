@@ -3048,7 +3048,7 @@ public:
 
         if (rows.empty()) {
             QLabel* empty = new QLabel(
-                "No Zoom Participant sources yet.\n"
+                "No Feeds Participant sources yet.\n"
                 "Click “Create Participant Feed” below to create one.");
             empty->setWordWrap(true);
             empty->setStyleSheet("QLabel { color: #7a7d80; }");
@@ -3266,11 +3266,11 @@ private:
         m_hdrScreenshare = MakeHeaderButton("Screenshare");
         QObject::connect(m_hdrScreenshare, &QPushButton::clicked, [this]() {
             if (g_currentTier < 1) {   // tier-locked (Basic+): actionable upgrade prompt
-                ShowSourceUpgradePrompt("Zoom Screenshare", "Basic");
+                ShowSourceUpgradePrompt("Feeds Screenshare", "Basic");
                 return;   // locked: no add to cool down (upgrade-prompt throttle handles it)
             }
             if (m_cdScreenshare) return;   // on add-cooldown: absorb the rapid re-click
-            AddOrReferenceSourceInCurrentScene("zoom_screenshare_source", "Zoom Screenshare",
+            AddOrReferenceSourceInCurrentScene("zoom_screenshare_source", "Feeds Screenshare",
                                                RefAddPlacement::FitCenter);
             BeginHeaderCooldown(&m_cdScreenshare);
         });
@@ -3278,11 +3278,11 @@ private:
         m_hdrChatOverlay = MakeHeaderButton("Chat Overlay");
         QObject::connect(m_hdrChatOverlay, &QPushButton::clicked, [this]() {
             if (g_currentTier < 2) {   // tier-locked (Streamer+): actionable upgrade prompt
-                ShowSourceUpgradePrompt("Zoom Chat Overlay", "Streamer");
+                ShowSourceUpgradePrompt("Feeds Chat Overlay", "Streamer");
                 return;
             }
             if (m_cdChatOverlay) return;   // on add-cooldown: absorb the rapid re-click
-            CreateSourceOfTypeInCurrentScene("feeds_chat_overlay", "Zoom Chat Overlay");
+            CreateSourceOfTypeInCurrentScene("feeds_chat_overlay", "Feeds Chat Overlay");
             BeginHeaderCooldown(&m_cdChatOverlay);
         });
 
@@ -4465,7 +4465,7 @@ static void SetupParticipantDock() {
     // Stable id — never change this across versions (see SetupChatDock).
     g_participantDock = new FeedsParticipantDock();
     obs_frontend_add_dock_by_id(
-        "feeds_participant_dock", "Zoom Participants", g_participantDock);
+        "feeds_participant_dock", "Feeds Controls", g_participantDock);
     blog(LOG_INFO, "[feeds] participant dock registered");
 }
 
@@ -8380,7 +8380,7 @@ static void CreateSourceOfTypeInCurrentScene(const char* typeId, const char* bas
 }
 
 static void CreateParticipantSourceInCurrentScene() {
-    CreateSourceOfTypeInCurrentScene("zoom_participant_source", "Zoom Participant");
+    CreateSourceOfTypeInCurrentScene("zoom_participant_source", "Feeds Participant");
 }
 
 // Find the first live (non-removed) source of the given type, returning an owned
@@ -8769,7 +8769,7 @@ bool obs_module_load(void) {
     zoom_participant_info.id             = "zoom_participant_source";
     zoom_participant_info.type           = OBS_SOURCE_TYPE_INPUT;
     zoom_participant_info.output_flags   = OBS_SOURCE_ASYNC_VIDEO;
-    zoom_participant_info.get_name       = [](void*) { return "Zoom Participant"; };
+    zoom_participant_info.get_name       = [](void*) { return "Feeds Participant"; };
     zoom_participant_info.create         = zp_create;
     zoom_participant_info.destroy        = zp_destroy;
     zoom_participant_info.get_properties = zp_properties;
@@ -8781,7 +8781,7 @@ bool obs_module_load(void) {
     zoom_screenshare_info.id             = "zoom_screenshare_source";
     zoom_screenshare_info.type           = OBS_SOURCE_TYPE_INPUT;
     zoom_screenshare_info.output_flags   = OBS_SOURCE_ASYNC_VIDEO;
-    zoom_screenshare_info.get_name       = [](void*) { return "Zoom Screenshare"; };
+    zoom_screenshare_info.get_name       = [](void*) { return "Feeds Screenshare"; };
     zoom_screenshare_info.create         = zs_create;
     zoom_screenshare_info.destroy        = zs_destroy;
     zoom_screenshare_info.get_properties = zs_properties;
