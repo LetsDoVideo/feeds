@@ -75,13 +75,14 @@ namespace {
 // Settings keys used in obs_data_t blobs and properties UI.
 static constexpr const char* S_WIDTH            = "width";
 static constexpr const char* S_VISIBLE_MESSAGES = "visible_messages";
-static constexpr const char* S_PLATFORM_FILTER  = "platform_filter";
-
-// Per-instance platform filter values. BOTH is 0 (also the default an absent
-// setting reads back as, so existing overlays default to Both). ZOOM/YOUTUBE/
-// TWITCH equal feeds::ChatMsgOrigin's values so a non-Both filter is just
-// "keep if (int)origin == filter".
-enum { PLAT_BOTH = 0, PLAT_ZOOM = 1, PLAT_YOUTUBE = 2, PLAT_TWITCH = 3 };
+// Per-platform visibility toggles — one bool per origin, so any subset can be
+// shown. Replaced the single-select platform_filter int. All three default to
+// true, so a settings blob written before these keys existed (no stored
+// per-platform values) reads back all-on and keeps showing every platform; the
+// legacy platform_filter int, if still present, is simply ignored.
+static constexpr const char* S_SHOW_ZOOM        = "show_zoom";
+static constexpr const char* S_SHOW_YOUTUBE     = "show_youtube";
+static constexpr const char* S_SHOW_TWITCH      = "show_twitch";
 
 // Width range and step. WIDTH_DEFAULT_PX is the property-system default
 // (35% of 1920 ≈ 672 px) — a baseline for sources loaded from saves
@@ -159,7 +160,11 @@ struct FeedsChatOverlayData {
     // fcr_get_height return something sensible before fcr_update runs.
     uint32_t        width             = (uint32_t)WIDTH_DEFAULT_PX;
     int             visible_messages  = VISIBLE_DEFAULT;
-    int             platform_filter   = PLAT_BOTH;   // Zoom / YouTube / Both
+    // Per-platform visibility — any subset renders. Defaults all-on to match
+    // the historical all-platforms behaviour (and the get_defaults values).
+    bool            show_zoom         = true;
+    bool            show_youtube      = true;
+    bool            show_twitch       = true;
     uint32_t        height            = (uint32_t)(
                                             VISIBLE_DEFAULT * AVATAR_SIZE +
                                             (VISIBLE_DEFAULT - 1) * ROW_SPACING +
@@ -215,15 +220,20 @@ static void RenderOverlayToImage(FeedsChatOverlayData* d,
     QRect bgRect(0, 0, (int)d->width, (int)d->height);
     p.drawRoundedRect(bgRect, BG_CORNER_RADIUS, BG_CORNER_RADIUS);
 
-    // Apply this instance's platform filter to the shared history (BOTH keeps
-    // everything; otherwise keep only the matching origin), preserving order so
-    // the newest kept messages are still at the end.
+    // Keep only messages whose origin has its per-platform toggle enabled,
+    // preserving order so the newest kept messages are still at the end. All
+    // three toggles on (the default) keeps everything; all off yields an
+    // intentionally empty overlay.
     std::vector<const OverlayMessage*> filtered;
     filtered.reserve(messages.size());
     for (const OverlayMessage& m : messages) {
-        if (d->platform_filter == PLAT_BOTH ||
-            (int)m.origin == d->platform_filter)
-            filtered.push_back(&m);
+        bool keep = false;
+        switch (m.origin) {
+        case feeds::ChatMsgOrigin::Zoom:    keep = d->show_zoom;    break;
+        case feeds::ChatMsgOrigin::YouTube: keep = d->show_youtube; break;
+        case feeds::ChatMsgOrigin::Twitch:  keep = d->show_twitch;  break;
+        }
+        if (keep) filtered.push_back(&m);
     }
 
     const size_t take = std::min<size_t>(filtered.size(),
@@ -389,7 +399,12 @@ static const char* fcr_get_name(void*) {
 static void fcr_get_defaults(obs_data_t* settings) {
     obs_data_set_default_int(settings, S_WIDTH,            WIDTH_DEFAULT_PX);
     obs_data_set_default_int(settings, S_VISIBLE_MESSAGES, VISIBLE_DEFAULT);
-    obs_data_set_default_int(settings, S_PLATFORM_FILTER,  PLAT_BOTH);
+    // All platforms visible by default. These defaults apply to any settings
+    // blob lacking the keys, so overlays saved before the per-platform toggles
+    // existed load with every platform shown (no silent hiding).
+    obs_data_set_default_bool(settings, S_SHOW_ZOOM,    true);
+    obs_data_set_default_bool(settings, S_SHOW_YOUTUBE, true);
+    obs_data_set_default_bool(settings, S_SHOW_TWITCH,  true);
 }
 
 // Pull the configured dimensions out of settings, clamp to ranges,
@@ -401,21 +416,23 @@ static void fcr_update(void* data, obs_data_t* settings) {
     FeedsChatOverlayData* d = static_cast<FeedsChatOverlayData*>(data);
     if (!d || !settings) return;
 
-    int w = (int)obs_data_get_int(settings, S_WIDTH);
-    int v = (int)obs_data_get_int(settings, S_VISIBLE_MESSAGES);
-    int f = (int)obs_data_get_int(settings, S_PLATFORM_FILTER);
+    int  w  = (int)obs_data_get_int(settings, S_WIDTH);
+    int  v  = (int)obs_data_get_int(settings, S_VISIBLE_MESSAGES);
+    bool sz = obs_data_get_bool(settings, S_SHOW_ZOOM);
+    bool sy = obs_data_get_bool(settings, S_SHOW_YOUTUBE);
+    bool st = obs_data_get_bool(settings, S_SHOW_TWITCH);
     if (w < WIDTH_MIN_PX) w = WIDTH_MIN_PX;
     if (w > WIDTH_MAX_PX) w = WIDTH_MAX_PX;
     if (v < VISIBLE_MIN)  v = VISIBLE_MIN;
     if (v > VISIBLE_MAX)  v = VISIBLE_MAX;
-    if (f != PLAT_ZOOM && f != PLAT_YOUTUBE && f != PLAT_TWITCH)
-        f = PLAT_BOTH;  // unknown -> Both
 
     std::lock_guard<std::mutex> lock(g_overlayInstancesMutex);
     bool changed = false;
     if (d->width != (uint32_t)w) { d->width = (uint32_t)w; changed = true; }
     if (d->visible_messages != v) { d->visible_messages = v; changed = true; }
-    if (d->platform_filter != f) { d->platform_filter = f; changed = true; }
+    if (d->show_zoom    != sz) { d->show_zoom    = sz; changed = true; }
+    if (d->show_youtube != sy) { d->show_youtube = sy; changed = true; }
+    if (d->show_twitch  != st) { d->show_twitch  = st; changed = true; }
     if (changed) d->texture_dirty = true;
 }
 
@@ -519,15 +536,12 @@ static obs_properties_t* fcr_get_properties(void* data) {
     obs_properties_add_int(props, S_VISIBLE_MESSAGES,
                            "Visible Messages",
                            VISIBLE_MIN, VISIBLE_MAX, 1);
-    // Which platform's chat this overlay instance shows. Must-select (no None);
-    // defaults to Both. Values match PLAT_* / ChatMsgOrigin.
-    obs_property_t* plat = obs_properties_add_list(
-        props, S_PLATFORM_FILTER, "Chat Source",
-        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-    obs_property_list_add_int(plat, "Both",         PLAT_BOTH);
-    obs_property_list_add_int(plat, "Zoom Chat",    PLAT_ZOOM);
-    obs_property_list_add_int(plat, "YouTube Chat", PLAT_YOUTUBE);
-    obs_property_list_add_int(plat, "Twitch Chat",  PLAT_TWITCH);
+    // Which platforms this overlay shows — one checkbox per origin, any subset
+    // allowed. All on by default; unchecking every box yields an intentionally
+    // empty overlay (an explicit choice, unlike an accidental dropdown "None").
+    obs_properties_add_bool(props, S_SHOW_ZOOM,    "Show Zoom Chat");
+    obs_properties_add_bool(props, S_SHOW_YOUTUBE, "Show YouTube Chat");
+    obs_properties_add_bool(props, S_SHOW_TWITCH,  "Show Twitch Chat");
     return props;
 }
 
@@ -587,7 +601,13 @@ static void fcr_video_render(void* data, gs_effect_t* /*effect*/) {
         gs_texture_t* clipped = gs_texrender_get_texture(d->texrender);
         if (clipped) {
             gs_blend_state_push();
-            gs_blend_function(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA);
+            // Separate alpha factor (src_a = ONE) matches OBS's default
+            // composite blend (gs_reset_blend_state). The non-separate form
+            // squares the destination alpha, corrupting the accumulated alpha
+            // of a nested scene so its opaque siblings composite semi-
+            // transparent into the parent scene.
+            gs_blend_function_separate(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA,
+                                       GS_BLEND_ONE,      GS_BLEND_INVSRCALPHA);
 
             gs_effect_t* eff   = obs_get_base_effect(OBS_EFFECT_DEFAULT);
             gs_eparam_t* param = gs_effect_get_param_by_name(eff, "image");
@@ -606,7 +626,10 @@ static void fcr_video_render(void* data, gs_effect_t* /*effect*/) {
     // the bbox; good enough that the source still works under
     // graphics-memory pressure.
     gs_blend_state_push();
-    gs_blend_function(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA);
+    // Separate alpha factor (src_a = ONE) matches OBS's default composite
+    // blend — see the phase-2 note above on nested-scene alpha accumulation.
+    gs_blend_function_separate(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA,
+                               GS_BLEND_ONE,      GS_BLEND_INVSRCALPHA);
 
     gs_effect_t* eff   = obs_get_base_effect(OBS_EFFECT_DEFAULT);
     gs_eparam_t* param = gs_effect_get_param_by_name(eff, "image");

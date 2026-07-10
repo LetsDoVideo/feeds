@@ -721,7 +721,13 @@ static void fcp_video_render(void* data, gs_effect_t* /*effect*/) {
         gs_texture_t* clipped = gs_texrender_get_texture(d->texrender);
         if (clipped) {
             gs_blend_state_push();
-            gs_blend_function(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA);
+            // Separate alpha factor (src_a = ONE) matches OBS's default
+            // composite blend (gs_reset_blend_state). The non-separate form
+            // squares the destination alpha, corrupting the accumulated alpha
+            // of a nested scene so its opaque siblings composite semi-
+            // transparent into the parent scene.
+            gs_blend_function_separate(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA,
+                                       GS_BLEND_ONE,      GS_BLEND_INVSRCALPHA);
 
             gs_effect_t* eff   = obs_get_base_effect(OBS_EFFECT_DEFAULT);
             gs_eparam_t* param = gs_effect_get_param_by_name(eff, "image");
@@ -740,7 +746,10 @@ static void fcp_video_render(void* data, gs_effect_t* /*effect*/) {
     // is visible outside its bbox during the slide. Better than not
     // rendering at all.
     gs_blend_state_push();
-    gs_blend_function(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA);
+    // Separate alpha factor (src_a = ONE) matches OBS's default composite
+    // blend — see the phase-2 note above on nested-scene alpha accumulation.
+    gs_blend_function_separate(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA,
+                               GS_BLEND_ONE,      GS_BLEND_INVSRCALPHA);
 
     gs_matrix_push();
     gs_matrix_translate3f(0.0f, yOffset, 0.0f);

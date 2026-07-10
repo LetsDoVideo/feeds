@@ -12,10 +12,11 @@
 
 namespace feeds {
 
-// Platform a chat message came from — tags each overlay-history entry so a
-// per-instance filter (Zoom / YouTube / Twitch / Both) can show or drop it.
-// Values are deliberately 1/2/3 so they equal the non-"Both" dropdown filter
-// values (PLAT_*).
+// Platform a chat message came from — tags each overlay-history entry so the
+// overlay's per-platform visibility toggles (Show Zoom / YouTube / Twitch)
+// can show or drop it. Values are 1/2/3 for a stable settings representation;
+// they no longer need to line up with a dropdown filter (the single-select
+// "Chat Source" combo was replaced by per-platform checkboxes).
 enum class ChatMsgOrigin { Zoom = 1, YouTube = 2, Twitch = 3 };
 
 void RegisterChatOverlaySource();
