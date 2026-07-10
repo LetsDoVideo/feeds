@@ -760,10 +760,42 @@ static void RefreshAllSourceProperties() {
 // guard correctly lets the source re-subscribe to the new id.
 static bool SubscribeBoundSourceLocked(ZpSourceData* s) {
     if (!s || s->uuid.empty()) return false;
-    if (s->tier_disabled) return false;
-    if (s->current_user_id < 1) return false;            // unbound (0)
-    if (!(g_isInMeeting && g_rawLiveStreamGranted)) return false;
+    const char* srcName = s->source ? obs_source_get_name(s->source) : "";
+    if (srcName == nullptr) srcName = "";
+    if (s->tier_disabled) {
+        blog(LOG_INFO, "[feeds] bind-decision: REFUSED subscribe source='%s' "
+             "userId=%u bound_this_session=%d reason=tier_disabled",
+             srcName, s->current_user_id, s->bound_this_session ? 1 : 0);
+        return false;
+    }
+    if (s->current_user_id < 1) return false;            // unbound (0) — quiet
+    if (!(g_isInMeeting && g_rawLiveStreamGranted)) {
+        blog(LOG_INFO, "[feeds] bind-decision: DEFERRED subscribe source='%s' "
+             "userId=%u bound_this_session=%d reason=no_privilege_yet",
+             srcName, s->current_user_id, s->bound_this_session ? 1 : 0);
+        return false;
+    }
     if (s->subscribed_user_id == s->current_user_id) return false;  // already subscribed
+
+    // Decision log: this is the single choke point where a bound source is
+    // (re)subscribed. bound_this_session==1 is a binding CONFIRMED this session
+    // (manual pick, name reconcile, or the active-speaker sentinel).
+    // bound_this_session==0 means current_user_id is a runtime id carried over
+    // WITHOUT a this-session confirmation — the suspected first-time auto-assign
+    // fallback: a stale id from a prior meeting that the grant sweep re-subscribes,
+    // landing whoever now holds that id into this source. Flagged loudly so a
+    // single join self-documents an unbidden bind.
+    if (s->bound_this_session) {
+        blog(LOG_INFO, "[feeds] bind-decision: SUBSCRIBE (confirmed) source='%s' "
+             "uuid=%s userId=%u bound_this_session=1",
+             srcName, s->uuid.c_str(), s->current_user_id);
+    } else {
+        blog(LOG_WARNING, "[feeds] bind-decision: SUBSCRIBE (FALLBACK / stale "
+             "runtime id — first-available auto-assign) source='%s' uuid=%s "
+             "userId=%u bound_this_session=0 — subscribing a source whose binding "
+             "was NOT confirmed this session (suspected auto-bind bug)",
+             srcName, s->uuid.c_str(), s->current_user_id);
+    }
 
     // Auto-rebind / grant / rejoin all route through the engine's RECREATE path
     // (full destroy + fresh createRenderer via the sequenced gate), not a plain
@@ -849,7 +881,13 @@ static void ReconcileRememberedParticipants(
         // reached it because the source was never marked bound. bound_this_session
         // is harmless for a sentinel (Case A needs current_user_id > 1, and nothing
         // name-rebinds it).
+        const char* srcName = s->source ? obs_source_get_name(s->source) : "";
+        if (srcName == nullptr) srcName = "";
+
         if (pid == 1) {
+            blog(LOG_INFO, "[feeds] bind-decision: rule=active-speaker source='%s' "
+                 "uuid=%s (sentinel) bound_this_session=%d",
+                 srcName, s->uuid.c_str(), s->bound_this_session ? 1 : 0);
             s->current_user_id    = 1;
             s->bound_this_session = true;
             SubscribeBoundSourceLocked(s);
@@ -880,6 +918,12 @@ static void ReconcileRememberedParticipants(
                 // present all along is left untouched (working binding).
                 bool justJoined = std::find(joinedIds.begin(), joinedIds.end(),
                                             s->current_user_id) != joinedIds.end();
+                blog(LOG_INFO, "[feeds] bind-decision: rule=%s source='%s' key='%s' "
+                     "participant='%s' userId=%u bound_this_session=1",
+                     justJoined ? "same-session-rejoin (force recreate)"
+                                : "same-session-keep",
+                     srcName, remembered.c_str(), it->second.c_str(),
+                     s->current_user_id);
                 if (justJoined) {
                     s->subscribed_user_id = 0;   // bypass already-subscribed guard
                     SubscribeBoundSourceLocked(s);
@@ -889,22 +933,38 @@ static void ReconcileRememberedParticipants(
             }
             // Bound participant is absent (dropped) — fall through and try to
             // re-bind them by remembered name (handles the rejoin).
+            blog(LOG_INFO, "[feeds] bind-decision: source='%s' key='%s' "
+                 "bound userId=%u now ABSENT — trying name rebind",
+                 srcName, remembered.c_str(), s->current_user_id);
         }
 
         // Case B: unbound, or bound-but-absent. Auto-bind only on an exact
         // name match with exactly one present candidate.
         if (remembered.empty()) {
+            // No saved persistent key and no confirmed this-session binding —
+            // a never-assigned source. Left unbound by design; log only when a
+            // stale runtime id lingers (would be a fallback-subscribe candidate).
+            if (s->current_user_id > 1)
+                blog(LOG_INFO, "[feeds] bind-decision: REFUSED source='%s' "
+                     "key='' userId=%u bound_this_session=%d "
+                     "reason=no-saved-key (leave unbound)",
+                     srcName, s->current_user_id, s->bound_this_session ? 1 : 0);
             obs_data_release(settings);
             continue;
         }
         auto cit = countByName.find(remembered);
         if (cit == countByName.end() || cit->second != 1) {
+            blog(LOG_INFO, "[feeds] bind-decision: REFUSED source='%s' key='%s' "
+                 "bound_this_session=%d reason=%s (leave unbound)",
+                 srcName, remembered.c_str(), s->bound_this_session ? 1 : 0,
+                 cit == countByName.end() ? "no-name-match"
+                                          : "duplicate-names");
             obs_data_release(settings);  // no match, or duplicate names
             continue;
         }
         unsigned int newId = idByName[remembered];
         if (s->bound_this_session && newId == s->current_user_id) {
-            obs_data_release(settings);  // already correctly bound
+            obs_data_release(settings);  // already correctly bound — quiet
             continue;
         }
 
@@ -913,6 +973,11 @@ static void ReconcileRememberedParticipants(
         // subscribe. If privilege isn't granted yet (initial join sweep),
         // SubscribeBoundSourceLocked is a no-op and the raw_livestream_granted
         // handler subscribes this source once privilege exists.
+        blog(LOG_INFO, "[feeds] bind-decision: rule=matched-saved-persistent-key "
+             "source='%s' key='%s' participant='%s' userId=%u "
+             "bound_this_session(prev)=%d",
+             srcName, remembered.c_str(), remembered.c_str(), newId,
+             s->bound_this_session ? 1 : 0);
         s->current_user_id    = newId;
         s->bound_this_session = true;
         obs_data_set_int(settings, "participant_id", (long long)newId);
@@ -6720,9 +6785,16 @@ static void RecordParticipantBinding(ZpSourceData* data, obs_data_t* settings) {
         if (!name.empty())
             obs_data_set_string(settings, kParticipantNameKey, name.c_str());
         if (data) data->bound_this_session = true;
+        blog(LOG_INFO, "[feeds] bind-decision: rule=manual-assign source='%s' "
+             "key='%s' userId=%lld bound_this_session=1",
+             (data && data->source) ? obs_source_get_name(data->source) : "",
+             name.c_str(), sel);
     } else {
         obs_data_set_string(settings, kParticipantNameKey, "");
         if (data) data->bound_this_session = false;
+        blog(LOG_INFO, "[feeds] bind-decision: rule=manual-unassign source='%s' "
+             "userId=%lld bound_this_session=0",
+             (data && data->source) ? obs_source_get_name(data->source) : "", sel);
     }
 
     // Interactive assignment changed — refresh the participant dock. This is the
@@ -8023,6 +8095,8 @@ static void RegisterEngineHandlers() {
             ReconcileRememberedParticipants({});
             {
                 std::lock_guard<std::mutex> lock(g_sourcesMutex);
+                blog(LOG_INFO, "[feeds] bind-decision: grant sweep — "
+                     "(re)subscribing all bound sources after raw_livestream_granted");
                 for (ZpSourceData* s : g_allParticipantSources)
                     SubscribeBoundSourceLocked(s);
             }
