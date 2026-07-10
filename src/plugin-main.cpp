@@ -2073,7 +2073,7 @@ public:
                          });
 
         m_input = new QLineEdit(this);
-        m_input->setPlaceholderText("Send message to everyone...");
+        m_input->setPlaceholderText(QString::fromUtf8("Message Zoom chat…"));
         m_sendBtn = new QPushButton("Send", this);
 
         // Disabled until we're in a meeting. OnMeetingJoined/OnMeetingLeft
