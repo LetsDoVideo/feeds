@@ -45,6 +45,7 @@
 #include <QLineEdit>
 #include <QListWidget>
 #include <QListWidgetItem>
+#include <QScrollBar>
 #include <QPainter>
 #include <QRegularExpression>
 #include <QStyledItemDelegate>
@@ -2002,6 +2003,14 @@ public:
     static constexpr int RoleSenderName = Qt::UserRole + 2;
     static constexpr int RoleContent    = Qt::UserRole + 3;
 
+    // Sticky-bottom tolerance: a scroll value "within this many px of the
+    // maximum" counts as at-bottom, so normal reading-the-latest stays pinned
+    // but any deliberate scroll-up breaks the stick.
+    static constexpr int kStickyBottomTolerancePx = 8;
+    // Retained-row cap across all platforms (a unified display cap, not
+    // per-platform). Oldest rows trim as new ones arrive.
+    static constexpr int kMaxChatRows = 500;
+
     explicit FeedsChatDock(QWidget* parent = nullptr) : QWidget(parent) {
         m_list = new QListWidget(this);
         m_list->addItem(CurrentPlaceholderText());
@@ -2021,6 +2030,46 @@ public:
         QObject::connect(m_list, &QListWidget::itemClicked,
                          this, [this](QListWidgetItem* item) {
                              OnMessageClicked(item);
+                         });
+
+        // Pixel-granular scrolling so the sticky-bottom tolerance and the
+        // resize/relayout preservation below can reason in pixels — the
+        // default per-item mode makes "near the bottom" coarse and jumpy
+        // with variable-height wrapped rows.
+        m_list->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+
+        // Floating "new messages" pill — parented to the viewport so it hovers
+        // over the bottom of the list without taking part in the layout. Styled
+        // to match the dock's subtle grey chrome (rgba greys + thin border, as
+        // in the participant header bar). Hidden until a message arrives while
+        // the user is scrolled up.
+        m_newMsgPill = new QPushButton(
+            QString::fromUtf8("\xE2\x86\x93 New messages"), m_list->viewport());
+        m_newMsgPill->setCursor(Qt::PointingHandCursor);
+        m_newMsgPill->setFocusPolicy(Qt::NoFocus);
+        m_newMsgPill->setStyleSheet(
+            "QPushButton {"
+            " background: rgba(40,40,40,0.92);"
+            " color: #d6d8da;"
+            " border: 1px solid rgba(128,128,128,0.35);"
+            " border-radius: 10px;"
+            " padding: 3px 12px; }"
+            "QPushButton:hover { background: rgba(64,64,64,0.95); }");
+        m_newMsgPill->hide();
+        QObject::connect(m_newMsgPill, &QPushButton::clicked, this, [this]() {
+            m_list->scrollToBottom();
+            HideNewMessagesPill();
+        });
+
+        // Reposition the pill on viewport resize and preserve the reading
+        // position across the width-driven word-wrap reflow (see eventFilter).
+        m_list->viewport()->installEventFilter(this);
+
+        // Dismiss the pill the moment the view is back at the bottom — whether
+        // via the pill, a manual drag, or a wheel scroll.
+        QObject::connect(m_list->verticalScrollBar(), &QScrollBar::valueChanged,
+                         this, [this](int) {
+                             if (IsAtBottom()) HideNewMessagesPill();
                          });
 
         m_input = new QLineEdit(this);
@@ -2058,6 +2107,72 @@ public:
         UpdateChatHeaderState();
     }
 
+    // --- Sticky-bottom scroll helpers ---------------------------------------
+
+    // True when the view is at (or within a few px of) the bottom. Read BEFORE
+    // appending a row, since adding a row raises the scrollbar maximum. With
+    // content shorter than the viewport, maximum is 0 and this is trivially
+    // true, so the first messages pin to the bottom.
+    bool IsAtBottom() const {
+        QScrollBar* sb = m_list->verticalScrollBar();
+        if (!sb) return true;
+        return sb->value() >= sb->maximum() - kStickyBottomTolerancePx;
+    }
+
+    void ShowNewMessagesPill() {
+        if (!m_newMsgPill) return;
+        PositionNewMessagesPill();
+        m_newMsgPill->show();
+        m_newMsgPill->raise();
+    }
+    void HideNewMessagesPill() {
+        if (m_newMsgPill) m_newMsgPill->hide();
+    }
+
+    // Centre the pill horizontally, a small margin above the viewport bottom.
+    void PositionNewMessagesPill() {
+        if (!m_newMsgPill) return;
+        QWidget* vp = m_list->viewport();
+        m_newMsgPill->adjustSize();
+        int x = (vp->width()  - m_newMsgPill->width())  / 2;
+        int y =  vp->height() - m_newMsgPill->height() - 8;
+        m_newMsgPill->move(x < 0 ? 0 : x, y < 0 ? 0 : y);
+    }
+
+    // Enforce the retained-row cap by trimming the oldest rows. When the user
+    // is scrolled up, subtract the removed rows' height from the scroll value
+    // so the messages they're reading don't shift under them. When at the
+    // bottom the caller re-pins with scrollToBottom(), so no adjustment needed.
+    void TrimToCap(bool atBottom) {
+        const int over = m_list->count() - kMaxChatRows;
+        if (over <= 0) return;
+        if (atBottom) {
+            for (int i = 0; i < over; ++i) delete m_list->takeItem(0);
+            return;
+        }
+        QScrollBar* sb = m_list->verticalScrollBar();
+        int removedH = 0;
+        for (int i = 0; i < over; ++i) removedH += m_list->sizeHintForRow(i);
+        const int oldVal = sb ? sb->value() : 0;
+        for (int i = 0; i < over; ++i) delete m_list->takeItem(0);
+        if (sb) { int nv = oldVal - removedH; sb->setValue(nv < 0 ? 0 : nv); }
+    }
+
+    // Shared tail of the three platform append paths: gate scroll-to-bottom on
+    // whether the view was already at the bottom, enforce the row cap, and
+    // surface the "new messages" pill when a message lands while scrolled up.
+    void AppendChatItem(QListWidgetItem* item) {
+        const bool atBottom = IsAtBottom();
+        m_list->addItem(item);
+        TrimToCap(atBottom);
+        if (atBottom) {
+            m_list->scrollToBottom();
+            HideNewMessagesPill();
+        } else {
+            ShowNewMessagesPill();
+        }
+    }
+
     // All methods below must run on the Qt main thread. The IPC
     // handlers marshal via QTimer::singleShot onto the main window before
     // invoking them.
@@ -2092,8 +2207,7 @@ public:
         item->setData(RoleSenderName, senderName);
         item->setData(RoleContent,    content);
         item->setData(kRoleChatOrigin, kChatOriginZoom);   // blue Zoom glyph
-        m_list->addItem(item);
-        m_list->scrollToBottom();
+        AppendChatItem(item);
     }
 
     // Inject a YouTube live-chat message into the dock. Phase 1 is dock-only:
@@ -2121,8 +2235,7 @@ public:
         item->setData(kRoleChatAvatar, avatarUrl);
         // Note: no RoleSenderId — YouTube has no Zoom uint id; OnMessageClicked
         // keys off kRoleChatOrigin, not the presence of RoleSenderId.
-        m_list->addItem(item);
-        m_list->scrollToBottom();
+        AppendChatItem(item);
     }
 
     // Moderator deletion of a single YouTube message (by message id). Removes the
@@ -2158,8 +2271,7 @@ public:
         item->setData(kRoleChatOrigin, kChatOriginTwitch);  // purple Twitch glyph
         item->setData(kRoleChatMsgId,  msgId);
         item->setData(kRoleChatChannel, userId);
-        m_list->addItem(item);
-        m_list->scrollToBottom();
+        AppendChatItem(item);
     }
 
     // Twitch CLEARMSG (single message removed by id).
@@ -2536,6 +2648,28 @@ private:
     // login when logged out and the upgrade URL when tier-locked, matching what
     // ResolveRowStatus rendered.
     bool eventFilter(QObject* obj, QEvent* ev) override {
+        // Preserve the user's reading position across the list's width-driven
+        // word-wrap reflow (and keep the floating pill positioned). When this
+        // Resize arrives the view hasn't relaid out yet, so we can read the
+        // current at-bottom state / top row now and restore it after the
+        // relayout via a queued call (scrollTo* flushes the pending layout).
+        if (ev->type() == QEvent::Resize && m_list && obj == m_list->viewport()) {
+            const bool atBottom = IsAtBottom();
+            const QModelIndex topIdx =
+                atBottom ? QModelIndex() : m_list->indexAt(QPoint(2, 2));
+            const int topRow = topIdx.isValid() ? topIdx.row() : -1;
+            QTimer::singleShot(0, this, [this, atBottom, topRow]() {
+                if (atBottom) {
+                    m_list->scrollToBottom();
+                } else if (topRow >= 0 && topRow < m_list->count()) {
+                    m_list->scrollToItem(m_list->item(topRow),
+                                         QAbstractItemView::PositionAtTop);
+                }
+                PositionNewMessagesPill();
+            });
+            PositionNewMessagesPill();
+            return false;  // let the view handle the resize / relayout
+        }
         if (ev->type() == QEvent::MouseButtonRelease &&
             (obj == m_zoomStatus ||
              (obj == m_ytWord && m_ytWordClickable) ||
@@ -2644,6 +2778,7 @@ private:
     QListWidget* m_list             = nullptr;
     QLineEdit*   m_input            = nullptr;
     QPushButton* m_sendBtn          = nullptr;
+    QPushButton* m_newMsgPill       = nullptr;  // floating "↓ New messages"
     bool         m_messagesStarted  = false;
 
     // Platform header widgets (see BuildChatHeader).
