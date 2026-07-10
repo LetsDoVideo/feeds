@@ -769,33 +769,38 @@ static bool SubscribeBoundSourceLocked(ZpSourceData* s) {
         return false;
     }
     if (s->current_user_id < 1) return false;            // unbound (0) — quiet
+
+    // Fallback removal (participant auto-bind fix). A source is (re)subscribed
+    // ONLY when its binding was CONFIRMED this session — a manual pick, a
+    // remembered display-name reconcile match, or the active-speaker sentinel
+    // (all three set bound_this_session=true before we get here). A
+    // current_user_id with bound_this_session=0 is a runtime id left over from
+    // a prior meeting (meeting_left / logout / session_expired clear the flag
+    // but the id lingered): NOT a binding. Zoom reassigns runtime ids per
+    // meeting, so re-subscribing that dead id lands whoever now holds it into
+    // this source — the never-assigned auto-bind. Refuse: the source stays
+    // unbound and off-screen until the operator assigns someone. There is no
+    // substitute-source behavior.
+    if (!s->bound_this_session) {
+        blog(LOG_INFO, "[feeds] bind-decision: REFUSED subscribe source='%s' "
+             "userId=%u bound_this_session=0 reason=not-confirmed-this-session "
+             "(stale runtime id — leave unbound, no auto-place)",
+             srcName, s->current_user_id);
+        return false;
+    }
+
     if (!(g_isInMeeting && g_rawLiveStreamGranted)) {
         blog(LOG_INFO, "[feeds] bind-decision: DEFERRED subscribe source='%s' "
-             "userId=%u bound_this_session=%d reason=no_privilege_yet",
-             srcName, s->current_user_id, s->bound_this_session ? 1 : 0);
+             "userId=%u bound_this_session=1 reason=no_privilege_yet",
+             srcName, s->current_user_id);
         return false;
     }
     if (s->subscribed_user_id == s->current_user_id) return false;  // already subscribed
 
-    // Decision log: this is the single choke point where a bound source is
-    // (re)subscribed. bound_this_session==1 is a binding CONFIRMED this session
-    // (manual pick, name reconcile, or the active-speaker sentinel).
-    // bound_this_session==0 means current_user_id is a runtime id carried over
-    // WITHOUT a this-session confirmation — the suspected first-time auto-assign
-    // fallback: a stale id from a prior meeting that the grant sweep re-subscribes,
-    // landing whoever now holds that id into this source. Flagged loudly so a
-    // single join self-documents an unbidden bind.
-    if (s->bound_this_session) {
-        blog(LOG_INFO, "[feeds] bind-decision: SUBSCRIBE (confirmed) source='%s' "
-             "uuid=%s userId=%u bound_this_session=1",
-             srcName, s->uuid.c_str(), s->current_user_id);
-    } else {
-        blog(LOG_WARNING, "[feeds] bind-decision: SUBSCRIBE (FALLBACK / stale "
-             "runtime id — first-available auto-assign) source='%s' uuid=%s "
-             "userId=%u bound_this_session=0 — subscribing a source whose binding "
-             "was NOT confirmed this session (suspected auto-bind bug)",
-             srcName, s->uuid.c_str(), s->current_user_id);
-    }
+    // Single choke point where a CONFIRMED binding is (re)subscribed.
+    blog(LOG_INFO, "[feeds] bind-decision: SUBSCRIBE (confirmed) source='%s' "
+         "uuid=%s userId=%u bound_this_session=1",
+         srcName, s->uuid.c_str(), s->current_user_id);
 
     // Auto-rebind / grant / rejoin all route through the engine's RECREATE path
     // (full destroy + fresh createRenderer via the sequenced gate), not a plain
@@ -7752,7 +7757,13 @@ static void RegisterEngineHandlers() {
             for (ZpSourceData* s : g_allParticipantSources) {
                 CloseSharedMemory(s);
                 // Runtime IDs are dead and the engine tore down subscriptions.
-                if (s) { s->bound_this_session = false; s->subscribed_user_id = 0; }
+                // Clear current_user_id too so no stale id can be re-subscribed
+                // on the next login/meeting (auto-bind fix).
+                if (s) {
+                    s->bound_this_session = false;
+                    s->current_user_id    = 0;
+                    s->subscribed_user_id = 0;
+                }
             }
         }
         CloseSharedMemoryForAllScreenshareSources();
@@ -7817,7 +7828,13 @@ static void RegisterEngineHandlers() {
             for (ZpSourceData* s : g_allParticipantSources) {
                 CloseSharedMemory(s);
                 // Runtime IDs are dead and the engine tore down subscriptions.
-                if (s) { s->bound_this_session = false; s->subscribed_user_id = 0; }
+                // Clear current_user_id too so no stale id can be re-subscribed
+                // on the next login/meeting (auto-bind fix).
+                if (s) {
+                    s->bound_this_session = false;
+                    s->current_user_id    = 0;
+                    s->subscribed_user_id = 0;
+                }
             }
         }
         CloseSharedMemoryForAllScreenshareSources();
@@ -8027,10 +8044,17 @@ static void RegisterEngineHandlers() {
                 // The meeting's runtime user IDs are now dead. Drop the
                 // session-confirmed flag so the next join re-binds purely by
                 // remembered name (and a reused ID can't masquerade as a live
-                // binding). The remembered name in obs_data is untouched.
-                // The engine tore down the subscriptions, so clear the
-                // subscribed marker too — the next join must re-subscribe.
-                if (s) { s->bound_this_session = false; s->subscribed_user_id = 0; }
+                // binding). Also clear current_user_id: the runtime id is dead,
+                // and leaving it set is what let the grant sweep re-subscribe a
+                // stale id to whoever now holds it (the auto-bind bug). The
+                // remembered name in obs_data is untouched, so a legitimate
+                // rejoin still re-binds by display name. The engine tore down
+                // the subscriptions, so clear the subscribed marker too.
+                if (s) {
+                    s->bound_this_session = false;
+                    s->current_user_id    = 0;
+                    s->subscribed_user_id = 0;
+                }
             }
         }
         CloseSharedMemoryForAllScreenshareSources();
