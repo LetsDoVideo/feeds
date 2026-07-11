@@ -34,8 +34,18 @@ jobs:
         env:
           FEEDS_ZOOM_CLIENT_ID: ${{ secrets.FEEDS_ZOOM_CLIENT_ID }}
         run: |
-          cmake -B build -G "Visual Studio 18 2026" -A x64 -DFEEDS_ZOOM_CLIENT_ID="%FEEDS_ZOOM_CLIENT_ID%"
+          cmake -B build -G "Visual Studio 18 2026" -A x64 -DFEEDS_ZOOM_CLIENT_ID="%FEEDS_ZOOM_CLIENT_ID%" -DFEEDS_BUILD_TESTS=ON
           cmake --build build --config Release
+      - name: Run Tests
+        shell: pwsh
+        run: |
+          # Run the standalone parsing/IPC tests (e2p_reader) before signing and
+          # packaging, so a broken >4KB E2P reader or roster parse gates the
+          # release build instead of shipping. This job configures with a raw
+          # cmake call (no preset), so -DFEEDS_BUILD_TESTS=ON above is what builds
+          # the target; ctest runs it out of the same build/ tree.
+          ctest --test-dir build --build-config Release --output-on-failure
+          if ( $LASTEXITCODE -ne 0 ) { throw "ctest failed with exit code $LASTEXITCODE" }
       - name: Azure Login
         uses: azure/login@v2
         with:
