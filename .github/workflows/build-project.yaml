@@ -112,6 +112,17 @@ jobs:
           target: x64
           config: ${{ needs.check-event.outputs.config }}
 
+      - name: Run Tests 🧪
+        shell: pwsh
+        run: |
+          # Run Tests 🧪
+          # ctest exercises the standalone parsing/IPC tests (e2p_reader) built
+          # by the plugin build (FEEDS_BUILD_TESTS=ON in the windows-ci-x64
+          # preset). A non-zero exit fails the job BEFORE packaging, so a broken
+          # >4KB reader / roster parse gates the build instead of shipping.
+          ctest --test-dir build_x64 --build-config ${{ needs.check-event.outputs.config }} --output-on-failure
+          if ( $LASTEXITCODE -ne 0 ) { throw "ctest failed with exit code $LASTEXITCODE" }
+
       - name: Package Plugin 📀
         uses: ./.github/actions/package-plugin
         with:
