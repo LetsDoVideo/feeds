@@ -10,6 +10,7 @@
 !/data
 !/engine
 !/src
+!/tests
 !.clang-format
 !.gersemirc
 !.gitignore

@@ -150,3 +150,12 @@ target_link_libraries(FeedsEngine PRIVATE winhttp crypt32 advapi32 shell32 sdk y
 target_compile_definitions(FeedsEngine PRIVATE
     FEEDS_ZOOM_CLIENT_ID="${FEEDS_ZOOM_CLIENT_ID}"
 )
+
+# Unit tests — standalone console exes covering the shared IPC helpers
+# (>4KB E2P reader reassembly + string-aware JSON parsing). No libobs/Qt/SDK,
+# so they build and run in CI as the "parsing-test target" on the roadmap.
+option(FEEDS_BUILD_TESTS "Build Feeds unit tests" ON)
+if(FEEDS_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
