@@ -16,6 +16,8 @@
 #include <chrono>
 #include <obs-module.h>
 
+#include "feeds-ipc-reassembly.h"
+
 namespace feeds {
 
 static HANDLE g_jobObject = NULL;
@@ -377,6 +379,13 @@ static void PipeReaderThread()
     // roster (50+ participant webinar) or a large Events payload would kill the
     // reader and silently stop ALL engine->plugin traffic for the session. A
     // message that fits in one read leaves this empty until that read completes.
+    //
+    // The concatenation itself is AccumulateE2PMessageSlice (feeds-ipc-reassembly.h)
+    // — a pure function unit-tested against fabricated slices and a real named-pipe
+    // loopback in tests/test_e2p_reader.cpp. Both ReadFile branches feed it: the
+    // ERROR_MORE_DATA branch with moreData=true (partial), the success branch with
+    // moreData=false (completing). `completed` receives a whole message on the
+    // completing read.
     std::string message;
     while (!g_shutdownRequested) {
         DWORD bytesRead = 0;
@@ -385,11 +394,11 @@ static void PipeReaderThread()
         if (!ok) {
             DWORD err = GetLastError();
             if (err == ERROR_MORE_DATA) {
-                // Partial message: this read filled `buffer`. Keep the bytes and
-                // loop to read the rest; the message completes on the next read
-                // that returns TRUE. Handles a message several buffers long
-                // (multiple ERROR_MORE_DATA reads before completion).
-                message.append(buffer, bytesRead);
+                // Partial message: this read filled `buffer`. Accumulate and loop;
+                // the message completes on the next read that returns TRUE. Handles
+                // a message several buffers long (multiple ERROR_MORE_DATA reads).
+                std::string unused;
+                AccumulateE2PMessageSlice(message, buffer, bytesRead, true, unused);
                 continue;
             }
             // ERROR_OPERATION_ABORTED (995) is expected during shutdown,
@@ -403,11 +412,11 @@ static void PipeReaderThread()
             break;
         }
 
-        // Successful read: append this final slice, completing the message
-        // (whole, if it fit in one read; or the tail of an ERROR_MORE_DATA run).
-        message.append(buffer, bytesRead);
-        if (!message.empty()) {
-            const std::string& json = message;
+        // Successful read: this slice completes the message (whole, if it fit in
+        // one read; or the tail of an ERROR_MORE_DATA run).
+        std::string completed;
+        if (AccumulateE2PMessageSlice(message, buffer, bytesRead, false, completed)) {
+            const std::string& json = completed;
             // Redaction: log only the message type, never the payload.
             // Inbound login_succeeded carries the user's name and PMI, and
             // forwarded engine "log" messages are re-emitted by their own
@@ -418,7 +427,6 @@ static void PipeReaderThread()
             blog(LOG_DEBUG, "[feeds] PipeReaderThread: received: %s", rtype.c_str());
             DispatchMessage(json);
         }
-        message.clear();
     }
 
     blog(LOG_INFO, "[feeds] PipeReaderThread: exiting");
