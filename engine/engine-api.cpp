@@ -12,6 +12,8 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "engine-http.h"  // proxy-aware WinHTTP session helper
+
 // Defined in engine-main.cpp
 extern void LogToFile(const char* msg);  // forwards at DEBUG
 extern void LogInfo(const char* msg);
@@ -136,10 +138,9 @@ static bool RefreshAccessToken() {
         "&refresh_token=" + g_refreshToken +   // refresh tokens are already URL-safe
         "&client_id="     + std::string(FEEDS_ZOOM_CLIENT_ID);
 
-    HINTERNET hSession = WinHttpOpen(L"Feeds/1.0",
-                                      WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                                      WINHTTP_NO_PROXY_NAME,
-                                      WINHTTP_NO_PROXY_BYPASS, 0);
+    ProxyResolution px = ResolveProxyForUrl(L"https://zoom.us/oauth/token");
+    LogProxyResolution(px, "API", /*forceInfo=*/false);
+    HINTERNET hSession = OpenProxiedSession(L"Feeds/1.0", px);
     if (!hSession) return false;
     HINTERNET hConnect = WinHttpConnect(hSession, L"zoom.us",
                                          INTERNET_DEFAULT_HTTPS_PORT, 0);
@@ -199,10 +200,10 @@ std::string ZoomApiGetWithStatus(const std::wstring& path, int& outStatus) {
     outStatus = 0;
     auto doRequest = [&](int& st) -> std::string {
         st = 0;
-        HINTERNET hSession = WinHttpOpen(L"Feeds/1.0",
-                                          WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                                          WINHTTP_NO_PROXY_NAME,
-                                          WINHTTP_NO_PROXY_BYPASS, 0);
+        ProxyResolution px = ResolveProxyForUrl(L"https://api.zoom.us" +
+                                                std::wstring(path));
+        LogProxyResolution(px, "API", /*forceInfo=*/false);
+        HINTERNET hSession = OpenProxiedSession(L"Feeds/1.0", px);
         if (!hSession) return "";
         HINTERNET hConnect = WinHttpConnect(hSession, L"api.zoom.us",
                                              INTERNET_DEFAULT_HTTPS_PORT, 0);
@@ -278,10 +279,10 @@ std::string ZoomApiGet(const std::wstring& path) {
 // ---------------------------------------------------------------------------
 std::string ZoomApiPost(const std::wstring& path, const std::string& jsonBody) {
     auto doRequest = [&]() -> std::string {
-        HINTERNET hSession = WinHttpOpen(L"Feeds/1.0",
-                                          WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                                          WINHTTP_NO_PROXY_NAME,
-                                          WINHTTP_NO_PROXY_BYPASS, 0);
+        ProxyResolution px = ResolveProxyForUrl(L"https://api.zoom.us" +
+                                                std::wstring(path));
+        LogProxyResolution(px, "API", /*forceInfo=*/false);
+        HINTERNET hSession = OpenProxiedSession(L"Feeds/1.0", px);
         if (!hSession) return "";
         HINTERNET hConnect = WinHttpConnect(hSession, L"api.zoom.us",
                                              INTERNET_DEFAULT_HTTPS_PORT, 0);
@@ -663,16 +664,18 @@ bool FetchEventJoinToken(const std::string& eventId, const std::string& sessionI
 // ---------------------------------------------------------------------------
 static const std::string FEEDS_BACKEND_URL =
     "https://feeds-entitlement.square-dust-0e00.workers.dev/tier";
+// Wide form for proxy resolution (ResolveProxyForUrl takes a std::wstring).
+static const std::wstring FEEDS_BACKEND_URL_W =
+    L"https://feeds-entitlement.square-dust-0e00.workers.dev/tier";
 
 void FetchAndApplyEntitlement() {
     LogToFile("API: FetchAndApplyEntitlement starting");
 
     g_currentTier = 0;  // Default to Free; updated only on a clean 200 + parse.
 
-    HINTERNET hSession = WinHttpOpen(L"Feeds/1.0",
-                                      WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                                      WINHTTP_NO_PROXY_NAME,
-                                      WINHTTP_NO_PROXY_BYPASS, 0);
+    ProxyResolution px = ResolveProxyForUrl(FEEDS_BACKEND_URL_W);
+    LogProxyResolution(px, "API", /*forceInfo=*/false);
+    HINTERNET hSession = OpenProxiedSession(L"Feeds/1.0", px);
     if (!hSession) {
         LogWarn("API: tier query failed (WinHttpOpen) — applying tier=0");
         return;

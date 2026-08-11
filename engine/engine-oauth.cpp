@@ -29,6 +29,8 @@
 #include <mutex>
 #include <cstdio>
 
+#include "engine-http.h"  // proxy-aware WinHTTP session helper
+
 // Defined in engine-main.cpp
 extern void LogToFile(const char* msg);  // forwards at DEBUG
 extern void LogInfo(const char* msg);
@@ -163,10 +165,9 @@ static std::string ExchangeCodeForToken(const std::string& code, const std::stri
         "&redirect_uri="  + UrlEncode("https://letsdovideo.com/loginsuccess") +
         "&code_verifier=" + UrlEncode(verifier);
 
-    HINTERNET hSession = WinHttpOpen(L"Feeds/1.0",
-                                      WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                                      WINHTTP_NO_PROXY_NAME,
-                                      WINHTTP_NO_PROXY_BYPASS, 0);
+    ProxyResolution px = ResolveProxyForUrl(L"https://zoom.us/oauth/token");
+    LogProxyResolution(px, "OAuth", /*forceInfo=*/true);
+    HINTERNET hSession = OpenProxiedSession(L"Feeds/1.0", px);
     if (!hSession) return "";
 
     HINTERNET hConnect = WinHttpConnect(hSession, L"zoom.us",
@@ -262,16 +263,32 @@ static std::string PollWorkerForAuthCode(const std::string& state, bool& outCanc
     std::wstring path = L"/authresult?state=" +
         std::wstring(state.begin(), state.end());
 
+    // Resolve the proxy ONCE for this login flow (not per poll): the loop opens
+    // a fresh session every ~1.5s up to 80 times, so re-running WPAD/PAC each
+    // iteration would be wasteful and could eat the timeout budget. The single
+    // "proxy resolved: ..." line is logged here — forced to INFO because on the
+    // failing library networks a DIRECT result is itself the key diagnostic.
+    std::wstring fullUrl =
+        L"https://feeds-entitlement.square-dust-0e00.workers.dev" + path;
+    ProxyResolution px = ResolveProxyForUrl(fullUrl);
+    LogProxyResolution(px, "OAuth", /*forceInfo=*/true);
+
+    // Diagnostic accounting for the poll loop. Each attempt that does not yield
+    // a code is logged with its failure mode (GetLastError when the request
+    // never got a response, or the HTTP status when it did) — the first failure
+    // and then sparsely, so a stuck login's log distinguishes a timeout from a
+    // TLS-inspection failure, a connection block, or a 407 proxy-auth wall.
+    int failureCount = 0;
+
     for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
         if (IsLoginCancelled()) { outCancelled = true; return ""; }
 
         std::string code;
         DWORD       statusCode = 0;
+        DWORD       lastErr    = 0;      // GetLastError from a pre-response failure
+        bool        gotResponse = false; // reached the server (any HTTP status)
 
-        HINTERNET hSession = WinHttpOpen(L"Feeds/1.0",
-                                          WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                                          WINHTTP_NO_PROXY_NAME,
-                                          WINHTTP_NO_PROXY_BYPASS, 0);
+        HINTERNET hSession = OpenProxiedSession(L"Feeds/1.0", px);
         if (hSession) {
             // Short per-phase timeouts (resolve/connect/send/receive, in ms)
             // so a stalled request can't hang a single poll, leave Cancel
@@ -288,7 +305,12 @@ static std::string PollWorkerForAuthCode(const std::string& state, bool& outCanc
                 if (hRequest) {
                     BOOL sentOk = WinHttpSendRequest(hRequest,
                         WINHTTP_NO_ADDITIONAL_HEADERS, 0, nullptr, 0, 0, 0);
-                    if (sentOk && WinHttpReceiveResponse(hRequest, nullptr)) {
+                    if (!sentOk) {
+                        lastErr = GetLastError();     // couldn't send (proxy/TLS/DNS/block)
+                    } else if (!WinHttpReceiveResponse(hRequest, nullptr)) {
+                        lastErr = GetLastError();     // sent, no response (timeout/TLS)
+                    } else {
+                        gotResponse = true;           // reached the server
                         DWORD statusSize = sizeof(statusCode);
                         WinHttpQueryHeaders(hRequest,
                             WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
@@ -307,15 +329,39 @@ static std::string PollWorkerForAuthCode(const std::string& state, bool& outCanc
                             code = JsonExtractString(response, "code");
                     }
                     WinHttpCloseHandle(hRequest);
+                } else {
+                    lastErr = GetLastError();
                 }
                 WinHttpCloseHandle(hConnect);
+            } else {
+                lastErr = GetLastError();
             }
             WinHttpCloseHandle(hSession);
+        } else {
+            lastErr = GetLastError();
         }
 
         if (statusCode == 200 && !code.empty()) {
             LogToFile("OAuth: worker returned auth code");
             return code;
+        }
+
+        // This attempt yielded no code. Log its failure mode — first failure
+        // and then every 10th — so a stuck login is diagnosable without spam.
+        // A pre-response WinHTTP error means we never reached Cloudflare (the
+        // proxy/TLS/block signature); an HTTP status (e.g. 204 waiting, or 407
+        // proxy-auth) means we did. GetLastError codes of note: 12002 timeout,
+        // 12007 name-not-resolved, 12029 cannot-connect, 12175 secure-failure.
+        ++failureCount;
+        if (failureCount == 1 || failureCount % 10 == 0) {
+            char msg[192];
+            if (gotResponse)
+                sprintf_s(msg, "OAuth: poll attempt %d reached worker, HTTP %lu "
+                               "(no code yet)", attempt + 1, statusCode);
+            else
+                sprintf_s(msg, "OAuth: poll attempt %d never reached worker "
+                               "(WinHTTP error %lu)", attempt + 1, lastErr);
+            LogWarn(msg);
         }
 
         // 204 (not ready yet) or a transient error — wait before the next
@@ -390,8 +436,15 @@ static void LoginThreadFunc()
     }
 
     if (code.empty()) {
-        LogToFile("OAuth: auth code was empty (worker timeout or error, not a user cancel)");
-        SendToPlugin("{\"type\":\"login_failed\",\"error\":\"user_cancelled\"}");
+        // The poll gave up without a code and this was NOT a user cancel (that
+        // path returns via wasCancelled above). This is a timeout or network
+        // failure — most often the engine couldn't reach the worker on a
+        // proxied/firewalled network. Report it honestly as login_timeout so
+        // the plugin shows a proxy/firewall message instead of the old
+        // mislabeled "user_cancelled". The per-attempt poll diagnostics above
+        // record which failure mode it was.
+        LogWarn("OAuth: auth code was empty (worker timeout or network error, not a user cancel)");
+        SendToPlugin("{\"type\":\"login_failed\",\"error\":\"login_timeout\"}");
         return;
     }
 

@@ -7553,7 +7553,21 @@ static void RegisterEngineHandlers() {
         blog(LOG_ERROR, "[feeds] login_failed: %s", error.c_str());
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
             [error]() {
-                std::string msg = "Login failed: " + error;
+                // login_timeout is the engine's honest signal that the worker
+                // poll never got the auth code (timeout / network failure),
+                // most often an unreachable login server on a proxied or
+                // firewalled managed network. Give a message that points at
+                // that cause instead of the raw error slug. Every other error
+                // keeps the generic "Login failed: <error>" form.
+                std::string msg;
+                if (error == "login_timeout") {
+                    msg = "Feeds couldn't reach the login server. On managed "
+                          "or corporate networks this can be caused by a proxy "
+                          "or firewall. Please try again, or contact support "
+                          "if it continues.";
+                } else {
+                    msg = "Login failed: " + error;
+                }
                 QMessageBox::critical(
                     static_cast<QWidget*>(obs_frontend_get_main_window()),
                     QString::fromUtf8("Feeds - Login"),
