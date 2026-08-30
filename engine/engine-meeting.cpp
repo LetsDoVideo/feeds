@@ -1940,6 +1940,10 @@ void HandleLogout(const std::string& /*json*/) {
     ClearUserInfo();
     CredDeleteA("Feeds_AccessToken",  CRED_TYPE_GENERIC, 0);
     CredDeleteA("Feeds_RefreshToken", CRED_TYPE_GENERIC, 0);
+    // The cached last-known-good tier is per-account, so it must die with the
+    // tokens — otherwise the next user to log in on this PC would inherit the
+    // previous user's entitlement until their own tier query lands.
+    CredDeleteA("Feeds_CachedTier",   CRED_TYPE_GENERIC, 0);
 
     // The SDK just logged out, so its prior SDKAuth no longer counts as
     // "ready to connect." Reset the lazy bring-up so a subsequent login +

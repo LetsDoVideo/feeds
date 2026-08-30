@@ -23,6 +23,7 @@ namespace feeds_engine {
 // From engine-api.cpp
 bool FetchUserInfo();
 void FetchAndApplyEntitlement();
+bool WasTierUnresolved();
 const std::string& GetUserDisplayName();
 const std::string& GetUserPMI();
 const std::string& GetUserEmail();
@@ -249,6 +250,15 @@ static void AnnounceLoginSucceeded() {
     // plugin's cache is populated), then sdk_authenticated ("ready to
     // connect"). See the semantic note above.
     SendToPlugin("{\"type\":\"sdk_authenticated\"}");
+
+    // The tier query failed AND there was no cached tier to fall back on — the
+    // only case where the user involuntarily lands on Free. Sent last, after
+    // the UI has flipped to logged-in, deliberately: the plugin's handler puts
+    // up a modal box, and a modal blocks the Qt event loop, so announcing this
+    // any earlier would stall the login_succeeded / sdk_authenticated handlers
+    // behind it and leave the window looking stuck mid-login.
+    if (WasTierUnresolved())
+        SendToPlugin("{\"type\":\"tier_unreachable\"}");
 }
 
 // Called by engine-oauth.cpp's LoginThreadFunc after a fresh OAuth login saves

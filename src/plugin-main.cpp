@@ -203,6 +203,13 @@ enum class RawPrivilegeState {
 };
 RawPrivilegeState g_rawPrivilegeState = RawPrivilegeState::NotRequested;
 
+// Single network-requirements page that BOTH network-failure messages point
+// at (login_timeout and tier_unreachable), so a blocked user — or the IT desk
+// they forward the message to — lands in one place that lists every host Feeds
+// needs, instead of two half-answers.
+static const char* kNetworkRequirementsUrl =
+    "https://letsdovideo.com/feeds-network";
+
 static std::string g_userDisplayName;
 static std::string g_userPMI;
 // Non-static for the same reason as g_isLoggedIn above.
@@ -7564,7 +7571,8 @@ static void RegisterEngineHandlers() {
                     msg = "Feeds couldn't reach the login server. On managed "
                           "or corporate networks this can be caused by a proxy "
                           "or firewall. Please try again, or contact support "
-                          "if it continues.";
+                          "if it continues.\n\nNetwork requirements for IT: " +
+                          std::string(kNetworkRequirementsUrl);
                 } else {
                     msg = "Login failed: " + error;
                 }
@@ -7576,6 +7584,37 @@ static void RegisterEngineHandlers() {
                 UpdateLoginLogoutMenuItem();
                 g_pendingMeetingJoin = false;
             });
+    });
+
+    // The engine resolved no tier and had no cached tier to fall back on, so
+    // the user is sitting on Free without having chosen it. Every other tier
+    // outcome is silent: a successful fetch is normal, and a failed fetch that
+    // falls back to a cached tier worked as far as the user is concerned.
+    // Warning (not critical) because Feeds is running — just limited.
+    feeds::RegisterMessageHandler("tier_unreachable", [](const std::string&) {
+        blog(LOG_WARNING, "[feeds] tier_unreachable: licensing server "
+                          "unreachable and no cached tier — running as Free");
+        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
+            // Once per OBS session. The engine re-announces on every session
+            // restore, so without this a user parked on a blocking network
+            // would get this dialog on every launch.
+            static bool shown = false;
+            if (shown) return;
+            shown = true;
+
+            const std::string msg =
+                "Feeds couldn't reach the licensing server, so it's running "
+                "in Free mode. On managed or corporate networks this can be "
+                "caused by a proxy or firewall.\n\nIf you have a paid plan, "
+                "it will be restored automatically once Feeds can reach the "
+                "server.\n\nNetwork requirements for IT: " +
+                std::string(kNetworkRequirementsUrl);
+
+            QMessageBox::warning(
+                static_cast<QWidget*>(obs_frontend_get_main_window()),
+                QString::fromUtf8("Feeds - Licensing"),
+                QString::fromUtf8(msg.c_str()));
+        });
     });
 
     // sdk_authenticated now means "credentials are valid and Feeds is ready to

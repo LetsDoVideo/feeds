@@ -36,6 +36,11 @@ static std::string g_userPMI;
 static std::string g_userEmail;
 static int         g_currentTier = 0;   // 0 = Free until proven otherwise
 
+// True only when the tier fetch failed AND there was no cached tier to fall
+// back on — i.e. the one case where the user involuntarily lands on Free. Read
+// by engine-sdk.cpp after the login announce to decide whether to warn.
+static bool        g_tierUnresolved = false;
+
 // ---------------------------------------------------------------------------
 // Public accessors for other engine TUs
 // ---------------------------------------------------------------------------
@@ -44,6 +49,7 @@ const std::string& GetUserDisplayName() { return g_userDisplayName; }
 const std::string& GetUserPMI()         { return g_userPMI; }
 const std::string& GetUserEmail()       { return g_userEmail; }
 int                GetCurrentTier()     { return g_currentTier; }
+bool               WasTierUnresolved()  { return g_tierUnresolved; }
 
 void SetAccessToken(const std::string& t)  { g_accessToken  = t; }
 void SetRefreshToken(const std::string& t) { g_refreshToken = t; }
@@ -121,6 +127,56 @@ static void LoadRefreshTokenFromCredentialManager() {
                                      pCred->CredentialBlobSize);
         CredFree(pCred);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Last-known-good tier cache.
+//
+// The tier query is the one network call whose failure silently changes what
+// the user is allowed to do. Before this cache every failure path in
+// FetchAndApplyEntitlement applied tier=0, so a paying customer on a network
+// that blocks the worker host (proxy, firewall, deny-by-default institutional
+// filter) was demoted to Free with no message — which reads as "I paid and got
+// nothing."
+//
+// The cache lives in Credential Manager beside the tokens deliberately: it
+// inherits their per-Windows-user scope and their CRED_PERSIST_ENTERPRISE
+// class, and the logout path that deletes them (engine-meeting.cpp) deletes
+// this in the same place, so a second Windows user on the same PC can never
+// inherit the first user's tier. The tier is not a secret; Credential Manager
+// is used here for lifecycle coupling, not confidentiality.
+//
+// Written ONLY on a clean 200 + parse. Read once at the top of the fetch, so
+// every failure path keeps the cached value without each one having to know
+// the cache exists.
+// ---------------------------------------------------------------------------
+static void SaveCachedTier(int tier) {
+    char buf[16];
+    sprintf_s(buf, "%d", tier);
+    std::string blob(buf);
+
+    CREDENTIALA cred = {};
+    cred.Type               = CRED_TYPE_GENERIC;
+    cred.TargetName         = (LPSTR)"Feeds_CachedTier";
+    cred.CredentialBlobSize = (DWORD)blob.size();
+    cred.CredentialBlob     = (LPBYTE)blob.data();
+    cred.Persist            = CRED_PERSIST_ENTERPRISE;
+    CredWriteA(&cred, 0);
+}
+
+// Returns the cached tier, or -1 when nothing has ever been cached — the
+// brand-new user who has never once reached the backend. -1 is deliberately
+// distinct from a cached 0: a cached 0 is a real answer the backend gave us
+// and must still suppress the "couldn't reach licensing" warning.
+static int LoadCachedTier() {
+    PCREDENTIALA pCred = nullptr;
+    if (!CredReadA("Feeds_CachedTier", CRED_TYPE_GENERIC, 0, &pCred))
+        return -1;
+    std::string v((char*)pCred->CredentialBlob, pCred->CredentialBlobSize);
+    CredFree(pCred);
+    if (v.empty()) return -1;
+    int tier = atoi(v.c_str());
+    return (tier >= 0 && tier <= 3) ? tier : -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -671,13 +727,35 @@ static const std::wstring FEEDS_BACKEND_URL_W =
 void FetchAndApplyEntitlement() {
     LogToFile("API: FetchAndApplyEntitlement starting");
 
-    g_currentTier = 0;  // Default to Free; updated only on a clean 200 + parse.
+    // Start from the last successfully-resolved tier rather than Free, so every
+    // failure path below leaves a returning user's entitlement intact. Only a
+    // clean 200 + parse changes it (and re-caches it).
+    const int cachedTier = LoadCachedTier();
+    g_currentTier    = (cachedTier >= 0) ? cachedTier : 0;
+    g_tierUnresolved = false;
+
+    // One place that decides what a failure means, so the six early-returns
+    // below don't each have to reason about the cache. With a cached tier we
+    // keep it and stay quiet; without one the user really is landing on Free
+    // involuntarily, which the plugin surfaces as a network warning.
+    auto giveUp = [&](const char* why) {
+        char msg[192];
+        if (cachedTier >= 0) {
+            sprintf_s(msg, "API: tier query failed (%s) — keeping cached tier=%d",
+                      why, cachedTier);
+        } else {
+            g_tierUnresolved = true;
+            sprintf_s(msg, "API: tier query failed (%s) — no cached tier, "
+                           "applying tier=0", why);
+        }
+        LogWarn(msg);
+    };
 
     ProxyResolution px = ResolveProxyForUrl(FEEDS_BACKEND_URL_W);
     LogProxyResolution(px, "API", /*forceInfo=*/false);
     HINTERNET hSession = OpenProxiedSession(L"Feeds/1.0", px);
     if (!hSession) {
-        LogWarn("API: tier query failed (WinHttpOpen) — applying tier=0");
+        giveUp("WinHttpOpen");
         return;
     }
     HINTERNET hConnect = WinHttpConnect(hSession,
@@ -685,7 +763,7 @@ void FetchAndApplyEntitlement() {
         INTERNET_DEFAULT_HTTPS_PORT, 0);
     if (!hConnect) {
         WinHttpCloseHandle(hSession);
-        LogWarn("API: tier query failed (WinHttpConnect) — applying tier=0");
+        giveUp("WinHttpConnect");
         return;
     }
     HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", L"/tier",
@@ -695,7 +773,7 @@ void FetchAndApplyEntitlement() {
     if (!hRequest) {
         WinHttpCloseHandle(hConnect);
         WinHttpCloseHandle(hSession);
-        LogWarn("API: tier query failed (WinHttpOpenRequest) — applying tier=0");
+        giveUp("WinHttpOpenRequest");
         return;
     }
 
@@ -710,7 +788,7 @@ void FetchAndApplyEntitlement() {
         WinHttpCloseHandle(hRequest);
         WinHttpCloseHandle(hConnect);
         WinHttpCloseHandle(hSession);
-        LogWarn("API: tier query failed (network error) — applying tier=0");
+        giveUp("network error");
         return;
     }
 
@@ -734,26 +812,32 @@ void FetchAndApplyEntitlement() {
     WinHttpCloseHandle(hConnect);
     WinHttpCloseHandle(hSession);
 
+    // A 401 means our access token is stale, not that the user's entitlement
+    // changed — so it takes the same keep-the-cache path as a network failure
+    // rather than demoting someone whose subscription is fine.
     if (statusCode == 401) {
-        LogWarn("API: tier query auth failed — applying tier=0");
+        giveUp("HTTP 401");
         return;
     }
 
     if (statusCode != 200) {
-        char msg[128];
-        sprintf_s(msg, "API: tier query failed (HTTP %lu) — applying tier=0",
-                  statusCode);
-        LogWarn(msg);
+        char why[32];
+        sprintf_s(why, "HTTP %lu", statusCode);
+        giveUp(why);
         return;
     }
 
     std::string tierStr = JsonExtractNumber(response, "tier");
     if (tierStr.empty()) {
-        LogWarn("API: tier query response missing tier field — applying tier=0");
+        giveUp("missing tier field");
         return;
     }
 
+    // The one path that is allowed to change the tier. Note this legitimately
+    // caches a 0: a backend that answers "tier 0" is a real downgrade (expired
+    // or cancelled subscription) and must stick, unlike an unanswered query.
     g_currentTier = atoi(tierStr.c_str());
+    SaveCachedTier(g_currentTier);
 
     char msg[128];
     sprintf_s(msg, "API: entitlement applied, tier=%d (from backend)",
