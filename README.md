@@ -149,14 +149,6 @@ If you see a "couldn't reach the login server" or "couldn't reach the licensing 
 
 ## Troubleshooting
 
-**Participant list is empty after connecting**
-
-- Click the **Refresh Participant List** button in the source Properties window, or check the Feeds Controls dock.
-
-**Black screen / 0x0 pixels on a source**
-
-- Delete the source and re-add it after connecting to the meeting.
-
 **The host saw a "Request to livestream" popup. Is that normal?**
 
 - Yes. Click Allow. This is how the plugin accesses raw video feeds via the Zoom SDK.
