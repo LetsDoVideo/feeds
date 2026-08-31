@@ -114,6 +114,17 @@ void LogInfo  (const char* msg) { ForwardLog("info",    msg); }
 void LogWarn  (const char* msg) { ForwardLog("warning", msg); }
 void LogError (const char* msg) { ForwardLog("error",   msg); }
 
+// The engine's half of common/feeds-http.h's one outward dependency. The
+// plugin defines the same function over blog(); this is what lets the proxy
+// helper live in common/ without either binary's logging stack leaking into it.
+namespace feeds_http {
+void HttpLog(bool important, const char* msg)
+{
+    if (important) LogInfo(msg);
+    else           LogToFile(msg);
+}
+}
+
 // ---------------------------------------------------------------------------
 // Pipe send/receive
 // ---------------------------------------------------------------------------

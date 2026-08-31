@@ -130,7 +130,6 @@ set(CMAKE_COMPILE_WARNING_AS_ERROR ${_FEEDS_SAVED_WAE})
 add_executable(FeedsEngine WIN32
     engine/engine-main.cpp
     engine/engine-oauth.cpp
-    engine/engine-http.cpp
     engine/engine-sdk.cpp
     engine/engine-api.cpp
     engine/engine-meeting.cpp

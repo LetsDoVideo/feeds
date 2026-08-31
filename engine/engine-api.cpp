@@ -12,7 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-#include "engine-http.h"  // proxy-aware WinHTTP session helper
+#include "feeds-http.h"   // proxy-aware WinHTTP session helper (shared, common/)
 
 // Defined in engine-main.cpp
 extern void LogToFile(const char* msg);  // forwards at DEBUG

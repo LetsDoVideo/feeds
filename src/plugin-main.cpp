@@ -106,6 +106,38 @@
 #include "shared-frame.h"
 #include "feeds-version.h"
 #include "feeds-json-lite.h"
+#include "feeds-http.h"
+
+// The plugin's half of feeds-http.h's one outward dependency (the engine
+// defines the same function over its Log* stack). DEBUG for a routine DIRECT
+// resolution, INFO when a proxy is actually in play — the line that makes a
+// "chat doesn't work on my work network" report self-diagnosing.
+namespace feeds_http {
+void HttpLog(bool important, const char* msg)
+{
+    blog(important ? LOG_INFO : LOG_DEBUG, "[feeds] %s", msg);
+}
+}
+
+// LogProxyResolution logs at INFO whenever a proxy is actually in use. Three of
+// the four plugin call sites sit in polling loops (YouTube chat polls every few
+// seconds; Twitch reconnects), so logging every call would flood the OBS log on
+// exactly the managed networks we most need a readable log from. Log the first
+// resolution per flow and stay quiet after: the first line is the diagnostic,
+// the two-hundredth adds nothing. Deduped on the flow label, so if a PAC hands
+// out different answers for, say, youtube.com and the ggpht avatar host, only
+// the first is recorded — acceptable for a diagnostic breadcrumb.
+static void LogProxyResolutionOnce(const feeds_http::ProxyResolution& px,
+                                   const char* flow)
+{
+    static std::mutex            mtx;
+    static std::set<std::string> logged;
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        if (!logged.insert(flow).second) return;
+    }
+    feeds_http::LogProxyResolution(px, flow, /*forceInfo=*/false);
+}
 
 // The IPC JSON helpers now live in feeds-json-lite.h (shared, unit-tested in
 // tests/test_e2p_reader.cpp). Pull them into this TU's global scope so the ~68
@@ -470,11 +502,11 @@ static bool IsNewer(const std::string& latest, const std::string& current) {
 // (engine/engine-api.cpp::FetchAndApplyEntitlement). Tight timeouts so
 // plugin unload never waits more than a few seconds for this to finish.
 static std::string FetchGitHubLatestRelease() {
-    HINTERNET hSession = WinHttpOpen(
-        L"Feeds-OBS-Plugin/1.0",
-        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-        WINHTTP_NO_PROXY_NAME,
-        WINHTTP_NO_PROXY_BYPASS, 0);
+    feeds_http::ProxyResolution px = feeds_http::ResolveProxyForUrl(
+        L"https://api.github.com/repos/LetsDoVideo/feeds/releases/latest");
+    feeds_http::LogProxyResolution(px, "UpdateCheck", /*forceInfo=*/false);
+    HINTERNET hSession =
+        feeds_http::OpenProxiedSession(L"Feeds-OBS-Plugin/1.0", px);
     if (!hSession) return "";
 
     WinHttpSetTimeouts(hSession, 5000, 5000, 5000, 5000);
@@ -4904,10 +4936,16 @@ static bool YtHttpRequest(const std::wstring& host, const wchar_t* method,
                           DWORD& status, std::string& respBody) {
     status = 0;
     respBody.clear();
-    HINTERNET hSession = WinHttpOpen(
-        L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) FeedsOBS",
-        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
-        WINHTTP_NO_PROXY_BYPASS, 0);
+    // Resolved per call rather than cached per host: this is a leaf used by the
+    // chat poller and by avatar downloads, and a process-lifetime cache would
+    // pin a stale proxy when the user moves between networks (office -> home),
+    // breaking chat until OBS restarts. WinHTTP caches the PAC script and its
+    // results internally, so the repeat cost is small; a stale proxy is not.
+    feeds_http::ProxyResolution px =
+        feeds_http::ResolveProxyForUrl(L"https://" + host + path);
+    LogProxyResolutionOnce(px, "YouTube");
+    HINTERNET hSession = feeds_http::OpenProxiedSession(
+        L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) FeedsOBS", px);
     if (!hSession) return false;
     WinHttpSetTimeouts(hSession, 8000, 8000, 10000, 15000);
 
@@ -5761,10 +5799,11 @@ static QImage TwResolveAvatar(const std::string& userId) {
 // needs the Client-ID header and not YouTube's consent cookie.
 static bool TwGqlPost(const std::string& body, std::string& respBody) {
     respBody.clear();
-    HINTERNET hSession = WinHttpOpen(
-        L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) FeedsOBS",
-        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
-        WINHTTP_NO_PROXY_BYPASS, 0);
+    feeds_http::ProxyResolution px =
+        feeds_http::ResolveProxyForUrl(L"https://gql.twitch.tv/gql");
+    LogProxyResolutionOnce(px, "TwitchGQL");
+    HINTERNET hSession = feeds_http::OpenProxiedSession(
+        L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) FeedsOBS", px);
     if (!hSession) return false;
     WinHttpSetTimeouts(hSession, 8000, 8000, 10000, 15000);
     HINTERNET hConnect = WinHttpConnect(hSession, L"gql.twitch.tv",
@@ -5908,9 +5947,20 @@ static void TwDeliverClearAll() {
 // on any failure everything opened here is closed and false is returned.
 static bool TwWsConnect(HINTERNET& hSession, HINTERNET& hConnect, HINTERNET& hWs) {
     hSession = hConnect = hWs = nullptr;
-    hSession = WinHttpOpen(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) FeedsOBS",
-        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
-        WINHTTP_NO_PROXY_BYPASS, 0);
+    // A proxied session works for the upgrade: this is a wss:// request
+    // (WINHTTP_FLAG_SECURE to :443), so through a NAMED_PROXY WinHTTP issues
+    // CONNECT irc-ws.chat.twitch.tv:443 and runs TLS end-to-end inside that
+    // tunnel. The proxy never sees the Upgrade header — it only decides whether
+    // to allow the tunnel — and the upgrade options below act on the request
+    // handle, which is unaffected by how the session was opened. A proxy that
+    // refuses CONNECT, or a TLS-inspecting proxy that re-terminates and drops
+    // the upgrade, still fails here: that is the existing fail-soft path
+    // (Twitch chat simply doesn't connect), not a regression.
+    feeds_http::ProxyResolution px =
+        feeds_http::ResolveProxyForUrl(L"https://irc-ws.chat.twitch.tv/");
+    LogProxyResolutionOnce(px, "TwitchChat");
+    hSession = feeds_http::OpenProxiedSession(
+        L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) FeedsOBS", px);
     if (!hSession) return false;
     // Bound connect/send; leave receive at 0 (infinite) — the read loop blocks and
     // is unblocked by TwCloseSocket, not by a timeout (which would drop idle chats).
