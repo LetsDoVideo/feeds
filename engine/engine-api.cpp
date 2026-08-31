@@ -12,7 +12,8 @@
 #include <cstdio>
 #include <cstdlib>
 
-#include "feeds-http.h"   // proxy-aware WinHTTP session helper (shared, common/)
+#include "feeds-http.h"      // proxy-aware WinHTTP session helper (shared, common/)
+#include "feeds-backend.h"   // entitlement backend hostname (shared, common/)
 
 // Defined in engine-main.cpp
 extern void LogToFile(const char* msg);  // forwards at DEBUG
@@ -718,11 +719,11 @@ bool FetchEventJoinToken(const std::string& eventId, const std::string& sessionI
 // On any failure (network, non-200 status, missing tier field) we log and
 // fall back to tier 0 (Free).
 // ---------------------------------------------------------------------------
-static const std::string FEEDS_BACKEND_URL =
-    "https://feeds-entitlement.square-dust-0e00.workers.dev/tier";
+// Host and origin come from common/feeds-backend.h — the one place the Worker
+// hostname is spelled out.
+static const std::string FEEDS_BACKEND_URL = FEEDS_BACKEND_ORIGIN "/tier";
 // Wide form for proxy resolution (ResolveProxyForUrl takes a std::wstring).
-static const std::wstring FEEDS_BACKEND_URL_W =
-    L"https://feeds-entitlement.square-dust-0e00.workers.dev/tier";
+static const std::wstring FEEDS_BACKEND_URL_W = FEEDS_BACKEND_ORIGIN_W L"/tier";
 
 void FetchAndApplyEntitlement() {
     LogToFile("API: FetchAndApplyEntitlement starting");
@@ -759,7 +760,7 @@ void FetchAndApplyEntitlement() {
         return;
     }
     HINTERNET hConnect = WinHttpConnect(hSession,
-        L"feeds-entitlement.square-dust-0e00.workers.dev",
+        FEEDS_BACKEND_HOST_W,
         INTERNET_DEFAULT_HTTPS_PORT, 0);
     if (!hConnect) {
         WinHttpCloseHandle(hSession);

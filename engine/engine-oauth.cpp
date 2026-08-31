@@ -29,7 +29,8 @@
 #include <mutex>
 #include <cstdio>
 
-#include "feeds-http.h"   // proxy-aware WinHTTP session helper (shared, common/)
+#include "feeds-http.h"      // proxy-aware WinHTTP session helper (shared, common/)
+#include "feeds-backend.h"   // entitlement backend hostname (shared, common/)
 
 // Defined in engine-main.cpp
 extern void LogToFile(const char* msg);  // forwards at DEBUG
@@ -268,8 +269,7 @@ static std::string PollWorkerForAuthCode(const std::string& state, bool& outCanc
     // iteration would be wasteful and could eat the timeout budget. The single
     // "proxy resolved: ..." line is logged here — forced to INFO because on the
     // failing library networks a DIRECT result is itself the key diagnostic.
-    std::wstring fullUrl =
-        L"https://feeds-entitlement.square-dust-0e00.workers.dev" + path;
+    std::wstring fullUrl = FEEDS_BACKEND_ORIGIN_W + path;
     ProxyResolution px = ResolveProxyForUrl(fullUrl);
     LogProxyResolution(px, "OAuth", /*forceInfo=*/true);
 
@@ -296,7 +296,7 @@ static std::string PollWorkerForAuthCode(const std::string& state, bool& outCanc
             WinHttpSetTimeouts(hSession, 8000, 8000, 8000, 8000);
 
             HINTERNET hConnect = WinHttpConnect(hSession,
-                L"feeds-entitlement.square-dust-0e00.workers.dev",
+                FEEDS_BACKEND_HOST_W,
                 INTERNET_DEFAULT_HTTPS_PORT, 0);
             if (hConnect) {
                 HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET",

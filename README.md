@@ -34,14 +34,14 @@ Download the latest **Feeds.zip** from the [Releases](https://github.com/LetsDoV
 
 ## Quick Start
 
-1. In OBS, click **+** in the Sources panel and add a **Zoom Participant** source
+1. In OBS, click **+** in the Sources panel and add a **Feeds Participant** source
 2. In the source Properties window, click **Not connected to Zoom. Click to Connect...**
 3. Enter your Zoom meeting number or link when prompted
 4. Enter the meeting password if required
 5. The host will see a **"Request to livestream"** popup in Zoom. Have them click **Allow**
 6. Once connected, select a participant from the dropdown to display their feed
-7. Add additional **Zoom Participant** sources for more feeds
-8. Add a **Zoom Screenshare** source to capture active screenshares
+7. Add additional **Feeds Participant** sources for more feeds
+8. Add a **Feeds Screenshare** source to capture active screenshares
 
 > **Note:** When the plugin connects, the Zoom client will open on your desktop. This is expected and useful. Place it on a secondary monitor to keep an eye on all meeting participants, including those not currently in your OBS scene. Audio from the Zoom meeting will automatically appear in OBS as Desktop Audio, ready to use in your stream or recording.
 
@@ -59,8 +59,8 @@ Download the latest **Feeds.zip** from the [Releases](https://github.com/LetsDoV
 
 | Source | Description |
 |--------|-------------|
-| **Zoom Participant** | Captures an individual participant's camera feed |
-| **Zoom Screenshare** | Captures whatever is being shared on screen |
+| **Feeds Participant** | Captures an individual participant's camera feed |
+| **Feeds Screenshare** | Captures whatever is being shared on screen |
 
 ### Special Options
 - **[Active Speaker]** - automatically follows whoever is currently talking

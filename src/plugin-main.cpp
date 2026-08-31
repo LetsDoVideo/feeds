@@ -1826,7 +1826,9 @@ static QPixmap MakeChatOriginPixmap(int origin, int size) {
 // / backoff / transient failure — the self-healing loops make failures
 // indistinguishable, so there's no separate "Error"); Live = connected. Shared by
 // the YouTube and Twitch rows; the header's ResolveRowStatus turns this plus the
-// account state into the final label (Off / Log In / Upgrade / Waiting / Live).
+// account state into the final label (Off / Log In / Upgrade / Waiting /
+// Connected — the displayed word for kChatConnLive says "Connected" because the
+// chat socket being up doesn't mean the stream is on air).
 enum { kChatConnOff = 0, kChatConnWaiting = 1, kChatConnLive = 2 };
 
 // YouTube target: a channel handle (resolve via /@handle/live) or a pinned video
@@ -2563,8 +2565,11 @@ private:
         if (m_tierDisabled || g_currentTier < 1)
             return { "#e0a020", "Upgrade",
                      QString("Upgrade your plan to enable Feeds Chat"), true };
+        // "Connected" (not "Live"): this reports the chat connection, not the
+        // broadcast. A scheduled stream that hasn't gone on-air yet still has a
+        // live-chat connection, and "Live" would wrongly claim it's airing.
         if (conn == kChatConnLive)
-            return { "#40c060", "Live", liveDetail, false };
+            return { "#40c060", "Connected", liveDetail, false };
         return { "#e0a020", "Waiting",
                  QString("Target set \xE2\x80\x94 connecting"), false };
     }
