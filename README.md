@@ -60,7 +60,7 @@ From the dock you can:
 - **See every participant** in the meeting at a glance and assign them to sources
 - **Manage your feeds** without hunting through individual source Properties windows
 
-![Feeds Controls Dock](assets/dock.png)
+![Feeds Controls Dock](assets/Dock.png)
 
 There is also a separate **Feeds Chat** dock (see below) for live chat.
 
