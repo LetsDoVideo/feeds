@@ -60,7 +60,15 @@ void DrawAvatarCircle(QPainter& p, const QRect& rect, const QImage& avatar,
     }
     p.restore();
 
-    QPen ring(QColor(kAccentColor));
+    // Brace-init, not parens: kAccentColor is a NAMED constant, so
+    // `QPen ring(QColor(kAccentColor));` is a most-vexing parse — the compiler
+    // reads it as declaring a function `ring` taking a QColor and returning a
+    // QPen. (The popup's original was `QPen ring(QColor("#FFA500"));`, which
+    // was unambiguous only because a string literal can't be a parameter
+    // declarator; swapping in the named constant during this extraction is
+    // what introduced the ambiguity.) Braces can never be parsed as a
+    // function declaration.
+    QPen ring{QColor(kAccentColor)};
     ring.setWidth(stroke);
     p.setPen(ring);
     p.setBrush(Qt::NoBrush);
