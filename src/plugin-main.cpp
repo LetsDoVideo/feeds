@@ -52,6 +52,7 @@
 #include <QStyledItemDelegate>
 #include <QStyle>
 #include <QStyleOption>
+#include <QStylePainter>
 #include <QTextLayout>
 #include <QTimer>
 #include <QDialog>
@@ -2943,6 +2944,68 @@ private:
     QString m_full;
 };
 
+// A QComboBox whose CLOSED value elides with a trailing ellipsis instead of
+// being clipped mid-glyph, and which never lets the widest roster name set its
+// own width floor. Both matter now that the participant picker shares its line
+// with the lower-third title field and the show/hide button: stock QComboBox
+// takes its minimum width from the longest item it holds, which a long Zoom
+// display name would turn into a dock-widening (or field-crushing) demand.
+//
+// The popup list is untouched — it is free to be wider than the closed widget,
+// which is exactly what makes a long name still readable when picking.
+class ElidingComboBox : public QComboBox {
+public:
+    // Characters the picker and the title field are each guaranteed, whatever
+    // their content — see MakeParticipantRow, which applies the same floor to
+    // the field so the two shrink in step.
+    static constexpr int kFloorChars = 6;
+
+    explicit ElidingComboBox(QWidget* parent = nullptr) : QComboBox(parent) {
+        // Ignored horizontally: the layout allocates from the stretch factor
+        // rather than from a natural text width, so the picker and the title
+        // field split the line's spare width evenly instead of by whose
+        // content happens to be longer today.
+        setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+        // Ignored also drops the widget's OWN minimum to zero (Qt's
+        // qSmartMinSize skips minimumSizeHint entirely for it), which is what
+        // kills the "as wide as my widest item" demand — but it would equally
+        // let the picker collapse to a sliver. Only an EXPLICIT minimum
+        // survives that path, so state the floor here.
+        ensurePolished();   // themed font/metrics before measuring
+        const QFontMetrics fm(font());
+        setMinimumWidth(fm.horizontalAdvance(QLatin1Char('X')) * kFloorChars +
+                        kArrowAndFramePx);
+    }
+protected:
+    // Mirrors QComboBox::paintEvent (frame + arrow via CC_ComboBox, then the
+    // label via CE_ComboBoxLabel, with the placeholder's greyed brush) and
+    // changes exactly one thing: the label text is elided to the edit field's
+    // width first.
+    void paintEvent(QPaintEvent*) override {
+        QStylePainter p(this);
+        p.setPen(palette().color(QPalette::Text));
+
+        QStyleOptionComboBox opt;
+        initStyleOption(&opt);
+        p.drawComplexControl(QStyle::CC_ComboBox, opt);
+
+        const QRect field = style()->subControlRect(
+            QStyle::CC_ComboBox, &opt, QStyle::SC_ComboBoxEditField, this);
+        opt.currentText = fontMetrics().elidedText(
+            opt.currentText, Qt::ElideRight, qMax(0, field.width()));
+
+        if (currentIndex() < 0 && !placeholderText().isEmpty())
+            opt.palette.setBrush(QPalette::ButtonText,
+                                 opt.palette.placeholderText());
+        p.drawControl(QStyle::CE_ComboBoxLabel, opt);
+    }
+private:
+    // Rough allowance for the drop-arrow subcontrol plus the frame, so the
+    // floor above is six characters of TEXT rather than six characters minus
+    // whatever the theme spends on chrome.
+    static constexpr int kArrowAndFramePx = 28;
+};
+
 // Inline rename editor for a source-box header. Double-clicking the header swaps
 // one of these in (FeedsParticipantDock::BeginRename); Enter or focus-out commits,
 // Escape cancels. No Q_OBJECT/signals — the two outcomes are delivered through
@@ -4385,7 +4448,7 @@ private:
         //    participant. Selections used by ANOTHER source are demoted below a
         //    non-selectable "── Already used ──" divider and greyed — still fully
         //    selectable (nothing is ever blocked).
-        QComboBox* combo = new QComboBox();
+        QComboBox* combo = new ElidingComboBox();
         const long long ownPid = r.pid;
 
         // Closed-state display of the current pick (NOT added to the list itself).
@@ -4459,22 +4522,38 @@ private:
                 OnDockParticipantPicked(
                     uuid, (long long)combo->currentData().toULongLong());
             });
-        boxL->addWidget(combo);
 
-        boxL->addWidget(MakeLowerThirdRow(r));
+        // Full text on hover — the closed value elides (ElidingComboBox), and
+        // the picker no longer owns the whole line.
+        combo->setToolTip(haveCurrent ? currentText
+                                      : QString::fromUtf8("Select participant…"));
+
+        boxL->addWidget(MakeParticipantRow(r, combo));
         return box;
     }
 
-    // --- Lower third: the box's third line ------------------------------------
-    //   [ title QLineEdit (stretch) ][ Create / Show / Hide Lower Third ]
+    // --- The box's second (and last) line -------------------------------------
+    //   no lower third yet:  [ participant combo (stretch) ][ Create Lower Third ]
+    //   lower third exists:  [ combo (stretch) ][ title (stretch) ][ Hide|Show ]
     //
-    // Lives here rather than in the header cluster because the header row is
-    // already crowded (the eliding name loses width on a narrow dock) and the
-    // title field needs real width, which an 18px icon slot can't give.
+    // The participant picker and the lower-third controls share one line rather
+    // than owning two. The title field was previously a full-width bar under
+    // EVERY participant, including the majority that never get a nameplate; it
+    // now appears only once there is a nameplate for it to title, which is what
+    // buys the row back from three lines to two.
+    //
+    // Widths: the button takes its natural label width (never a fixed share) —
+    // "Create Lower Third" is spelled out because there is room for it and it
+    // says what the button does, while "Hide"/"Show" stay terse because the
+    // title field sitting beside them already establishes the context. The
+    // field(s) then split whatever is left, both sized off the layout's stretch
+    // rather than off their content, so neither a long name nor a long title
+    // can push the other out. Everything elides; nothing wraps; the row is
+    // exactly two lines at any content length.
     //
     // Live boxes only — the non-live box has no combo and no bound participant,
     // so offering it a nameplate would be offering a nameplate for nobody.
-    QWidget* MakeLowerThirdRow(const Row& r) {
+    QWidget* MakeParticipantRow(const Row& r, QComboBox* combo) {
         QWidget*     row  = new QWidget();
         QHBoxLayout* rowL = new QHBoxLayout(row);
         rowL->setContentsMargins(0, 0, 0, 0);
@@ -4482,46 +4561,76 @@ private:
 
         const bool locked = (g_currentTier < kLowerThirdMinTier);
         const std::string uuid = r.uuid;
+        const bool exists = !r.ltUuid.empty();
+
+        rowL->addWidget(combo, 1);
 
         // Title field — one of the three surfaces onto the single stored title
         // (the other two are the participant's and the lower third's properties
-        // panels). Commits on editingFinished (Enter or focus-out), never on
-        // every keystroke, so a mid-typing dock refresh can't write a partial
-        // value.
-        QLineEdit* title = new QLineEdit(QString::fromStdString(r.ltTitle));
-        title->setPlaceholderText(QString::fromUtf8("Lower third title…"));
-        title->setEnabled(!locked);
-        // Same deferral contract as the inline rename, on its own flag: while
-        // an edit is in progress Refresh() defers (m_refreshPending) instead of
-        // tearing the box — and this field — out from under the user mid-type.
-        // Set on the first keystroke rather than on focus, so merely tabbing
-        // through the field doesn't wedge refreshes.
-        QObject::connect(title, &QLineEdit::textEdited, this,
-                         [this]() { m_titleEditActive = true; });
-        QObject::connect(title, &QLineEdit::editingFinished, this,
-            [this, title, uuid]() {
-                if (!m_titleEditActive) return;   // focus-out, nothing typed
-                m_titleEditActive = false;
-                SetLowerThirdTitleFor(uuid, title->text().toStdString());
-                // SetLowerThirdTitleFor posts its own refresh; only flush a
-                // refresh that was deferred while the edit was open.
-                if (m_refreshPending) { m_refreshPending = false; Refresh(); }
-            });
-        rowL->addWidget(title, 1);
+        // panels). Shown only alongside an existing nameplate; its content is
+        // that stored value, so re-opening the dock or toggling show/hide
+        // always displays the real title. Commits on editingFinished (Enter or
+        // focus-out), never on every keystroke, so a mid-typing dock refresh
+        // can't write a partial value.
+        if (exists) {
+            const QString full = QString::fromStdString(r.ltTitle);
+            QLineEdit* title = new QLineEdit(full);
+            title->setPlaceholderText(QString::fromUtf8("Lower third title…"));
+            title->setEnabled(!locked);
+            title->setToolTip(full);
+            // A QLineEdit clips rather than elides (it must keep the real text
+            // for editing), so show it from the start and hand the full string
+            // to the tooltip. Single-line by construction — it cannot wrap.
+            title->setCursorPosition(0);
+            // Same width contract as the combo (see ElidingComboBox): sized by
+            // the layout's stretch rather than by the 17-character natural
+            // width a QLineEdit asks for, with the same explicit character
+            // floor so the two shrink in step instead of one eating the other.
+            title->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+            title->ensurePolished();
+            title->setMinimumWidth(
+                QFontMetrics(title->font()).horizontalAdvance(QLatin1Char('X')) *
+                ElidingComboBox::kFloorChars);
+            // Same deferral contract as the inline rename, on its own flag: while
+            // an edit is in progress Refresh() defers (m_refreshPending) instead of
+            // tearing the box — and this field — out from under the user mid-type.
+            // Set on the first keystroke rather than on focus, so merely tabbing
+            // through the field doesn't wedge refreshes.
+            QObject::connect(title, &QLineEdit::textEdited, this,
+                [this, title](const QString& t) {
+                    m_titleEditActive = true;
+                    title->setToolTip(t);
+                });
+            QObject::connect(title, &QLineEdit::editingFinished, this,
+                [this, title, uuid]() {
+                    if (!m_titleEditActive) return;   // focus-out, nothing typed
+                    m_titleEditActive = false;
+                    SetLowerThirdTitleFor(uuid, title->text().toStdString());
+                    // SetLowerThirdTitleFor posts its own refresh; only flush a
+                    // refresh that was deferred while the edit was open.
+                    if (m_refreshPending) { m_refreshPending = false; Refresh(); }
+                });
+            rowL->addWidget(title, 1);
+        }
 
-        // Three-state button. The state is read from the lower third itself, so
-        // it is unambiguous: no source -> Create; source with shown=true ->
-        // Hide; source with shown=false -> Show.
+        // Three-state button, unchanged in behaviour and only relabelled: the
+        // state is still read from the lower third itself, so it is
+        // unambiguous: no source -> Create; source with shown=true -> Hide;
+        // source with shown=false -> Show.
         //
         // No stream-state gating, deliberately: Feeds can't reliably tell live
         // from setup (the same reason binding isn't gated either). Creating
         // mid-stream is the one accepted low-risk edge; show/hide is pure
         // visibility and is live-safe.
-        const bool exists = !r.ltUuid.empty();
-        QPushButton* btn = new QPushButton(
+        //
+        // Eliding: it keeps its natural label width wherever the dock has room
+        // (that is the whole point of the long Create label), and gives way to
+        // an ellipsis only when the dock is dragged narrower than the row —
+        // which beats forcing a horizontal scrollbar on the whole dock.
+        ElidingPushButton* btn = new ElidingPushButton(
             !exists     ? "Create Lower Third"
-            : r.ltShown ? "Hide Lower Third"
-                        : "Show Lower Third");
+            : r.ltShown ? "Hide"
+                        : "Show");
         btn->setToolTip(
             !exists     ? "Create a nameplate for this participant"
             : r.ltShown ? "Hide the nameplate (the source is kept)"
@@ -7795,7 +7904,7 @@ static void ReconcileSourcesToTier() {
     // than Streamer: the lower third is Basic's marquee feature. A Free user's
     // nameplates render nothing and their properties panel explains why; the
     // dock's per-row button greys and opens the upgrade prompt (see
-    // MakeLowerThirdRow), so both surfaces agree.
+    // MakeParticipantRow), so both surfaces agree.
     feeds::ReconcileLowerThirdSources();
 
     // Chat dock — gated at Basic (>= 1). The dock object always exists
@@ -9587,6 +9696,26 @@ static void SetLowerThirdShownFor(const std::string& participantUuid,
 
     if (obs_data_t* s = obs_source_get_settings(lt)) {
         obs_data_set_bool(s, "shown", shown);
+        // Refresh the nameplate's title mirror ("title" on its own settings —
+        // kLtTitleKey in feeds-lower-third-source.cpp) while we already hold
+        // its settings open. Two reasons, neither cosmetic:
+        //   - obs_source_update hands lt_update the WHOLE settings object, so a
+        //     mirror left stale here is a stale title arriving at the card. The
+        //     source now prefers the participant's canonical value over the
+        //     mirror, but leaving a known-wrong value in the object it reads is
+        //     just laying the trap again.
+        //   - this is the write that gets persisted into the scene collection,
+        //     and the mirror is what a reload has to fall back on until the
+        //     participant resolves.
+        // Only when the participant resolved: otherwise the existing mirror IS
+        // the best value anyone has.
+        if (participant) {
+            if (obs_data_t* ps = obs_source_get_settings(participant)) {
+                const char* t = obs_data_get_string(ps, kLowerThirdTitleKey);
+                obs_data_set_string(s, "title", t ? t : "");
+                obs_data_release(ps);
+            }
+        }
         // Deferred for a video-flagged source; lt_update picks the change up on
         // the next graphics tick and starts the slide. The dock's button state
         // reads the settings value, which is already committed here, so the

@@ -69,7 +69,10 @@ static constexpr int LOWER_THIRD_MIN_TIER = 1;
 //                      truth. Present only so this source's properties panel
 //                      has something to bind a text field to; edits are
 //                      written straight through to the participant. The render
-//                      path never trusts it while the participant resolves.
+//                      path never trusts it while the participant resolves —
+//                      see ResolveDisplayTitle, which is what enforces that
+//                      precedence on every settings update, not just on the
+//                      properties panel's own path.
 static constexpr const char* kLtParticipantUuidKey = "participant_uuid";
 static constexpr const char* kLtShownKey           = "shown";
 static constexpr const char* kLtTitleKey           = "title";
@@ -369,17 +372,35 @@ static obs_source_t* ResolveParticipant(const std::string& uuid) {
     return obs_get_source_by_uuid(uuid.c_str());
 }
 
-static std::string ReadParticipantTitle(const std::string& participantUuid) {
+// Reads the canonical title into `out` and reports whether the participant
+// actually resolved. The bool matters: an EMPTY canonical title is a
+// legitimate value (the user cleared the field), so callers must be able to
+// tell "no title" from "no participant" rather than treating both as "" and
+// falling back to a stale mirror.
+static bool ReadParticipantTitle(const std::string& participantUuid,
+                                 std::string& out) {
     obs_source_t* p = ResolveParticipant(participantUuid);
-    if (!p) return std::string();
-    std::string out;
+    if (!p) return false;
+    out.clear();
     if (obs_data_t* s = obs_source_get_settings(p)) {
         const char* t = obs_data_get_string(s, kParticipantTitleKey);
         if (t) out = t;
         obs_data_release(s);
     }
     obs_source_release(p);
-    return out;
+    return true;
+}
+
+// The title this instance should DISPLAY: the participant's setting whenever
+// the participant resolves, and only otherwise the mirror off our own
+// settings. Must be called WITHOUT g_ltStateMutex held — it walks libobs'
+// source list, and the lock ordering here keeps Feeds mutexes innermost.
+static QString ResolveDisplayTitle(const std::string& participantUuid,
+                                   const char*        mirror) {
+    std::string truth;
+    if (ReadParticipantTitle(participantUuid, truth))
+        return QString::fromStdString(truth);
+    return QString::fromUtf8(mirror ? mirror : "");
 }
 
 // ---------------------------------------------------------------------------
@@ -422,6 +443,10 @@ static void* lt_create(obs_data_t* settings, obs_source_t* source) {
         // whatever state it was left in — shown means shown, with no slide
         // (there is nothing to animate into on a scene load).
         d->anim = d->shown ? LtAnimState::Shown : LtAnimState::Hidden;
+        // Mirror only, deliberately: during a scene-collection load the
+        // participant we point at may not have been created yet, so the truth
+        // is unreadable here. lt_load re-reads it once the whole collection
+        // exists — see the info.load contract.
         const char* t = obs_data_get_string(settings, kLtTitleKey);
         if (t) d->title = QString::fromUtf8(t);
     }
@@ -489,6 +514,20 @@ static void lt_update(void* data, obs_data_t* settings) {
     const bool  shown = obs_data_get_bool(settings, kLtShownKey);
     const char* mirror = obs_data_get_string(settings, kLtTitleKey);
 
+    // Resolve the title BEFORE taking the state lock (ResolveDisplayTitle
+    // walks libobs' source list).
+    //
+    // Truth-first, not mirror-first, and that ordering is load-bearing: EVERY
+    // caller of obs_source_update hands lt_update the WHOLE settings object,
+    // including a title mirror it may never have written. The dock's show/hide
+    // is exactly that caller — it writes `shown` and nothing else — so a
+    // mirror-wins assignment here overwrote the title that the dock's
+    // UpdateLowerThirdContent push had just delivered, and the re-shown card
+    // came up blank until the user nudged the title field and re-triggered the
+    // push. Re-reading the participant makes any settings update, show
+    // included, re-apply the stored title instead of clobbering it.
+    const QString title = ResolveDisplayTitle(pu ? pu : "", mirror);
+
     std::lock_guard<std::mutex> lock(g_ltStateMutex);
 
     if (pu && d->participant_uuid != pu) {
@@ -496,21 +535,31 @@ static void lt_update(void* data, obs_data_t* settings) {
         d->texture_dirty    = true;
     }
 
-    // The mirror is display state only: it seeds the card when the
-    // participant can't be resolved (deleted source), and is otherwise
-    // overwritten by the next UpdateLowerThirdContent push.
-    if (mirror) {
-        const QString m = QString::fromUtf8(mirror);
-        if (d->title != m) {
-            d->title         = m;
-            d->texture_dirty = true;
-        }
+    if (d->title != title) {
+        d->title         = title;
+        d->texture_dirty = true;
     }
 
     if (shown != d->shown) {
         d->shown = shown;
         StartSlide_locked(d, shown);
     }
+}
+
+// libobs calls this once the ENTIRE scene collection has been created —
+// info.load is documented as running "after all the loading sources have
+// actually been created because sometimes there are sources that depend on
+// each other", and this source is precisely that case: at lt_create time the
+// participant holding our title may not exist yet.
+//
+// Re-running lt_update against the same settings is all that is needed: it
+// re-reads the title from the participant (which now resolves) and leaves
+// `shown` alone, since lt_create already applied the same value, so there is
+// no spurious slide on load. This is what makes a nameplate restored from a
+// saved scene collection come up showing its stored title with no dock
+// interaction at all.
+static void lt_load(void* data, obs_data_t* settings) {
+    lt_update(data, settings);
 }
 
 static obs_properties_t* lt_get_properties(void* data) {
@@ -546,10 +595,12 @@ static obs_properties_t* lt_get_properties(void* data) {
     // properties view reads settings after this call returns, and calling
     // update from inside get_properties invites re-entrancy.
     if (d && !d->participant_uuid.empty()) {
-        const std::string truth = ReadParticipantTitle(d->participant_uuid);
-        if (obs_data_t* s = obs_source_get_settings(d->source)) {
-            obs_data_set_string(s, kLtTitleKey, truth.c_str());
-            obs_data_release(s);
+        std::string truth;
+        if (ReadParticipantTitle(d->participant_uuid, truth)) {
+            if (obs_data_t* s = obs_source_get_settings(d->source)) {
+                obs_data_set_string(s, kLtTitleKey, truth.c_str());
+                obs_data_release(s);
+            }
         }
     }
 
@@ -595,7 +646,7 @@ static obs_properties_t* lt_get_properties(void* data) {
 
     obs_properties_add_text(props, "managed_msg",
         "This source is managed from the Feeds Controls dock — use the "
-        "Show / Hide Lower Third button on the participant's row. Showing it "
+        "Show / Hide button on the participant's row. Showing it "
         "re-positions the card over the participant's current video.",
         OBS_TEXT_INFO);
 
@@ -690,6 +741,7 @@ void RegisterLowerThirdSource() {
     feeds_lower_third_info.get_defaults   = lt_get_defaults;
     feeds_lower_third_info.get_properties = lt_get_properties;
     feeds_lower_third_info.update         = lt_update;
+    feeds_lower_third_info.load           = lt_load;
     feeds_lower_third_info.video_render   = lt_video_render;
     feeds_lower_third_info.video_tick     = lt_video_tick;
     feeds_lower_third_info.icon_type      = OBS_ICON_TYPE_TEXT;
