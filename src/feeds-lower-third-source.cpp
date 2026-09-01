@@ -692,10 +692,21 @@ static void lt_video_render(void* data, gs_effect_t* /*effect*/) {
     QString title;
     QImage  avatar;
     float   fraction;
-    LtAnimState anim;
     {
         std::lock_guard<std::mutex> lock(g_ltStateMutex);
-        anim     = d->anim;
+
+        // Fully hidden — nothing to draw at all. (Mid-slide states fall
+        // through: the card is partially on screen.)
+        //
+        // Bail BEFORE touching texture_dirty. Consuming the flag here would
+        // throw away a content change that arrived while the card was hidden:
+        // no texture is regenerated on a hidden frame, so the next show slides
+        // in the stale one. Nothing re-dirties it either — the show path now
+        // resolves the same title the push already delivered, so it has no
+        // difference to notice. Leaving the flag set is what makes an edit made
+        // while hidden appear on the next show.
+        if (d->anim == LtAnimState::Hidden) return;
+
         dirty    = d->texture_dirty;
         name     = d->name;
         title    = d->title;
@@ -703,10 +714,6 @@ static void lt_video_render(void* data, gs_effect_t* /*effect*/) {
         if (dirty) d->texture_dirty = false;
         fraction = ComputeFraction_locked(d);
     }
-
-    // Fully hidden — nothing to draw at all. (Mid-slide states still draw:
-    // the card is partially on screen.)
-    if (anim == LtAnimState::Hidden) return;
 
     if (dirty || !d->texture) {
         RegenerateTexture(d, name, title, avatar);

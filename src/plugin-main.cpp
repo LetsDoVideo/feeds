@@ -2989,12 +2989,26 @@ protected:
         initStyleOption(&opt);
         p.drawComplexControl(QStyle::CC_ComboBox, opt);
 
+        // Take the string to draw from the WIDGET, not from whatever
+        // initStyleOption left in opt.currentText. With nothing selected the
+        // text to draw is the placeholder, and depending on the option to
+        // carry it across is what blanked the picker's "Select participant…"
+        // when this class replaced the stock QComboBox.
+        const bool    placeholder = (currentIndex() < 0);
+        const QString full = placeholder ? placeholderText() : currentText();
+        if (full.isEmpty()) return;   // frame and arrow are already drawn
+
         const QRect field = style()->subControlRect(
             QStyle::CC_ComboBox, &opt, QStyle::SC_ComboBoxEditField, this);
-        opt.currentText = fontMetrics().elidedText(
-            opt.currentText, Qt::ElideRight, qMax(0, field.width()));
+        const QString shown = fontMetrics().elidedText(
+            full, Qt::ElideRight, qMax(0, field.width()));
+        // Below the width of an ellipsis elidedText returns an EMPTY string,
+        // which would blank the picker outright. Clipped text beats no text —
+        // the style clips the label to the field rect regardless.
+        opt.currentText = shown.isEmpty() ? full : shown;
 
-        if (currentIndex() < 0 && !placeholderText().isEmpty())
+        // Greyed exactly as QComboBox::paintEvent greys a placeholder.
+        if (placeholder)
             opt.palette.setBrush(QPalette::ButtonText,
                                  opt.palette.placeholderText());
         p.drawControl(QStyle::CE_ComboBoxLabel, opt);
