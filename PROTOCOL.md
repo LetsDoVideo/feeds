@@ -249,12 +249,16 @@ Plugin requests the current participant list. Sent from `zp_properties` on every
 #### `participant_list_changed` (E→P)
 Sent as a response to `get_participants`, and also unsolicited after `raw_livestream_granted` so the plugin gets an initial list. Includes the full current list, not a diff. `my_user_id` is the plugin's own user in the meeting, which the plugin filters out of the dropdown.
 
+`avatar_path` is the SDK's on-disk profile picture for that user (under `%APPDATA%\ZoomSDK\data\ConfAvatar\`, readable by both processes), or `""` when they have no profile picture. It is the same field `chat_message` carries; sending it on the roster too is what lets the plugin show an avatar for a participant who has not sent a chat message — the lower third needs one for anybody. The field is additive in both directions: an older engine omits it and the plugin reads `""` (the same value as "no picture"), and an older plugin ignores it.
+
+`muted` seeds the dock's mute indicator so a row shows the right mark immediately; `participant_audio_status` keeps it live between roster changes.
+
 ```json
 {"type": "participant_list_changed",
  "my_user_id": 12345678,
  "participants": [
-    {"id": 12345679, "name": "Alice"},
-    {"id": 12345680, "name": "Bob"}
+    {"id": 12345679, "name": "Alice", "avatar_path": "C:\\Users\\me\\AppData\\Roaming\\ZoomSDK\\data\\ConfAvatar\\a1b2c3.png", "muted": 0},
+    {"id": 12345680, "name": "Bob", "avatar_path": "", "muted": 1}
  ]}
 ```
 

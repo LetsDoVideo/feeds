@@ -13,6 +13,7 @@
 // a different one replaces the content. Animation lands in 3d.
 
 #include "feeds-chat-popup-source.h"
+#include "feeds-card-render.h"
 #include "feeds-version.h"
 
 #include <obs-module.h>
@@ -23,7 +24,6 @@
 #include <QFontMetrics>
 #include <QImage>
 #include <QPainter>
-#include <QPainterPath>
 #include <QString>
 #include <QUrl>
 
@@ -64,8 +64,10 @@ namespace {
 
 // Slide animation duration per direction. Ease-out cubic — smooth
 // deceleration on arrival, smooth acceleration on departure. Matches
-// SSN's visual feel; not a bezier-perfect match (no overshoot).
-static constexpr float ANIM_DURATION_SECONDS = 0.5f;
+// SSN's visual feel; not a bezier-perfect match (no overshoot). Now shared
+// with the lower third (feeds-card-render.h) so the two cards animate at
+// the same speed.
+static constexpr float ANIM_DURATION_SECONDS = feeds::card::kSlideDurationSeconds;
 
 // 80% of the active OBS canvas width. Queried once per content change
 // inside RenderPopupToImage so the popup is the same proportion of the
@@ -210,15 +212,13 @@ static void RenderPopupToImage(FeedsChatPopupData* d,
     const int PILL_CORNER_RADIUS      = (int)(6   * scale);
     const int PILL_FONT_PIXEL_SIZE    = (int)(24  * scale);
 
-    // Avatar. AVATAR_BORDER_WIDTH and AVATAR_RING_INSET are clamped to
-    // at least 1 so the yellow ring never disappears at sub-1080p
-    // resolutions. Inset = border/2 keeps the stroke centred over the
-    // circle edge regardless of scale.
+    // Avatar. AVATAR_BORDER_WIDTH is clamped to at least 1 so the yellow
+    // ring never disappears at sub-1080p resolutions; the matching ring
+    // inset (border/2, likewise clamped) lives inside DrawAvatarCircle.
     const int AVATAR_X                = (int)(15  * scale);
     const int AVATAR_Y                = (int)(15  * scale);
     const int AVATAR_SIZE             = (int)(128 * scale);
     const int AVATAR_BORDER_WIDTH     = std::max(1, (int)(3 * scale));
-    const int AVATAR_RING_INSET       = std::max(1, AVATAR_BORDER_WIDTH / 2);
 
     // Shadow offset (no real gaussian blur — hard offset).
     const int SHADOW_OFFSET           = (int)(5   * scale);
@@ -263,15 +263,9 @@ static void RenderPopupToImage(FeedsChatPopupData* d,
         canvasWidth - BUBBLE_LEFT_MARGIN - BUBBLE_RIGHT_MARGIN,
         bubbleHeight);
 
-    // Drop shadow first so the bubble draws over it.
-    p.setPen(Qt::NoPen);
-    p.setBrush(QColor(0, 0, 0, 80));
-    p.drawRoundedRect(bubbleRect.translated(SHADOW_OFFSET, SHADOW_OFFSET),
-                      BUBBLE_CORNER_RADIUS, BUBBLE_CORNER_RADIUS);
-
-    // Bubble body
-    p.setBrush(QColor("#222222"));
-    p.drawRoundedRect(bubbleRect, BUBBLE_CORNER_RADIUS, BUBBLE_CORNER_RADIUS);
+    // Drop shadow then bubble body (feeds-card-render).
+    feeds::card::DrawCardBody(p, bubbleRect, BUBBLE_CORNER_RADIUS,
+                              SHADOW_OFFSET);
 
     // Message text inside the bubble, padded left to clear avatar
     p.setFont(msgFont);
@@ -284,49 +278,16 @@ static void RenderPopupToImage(FeedsChatPopupData* d,
                Qt::TextWordWrap | Qt::AlignLeft | Qt::AlignTop,
                content);
 
-    // Username pill — yellow rounded rect, dark text, sized to fit
-    QFont pillFont = p.font();
-    pillFont.setBold(true);
-    pillFont.setPixelSize(PILL_FONT_PIXEL_SIZE);
-    p.setFont(pillFont);
-    QFontMetrics pillFm(pillFont);
-    int textWidth  = pillFm.horizontalAdvance(senderName);
-    int textHeight = pillFm.height();
-    QRect pillRect(PILL_X, PILL_Y,
-                   textWidth  + 2 * PILL_H_PAD,
-                   textHeight + 2 * PILL_V_PAD);
-    p.setBrush(QColor("#FFA500"));
-    p.setPen(Qt::NoPen);
-    p.drawRoundedRect(pillRect, PILL_CORNER_RADIUS, PILL_CORNER_RADIUS);
-    p.setPen(QColor("#222222"));
-    p.drawText(pillRect, Qt::AlignCenter, senderName);
+    // Username pill — yellow rounded rect, dark text, sized to fit. Derives
+    // its font from the painter's current font (msgFont), as it always has.
+    feeds::card::DrawPill(p, QPoint(PILL_X, PILL_Y), senderName,
+                          PILL_FONT_PIXEL_SIZE, PILL_H_PAD, PILL_V_PAD,
+                          PILL_CORNER_RADIUS);
 
-    // Avatar — circular clip, then a scaled yellow ring on top
-    const QRect avatarRect(AVATAR_X, AVATAR_Y, AVATAR_SIZE, AVATAR_SIZE);
-    p.save();
-    QPainterPath circle;
-    circle.addEllipse(avatarRect);
-    p.setClipPath(circle);
-    if (!avatar.isNull()) {
-        p.drawImage(avatarRect,
-                    avatar.scaled(AVATAR_SIZE, AVATAR_SIZE,
-                                  Qt::KeepAspectRatioByExpanding,
-                                  Qt::SmoothTransformation));
-    } else {
-        // Null fallback — flat neutral grey circle.
-        p.fillRect(avatarRect, QColor(120, 120, 120));
-    }
-    p.restore();
-
-    QPen ring(QColor("#FFA500"));
-    ring.setWidth(AVATAR_BORDER_WIDTH);
-    p.setPen(ring);
-    p.setBrush(Qt::NoBrush);
-    // Inset by half the stroke width so the ring sits visually centred
-    // over the avatar circle's edge (Qt strokes are centre-aligned by
-    // default; without the inset the outer half clips beyond the bbox).
-    p.drawEllipse(avatarRect.adjusted( AVATAR_RING_INSET,  AVATAR_RING_INSET,
-                                      -AVATAR_RING_INSET, -AVATAR_RING_INSET));
+    // Avatar — circular clip, then a scaled yellow ring on top.
+    feeds::card::DrawAvatarCircle(
+        p, QRect(AVATAR_X, AVATAR_Y, AVATAR_SIZE, AVATAR_SIZE),
+        avatar, AVATAR_BORDER_WIDTH);
 
     p.end();
 }
@@ -348,31 +309,8 @@ static void RegenerateTexture(FeedsChatPopupData* d,
     // null image renders the neutral circle (see RenderPopupToImage).
     RenderPopupToImage(d, senderName, content, avatar);
 
-    // QImage rows are 4-byte aligned for RGBA8888 with a width divisible
-    // by 1 — i.e., always tightly packed at 4 bytes per pixel. The
-    // memcpy fallback is defence in depth: if Qt ever returns a strided
-    // image (unusual width, debug build, future Qt version), we copy.
-    const QImage& img = d->rendered_image;
-    const uint8_t* pixels = nullptr;
-    std::vector<uint8_t> tight;
-    if (img.bytesPerLine() == (int)d->width * 4) {
-        pixels = img.constBits();
-    } else {
-        tight.resize((size_t)d->width * d->height * 4);
-        for (uint32_t y = 0; y < d->height; ++y) {
-            memcpy(tight.data() + (size_t)y * d->width * 4,
-                   img.constScanLine((int)y),
-                   (size_t)d->width * 4);
-        }
-        pixels = tight.data();
-    }
-
-    if (d->texture) {
-        gs_texture_destroy(d->texture);
-        d->texture = nullptr;
-    }
-    d->texture = gs_texture_create(d->width, d->height, GS_RGBA, 1,
-                                   &pixels, 0);
+    feeds::card::UploadImageToTexture(d->rendered_image, d->width, d->height,
+                                      d->texture);
     d->texture_dirty = false;
 }
 
@@ -412,13 +350,6 @@ static void UpdateAllInstances() {
     }
 }
 
-// Ease-out cubic. Decelerates as t approaches 1 — smooth landing on
-// arrival, smooth lift-off on departure when curve runs in reverse.
-static float EaseOutCubic(float t) {
-    float f = 1.0f - t;
-    return 1.0f - f * f * f;
-}
-
 // Current Y-offset fraction for the popup (0 = in place, 1 = fully below).
 // Caller must hold g_popupStateMutex.
 static float ComputeCurrentFraction_locked() {
@@ -430,7 +361,7 @@ static float ComputeCurrentFraction_locked() {
             float t = g_popupAnimElapsed / ANIM_DURATION_SECONDS;
             if (t < 0.0f) t = 0.0f;
             if (t > 1.0f) t = 1.0f;
-            float e = EaseOutCubic(t);
+            float e = feeds::card::EaseOutCubic(t);
             return g_popupAnimFrom + (g_popupAnimTo - g_popupAnimFrom) * e;
         }
     }
@@ -669,100 +600,14 @@ static void fcp_video_render(void* data, gs_effect_t* /*effect*/) {
 
     // Translate by fraction × bbox-height: 0 = popup sits in its bbox;
     // 1 = popup sits one bbox-height below. Slide-in animates 1 → 0;
-    // slide-out animates 0 → 1. OBS_SOURCE_CUSTOM_DRAW draws straight to
-    // the scene render target with no per-source clipping, so a raw
-    // translated draw would show the popup spilling outside its bbox.
-    // We route through gs_texrender below so the bbox naturally clips
-    // the slide.
+    // slide-out animates 0 → 1. The texrender clip, the two blend setups
+    // and the no-texrender fallback all live in DrawClippedSlide now
+    // (feeds-card-render), shared with the lower third — which passes an X
+    // offset instead of this Y one. Behaviour here is unchanged.
     const float yOffset = animFraction * (float)d->height;
 
-    if (d->texrender) {
-        // Phase 1: render the popup (with its Y translation) into a
-        // bbox-sized intermediate texture. Anything translated outside
-        // (0,0)-(width,height) is discarded by the texrender.
-        gs_texrender_reset(d->texrender);
-        if (gs_texrender_begin(d->texrender, d->width, d->height)) {
-            struct vec4 clear_color = { 0.0f, 0.0f, 0.0f, 0.0f };
-            gs_clear(GS_CLEAR_COLOR, &clear_color, 1.0f, 0);
-            gs_ortho(0.0f, (float)d->width,
-                     0.0f, (float)d->height,
-                     -100.0f, 100.0f);
-
-            // Straight copy from the popup texture into the texrender
-            // (which is pre-cleared to fully transparent). Using normal
-            // SRCALPHA/INVSRCALPHA against a transparent dest would
-            // square the alpha — dst.a = src.a*src.a — quietly making
-            // the drop shadow ~3× too transparent after the final
-            // composite. Replace blending (src=ONE, dst=ZERO) writes
-            // the popup's RGBA verbatim, including alpha; GPU scissor
-            // discards pixels translated outside (0,0)-(width,height).
-            gs_blend_state_push();
-            gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
-
-            gs_matrix_push();
-            gs_matrix_translate3f(0.0f, yOffset, 0.0f);
-
-            gs_effect_t* eff   = obs_get_base_effect(OBS_EFFECT_DEFAULT);
-            gs_eparam_t* param = gs_effect_get_param_by_name(eff, "image");
-            gs_effect_set_texture(param, d->texture);
-            while (gs_effect_loop(eff, "Draw")) {
-                gs_draw_sprite(d->texture, 0, d->width, d->height);
-            }
-
-            gs_matrix_pop();
-            gs_blend_state_pop();
-
-            gs_texrender_end(d->texrender);
-        }
-
-        // Phase 2: composite the (clipped) intermediate texture into the
-        // scene at the source's natural position — no translation here,
-        // the slide offset is already baked into the texrender contents.
-        gs_texture_t* clipped = gs_texrender_get_texture(d->texrender);
-        if (clipped) {
-            gs_blend_state_push();
-            // Separate alpha factor (src_a = ONE) matches OBS's default
-            // composite blend (gs_reset_blend_state). The non-separate form
-            // squares the destination alpha, corrupting the accumulated alpha
-            // of a nested scene so its opaque siblings composite semi-
-            // transparent into the parent scene.
-            gs_blend_function_separate(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA,
-                                       GS_BLEND_ONE,      GS_BLEND_INVSRCALPHA);
-
-            gs_effect_t* eff   = obs_get_base_effect(OBS_EFFECT_DEFAULT);
-            gs_eparam_t* param = gs_effect_get_param_by_name(eff, "image");
-            gs_effect_set_texture(param, clipped);
-            while (gs_effect_loop(eff, "Draw")) {
-                gs_draw_sprite(clipped, 0, d->width, d->height);
-            }
-
-            gs_blend_state_pop();
-        }
-        return;
-    }
-
-    // Fallback: texrender allocation failed during fcp_create. Direct
-    // draw with translation — same behaviour as the 3d commit, popup
-    // is visible outside its bbox during the slide. Better than not
-    // rendering at all.
-    gs_blend_state_push();
-    // Separate alpha factor (src_a = ONE) matches OBS's default composite
-    // blend — see the phase-2 note above on nested-scene alpha accumulation.
-    gs_blend_function_separate(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA,
-                               GS_BLEND_ONE,      GS_BLEND_INVSRCALPHA);
-
-    gs_matrix_push();
-    gs_matrix_translate3f(0.0f, yOffset, 0.0f);
-
-    gs_effect_t* eff   = obs_get_base_effect(OBS_EFFECT_DEFAULT);
-    gs_eparam_t* param = gs_effect_get_param_by_name(eff, "image");
-    gs_effect_set_texture(param, d->texture);
-    while (gs_effect_loop(eff, "Draw")) {
-        gs_draw_sprite(d->texture, 0, d->width, d->height);
-    }
-
-    gs_matrix_pop();
-    gs_blend_state_pop();
+    feeds::card::DrawClippedSlide(d->texrender, d->texture,
+                                  d->width, d->height, 0.0f, yOffset);
 }
 
 static struct obs_source_info feeds_chat_popup_info = {};

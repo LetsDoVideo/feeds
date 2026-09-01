@@ -63,8 +63,10 @@ endif()
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     src/plugin-main.cpp
     src/engine-client.cpp
+    src/feeds-card-render.cpp
     src/feeds-chat-popup-source.cpp
     src/feeds-chat-overlay-source.cpp
+    src/feeds-lower-third-source.cpp
     src/feeds-iso-recorder.cpp
 )
 

@@ -23,6 +23,7 @@
 #include <map>
 #include <set>
 #include <functional>
+#include <algorithm>
 #include <mutex>
 #include <atomic>
 #include <thread>
@@ -89,7 +90,12 @@
 
 #include "feeds-chat-popup-source.h"
 #include "feeds-chat-overlay-source.h"
+#include "feeds-lower-third-source.h"
 #include "feeds-iso-recorder.h"
+
+// matrix4 by value, for reading a scene-item's box transform when placing a
+// lower third over its participant (obs.h only forward-declares it).
+#include <graphics/matrix4.h>
 
 // Qt defines `slots` and `signals` as preprocessor macros (expanding to
 // empty or to annotations for the Meta-Object Compiler). Any non-Qt code
@@ -274,6 +280,13 @@ static unsigned int       g_activeSpeakerUserId  = 0;
 struct CachedParticipant {
     unsigned int id;
     std::string  name;
+    // Zoom SDK profile-picture path, from the participant_list_changed IPC.
+    // Empty when the participant has no profile picture. The roster handler
+    // seeds g_avatarCache from it so the lower third can show an avatar for
+    // ANY participant — before v1.7 an avatar only reached the plugin on a
+    // chat message, so a nameplate for someone who hadn't chatted fell back
+    // to the bundled logo.
+    std::string  avatar_path;
 };
 static std::vector<CachedParticipant> g_cachedParticipants;
 static std::mutex                     g_participantsMutex;
@@ -360,6 +373,28 @@ static void AddOrReferenceSourceInCurrentScene(const char* typeId, const char* b
 static void OpenSourceFilters(const std::string& uuid);
 static void ShowIncludedScenesMenu(const std::string& uuid);
 
+// Lower-third orchestration (defined with the scene helpers, far below —
+// they need the scene-placement machinery and the participant-name/avatar
+// resolvers). The dock's per-row lower-third controls call these:
+//   GetLowerThirdUuidFor  — the participant's forward pointer, validated
+//                           ("" = never created, or since deleted)
+//   IsLowerThirdShown     — the lower third's persisted shown flag
+//   CreateLowerThirdFor   — create the source + a scene-item in every scene
+//                           the participant is in, place them, show it
+//   SetLowerThirdShownFor — show (re-placing one-shot) or hide
+//   SetLowerThirdTitleFor — write the canonical title + fan the change out
+static std::string GetLowerThirdUuidFor(const std::string& participantUuid);
+static bool        IsLowerThirdShown(const std::string& ltUuid);
+static void        CreateLowerThirdFor(const std::string& participantUuid);
+static void        SetLowerThirdShownFor(const std::string& participantUuid,
+                                         bool shown);
+static void        SetLowerThirdTitleFor(const std::string& participantUuid,
+                                         const std::string& title);
+// Re-resolve one participant's (or every participant's) nameplate content —
+// name, title, avatar — and push it into the matching lower-third instances.
+static void        RefreshLowerThirdContentFor(const std::string& participantUuid);
+static void        RefreshAllLowerThirdContent();
+
 // ---------------------------------------------------------------------------
 // Per-source data
 // ---------------------------------------------------------------------------
@@ -370,6 +405,41 @@ static void ShowIncludedScenesMenu(const std::string& uuid);
 // a mid-session drop/rejoin, an OBS restart, and scene-collection save/load,
 // so it is the key we auto-rebind on. See ReconcileRememberedParticipants.
 static constexpr const char* kParticipantNameKey = "participant_name";
+
+// ---------------------------------------------------------------------------
+// Lower third — the two obs_data keys that live on the PARTICIPANT source.
+//
+// kLowerThirdTitleKey is the SINGLE SOURCE OF TRUTH for the nameplate's
+// title/subtitle string. All three edit surfaces read and write this one
+// value: the participant's row in the Feeds Controls dock, the participant
+// source's own properties panel (which binds to it directly — it is this
+// source's setting), and the lower third's properties panel (which cannot
+// bind to another source's settings, so it mirrors the value for display and
+// writes edits straight back here — see lt_get_properties). There is no
+// "which wins" question because there is only ever one stored string.
+//
+// kLowerThirdUuidKey is the forward pointer to the lower-third source created
+// for this participant ("" until the user creates one). The lower third holds
+// the matching back-pointer. Both are source UUIDs rather than names because
+// libobs persists a source's UUID in the scene-collection JSON, so the link
+// survives save/load and an OBS restart — whereas the dock lets users rename
+// sources freely.
+static constexpr const char* kLowerThirdTitleKey = "feeds_lower_third_title";
+static constexpr const char* kLowerThirdUuidKey  = "feeds_lower_third_uuid";
+
+// Lower-third placement, as fractions of the participant's on-canvas rect:
+// the card spans 92% of the rect's width (a small inset so it never touches
+// the video edges) and its bottom edge sits 6% of the rect's height above the
+// bottom. Bottom-centre alignment means a taller card grows upward and this
+// gap stays constant.
+static constexpr float kLowerThirdWidthFraction = 0.92f;
+static constexpr float kLowerThirdBottomInset   = 0.06f;
+
+// Tier gate for the lower third: Basic and up. Deliberately lower than the
+// chat popup/overlay (Streamer, >= 2) — the lower third is Basic's marquee
+// feature. Mirrored inside feeds-lower-third-source.cpp, which enforces it on
+// the source itself; this copy gates the dock button.
+static constexpr int kLowerThirdMinTier = 1;
 
 struct ZpSourceData {
     obs_source_t* source          = nullptr;
@@ -3059,7 +3129,9 @@ public:
         // run it once the edit commits or cancels (EndRenameUi flushes it). Every
         // edit resolves via focus-out at the latest, so this can't wedge the dock
         // into a permanently-deferred state.
-        if (m_activeEdit) { m_refreshPending = true; return; }
+        // Same for the lower-third title field (m_titleEditActive) — a rebuild
+        // mid-type would drop whatever the user has entered so far.
+        if (m_activeEdit || m_titleEditActive) { m_refreshPending = true; return; }
 
         // --- Gather a plain-value snapshot (no OBS/Qt handles retained) ---
         // Roster copy first, under g_participantsMutex, then release it before
@@ -3095,6 +3167,13 @@ public:
                 obs_data_t* st = obs_source_get_settings(s->source);
                 if (st) {
                     r.pid = obs_data_get_int(st, "participant_id");
+                    // The canonical lower-third title, off the same settings
+                    // read. The lower-third source pointer is resolved after
+                    // this lock instead: validating it means resolving a
+                    // source, and doing that under g_sourcesMutex would nest
+                    // libobs' source list beneath ours.
+                    const char* tt = obs_data_get_string(st, kLowerThirdTitleKey);
+                    if (tt) r.ltTitle = tt;
                     obs_data_release(st);
                 }
                 r.disabled = s->tier_disabled;
@@ -3107,6 +3186,15 @@ public:
             }
         }
         // --- Both mutexes released. From here on, Qt only. ---
+
+        // Resolve each row's lower third now that no Feeds mutex is held.
+        // GetLowerThirdUuidFor validates the stored pointer, so a lower third
+        // the user deleted from the OBS source list reads as "none" and the
+        // row's button falls back to "Create Lower Third".
+        for (auto& r : rows) {
+            r.ltUuid  = GetLowerThirdUuidFor(r.uuid);
+            r.ltShown = IsLowerThirdShown(r.ltUuid);
+        }
 
         const bool   loggedIn    = g_isLoggedIn;
         const bool   inMeeting   = g_isInMeeting;
@@ -3734,6 +3822,10 @@ private:
         long long   pid = 0;     // participant_id setting
         bool        disabled = false;  // tier_disabled (authoritative only when logged in)
         bool        liveNow = false;   // receiving real frames now (for the live dot)
+        // --- Lower third ---
+        std::string ltUuid;            // "" = none created yet (or since deleted)
+        bool        ltShown = false;   // the lower third's persisted shown flag
+        std::string ltTitle;           // the canonical title (participant settings)
     };
 
     // In-place per-row indicator handles, keyed by source uuid, rebuilt on each
@@ -4368,7 +4460,121 @@ private:
                     uuid, (long long)combo->currentData().toULongLong());
             });
         boxL->addWidget(combo);
+
+        boxL->addWidget(MakeLowerThirdRow(r));
         return box;
+    }
+
+    // --- Lower third: the box's third line ------------------------------------
+    //   [ title QLineEdit (stretch) ][ Create / Show / Hide Lower Third ]
+    //
+    // Lives here rather than in the header cluster because the header row is
+    // already crowded (the eliding name loses width on a narrow dock) and the
+    // title field needs real width, which an 18px icon slot can't give.
+    //
+    // Live boxes only — the non-live box has no combo and no bound participant,
+    // so offering it a nameplate would be offering a nameplate for nobody.
+    QWidget* MakeLowerThirdRow(const Row& r) {
+        QWidget*     row  = new QWidget();
+        QHBoxLayout* rowL = new QHBoxLayout(row);
+        rowL->setContentsMargins(0, 0, 0, 0);
+        rowL->setSpacing(6);
+
+        const bool locked = (g_currentTier < kLowerThirdMinTier);
+        const std::string uuid = r.uuid;
+
+        // Title field — one of the three surfaces onto the single stored title
+        // (the other two are the participant's and the lower third's properties
+        // panels). Commits on editingFinished (Enter or focus-out), never on
+        // every keystroke, so a mid-typing dock refresh can't write a partial
+        // value.
+        QLineEdit* title = new QLineEdit(QString::fromStdString(r.ltTitle));
+        title->setPlaceholderText(QString::fromUtf8("Lower third title…"));
+        title->setEnabled(!locked);
+        // Same deferral contract as the inline rename, on its own flag: while
+        // an edit is in progress Refresh() defers (m_refreshPending) instead of
+        // tearing the box — and this field — out from under the user mid-type.
+        // Set on the first keystroke rather than on focus, so merely tabbing
+        // through the field doesn't wedge refreshes.
+        QObject::connect(title, &QLineEdit::textEdited, this,
+                         [this]() { m_titleEditActive = true; });
+        QObject::connect(title, &QLineEdit::editingFinished, this,
+            [this, title, uuid]() {
+                if (!m_titleEditActive) return;   // focus-out, nothing typed
+                m_titleEditActive = false;
+                SetLowerThirdTitleFor(uuid, title->text().toStdString());
+                // SetLowerThirdTitleFor posts its own refresh; only flush a
+                // refresh that was deferred while the edit was open.
+                if (m_refreshPending) { m_refreshPending = false; Refresh(); }
+            });
+        rowL->addWidget(title, 1);
+
+        // Three-state button. The state is read from the lower third itself, so
+        // it is unambiguous: no source -> Create; source with shown=true ->
+        // Hide; source with shown=false -> Show.
+        //
+        // No stream-state gating, deliberately: Feeds can't reliably tell live
+        // from setup (the same reason binding isn't gated either). Creating
+        // mid-stream is the one accepted low-risk edge; show/hide is pure
+        // visibility and is live-safe.
+        const bool exists = !r.ltUuid.empty();
+        QPushButton* btn = new QPushButton(
+            !exists     ? "Create Lower Third"
+            : r.ltShown ? "Hide Lower Third"
+                        : "Show Lower Third");
+        btn->setToolTip(
+            !exists     ? "Create a nameplate for this participant"
+            : r.ltShown ? "Hide the nameplate (the source is kept)"
+                        : "Show the nameplate, repositioned over the "
+                          "participant's current video");
+        StyleLowerThirdButton(btn, locked, m_cdLowerThird.count(uuid) != 0);
+        m_ltButtons[uuid] = btn;
+
+        const bool shown = r.ltShown;
+        QObject::connect(btn, &QPushButton::clicked, this,
+            [this, uuid, exists, shown]() {
+                if (g_currentTier < kLowerThirdMinTier) {
+                    // Tier-locked: actionable upgrade prompt instead of the
+                    // action, exactly like the header source buttons.
+                    ShowSourceUpgradePrompt("Feeds Lower Third", "Basic");
+                    return;
+                }
+                if (!exists) {
+                    // Create makes a source and N scene items, so it takes the
+                    // same 1s cooldown the row's "+" uses to absorb a rapid
+                    // double-click. Show/Hide is idempotent and needs none.
+                    if (m_cdLowerThird.count(uuid)) return;
+                    m_cdLowerThird.insert(uuid);
+                    if (auto it = m_ltButtons.find(uuid);
+                        it != m_ltButtons.end() && it->second)
+                        StyleLowerThirdButton(it->second, false, true);
+                    QTimer::singleShot(kAddCooldownMs, this, [this, uuid]() {
+                        m_cdLowerThird.erase(uuid);
+                        auto it = m_ltButtons.find(uuid);
+                        if (it != m_ltButtons.end() && it->second)
+                            StyleLowerThirdButton(it->second, false, false);
+                    });
+                    CreateLowerThirdFor(uuid);
+                    return;
+                }
+                SetLowerThirdShownFor(uuid, !shown);
+            });
+        rowL->addWidget(btn);
+
+        return row;
+    }
+
+    // Lower-third button styling, matching the header buttons' conventions:
+    // kept ENABLED when tier-locked (a disabled Qt widget gets no hover events,
+    // so its tooltip wouldn't show, and the button must still open the upgrade
+    // prompt), greyed to #7a7d80 when locked or cooling, with the arrow cursor
+    // in both of those states.
+    static void StyleLowerThirdButton(QPushButton* b, bool locked, bool cooling) {
+        if (!b) return;
+        const QString color = (locked || cooling) ? " color: #7a7d80;" : "";
+        b->setCursor((locked || cooling) ? Qt::ArrowCursor : Qt::PointingHandCursor);
+        b->setStyleSheet(QString(
+            "QPushButton { padding-left: 6px; padding-right: 6px;%1 }").arg(color));
     }
 
     // Derive a comfortable dock minimum width from the live theme/font: measure a
@@ -4432,6 +4638,9 @@ private:
         // SET (m_cdRows) is deliberately NOT cleared here, so a row's cooldown
         // survives an unrelated rebuild and re-applies when the row is rebuilt.
         m_rowAddButtons.clear();
+        // Same for the lower-third buttons — borrowed, and m_cdLowerThird (the
+        // enforcement) likewise survives the rebuild.
+        m_ltButtons.clear();
         // The create button is about to be deleted; drop the pointer so a pending
         // cooldown timer can't touch a freed widget if the rebuild omits it (e.g.
         // hidden at/over the tier cap). AppendCreateButton re-sets it when present.
@@ -4479,11 +4688,22 @@ private:
     std::set<std::string> m_cdRows;                // row uuids currently cooling
     std::map<std::string, QPointer<QPushButton>> m_rowAddButtons;  // uuid -> current "+"
 
+    // Lower-third create cooldown + button tracking, same shape as the "+"
+    // above: the cooling SET is the enforcement (it survives rebuilds), the
+    // button map is only so the expiry restyle reaches whichever button is
+    // currently live for that uuid.
+    std::set<std::string> m_cdLowerThird;
+    std::map<std::string, QPointer<QPushButton>> m_ltButtons;
+
     // Inline rename state (UI thread). m_activeEdit != null means an edit is open:
     // Refresh() defers while it is, and m_refreshPending records that a deferred
     // refresh is owed (flushed when the edit ends). See BeginRename/EndRenameUi.
     RenameLineEdit* m_activeEdit     = nullptr;
     bool            m_refreshPending = false;
+    // Lower-third title field equivalent: true between the first keystroke and
+    // the commit (Enter / focus-out). Separate from m_activeEdit because that
+    // one doubles as the handle to the open rename editor.
+    bool            m_titleEditActive = false;
 };
 
 // Non-owning pointer to the participant dock — same ownership model as
@@ -4498,6 +4718,12 @@ static void PostParticipantDockRefresh() {
     // the primary guard against a shutdown-time use-after-free, since source
     // destroy (which posts these) runs on OBS's destruction worker thread.
     QTimer::singleShot(0, g_participantDock, []() {
+        // Re-resolve every nameplate's name/title/avatar before the rebuild.
+        // This is the single choke point that keeps them current: every state
+        // change that matters to a lower third — a roster update (names and
+        // avatars), a rebind, a rename, a tier change, a title edit — already
+        // routes through here, so there is no separate mechanism to maintain.
+        RefreshAllLowerThirdContent();
         if (g_participantDock) g_participantDock->Refresh();
     });
 }
@@ -4570,6 +4796,23 @@ static QImage GetAvatarForSender(unsigned int senderId,
     }
     g_avatarCache[senderId] = img;
     return img;
+}
+
+// Read-only cache lookup: this user's cached avatar, or the bundled fallback.
+//
+// Deliberately does NOT insert, unlike GetAvatarForSender. The lower third
+// asks for an avatar every time its content is re-resolved, including well
+// before the roster has delivered a path — and an inserting lookup would
+// cache the fallback under that user id, permanently shadowing the real
+// avatar when it does arrive. Callers that actually have a path (the chat and
+// roster handlers) use GetAvatarForSender to populate.
+static QImage GetCachedAvatar(unsigned int userId) {
+    EnsureFallbackAvatarLoaded();
+
+    std::lock_guard<std::mutex> lock(g_avatarCacheMutex);
+    auto it = g_avatarCache.find(userId);
+    if (it != g_avatarCache.end()) return it->second;
+    return g_fallbackAvatar;
 }
 
 static void SetupChatDock() {
@@ -6924,6 +7167,37 @@ static obs_properties_t* zp_properties(void* data) {
         }
     }
 
+    // Lower-third title — the second of the three edit surfaces onto the one
+    // stored string. This one needs NO sync code: the value lives in this
+    // source's own settings, so an OBS text property bound to
+    // kLowerThirdTitleKey edits the canonical value directly. (The dock row
+    // writes the same key; the lower third's own panel, which can't bind
+    // across sources, mirrors and writes through.) The callback exists only to
+    // fan the change out — re-render the card, rebuild the dock row.
+    {
+        obs_property_t* ltTitle = obs_properties_add_text(
+            props, kLowerThirdTitleKey, "Lower Third Title", OBS_TEXT_DEFAULT);
+        obs_property_set_long_description(ltTitle,
+            "Shown under the participant's name on their lower third. Create "
+            "and show the lower third from this participant's row in the Feeds "
+            "Controls dock.");
+        // Below Basic the field is shown but disabled, matching how the dock
+        // greys its lower-third controls rather than hiding them — the feature
+        // stays discoverable, and the upgrade path lives in the dock's prompt.
+        obs_property_set_enabled(ltTitle, g_currentTier >= kLowerThirdMinTier);
+        obs_property_set_modified_callback2(ltTitle,
+            [](void* priv, obs_properties_t*, obs_property_t*,
+               obs_data_t*) -> bool {
+                ZpSourceData* d = static_cast<ZpSourceData*>(priv);
+                if (d && d->source) {
+                    if (const char* u = obs_source_get_uuid(d->source))
+                        RefreshLowerThirdContentFor(u);
+                }
+                PostParticipantDockRefresh();
+                return false;   // value persists; no property layout change
+            }, data);
+    }
+
     // Contextual hints for users who skipped the tutorial video. Plain
     // OBS_TEXT_INFO entries render as muted info text in the properties
     // panel — visually distinct from the interactive controls above.
@@ -7516,6 +7790,13 @@ static void ReconcileSourcesToTier() {
 
     // Chat overlay sources — same threshold and pattern as the popup.
     feeds::ReconcileChatOverlaySources();
+
+    // Lower-third sources — same mechanism, but gated at Basic (>= 1) rather
+    // than Streamer: the lower third is Basic's marquee feature. A Free user's
+    // nameplates render nothing and their properties panel explains why; the
+    // dock's per-row button greys and opens the upgrade prompt (see
+    // MakeLowerThirdRow), so both surfaces agree.
+    feeds::ReconcileLowerThirdSources();
 
     // Chat dock — gated at Basic (>= 1). The dock object always exists
     // (registered at module-load); SetTierDisabled flips it between
@@ -8170,10 +8451,24 @@ static void RegisterEngineHandlers() {
             CachedParticipant p;
             p.id   = (unsigned int)ExtractJsonNumber(obj, "id");
             p.name = ExtractJsonString(obj, "name");
+            // Absent on an older engine — ExtractJsonString returns "", which
+            // is exactly the "no profile picture" value, so the field is
+            // additive in both directions.
+            p.avatar_path = ExtractJsonString(obj, "avatar_path");
             if (p.id != 0 && !p.name.empty()) {
                 newList.push_back(p);
                 mutedSnap[p.id] = ExtractJsonNumber(obj, "muted") != 0;
             }
+        }
+
+        // Seed the avatar cache from the roster, so a lower third (or a chat
+        // popup) can show a real avatar for someone who hasn't chatted. Only
+        // for participants that actually carry a path: GetAvatarForSender
+        // caches the fallback on an empty one, which would then shadow a real
+        // avatar arriving later. QImage::load is thread-safe and this runs on
+        // the IPC reader thread, same as the chat handler's avatar resolve.
+        for (const auto& p : newList) {
+            if (!p.avatar_path.empty()) GetAvatarForSender(p.id, p.avatar_path);
         }
 
         bool changed = false;
@@ -8874,6 +9169,490 @@ static void ApplyChatOverlayDefaults(obs_source_t* source) {
     obs_enum_scenes(enum_cb, &ctx);
 }
 
+// ---------------------------------------------------------------------------
+// Lower third — placement and lifecycle orchestration
+// ---------------------------------------------------------------------------
+// The nameplate is a SEPARATE source sitting above the participant in the
+// scene, never composited into the participant's engine-rendered frames. A
+// sibling scene item drawn after the participant is composited only once the
+// participant's own filter chain has run, so an NVIDIA-background-removal
+// filter on the participant can't touch the nameplate — that isolation is the
+// whole reason it's separate.
+//
+// Multiplicity mirrors the participant exactly: ONE lower-third source per
+// participant source, referenced into every scene the participant appears in
+// (the dock's "+" button Paste-References participants across scenes, so there
+// is no single "the" transform to read). One source-list entry per nameplate,
+// N scene-items, each placed from its own scene's participant item.
+
+// The participant's on-canvas rect, from its scene-item box transform.
+//
+// obs_sceneitem_get_box_transform maps the unit square onto the item's
+// on-canvas quad with crop, scale, bounds type/alignment, item alignment,
+// rotation and position ALL already folded in (libobs builds it in
+// update_item_transform). Reading pos/scale/bounds separately and re-deriving
+// the rect would reimplement ~90 lines of libobs and get it wrong for Feeds'
+// own defaults in two ways: participants are placed with OBS_BOUNDS_NONE
+// precisely so Alt-drag crops naturally (see ApplyParticipantPlacement), and
+// with OBS_ALIGN_CENTER, so the item's pos is its CENTRE, not its top-left.
+//
+// Coordinates are absolute canvas pixels — box_transform is built from the
+// position after pos_to_absolute, and obs_sceneitem_set_pos / set_scale
+// convert back from absolute — so read and write are symmetric and a scene in
+// relative-coordinate mode needs no special handling on our side.
+//
+// A rotated participant yields the axis-aligned bounding box of its quad, and
+// the nameplate is placed against that WITHOUT copying the rotation. A rotated
+// nameplate over a rotated feed is a deliberate v2; the AABB placement stays
+// readable meanwhile.
+//
+// Returns false for a degenerate box — a participant whose camera is off or
+// which hasn't subscribed yet reports 0x0, collapsing the transform.
+static bool GetSceneItemCanvasRect(obs_sceneitem_t* item,
+                                   float& outX, float& outY,
+                                   float& outW, float& outH) {
+    if (!item) return false;
+
+    matrix4 boxT;
+    obs_sceneitem_get_box_transform(item, &boxT);
+
+    float minX = 0.0f, minY = 0.0f, maxX = 0.0f, maxY = 0.0f;
+    // The four unit-square corners, mapped through the box transform. Separate
+    // src/dst vectors rather than transforming in place — vec3_transform makes
+    // no aliasing promise.
+    for (int i = 0; i < 4; ++i) {
+        vec3 corner;
+        vec3_set(&corner, (i & 1) ? 1.0f : 0.0f, (i & 2) ? 1.0f : 0.0f, 0.0f);
+        vec3 out;
+        vec3_transform(&out, &corner, &boxT);
+        if (i == 0) {
+            minX = maxX = out.x;
+            minY = maxY = out.y;
+        } else {
+            minX = std::min(minX, out.x);
+            maxX = std::max(maxX, out.x);
+            minY = std::min(minY, out.y);
+            maxY = std::max(maxY, out.y);
+        }
+    }
+
+    outX = minX;
+    outY = minY;
+    outW = maxX - minX;
+    outH = maxY - minY;
+    return (outW >= 1.0f && outH >= 1.0f);
+}
+
+// Position one nameplate scene-item over one participant scene-item, and stack
+// it directly above. One-shot: this reads the participant's transform as it is
+// right now. It is NOT live-follow — moving the participant afterwards leaves
+// the nameplate where it was until the next Show re-places it.
+static void PlaceLowerThirdItem(obs_sceneitem_t* ltItem,
+                                obs_sceneitem_t* participantItem,
+                                obs_source_t* ltSource) {
+    if (!ltItem || !ltSource) return;
+
+    // The card's natural size is canvas-derived and known from creation (see
+    // lt_create), so this doesn't need the poll-for-first-frame dance
+    // ApplyParticipantPlacement does.
+    const uint32_t natW = obs_source_get_width(ltSource);
+    if (natW == 0) return;
+
+    float rx = 0.0f, ry = 0.0f, rw = 0.0f, rh = 0.0f;
+    if (!GetSceneItemCanvasRect(participantItem, rx, ry, rw, rh)) {
+        // Degenerate participant box (camera off, not yet subscribed). Fall
+        // back to a canvas-relative default rather than polling for a first
+        // frame on the UI thread — the click must never block, and the next
+        // Show re-places the card correctly once video is flowing.
+        obs_video_info ovi;
+        uint32_t canvasW = 1920, canvasH = 1080;
+        if (obs_get_video_info(&ovi)) {
+            canvasW = ovi.base_width;
+            canvasH = ovi.base_height;
+        }
+        rx = 0.0f;
+        ry = 0.0f;
+        rw = (float)canvasW;
+        rh = (float)canvasH;
+    }
+
+    // Scale the card to span most of the participant's rect. Scaling the
+    // scene-item (rather than rendering the source at one specific pixel
+    // width) is what lets a SINGLE lower-third source serve N scene-items
+    // across N scenes, each over a differently-sized copy of the participant.
+    const float s = (rw * kLowerThirdWidthFraction) / (float)natW;
+
+    vec2 scale;
+    scale.x = s;
+    scale.y = s;
+
+    // Bottom-centre anchor, the same idiom ApplyChatPopupPlacementToItem uses:
+    // a taller card grows upward, so the gap from the bottom stays constant.
+    vec2 pos;
+    pos.x = rx + rw * 0.5f;
+    pos.y = ry + rh - rh * kLowerThirdBottomInset;
+
+    obs_sceneitem_set_bounds_type(ltItem, OBS_BOUNDS_NONE);
+    obs_sceneitem_set_alignment(ltItem, OBS_ALIGN_BOTTOM | OBS_ALIGN_CENTER);
+    obs_sceneitem_set_scale(ltItem, &scale);
+    obs_sceneitem_set_pos(ltItem, &pos);
+
+    // Stack directly above the participant. A scene's item list runs
+    // bottom-to-top (scene_video_render walks first_item -> next, so later
+    // items draw on top), and obs_sceneitem_set_order_position detaches the
+    // item before re-inserting, so the target index depends on which side of
+    // the participant we're currently on: coming from ABOVE, the participant
+    // keeps its index and we want index+1; coming from BELOW, the detach
+    // shifts the participant down one and the same slot is index itself.
+    if (participantItem) {
+        const int pPos  = obs_sceneitem_get_order_position(participantItem);
+        const int ltPos = obs_sceneitem_get_order_position(ltItem);
+        const int target = (ltPos > pPos) ? (pPos + 1) : pPos;
+        if (ltPos != target) obs_sceneitem_set_order_position(ltItem, target);
+    }
+}
+
+// Walk every scene; in each one that contains the participant, make sure a
+// nameplate item exists (adding it when addMissing) and place it.
+//
+// Called on Create and on every Show, which is what handles the user adding
+// the participant to a NEW scene after the nameplate already existed — the
+// next Show picks that scene up.
+static void SyncLowerThirdItems(obs_source_t* participant,
+                                obs_source_t* ltSource,
+                                bool addMissing) {
+    if (!participant || !ltSource) return;
+
+    struct SyncCtx {
+        obs_source_t* participant;
+        obs_source_t* lowerThird;
+        bool          addMissing;
+    } ctx{ participant, ltSource, addMissing };
+
+    obs_enum_scenes([](void* param, obs_source_t* sceneSrc) -> bool {
+        SyncCtx* c = (SyncCtx*)param;
+        obs_scene_t* scene = obs_scene_from_source(sceneSrc);   // borrowed
+        if (!scene) return true;
+
+        // Collect this scene's participant items and nameplate items in one
+        // pass.
+        //
+        // KNOWN v1 GAP: obs_scene_enum_items visits TOP-LEVEL items only — it
+        // does not descend into groups (that needs
+        // obs_sceneitem_group_enum_items). A participant the user has put
+        // inside a group is therefore invisible here and gets no nameplate.
+        // Positioning inside a group means group-local coordinates, a
+        // genuinely different placement problem, so v1 leaves it alone rather
+        // than half-handling it.
+        struct Collect {
+            obs_source_t* participant;
+            obs_source_t* lowerThird;
+            std::vector<obs_sceneitem_t*> pItems;
+            std::vector<obs_sceneitem_t*> ltItems;
+        } col{ c->participant, c->lowerThird, {}, {} };
+
+        // Items are collected and only USED after the enum returns:
+        // obs_scene_enum_items holds the scene's full_lock across the
+        // callback, and obs_scene_add locks the same scene, so adding from
+        // inside the callback would be reaching for a lock we already hold.
+        // Each collected item is addref'd (the enum's own ref is dropped when
+        // the callback returns) and released at the end of this scene.
+        obs_scene_enum_items(scene,
+            [](obs_scene_t*, obs_sceneitem_t* item, void* p) -> bool {
+                Collect* k = (Collect*)p;
+                obs_source_t* s = obs_sceneitem_get_source(item);
+                if (s == k->participant) {
+                    obs_sceneitem_addref(item);
+                    k->pItems.push_back(item);
+                } else if (s == k->lowerThird) {
+                    obs_sceneitem_addref(item);
+                    k->ltItems.push_back(item);
+                }
+                return true;
+            }, &col);
+
+        if (!col.pItems.empty()) {
+            // One nameplate per participant item. A scene that references the
+            // participant twice (a full-size feed and a small PIP, say) gets
+            // two nameplates — less surprising than silently picking one. The
+            // pairing is by index: arbitrary, but stable across refreshes.
+            for (size_t i = 0; i < col.pItems.size(); ++i) {
+                obs_sceneitem_t* ltItem =
+                    (i < col.ltItems.size()) ? col.ltItems[i] : nullptr;
+                if (!ltItem) {
+                    if (!c->addMissing) continue;
+                    // obs_scene_add appends to the tail, i.e. on top of
+                    // everything — already above the participant;
+                    // PlaceLowerThirdItem then tightens that to "directly
+                    // above". Borrowed (the scene owns it), so no release.
+                    ltItem = obs_scene_add(scene, c->lowerThird);
+                }
+                PlaceLowerThirdItem(ltItem, col.pItems[i], c->lowerThird);
+            }
+        }
+
+        for (obs_sceneitem_t* it : col.pItems)  obs_sceneitem_release(it);
+        for (obs_sceneitem_t* it : col.ltItems) obs_sceneitem_release(it);
+        return true;
+    }, &ctx);
+}
+
+// The participant's forward pointer, validated. Returns "" when no nameplate
+// was ever created, or when the source it names has since been deleted (the
+// user can delete it from the OBS source list — Feeds never does). A stale
+// pointer is left in place rather than cleared: clearing means a settings
+// write, and this runs on the dock's read path. Create overwrites it anyway,
+// so the state self-heals.
+static std::string GetLowerThirdUuidFor(const std::string& participantUuid) {
+    if (participantUuid.empty()) return std::string();
+
+    obs_source_t* participant = obs_get_source_by_uuid(participantUuid.c_str());
+    if (!participant) return std::string();
+
+    std::string uuid;
+    if (obs_data_t* s = obs_source_get_settings(participant)) {
+        if (const char* u = obs_data_get_string(s, kLowerThirdUuidKey)) uuid = u;
+        obs_data_release(s);
+    }
+    obs_source_release(participant);
+    if (uuid.empty()) return std::string();
+
+    obs_source_t* lt = obs_get_source_by_uuid(uuid.c_str());
+    const bool alive = lt && !obs_source_removed(lt);
+    if (lt) obs_source_release(lt);
+    return alive ? uuid : std::string();
+}
+
+// The nameplate's persisted shown flag — the dock's three-state read.
+//
+// Show/hide is the SOURCE's own flag (which drives its slide animation), not
+// per-scene-item visibility. That keeps one unambiguous answer for a source
+// with N scene-items, survives save/load, and preserves the slide-out that
+// flipping an item's eye icon can't give. The scene items stay visible either
+// way, exactly like a chat popup sitting in a scene with nothing to show.
+static bool IsLowerThirdShown(const std::string& ltUuid) {
+    if (ltUuid.empty()) return false;
+    obs_source_t* lt = obs_get_source_by_uuid(ltUuid.c_str());
+    if (!lt) return false;
+
+    bool shown = false;
+    if (obs_data_t* s = obs_source_get_settings(lt)) {
+        shown = obs_data_get_bool(s, "shown");
+        obs_data_release(s);
+    }
+    obs_source_release(lt);
+    return shown;
+}
+
+// Resolve one participant's nameplate content and push it to its instances.
+// The lower-third source is cache-agnostic (like the chat popup): plugin-main
+// owns the roster and the avatar cache, resolves here, and hands over plain
+// values.
+static void PushLowerThirdContent(obs_source_t* participant) {
+    if (!participant) return;
+    const char* pu = obs_source_get_uuid(participant);
+    if (!pu || !*pu) return;
+
+    std::string title;
+    if (obs_data_t* s = obs_source_get_settings(participant)) {
+        if (const char* t = obs_data_get_string(s, kLowerThirdTitleKey)) title = t;
+        obs_data_release(s);
+    }
+
+    // ZpSourceData is the create-returned instance data (borrowed; null for a
+    // husk). ResolveParticipantName is the same Zoom-name -> OBS-source-name
+    // chain the ISO recorder uses for its filenames.
+    //
+    // It reads current_user_id, which the DEFERRED zp_update sets — so for one
+    // tick after a rebind this still resolves the previous participant. zp_update
+    // posts a dock refresh when it lands, and that refresh re-runs this, so the
+    // card corrects itself on the next tick. Not worth a second name resolver.
+    ZpSourceData* d = static_cast<ZpSourceData*>(obs_obj_get_data(participant));
+    const std::string name   = ResolveParticipantName(d);
+    const QImage      avatar = d ? GetCachedAvatar(d->current_user_id) : QImage();
+
+    feeds::UpdateLowerThirdContent(pu, name, title, avatar);
+}
+
+// UUID-addressed wrapper, for the call sites that only have the uuid.
+static void RefreshLowerThirdContentFor(const std::string& participantUuid) {
+    if (participantUuid.empty()) return;
+    obs_source_t* participant = obs_get_source_by_uuid(participantUuid.c_str());
+    if (!participant) return;
+    PushLowerThirdContent(participant);
+    obs_source_release(participant);
+}
+
+// Sweep every participant source. Cheap (a settings read, a roster lookup and
+// a map lookup each), and it is the single place that keeps every nameplate's
+// name/title/avatar current — see the call in PostParticipantDockRefresh.
+// Pushes from the enum's borrowed source directly rather than re-resolving by
+// uuid inside the callback.
+static void RefreshAllLowerThirdContent() {
+    obs_enum_sources([](void*, obs_source_t* src) -> bool {
+        const char* id = obs_source_get_id(src);
+        if (id && strcmp(id, "zoom_participant_source") == 0)
+            PushLowerThirdContent(src);
+        return true;
+    }, nullptr);
+}
+
+// Create this participant's nameplate: one source, plus a scene-item in every
+// scene the participant is currently in, each placed over that scene's copy.
+// Created SHOWN — the user clicked "Create Lower Third" because they want to
+// see it. Never auto-created, and never deleted afterwards: creating and
+// destroying sources mid-stream risks OBS instability, so the source is made
+// once at setup and only shown/hidden from then on.
+static void CreateLowerThirdFor(const std::string& participantUuid) {
+    obs_source_t* participant = obs_get_source_by_uuid(participantUuid.c_str());
+    if (!participant) return;
+
+    // Already have one — the dock button would read Show/Hide, so this is a
+    // stale double-click. Nothing to do.
+    if (!GetLowerThirdUuidFor(participantUuid).empty()) {
+        obs_source_release(participant);
+        return;
+    }
+
+    // Name it after the participant so the OBS source-list entry is obviously
+    // ours and obviously auto-managed. A list entry is unavoidable (OBS has no
+    // hidden-source concept) and accepted — it only appears when the user
+    // deliberately creates one, and they never need to touch it there.
+    // Unique-ify OBS's way: the name, then " 2", " 3", ... until free.
+    const char* pn = obs_source_get_name(participant);
+    const std::string base =
+        std::string("Lower Third — ") + ((pn && *pn) ? pn : "Participant");
+    std::string name = base;
+    for (int i = 2; ; ++i) {
+        obs_source_t* existing = obs_get_source_by_name(name.c_str());
+        if (!existing) break;
+        obs_source_release(existing);
+        name = base + " " + std::to_string(i);
+    }
+
+    obs_data_t* settings = obs_data_create();
+    obs_data_set_string(settings, "participant_uuid", participantUuid.c_str());
+    obs_data_set_bool(settings, "shown", true);
+    obs_source_t* lt = obs_source_create("feeds_lower_third", name.c_str(),
+                                         settings, nullptr);
+    obs_data_release(settings);
+    if (!lt) {
+        obs_source_release(participant);
+        return;
+    }
+
+    // Forward pointer on the participant, so the dock and every later Show can
+    // find the nameplate. Both directions are UUIDs — libobs persists those in
+    // the scene-collection JSON, whereas names change (renaming a source is a
+    // first-class dock action here).
+    if (obs_data_t* ps = obs_source_get_settings(participant)) {
+        if (const char* ltUuid = obs_source_get_uuid(lt))
+            obs_data_set_string(ps, kLowerThirdUuidKey, ltUuid);
+        obs_source_update(participant, ps);
+        obs_data_release(ps);
+    }
+
+    SyncLowerThirdItems(participant, lt, /*addMissing=*/true);
+    PushLowerThirdContent(participant);
+
+    blog(LOG_INFO, "[feeds] lower-third: created '%s' for participant '%s'",
+         name.c_str(), (pn && *pn) ? pn : "");
+
+    obs_source_release(lt);
+    obs_source_release(participant);
+    PostParticipantDockRefresh();
+}
+
+// Show or hide this participant's nameplate. The source and all its scene
+// items are kept either way — pure visibility toggling, which is live-safe.
+static void SetLowerThirdShownFor(const std::string& participantUuid,
+                                  bool shown) {
+    const std::string ltUuid = GetLowerThirdUuidFor(participantUuid);
+    if (ltUuid.empty()) return;
+
+    obs_source_t* participant = obs_get_source_by_uuid(participantUuid.c_str());
+    obs_source_t* lt          = obs_get_source_by_uuid(ltUuid.c_str());
+    if (!lt) {
+        if (participant) obs_source_release(participant);
+        return;
+    }
+
+    if (shown && participant) {
+        // One-shot re-placement on every Show: pick up the participant's
+        // CURRENT transform, and pick up any scene it has been added to since
+        // the nameplate was created. Deliberately not live-follow.
+        SyncLowerThirdItems(participant, lt, /*addMissing=*/true);
+        PushLowerThirdContent(participant);
+    }
+
+    if (obs_data_t* s = obs_source_get_settings(lt)) {
+        obs_data_set_bool(s, "shown", shown);
+        // Deferred for a video-flagged source; lt_update picks the change up on
+        // the next graphics tick and starts the slide. The dock's button state
+        // reads the settings value, which is already committed here, so the
+        // label flips immediately.
+        obs_source_update(lt, s);
+        obs_data_release(s);
+    }
+
+    obs_source_release(lt);
+    if (participant) obs_source_release(participant);
+    PostParticipantDockRefresh();
+}
+
+// Write the canonical title (surface 1: the dock row) and fan the change out.
+// The value lives on the PARTICIPANT source — the single source of truth that
+// all three edit surfaces share.
+static void SetLowerThirdTitleFor(const std::string& participantUuid,
+                                  const std::string& title) {
+    obs_source_t* participant = obs_get_source_by_uuid(participantUuid.c_str());
+    if (!participant) return;
+
+    if (obs_data_t* s = obs_source_get_settings(participant)) {
+        const char* cur = obs_data_get_string(s, kLowerThirdTitleKey);
+        if (!cur || title != cur) {
+            obs_data_set_string(s, kLowerThirdTitleKey, title.c_str());
+            obs_source_update(participant, s);
+        }
+        obs_data_release(s);
+    }
+
+    // Surface 2 (this participant's own properties panel) binds to the same
+    // key, so it just needs a re-read if it happens to be open.
+    obs_source_update_properties(participant);
+    obs_source_release(participant);
+
+    // Surface 3 (the nameplate's own panel) mirrors the value when it opens,
+    // so nothing to push there; re-render the card with the new text.
+    RefreshLowerThirdContentFor(participantUuid);
+    PostParticipantDockRefresh();
+}
+
+namespace feeds {
+
+// Surface 3's callback into plugin-main. The lower third's properties panel is
+// the one edit surface that can't bind to the canonical value (an OBS property
+// only ever binds to its OWN source's settings), so it writes the new title
+// through to the participant itself and then calls this to fan the change out
+// to the other two surfaces.
+//
+// Note what is NOT done here: obs_source_update_properties on the lower third.
+// This runs from inside that source's own modified callback, and re-entering
+// its property build from there is asking for trouble — and pointless, since
+// its field already holds exactly what the user typed.
+void NotifyLowerThirdTitleChanged(const std::string& participantUuid) {
+    RefreshLowerThirdContentFor(participantUuid);
+
+    obs_source_t* participant = obs_get_source_by_uuid(participantUuid.c_str());
+    if (participant) {
+        obs_source_update_properties(participant);   // surface 2, if open
+        obs_source_release(participant);
+    }
+    PostParticipantDockRefresh();                    // surface 1
+}
+
+}  // namespace feeds
+
 static void OnSourceCreated(void* /*data*/, calldata_t* cd) {
     obs_source_t* source = (obs_source_t*)calldata_ptr(cd, "source");
     if (!source) return;
@@ -9012,6 +9791,7 @@ bool obs_module_load(void) {
 
     feeds::RegisterChatPopupSource();
     feeds::RegisterChatOverlaySource();
+    feeds::RegisterLowerThirdSource();
 
     // ISO recorder: registers the single frontend-event callback that fans
     // recording start/stop/pause out to every per-source recorder.

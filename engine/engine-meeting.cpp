@@ -254,12 +254,26 @@ static void SendParticipantList() {
             if (!info) continue;
 
             std::string name = WideToUtf8(info->GetUserName());
+
+            // Profile-picture path, the same field the chat handler already
+            // sends. The SDK writes avatars to %APPDATA%\ZoomSDK\data\ConfAvatar\
+            // — a per-user roaming location both processes can read — so the
+            // path travels rather than the image bytes. Empty when the user has
+            // no profile picture; the plugin falls back to the bundled Feeds
+            // logo. Sending it on the ROSTER (not only on a chat message) is
+            // what lets the plugin show an avatar for a participant who hasn't
+            // chatted — the lower third needs one for anybody. JsonEscape
+            // handles the backslashes.
+            const zchar_t* avatarRaw = info->GetAvatarPath();
+            std::string avatarPath = avatarRaw ? WideToUtf8(avatarRaw) : "";
+
             if (!first) msg << ",";
             // Seed current mute state so a dock row shows the right mute mark
             // immediately (not blank until the next toggle). onUserAudioStatusChange
             // keeps it live between roster changes.
             msg << "{\"id\":" << uid
                 << ",\"name\":\"" << JsonEscape(name) << "\""
+                << ",\"avatar_path\":\"" << JsonEscape(avatarPath) << "\""
                 << ",\"muted\":" << (info->IsAudioMuted() ? 1 : 0) << "}";
             first = false;
         }

@@ -82,6 +82,24 @@ To set it up: open **Docks → Feeds Chat**, then enter your YouTube channel and
 
 ---
 
+## Lower Thirds
+
+Put a nameplate on any participant — their avatar, their name, and a title you type — right over their video. *(Basic tier and up)*
+
+Everything happens on the participant's row in the **Feeds Controls** dock:
+
+1. Type a title (job title, location, whatever you want under their name) in the row's title box
+2. Click **Create Lower Third** — Feeds adds the nameplate over that participant, in every scene they appear in
+3. The button becomes **Hide Lower Third** / **Show Lower Third** from then on
+
+The nameplate is its own OBS source, deliberately: it sits *above* the participant, so it draws on top of the finished video and is unaffected by filters on the participant source — background removal included. It appears in your source list as **Lower Third — [name]**, but you never need to touch it there.
+
+> **Positioning:** the nameplate is placed over the participant's video wherever it currently sits. If you move or resize the participant afterwards, click **Show Lower Third** again to re-position it.
+
+You can also edit the title from the participant source's properties or from the lower third's own properties — all three edit the same text, so they always agree.
+
+---
+
 ## Screenshots
 
 ![OBS Source List](assets/source-list.png)
@@ -96,6 +114,7 @@ To set it up: open **Docks → Feeds Chat**, then enter your YouTube channel and
 |--------|-------------|------|
 | **Feeds Participant** | Captures an individual participant's camera feed | Free+ |
 | **Feeds Screenshare** | Captures whatever is being shared on screen | Basic+ |
+| **Feeds Lower Third** | Nameplate (avatar + name + title) over a participant's video | Basic+ |
 | **Feeds Chat Overlay** | On-stream scrolling chat overlay (Zoom/YouTube/Twitch) | Streamer+ |
 | **Feeds Chat Popup** | Feature a single chat message on stream | Streamer+ |
 
@@ -115,7 +134,7 @@ On **Basic tier and up**, Feeds can record isolated source recordings, giving yo
 | Tier | Price | Feeds | Resolution | Highlights |
 |------|-------|-------|------------|------------|
 | **Free** | Free | 1 | 720p | Active Speaker feed, full OBS integration, unlimited duration |
-| **Basic** | $9.99/user/mo | 3 | 1080p | Screenshare, ISO recording, Feeds Chat dock, priority email support |
+| **Basic** | $9.99/user/mo | 3 | 1080p | Lower thirds, screenshare, ISO recording, Feeds Chat dock, priority email support |
 | **Streamer** | $24.99/user/mo | 5 | 1080p | Chat overlay + message popup, scene collection starter pack |
 | **Broadcaster** | $79.99/user/mo | 8 | 1080p | Dedicated Discord channel, highest-priority SLA, consulting discount |
 
