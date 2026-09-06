@@ -1349,7 +1349,7 @@ void HandleJoinMeeting(const std::string& json) {
         SendToPlugin("{\"type\":\"meeting_failed\",\"code\":-4,"
                      "\"message\":\"This looks like a Zoom Events link, which can't "
                      "be joined by pasting the URL. Use the \\\"Zoom Events\\\" button "
-                     "on the Connect screen instead — it lists your events and joins "
+                     "on the Connect screen instead. It lists your events and joins "
                      "the session directly.\"}");
         return;
     }
@@ -1564,7 +1564,7 @@ void HandleJoinEventSession(const std::string& json) {
                            "session, so it can't be joined.";
                 break;
             case 1140:
-                friendly = "This Zoom Events session can't be joined — it may "
+                friendly = "This Zoom Events session can't be joined: it may "
                            "have already ended, or Zoom is temporarily busy. "
                            "Try again, or pick a session that's currently live "
                            "or upcoming.";

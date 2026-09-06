@@ -35,7 +35,7 @@ Download the latest **Feeds.zip** from the [Releases](https://github.com/LetsDoV
 ## Quick Start
 
 1. In OBS, click **+** in the Sources panel and add a **Feeds Participant** source
-2. In the source Properties window, click **Not logged in to Zoom. Click to Login.** — a browser window opens for you to sign in to your Zoom account, then return to OBS
+2. In the source Properties window, click **Not logged in to Zoom. Click to Login.** A browser window opens for you to sign in to your Zoom account, then return to OBS
 3. Once logged in, click **Logged in. Click to Connect to Zoom Meeting.**
 4. Enter your Zoom meeting number or link when prompted
 5. Enter the meeting password if required
@@ -64,39 +64,39 @@ From the dock you can:
 
 There is also a separate **Feeds Chat** dock (see below) for live chat.
 
-If you do nothing else, open the Feeds Controls dock — it's the fastest way to run a multi-participant production.
+If you do nothing else, open the Feeds Controls dock: it's the fastest way to run a multi-participant production.
 
 ---
 
 ## Feeds Chat
 
-Feeds brings your live stream chat into OBS alongside your Zoom feeds — **Zoom, YouTube, and Twitch chat in one place**, with no extra apps or browser windows to babysit.
+Feeds brings your live stream chat into OBS alongside your Zoom feeds: **Zoom, YouTube, and Twitch chat in one place**, with no extra apps or browser windows to babysit.
 
-- **Feeds Chat dock** — all three platforms' messages in one unified dock, each tagged by platform *(Basic tier and up)*
-- **Feeds Chat Popup** — click any message to feature it on stream *(Streamer tier and up)*
-- **Feeds Chat Overlay** — a scrolling on-stream chat overlay, filterable by platform *(Streamer tier and up)*
+- **Feeds Chat dock**: all three platforms' messages in one unified dock, each tagged by platform *(Basic tier and up)*
+- **Feeds Chat Popup**: click any message to feature it on stream *(Streamer tier and up)*
+- **Feeds Chat Overlay**: a scrolling on-stream chat overlay, filterable by platform *(Streamer tier and up)*
 
 To set it up: open **Docks → Feeds Chat**, then enter your YouTube channel and/or Twitch channel in the dock header. Zoom chat appears automatically once you're in a meeting.
 
-> **About chat:** You can send messages to your **Zoom** chat directly from the Feeds Chat dock. YouTube and Twitch chat are **receive-only** — monitor them and feature them on stream, but replies happen in your usual chat tools.
+> **About chat:** You can send messages to your **Zoom** chat directly from the Feeds Chat dock. YouTube and Twitch chat are **receive-only**: monitor them and feature them on stream, but replies happen in your usual chat tools.
 
 ---
 
 ## Lower Thirds
 
-Put a nameplate on any participant — their avatar, their name, and a title you type — right over their video. *(Basic tier and up)*
+Put a nameplate on any participant (their avatar, their name, and a title you type) right over their video. *(Basic tier and up)*
 
 Everything happens on the participant's row in the **Feeds Controls** dock:
 
-1. Click **Create Lower Third** — Feeds adds the nameplate over that participant, in every scene they appear in
+1. Click **Create Lower Third**. Feeds adds the nameplate over that participant, in every scene they appear in
 2. A title box appears on the row: type the title (job title, location, whatever you want under their name) and press Enter
 3. The button becomes **Hide** / **Show** from then on
 
-The nameplate is its own OBS source, deliberately: it sits *above* the participant, so it draws on top of the finished video and is unaffected by filters on the participant source — background removal included. It appears in your source list as **Lower Third — [name]**, but you never need to touch it there.
+The nameplate is its own OBS source, deliberately: it sits *above* the participant, so it draws on top of the finished video and is unaffected by filters on the participant source, background removal included. It appears in your source list as **Feeds Lower Third: [name]**, but you never need to touch it there.
 
 > **Positioning:** the nameplate is placed over the participant's video wherever it currently sits. If you move or resize the participant afterwards, click **Show** again to re-position it.
 
-You can also edit the title from the participant source's properties or from the lower third's own properties — all three edit the same text, so they always agree.
+You can also edit the title from the participant source's properties or from the lower third's own properties. All three edit the same text, so they always agree.
 
 ---
 
@@ -119,13 +119,13 @@ You can also edit the title from the participant source's properties or from the
 | **Feeds Chat Popup** | Feature a single chat message on stream | Streamer+ |
 
 ### Special Options
-- **[Active Speaker]** — a participant source can automatically follow whoever is currently talking
+- **[Active Speaker]**: a participant source can automatically follow whoever is currently talking
 
 ---
 
 ## ISO Recording
 
-On **Basic tier and up**, Feeds can record isolated source recordings, giving you clean per-source footage to work with in post. *(Local ISO Source Recording — see your tier below.)*
+On **Basic tier and up**, Feeds can record isolated source recordings, giving you clean per-source footage to work with in post. *(Local ISO Source Recording; see your tier below.)*
 
 ---
 
@@ -148,7 +148,7 @@ To upgrade, click the upgrade prompt inside Feeds, or visit [letsdovideo.com/fee
 
 Feeds works out of the box on most networks. On managed or restricted networks (common in libraries, schools, and corporate environments), a firewall or content filter may block the connections Feeds needs, causing login to fail or a paid plan to appear as Free.
 
-If you see a "couldn't reach the login server" or "couldn't reach the licensing server" message, share the [Feeds Network Requirements](https://letsdovideo.com/feeds-network/) page with your IT team — it lists exactly what to allow.
+If you see a "couldn't reach the login server" or "couldn't reach the licensing server" message, share the [Feeds Network Requirements](https://letsdovideo.com/feeds-network/) page with your IT team; it lists exactly what to allow.
 
 ---
 

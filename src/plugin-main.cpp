@@ -1770,7 +1770,7 @@ static void ShowSessionPickerDialog(const std::string& json) {
         const char* typeStr = (type == 0) ? "Meeting"
                             : (type == 2) ? "Webinar" : "Session";
         QString text = QString::fromStdString(name);
-        if (!start.empty()) text += "  —  " + QString::fromStdString(start);
+        if (!start.empty()) text += "  -  " + QString::fromStdString(start);
         text += QString("  (") + typeStr + ")";
         QListWidgetItem* item = new QListWidgetItem(text, list);
         item->setData(Qt::UserRole, QString::fromStdString(id));
@@ -2422,7 +2422,7 @@ public:
         m_ytConn = status;
         m_ytLiveDetail = videoId.isEmpty()
             ? QString("Connected")
-            : QString("Connected \xE2\x80\x94 video %1").arg(videoId);
+            : QString("Connected: video %1").arg(videoId);
         RefreshYouTubeRowStatus();
     }
 
@@ -2642,7 +2642,7 @@ private:
         if (conn == kChatConnLive)
             return { "#40c060", "Connected", liveDetail, false };
         return { "#e0a020", "Waiting",
-                 QString("Target set \xE2\x80\x94 connecting"), false };
+                 QString::fromUtf8("Target set, connecting…"), false };
     }
 
     // Apply a resolved status to a row's dot + word widgets, and record whether the
@@ -8091,7 +8091,7 @@ static void RegisterEngineHandlers() {
                     msg = "Feeds couldn't reach Zoom to restore your session, "
                           "so you're signed out for now. On managed or "
                           "corporate networks this can be caused by a proxy or "
-                          "firewall.\n\nYour saved login was kept — click "
+                          "firewall.\n\nYour saved login was kept. Click "
                           "Login to try again, or restart OBS once you're back "
                           "online.\n\nNetwork requirements for IT: " +
                           std::string(kNetworkRequirementsUrl);
@@ -8498,7 +8498,7 @@ static void RegisterEngineHandlers() {
                 QString::fromUtf8(
                     "Feeds needs to be re-authorized to access your Zoom Events.\n\n"
                     "Open the Feeds menu, log out of Zoom, then log back in to "
-                    "grant access — and try Zoom Events again."));
+                    "grant access, then try Zoom Events again."));
         });
     });
 
@@ -8812,7 +8812,7 @@ static void RegisterEngineHandlers() {
             [qError]() {
                 QMainWindow* main =
                     (QMainWindow*)obs_frontend_get_main_window();
-                QMessageBox::warning(main, "Feeds — Send Failed", qError);
+                QMessageBox::warning(main, "Feeds - Send Failed", qError);
             });
     });
 
@@ -9805,11 +9805,20 @@ static void CreateLowerThirdFor(const std::string& participantUuid) {
     // Name it after the participant so the OBS source-list entry is obviously
     // ours and obviously auto-managed. A list entry is unavoidable (OBS has no
     // hidden-source concept) and accepted — it only appears when the user
-    // deliberately creates one, and they never need to touch it there.
+    // deliberately creates one, and they never need to touch it there. The
+    // "Feeds" prefix is the reminder of what owns it while they're scanning
+    // that list.
+    //
+    // DISPLAY NAME ONLY. Nothing keys off it: the participant<->nameplate link
+    // is a pair of UUIDs (kLowerThirdUuidKey / kLtParticipantUuidKey) and the
+    // source id stays "feeds_lower_third", so changing this format cannot
+    // orphan anything. Nameplates already in a saved scene collection keep the
+    // name they were created with — this only shapes new ones.
+    //
     // Unique-ify OBS's way: the name, then " 2", " 3", ... until free.
     const char* pn = obs_source_get_name(participant);
     const std::string base =
-        std::string("Lower Third — ") + ((pn && *pn) ? pn : "Participant");
+        std::string("Feeds Lower Third: ") + ((pn && *pn) ? pn : "Participant");
     std::string name = base;
     for (int i = 2; ; ++i) {
         obs_source_t* existing = obs_get_source_by_name(name.c_str());

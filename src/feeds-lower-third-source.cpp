@@ -676,7 +676,7 @@ static obs_properties_t* lt_get_properties(void* data) {
     }
 
     obs_properties_add_text(props, "managed_msg",
-        "This source is managed from the Feeds Controls dock — use the "
+        "This source is managed from the Feeds Controls dock. Use the "
         "Show / Hide button on the participant's row. Showing it "
         "re-positions the card over the participant's current video.",
         OBS_TEXT_INFO);
