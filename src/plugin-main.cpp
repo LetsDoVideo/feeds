@@ -3254,6 +3254,10 @@ public:
                     obs_data_release(st);
                 }
                 r.disabled = s->tier_disabled;
+                // Runtime-only, never persisted — read here under the same lock
+                // as the settings above so the picker sees the pid and the flag
+                // that backs it as one consistent pair.
+                r.bound    = s->bound_this_session;
                 // Initial live state for the box's dot (kept updated by the poll
                 // between rebuilds). Read the atomic here under g_sourcesMutex.
                 uint64_t tick = s->lastRealFrameTick.load(std::memory_order_relaxed);
@@ -3897,6 +3901,16 @@ private:
                                  // combo -> source by this (name can change/collide)
         std::string name;        // OBS source name (copied — pointer not owned)
         long long   pid = 0;     // participant_id setting
+        // s->bound_this_session: does a CONFIRMED live binding back that pid?
+        // The setting persists into the scene collection while the runtime
+        // binding does not, so after a restart (or any reconcile that refused
+        // to auto-bind) pid is a leftover runtime id from an earlier meeting
+        // with nothing behind it. Zoom hands out ids per meeting and reuses the
+        // same numbers, so such an id routinely resolves against the CURRENT
+        // roster to an unrelated person — which is exactly how the picker came
+        // to show a name on a source that is genuinely unbound. Only the picker
+        // reads this; the indicators keep their own BoundUserId presence gate.
+        bool        bound = false;
         bool        disabled = false;  // tier_disabled (authoritative only when logged in)
         bool        liveNow = false;   // receiving real frames now (for the live dot)
         // --- Lower third ---
@@ -4463,7 +4477,21 @@ private:
         //    non-selectable "── Already used ──" divider and greyed — still fully
         //    selectable (nothing is ever blocked).
         QComboBox* combo = new ElidingComboBox();
-        const long long ownPid = r.pid;
+        // The source's current pick, or 0 when it has none. A persisted
+        // participant_id is only a real pick while a confirmed live binding
+        // backs it (Row::bound): an id left in the settings by an earlier
+        // meeting is just a number, and because Zoom reuses runtime ids across
+        // meetings it will often resolve against today's roster to somebody
+        // else entirely. Gating here rather than at the display alone keeps the
+        // whole combo consistent — an unbound source shows the placeholder AND
+        // offers that participant in its list, where before the name appeared
+        // as the closed value and was excluded from the list, so the one pick
+        // that would have fixed the binding was the one pick unavailable.
+        //
+        // The Active-Speaker sentinel (1) is deliberately exempt: it binds to a
+        // role rather than to a runtime id, so it cannot go stale, and gating it
+        // would blank a legitimate pick in the window before reconcile runs.
+        const long long ownPid = (r.pid == 1 || r.bound) ? r.pid : 0;
 
         // Closed-state display of the current pick (NOT added to the list itself).
         QString currentText;
