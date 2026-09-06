@@ -21,18 +21,21 @@ extern bool SendToPlugin(const std::string& json);
 namespace feeds_engine {
 
 // From engine-api.cpp
-bool FetchUserInfo();
+UserInfoResult FetchUserInfo();
 void FetchAndApplyEntitlement();
 bool WasTierUnresolved();
 const std::string& GetUserDisplayName();
 const std::string& GetUserPMI();
 const std::string& GetUserEmail();
 int                GetCurrentTier();
+void               ClearStoredCredentials();
+unsigned           GetSessionExpiredNoticeCount();
 
 // From engine-meeting.cpp
 bool InitializeMeetingSession();
 
-bool AuthenticateSDK();  // defined below
+bool AuthenticateSDK();      // defined below
+void ResetSdkBringupState(); // defined below
 
 static bool g_sdkInitialized = false;
 static ZOOM_SDK_NAMESPACE::IAuthService* g_authService = nullptr;
@@ -213,13 +216,56 @@ bool InitializeSDK() {
 // thread must invoke it from a background thread (FetchUserInfo does network
 // I/O). Order matters: FetchUserInfo first (its 401→refresh populates the
 // access token used by the tier query), then FetchAndApplyEntitlement.
+//
+// FetchUserInfo is also the gate. It used to be called for its side effects
+// with its result only logged, so a restore whose refresh token was dead still
+// announced login_succeeded — with an empty name/PMI and tier 0 — and the
+// plugin flipped to "logged in" on a cache nothing had populated. The user then
+// sat in a logged-in-looking Feeds whose PMI join is blocked client-side on the
+// empty PMI, with no clue that logging out and back in was the fix. Announcing
+// nothing but the truth is the whole point of the checks below.
 static void AnnounceLoginSucceeded() {
-    bool gotUser = FetchUserInfo();
-    FetchAndApplyEntitlement();
+    // Sample the API layer's session_expired counter across the fetch: the 401
+    // path announces session_expired from inside ZoomApiGetWithStatus, and we
+    // must not put a second identical modal on top of it.
+    const unsigned noticesBefore = GetSessionExpiredNoticeCount();
 
-    if (!gotUser) {
-        LogWarn("SDK: session-restore user-info fetch failed");
+    const UserInfoResult userInfo = FetchUserInfo();
+
+    // Fail closed. Anything short of a live 200 from /v2/users/me means we
+    // cannot honestly claim the credentials work, so we announce the logged-out
+    // state instead — the user sees "Not logged in", clicks Login, and it
+    // works. What differs between the two failure modes is only whether we're
+    // entitled to throw the stored credentials away.
+    if (userInfo != UserInfoResult::Ok) {
+        if (userInfo == UserInfoResult::SessionExpired) {
+            // Genuinely dead — the token was rejected and the refresh couldn't
+            // renew it. Clear the credentials so the next launch starts clean
+            // instead of replaying this failure, and drop the lazy bring-up
+            // flags so a later login re-auths from scratch.
+            LogWarn("SDK: session restore failed — credentials are dead, "
+                    "clearing them and staying logged out");
+            ClearStoredCredentials();
+            ResetSdkBringupState();
+            if (GetSessionExpiredNoticeCount() == noticesBefore)
+                SendToPlugin("{\"type\":\"session_expired\"}");
+        } else {
+            // Unreachable — proxy, firewall, or no network. The credentials are
+            // very likely fine, and deleting them would cost a full OAuth
+            // round-trip over a blip, so keep them and report a retryable
+            // failure. The next launch on a working network restores silently.
+            LogWarn("SDK: session restore could not reach Zoom — staying "
+                    "logged out, keeping stored credentials");
+            SendToPlugin("{\"type\":\"login_failed\","
+                         "\"error\":\"session_restore_unreachable\"}");
+        }
+        return;
     }
+
+    // Credentials are proven live from here down — the original happy path,
+    // unchanged. A routine refresh that genuinely succeeded still lands here
+    // and recovers silently.
+    FetchAndApplyEntitlement();
 
     // Build the login_succeeded message with everything the plugin needs to
     // populate its cache.

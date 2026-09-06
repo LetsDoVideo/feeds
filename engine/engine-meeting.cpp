@@ -1927,7 +1927,7 @@ void HandleLogout(const std::string& /*json*/);  // fwd, defined below
 // the auth service (to log out of the SDK), and should leave any active
 // meeting first. Keeping the whole thing here is tidier than spreading it
 // across files, and nothing outside this TU needs it.
-void ClearUserInfo();  // from engine-api.cpp
+void ClearStoredCredentials();  // from engine-api.cpp
 
 void HandleLogout(const std::string& /*json*/) {
     LogInfo("Meeting: HandleLogout called");
@@ -1950,14 +1950,10 @@ void HandleLogout(const std::string& /*json*/) {
         auth_service->LogOut();
     }
 
-    // Clear stored tokens + cached user info
-    ClearUserInfo();
-    CredDeleteA("Feeds_AccessToken",  CRED_TYPE_GENERIC, 0);
-    CredDeleteA("Feeds_RefreshToken", CRED_TYPE_GENERIC, 0);
-    // The cached last-known-good tier is per-account, so it must die with the
-    // tokens — otherwise the next user to log in on this PC would inherit the
-    // previous user's entitlement until their own tier query lands.
-    CredDeleteA("Feeds_CachedTier",   CRED_TYPE_GENERIC, 0);
+    // Clear stored tokens + cached user info. Shared with the fail-closed
+    // session restore (engine-sdk.cpp) so both routes to "logged out" wipe
+    // exactly the same state.
+    ClearStoredCredentials();
 
     // The SDK just logged out, so its prior SDKAuth no longer counts as
     // "ready to connect." Reset the lazy bring-up so a subsequent login +

@@ -7,11 +7,13 @@
 #include <windows.h>
 #include <winhttp.h>
 #include <wincred.h>
+#include <atomic>
 #include <string>
 #include <vector>
 #include <cstdio>
 #include <cstdlib>
 
+#include "engine-shared.h"   // UserInfoResult
 #include "feeds-http.h"      // proxy-aware WinHTTP session helper (shared, common/)
 #include "feeds-backend.h"   // entitlement backend hostname (shared, common/)
 
@@ -62,6 +64,43 @@ void ClearUserInfo() {
     g_userPMI.clear();
     g_userEmail.clear();
     g_currentTier = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Wipe every stored trace of the login: in-memory user info, both tokens, and
+// the cached tier. Shared by the logout handler (engine-meeting.cpp) and the
+// fail-closed session restore (engine-sdk.cpp) so the two can never drift —
+// "logged out" must mean the same thing however we got there.
+// ---------------------------------------------------------------------------
+void ClearStoredCredentials() {
+    ClearUserInfo();
+    CredDeleteA("Feeds_AccessToken",  CRED_TYPE_GENERIC, 0);
+    CredDeleteA("Feeds_RefreshToken", CRED_TYPE_GENERIC, 0);
+    // The cached last-known-good tier is per-account, so it must die with the
+    // tokens — otherwise the next user to log in on this PC would inherit the
+    // previous user's entitlement until their own tier query lands.
+    CredDeleteA("Feeds_CachedTier",   CRED_TYPE_GENERIC, 0);
+}
+
+// ---------------------------------------------------------------------------
+// session_expired bookkeeping.
+//
+// The 401 paths below announce session_expired to the plugin from deep inside
+// an API call, so a caller that later decides to fail closed can't tell whether
+// the user has already been told. NotifySessionExpired is the single send site
+// and bumps a counter; a caller samples the counter around its own work and
+// only sends its own notice if the count didn't move. Without that the user
+// gets two "session expired" modals back to back.
+// ---------------------------------------------------------------------------
+static std::atomic<unsigned> g_sessionExpiredNotices{0};
+
+unsigned GetSessionExpiredNoticeCount() {
+    return g_sessionExpiredNotices.load(std::memory_order_relaxed);
+}
+
+static void NotifySessionExpired() {
+    g_sessionExpiredNotices.fetch_add(1, std::memory_order_relaxed);
+    SendToPlugin("{\"type\":\"session_expired\"}");
 }
 
 // ---------------------------------------------------------------------------
@@ -309,7 +348,7 @@ std::string ZoomApiGetWithStatus(const std::wstring& path, int& outStatus) {
             body = doRequest(st);
         } else {
             LogWarn("API: refresh failed, session expired");
-            SendToPlugin("{\"type\":\"session_expired\"}");
+            NotifySessionExpired();
             outStatus = 401;
             return "";
         }
@@ -396,7 +435,7 @@ std::string ZoomApiPost(const std::wstring& path, const std::string& jsonBody) {
             body = (sep == std::string::npos) ? "" : result.substr(sep + 1);
         } else {
             LogWarn("API: refresh failed, session expired");
-            SendToPlugin("{\"type\":\"session_expired\"}");
+            NotifySessionExpired();
             return "";
         }
     }
@@ -486,13 +525,34 @@ bool CreateInstantMeeting(const std::string& topic,
 // ---------------------------------------------------------------------------
 // Fetch user display name + PMI. Caches results in engine-side globals.
 // Called once after SDK auth succeeds (pre-fetch so Connect is snappy).
+//
+// This doubles as the credential-validity test for the session restore, which
+// is why it reports a UserInfoResult rather than a bool: a 200 here is only
+// possible on a live access token, so Ok is proof the credentials are real,
+// while the caller needs SessionExpired and Unreachable kept apart to decide
+// whether it may delete the stored tokens. Uses ZoomApiGetWithStatus so the
+// 401 the body-only ZoomApiGet throws away survives to the caller.
 // ---------------------------------------------------------------------------
-bool FetchUserInfo() {
+UserInfoResult FetchUserInfo() {
     LogToFile("API: FetchUserInfo starting");
-    std::string response = ZoomApiGet(L"/v2/users/me");
+    int status = 0;
+    std::string response = ZoomApiGetWithStatus(L"/v2/users/me", status);
+
+    // 401 covers both dead-credential shapes: the refresh couldn't renew (in
+    // which case ZoomApiGetWithStatus has already announced session_expired and
+    // handed us an empty body), and the refresh minted a token Zoom still
+    // rejects (a deauthorized app — no notice sent, body is the error JSON).
+    // Both mean only a new login recovers.
+    if (status == 401) {
+        LogWarn("API: FetchUserInfo unauthorized — stored credentials are dead");
+        return UserInfoResult::SessionExpired;
+    }
+
     if (response.empty()) {
+        // No answer at all: transport failure, proxy, firewall, 5xx. Validity
+        // is unknown, so the caller must keep the stored credentials.
         LogToFile("API: FetchUserInfo got empty response");
-        return false;
+        return UserInfoResult::Unreachable;
     }
 
     std::string name = JsonExtractString(response, "display_name");
@@ -502,11 +562,19 @@ bool FetchUserInfo() {
     g_userPMI         = JsonExtractNumber(response, "pmi");
     g_userEmail       = JsonExtractString(response, "email");
 
+    // A 200 that carries no usable name leaves us without the display name the
+    // join paths require, so it isn't a usable login — but it's also not proof
+    // the credentials are dead, so it takes the keep-the-tokens path.
+    if (g_userDisplayName.empty()) {
+        LogWarn("API: FetchUserInfo got a response with no display name");
+        return UserInfoResult::Unreachable;
+    }
+
     // Redaction: never log the user's name, PMI, or email — these must not
     // reach the shared OBS log. Log success only.
     LogToFile("API: FetchUserInfo succeeded");
 
-    return !g_userDisplayName.empty();
+    return UserInfoResult::Ok;
 }
 
 // ---------------------------------------------------------------------------

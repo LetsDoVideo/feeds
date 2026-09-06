@@ -7969,26 +7969,41 @@ static void RegisterEngineHandlers() {
     });
 
     feeds::RegisterMessageHandler("login_succeeded", [](const std::string& json) {
-        g_userDisplayName = ExtractJsonString(json, "display_name");
-        g_userPMI         = ExtractJsonString(json, "pmi");
-        g_currentTier     = (int)ExtractJsonNumber(json, "tier");
+        // Parse on this (the IPC) thread, but publish on the main thread.
+        // g_userDisplayName / g_userPMI / g_currentTier have two other writers
+        // — the session_expired and logout_complete handlers — and both clear
+        // them from inside a QTimer::singleShot. Assigning them directly here
+        // let a session_expired that ARRIVED FIRST still LAND LAST and wipe a
+        // login that had already been applied, leaving the half-state this fix
+        // is about: logged-in UI over an empty display name and PMI with tier
+        // forced to 0, so PMI join fails client-side while everything that
+        // re-fetches live still works. All three writers now run on the main
+        // thread, so they apply in arrival order.
+        std::string displayName = ExtractJsonString(json, "display_name");
+        std::string pmi         = ExtractJsonString(json, "pmi");
+        int         tier        = (int)ExtractJsonNumber(json, "tier");
         // NOTE: g_loginAttemptCompleted is intentionally NOT armed here.
         // It is set together with g_isLoggedIn in the sdk_authenticated
         // handler so the popup gate (g_loginAttemptCompleted && !g_isLoggedIn)
         // never sees a window where the gate is armed but g_isLoggedIn is
         // still false. See sdk_authenticated below.
-        // Redaction: never log the user's name or PMI. The assignments above
-        // stay — the UI still needs them — only the log text is sign-in
+        // Redaction: never log the user's name or PMI. The values are still
+        // applied below — the UI needs them — only the log text is sign-in
         // completion plus the non-sensitive tier.
         blog(LOG_INFO, "[feeds] login_succeeded: sign-in completed, tier=%d",
-             g_currentTier);
+             tier);
 
-        // Reconcile on the UI thread — ReconcileSourcesToTier touches
-        // OBS source state and refreshes properties, both of which
-        // belong on the main thread.
-        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
-            ReconcileSourcesToTier();
-        });
+        // Apply and reconcile on the UI thread — ReconcileSourcesToTier
+        // touches OBS source state and refreshes properties, both of which
+        // belong on the main thread, and it reads g_currentTier, so the
+        // assignments have to precede it in this same step.
+        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
+            [displayName, pmi, tier]() {
+                g_userDisplayName = displayName;
+                g_userPMI         = pmi;
+                g_currentTier     = tier;
+                ReconcileSourcesToTier();
+            });
     });
 
     feeds::RegisterMessageHandler("login_failed", [](const std::string& json) {
@@ -8016,9 +8031,16 @@ static void RegisterEngineHandlers() {
             return;
         }
 
-        blog(LOG_ERROR, "[feeds] login_failed: %s", error.c_str());
+        // session_restore_unreachable is the engine reporting that a startup
+        // session restore couldn't reach Zoom at all. It deliberately KEPT the
+        // stored credentials — a proxy or firewall blip must not cost a full
+        // re-OAuth — so this is a retryable signed-out state, not a dead login.
+        // Warn rather than error, and say so, since nothing is broken.
+        const bool restoreUnreachable = (error == "session_restore_unreachable");
+        blog(restoreUnreachable ? LOG_WARNING : LOG_ERROR,
+             "[feeds] login_failed: %s", error.c_str());
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
-            [error]() {
+            [error, restoreUnreachable]() {
                 // login_timeout is the engine's honest signal that the worker
                 // poll never got the auth code (timeout / network failure),
                 // most often an unreachable login server on a proxied or
@@ -8026,7 +8048,15 @@ static void RegisterEngineHandlers() {
                 // that cause instead of the raw error slug. Every other error
                 // keeps the generic "Login failed: <error>" form.
                 std::string msg;
-                if (error == "login_timeout") {
+                if (restoreUnreachable) {
+                    msg = "Feeds couldn't reach Zoom to restore your session, "
+                          "so you're signed out for now. On managed or "
+                          "corporate networks this can be caused by a proxy or "
+                          "firewall.\n\nYour saved login was kept — click "
+                          "Login to try again, or restart OBS once you're back "
+                          "online.\n\nNetwork requirements for IT: " +
+                          std::string(kNetworkRequirementsUrl);
+                } else if (error == "login_timeout") {
                     msg = "Feeds couldn't reach the login server. On managed "
                           "or corporate networks this can be caused by a proxy "
                           "or firewall. Please try again, or contact support "
@@ -8035,13 +8065,23 @@ static void RegisterEngineHandlers() {
                 } else {
                     msg = "Login failed: " + error;
                 }
-                QMessageBox::critical(
-                    static_cast<QWidget*>(obs_frontend_get_main_window()),
-                    QString::fromUtf8("Feeds - Login"),
-                    QString::fromUtf8(msg.c_str()));
+                QWidget* parent =
+                    static_cast<QWidget*>(obs_frontend_get_main_window());
+                const QString title = QString::fromUtf8("Feeds - Login");
+                const QString body  = QString::fromUtf8(msg.c_str());
+                if (restoreUnreachable)
+                    QMessageBox::warning(parent, title, body);
+                else
+                    QMessageBox::critical(parent, title, body);
                 g_authInProgress = false;
                 UpdateLoginLogoutMenuItem();
                 g_pendingMeetingJoin = false;
+                // Make the dock say what's true. CurrentPlaceholderText reads
+                // g_isLoggedIn (false on every path that reaches here) and
+                // renders "Not logged in to Zoom. Click to Login." — the whole
+                // point of failing closed is that the user is shown the one
+                // action that recovers them.
+                if (g_chatDock) g_chatDock->RefreshPlaceholder();
             });
     });
 
@@ -8237,6 +8277,12 @@ static void RegisterEngineHandlers() {
                 std::lock_guard<std::mutex> lock(g_participantsMutex);
                 g_cachedParticipants.clear();
             }
+            // An expiry IS a completed answer about our login state, so arm
+            // the popup gate the same way login_succeeded/login_failed do.
+            // Without this an expiry at startup leaves it disarmed and
+            // source-creation silently no-ops instead of prompting the user
+            // to log in — which is the one action that fixes their state.
+            g_loginAttemptCompleted = true;
             g_authInProgress = false;
             UpdateLoginLogoutMenuItem();
             if (g_connectAction) g_connectAction->setEnabled(false);

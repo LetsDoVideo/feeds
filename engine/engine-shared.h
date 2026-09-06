@@ -52,6 +52,26 @@ extern HWND g_anchorWnd;
 
 namespace feeds_engine {
 
+// ---------------------------------------------------------------------------
+// Outcome of the user-info fetch that backs a login announce (FetchUserInfo,
+// engine-api.cpp). A plain bool used to be enough because the only consumer
+// logged it; it isn't, because the two failure modes must be handled
+// differently — one is allowed to delete the user's stored credentials and the
+// other must not be.
+//
+//   Ok             /v2/users/me answered 200 and we parsed a display name.
+//                  That is only possible on a live access token (the stored
+//                  one still worked, or the refresh minted a fresh one), so
+//                  this is the proof that the credentials are genuinely valid.
+//   SessionExpired The token was rejected and the refresh could not renew it.
+//                  The credentials are dead; nothing short of a new login
+//                  recovers, so they may be cleared.
+//   Unreachable    We never got an answer — proxy, firewall, no network. The
+//                  credentials may well be fine, so they must be KEPT: a
+//                  network blip must not cost the user a full re-OAuth.
+// ---------------------------------------------------------------------------
+enum class UserInfoResult { Ok, SessionExpired, Unreachable };
+
 // Defined in engine-meeting.cpp. Invoked by EngineWndProc on the main
 // thread when WM_FEEDS_SEND_CHAT arrives. Performs the actual SDK
 // chat-send work and dispatches the chat_send_result IPC reply.
