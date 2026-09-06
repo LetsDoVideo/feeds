@@ -34,14 +34,29 @@ void RegisterLowerThirdSource();
 
 // Push resolved display content into every lower-third instance bound to the
 // given participant source UUID. Like the popup, the source is cache-agnostic:
-// plugin-main resolves the name (Zoom roster name, falling back to the OBS
-// source name), the title (from the participant's settings — the single source
-// of truth) and the avatar (from g_avatarCache), and hands them over. A null
-// QImage renders the neutral placeholder circle.
+// plugin-main resolves the name (the Zoom roster name, and ONLY that), the
+// title (from the participant's settings — the single source of truth) and the
+// avatar (from g_avatarCache), and hands them over. A null QImage renders the
+// neutral placeholder circle.
+//
+// `bound` is the participant source's binding state, and it gates the card's
+// visibility independently of the user's Show/Hide choice: a nameplate is only
+// ever allowed on screen while its source is genuinely bound — to a real
+// participant, or to the Active-Speaker role. There is deliberately NO
+// source-name fallback: a lower third must never display an OBS source name
+// ("Participant 1"), so an unbound source shows nothing at all rather than
+// something wrong. Passing bound=false slides the card out and keeps it out;
+// the user's `shown` flag is untouched, so it returns on its own once a
+// participant is bound again.
+//
+// An Active-Speaker source with nobody yet speaking is bound with an EMPTY
+// name: the card stays up (the binding is to a role, which never goes away)
+// and simply carries no name pill until someone speaks.
 //
 // Safe to call from any thread; instances are marked dirty and re-render on
 // the next frame.
 void UpdateLowerThirdContent(const std::string& participantUuid,
+                             bool               bound,
                              const std::string& name,
                              const std::string& title,
                              const QImage&      avatar);

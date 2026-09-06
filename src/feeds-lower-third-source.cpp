@@ -185,7 +185,18 @@ struct FeedsLowerThirdData {
     QString       title;
     QImage        avatar;    // resolved by plugin-main; null -> neutral circle
 
+    // The user's Show/Hide choice (persisted) and the participant source's
+    // binding state (runtime, pushed by plugin-main). The card is on screen
+    // only when BOTH are true — see ApplyEffectiveVisibility_locked.
+    //
+    // Keeping them separate is what lets a nameplate survive its participant
+    // going away: losing the binding slides the card out without touching the
+    // user's choice, so re-binding brings it straight back with no click. It
+    // is also why `bound` starts false — a nameplate restored from a saved
+    // scene collection must show NOTHING until plugin-main confirms a real
+    // binding, which cannot happen before a meeting is joined.
     bool          shown        = false;
+    bool          bound        = false;
     LtAnimState   anim         = LtAnimState::Hidden;
     float         anim_elapsed = 0.0f;
     float         anim_from    = 1.0f;
@@ -362,6 +373,19 @@ static void StartSlide_locked(FeedsLowerThirdData* d, bool show) {
     d->anim_to      = show ? 0.0f : 1.0f;
 }
 
+// Reconcile the animation with the two inputs that decide whether the card
+// belongs on screen: the user's Show choice AND a genuine participant binding.
+// Idempotent — a slide only starts when the target actually differs from where
+// the card is heading, so repeated content pushes (which arrive on every dock
+// refresh) never restart an in-flight animation. Caller must hold
+// g_ltStateMutex.
+static void ApplyEffectiveVisibility_locked(FeedsLowerThirdData* d) {
+    const bool want = d->shown && d->bound;
+    const bool heading =
+        (d->anim == LtAnimState::Shown || d->anim == LtAnimState::AnimatingIn);
+    if (want != heading) StartSlide_locked(d, want);
+}
+
 // ---------------------------------------------------------------------------
 // Resolve the participant source this instance points at, as an owned ref the
 // caller must release (or null). Used by the properties panel to read and
@@ -439,10 +463,14 @@ static void* lt_create(obs_data_t* settings, obs_source_t* source) {
         const char* pu = obs_data_get_string(settings, kLtParticipantUuidKey);
         if (pu) d->participant_uuid = pu;
         d->shown = obs_data_get_bool(settings, kLtShownKey);
-        // A lower third restored from a saved scene collection comes back in
-        // whatever state it was left in — shown means shown, with no slide
-        // (there is nothing to animate into on a scene load).
-        d->anim = d->shown ? LtAnimState::Shown : LtAnimState::Hidden;
+        // Restored HIDDEN regardless of the stored `shown` flag. A saved scene
+        // collection is loaded long before any meeting exists, so no source can
+        // be bound yet, and a nameplate with no bound participant must display
+        // nothing — showing one here is exactly the "source name on a lower
+        // third at OBS startup" case. The stored choice is kept in `shown`, so
+        // the card slides in by itself the moment plugin-main pushes a real
+        // binding; if none ever arrives, it correctly stays down.
+        d->anim = LtAnimState::Hidden;
         // Mirror only, deliberately: during a scene-collection load the
         // participant we point at may not have been created yet, so the truth
         // is unreadable here. lt_load re-reads it once the whole collection
@@ -540,10 +568,13 @@ static void lt_update(void* data, obs_data_t* settings) {
         d->texture_dirty = true;
     }
 
-    if (shown != d->shown) {
-        d->shown = shown;
-        StartSlide_locked(d, shown);
-    }
+    // Record the user's choice, then let the shared gate decide — `shown` alone
+    // no longer determines visibility, the binding has to agree. Unconditional
+    // rather than guarded on a change: the gate is idempotent, and routing both
+    // inputs through one place is what keeps show/hide and bind/unbind from
+    // fighting over the animation.
+    d->shown = shown;
+    ApplyEffectiveVisibility_locked(d);
 }
 
 // libobs calls this once the ENTIRE scene collection has been created —
@@ -756,6 +787,7 @@ void RegisterLowerThirdSource() {
 }
 
 void UpdateLowerThirdContent(const std::string& participantUuid,
+                             bool               bound,
                              const std::string& name,
                              const std::string& title,
                              const QImage&      avatar) {
@@ -768,6 +800,14 @@ void UpdateLowerThirdContent(const std::string& participantUuid,
     std::lock_guard<std::mutex> stateLock(g_ltStateMutex);
     for (FeedsLowerThirdData* d : g_ltInstances) {
         if (!d || d->participant_uuid != participantUuid) continue;
+        // Binding first: losing it must take the card off screen in the same
+        // push that clears the name, so a deselect can never leave stale
+        // content visible for even one frame.
+        if (d->bound != bound) {
+            d->bound         = bound;
+            d->texture_dirty = true;
+        }
+        ApplyEffectiveVisibility_locked(d);
         if (d->name != qName || d->title != qTitle) {
             d->name          = qName;
             d->title         = qTitle;

@@ -4863,12 +4863,23 @@ private:
 static FeedsParticipantDock* g_participantDock = nullptr;
 
 static void PostParticipantDockRefresh() {
-    if (!g_participantDock) return;
-    // Marshal onto the dock's (UI) thread. Using the dock itself as the context
-    // object means the queued call auto-cancels if OBS destroys the widget —
-    // the primary guard against a shutdown-time use-after-free, since source
+    // Marshal onto the UI thread. The dock is the context object whenever it
+    // exists, so the queued call auto-cancels if OBS destroys the widget — the
+    // primary guard against a shutdown-time use-after-free, since source
     // destroy (which posts these) runs on OBS's destruction worker thread.
-    QTimer::singleShot(0, g_participantDock, []() {
+    //
+    // It can no longer bail out when the dock is closed, though: this is also
+    // the choke point that keeps every nameplate's content and VISIBILITY
+    // current, and a lower third lives on the user's stream, not in the dock.
+    // Bailing here meant a participant deselected with the dock closed left its
+    // nameplate on screen with stale content. The main window stands in as the
+    // context in that case; null means OBS is tearing down and there is nothing
+    // left to marshal onto.
+    QObject* ctx = g_participantDock
+                       ? static_cast<QObject*>(g_participantDock)
+                       : static_cast<QObject*>(obs_frontend_get_main_window());
+    if (!ctx) return;
+    QTimer::singleShot(0, ctx, []() {
         // Re-resolve every nameplate's name/title/avatar before the rebuild.
         // This is the single choke point that keeps them current: every state
         // change that matters to a lower third — a roster update (names and
@@ -8809,14 +8820,25 @@ static void RegisterEngineHandlers() {
     // context) so g_activeSpeakerUserId is fully UI-thread-owned, then recompute
     // mute marks: an Active-Speaker dock row (pid 1) re-resolves to the new
     // speaker's mute state. Runs on the pipe-reader thread here.
+    // The dock is no longer the only reader of g_activeSpeakerUserId: an
+    // Active-Speaker-bound lower third resolves its name and avatar through it,
+    // so this handler must run whether or not the dock exists (a user with the
+    // dock closed still has nameplates on their stream). Marshalled on the main
+    // window rather than the dock for that reason.
     feeds::RegisterMessageHandler("active_speaker_changed",
     [](const std::string& json) {
-        if (!g_participantDock) return;   // only the dock reads g_activeSpeakerUserId
         unsigned int userId = (unsigned int)ExtractJsonNumber(json, "participant_id");
-        QTimer::singleShot(0, g_participantDock, [userId]() {
-            g_activeSpeakerUserId = userId;
-            if (g_participantDock) g_participantDock->RecomputeMuteMarks();
-        });
+        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
+            [userId]() {
+                g_activeSpeakerUserId = userId;
+                if (g_participantDock) g_participantDock->RecomputeMuteMarks();
+                // Re-push nameplate content: this is the ONLY signal that moves
+                // an Active-Speaker card's name onto the new speaker. Cheap and
+                // self-limiting — UpdateLowerThirdContent only marks a texture
+                // dirty when the resolved content actually changed, so every
+                // non-Active-Speaker card ignores this.
+                RefreshAllLowerThirdContent();
+            });
     });
 
     // Per-user mute change from the engine's audio listener. Marshal to the UI
@@ -9440,6 +9462,26 @@ static bool GetSceneItemCanvasRect(obs_sceneitem_t* item,
     return (outW >= 1.0f && outH >= 1.0f);
 }
 
+// Stack a nameplate directly above its participant. A scene's item list runs
+// bottom-to-top (scene_video_render walks first_item -> next, so later items
+// draw on top), and obs_sceneitem_set_order_position detaches the item before
+// re-inserting, so the target index depends on which side of the participant we
+// are currently on: coming from ABOVE, the participant keeps its index and we
+// want index+1; coming from BELOW, the detach shifts the participant down one
+// and the same slot is index itself.
+//
+// Split out from PlaceLowerThirdItem because it is the half that needs no
+// measurement — a participant we cannot measure still has a well-defined place
+// in the stack, so the degenerate-box path below runs this and nothing else.
+static void StackLowerThirdAboveParticipant(obs_sceneitem_t* ltItem,
+                                            obs_sceneitem_t* participantItem) {
+    if (!ltItem || !participantItem) return;
+    const int pPos   = obs_sceneitem_get_order_position(participantItem);
+    const int ltPos  = obs_sceneitem_get_order_position(ltItem);
+    const int target = (ltPos > pPos) ? (pPos + 1) : pPos;
+    if (ltPos != target) obs_sceneitem_set_order_position(ltItem, target);
+}
+
 // Position one nameplate scene-item over one participant scene-item, and stack
 // it directly above. One-shot: this reads the participant's transform as it is
 // right now. It is NOT live-follow — moving the participant afterwards leaves
@@ -9457,20 +9499,27 @@ static void PlaceLowerThirdItem(obs_sceneitem_t* ltItem,
 
     float rx = 0.0f, ry = 0.0f, rw = 0.0f, rh = 0.0f;
     if (!GetSceneItemCanvasRect(participantItem, rx, ry, rw, rh)) {
-        // Degenerate participant box (camera off, not yet subscribed). Fall
-        // back to a canvas-relative default rather than polling for a first
-        // frame on the UI thread — the click must never block, and the next
-        // Show re-places the card correctly once video is flowing.
-        obs_video_info ovi;
-        uint32_t canvasW = 1920, canvasH = 1080;
-        if (obs_get_video_info(&ovi)) {
-            canvasW = ovi.base_width;
-            canvasH = ovi.base_height;
-        }
-        rx = 0.0f;
-        ry = 0.0f;
-        rw = (float)canvasW;
-        rh = (float)canvasH;
+        // Degenerate participant box — the source reports 0x0, which is any
+        // participant not delivering frames right now. Camera off is the
+        // everyday case; not-yet-subscribed is the transient one.
+        //
+        // This used to fall back to the FULL CANVAS rect, which is where the
+        // colliding-nameplates bug came from: the card was then scaled to 92%
+        // of the canvas (~2.3x its natural size at 1080p) and anchored to the
+        // bottom-centre of the whole screen, on top of every other nameplate.
+        // Reproduced with two sources bound to one camera-off participant: both
+        // boxes collapse, so both cards land in the same canvas-wide spot and
+        // one covers the other. Nothing about it is specific to sharing a
+        // participant — one camera-off source is enough.
+        //
+        // A box we cannot measure is not a box we should guess at. Leave the
+        // item's existing transform alone and fall through to the stacking fix
+        // below, which needs no rect. A card already placed stays where it was
+        // (correct — its participant hasn't moved either), and a brand-new one
+        // keeps OBS's default until the next Show re-places it once video is
+        // flowing, which is the contract this path always documented.
+        StackLowerThirdAboveParticipant(ltItem, participantItem);
+        return;
     }
 
     // Scale the card to span most of the participant's rect. Scaling the
@@ -9494,19 +9543,7 @@ static void PlaceLowerThirdItem(obs_sceneitem_t* ltItem,
     obs_sceneitem_set_scale(ltItem, &scale);
     obs_sceneitem_set_pos(ltItem, &pos);
 
-    // Stack directly above the participant. A scene's item list runs
-    // bottom-to-top (scene_video_render walks first_item -> next, so later
-    // items draw on top), and obs_sceneitem_set_order_position detaches the
-    // item before re-inserting, so the target index depends on which side of
-    // the participant we're currently on: coming from ABOVE, the participant
-    // keeps its index and we want index+1; coming from BELOW, the detach
-    // shifts the participant down one and the same slot is index itself.
-    if (participantItem) {
-        const int pPos  = obs_sceneitem_get_order_position(participantItem);
-        const int ltPos = obs_sceneitem_get_order_position(ltItem);
-        const int target = (ltPos > pPos) ? (pPos + 1) : pPos;
-        if (ltPos != target) obs_sceneitem_set_order_position(ltItem, target);
-    }
+    StackLowerThirdAboveParticipant(ltItem, participantItem);
 }
 
 // Walk every scene; in each one that contains the participant, make sure a
@@ -9645,6 +9682,50 @@ static bool IsLowerThirdShown(const std::string& ltUuid) {
 // The lower-third source is cache-agnostic (like the chat popup): plugin-main
 // owns the roster and the avatar cache, resolves here, and hands over plain
 // values.
+// The userId whose name and avatar this nameplate should carry, or 0 for none.
+// `outBound` reports whether the source has a genuine binding at all, which is
+// what gates the card being on screen.
+//
+// Deliberately NOT ResolveParticipantName: that is the ISO recorder's filename
+// hook, and a filename must always resolve to something, so it falls back to
+// the OBS source name. A nameplate must never do that — "Participant 1" burned
+// into a broadcast is always wrong — so this reports "no binding" instead and
+// the card stays down.
+//
+// bound_this_session is the gate rather than current_user_id alone. A
+// participant_id persisted in a saved scene collection is replayed into
+// current_user_id by zp_update at load, long before any meeting exists, and
+// Zoom reuses runtime ids across meetings — so trusting it would put a
+// stranger's name on the card, the nameplate version of the dock picker's
+// stale-id bug. The flag is runtime-only and cleared on meeting end, logout and
+// session expiry, so it means exactly "a binding confirmed in this meeting".
+static unsigned int ResolveLowerThirdUserId(ZpSourceData* d, bool& outBound) {
+    outBound = false;
+    if (!d || !d->bound_this_session || d->current_user_id == 0) return 0;
+
+    outBound = true;
+    // The Active-Speaker sentinel binds to a ROLE, not to a person: it counts
+    // as bound even before anyone has spoken (so the card stays up), and the
+    // name follows whoever is speaking right now. Returning 0 here is the
+    // "nobody speaking yet" case — bound, with no name to show.
+    if (d->current_user_id == 1) return g_activeSpeakerUserId;
+    return d->current_user_id;
+}
+
+// The roster name for a resolved userId, or "" when there is none. "" is a
+// legitimate answer — an Active-Speaker card with no current speaker, or a
+// participant the roster hasn't delivered yet — and the card renders it by
+// skipping the name pill, never by substituting anything.
+static std::string LowerThirdNameForUser(unsigned int uid) {
+    if (uid <= 1) return std::string();
+    std::lock_guard<std::mutex> lock(g_participantsMutex);
+    for (const auto& p : g_cachedParticipants) {
+        if (p.id != uid) continue;
+        return (p.name == "Unknown") ? std::string() : p.name;
+    }
+    return std::string();
+}
+
 static void PushLowerThirdContent(obs_source_t* participant) {
     if (!participant) return;
     const char* pu = obs_source_get_uuid(participant);
@@ -9657,18 +9738,28 @@ static void PushLowerThirdContent(obs_source_t* participant) {
     }
 
     // ZpSourceData is the create-returned instance data (borrowed; null for a
-    // husk). ResolveParticipantName is the same Zoom-name -> OBS-source-name
-    // chain the ISO recorder uses for its filenames.
+    // husk) — a husk resolves as unbound, which is the correct answer.
     //
-    // It reads current_user_id, which the DEFERRED zp_update sets — so for one
-    // tick after a rebind this still resolves the previous participant. zp_update
-    // posts a dock refresh when it lands, and that refresh re-runs this, so the
-    // card corrects itself on the next tick. Not worth a second name resolver.
+    // The resolver reads current_user_id, which the DEFERRED zp_update sets —
+    // so for one tick after a rebind this still resolves the previous
+    // participant. zp_update posts a dock refresh when it lands, and that
+    // refresh re-runs this, so the card corrects itself on the next tick.
     ZpSourceData* d = static_cast<ZpSourceData*>(obs_obj_get_data(participant));
-    const std::string name   = ResolveParticipantName(d);
-    const QImage      avatar = d ? GetCachedAvatar(d->current_user_id) : QImage();
 
-    feeds::UpdateLowerThirdContent(pu, name, title, avatar);
+    bool bound = false;
+    const unsigned int uid = ResolveLowerThirdUserId(d, bound);
+
+    // Avatar follows the same resolved user as the name, so an Active-Speaker
+    // card swaps both together as the speaker changes. uid <= 1 (unbound, or
+    // bound-to-role with nobody speaking) has no avatar to show.
+    const std::string name   = LowerThirdNameForUser(uid);
+    const QImage      avatar = (uid > 1) ? GetCachedAvatar(uid) : QImage();
+
+    // The title is read from the PARTICIPANT SOURCE's settings above and is
+    // never part of this resolution: it is the source's configured text, so an
+    // Active-Speaker nameplate keeps one fixed title while its name cycles
+    // through speakers.
+    feeds::UpdateLowerThirdContent(pu, bound, name, title, avatar);
 }
 
 // UUID-addressed wrapper, for the call sites that only have the uuid.
