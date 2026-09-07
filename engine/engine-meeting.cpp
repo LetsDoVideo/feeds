@@ -1224,6 +1224,44 @@ static void ApplyDefaultSettings() {
         return;
     }
 
+    // ----- Video settings: opt into HD -------------------------------------
+    // Done FIRST, and in its own block, so it cannot be skipped by the
+    // general-settings branch below bailing out.
+    //
+    // This is the negotiation-time half of Feeds' 1080p promise, and without
+    // it the per-renderer setRawDataResolution(1080P) requests can be asking
+    // for something the meeting was never negotiated to carry. HD video
+    // defaults to OFF on many account tiers, so the meeting settles at a
+    // sub-HD ceiling and every participant is capped upstream of anything the
+    // raw-data layer does. Requesting 1080 per renderer cannot lift a ceiling
+    // that was set when the meeting was negotiated.
+    //
+    // Timing: this runs from InitializeMeetingSession, i.e. inside
+    // onAuthenticationReturn(SUCCESS) on the SDK's pump thread, which is after
+    // auth and before any join — the only window where a client setting can
+    // still influence how the meeting is negotiated. It is a client-side
+    // preference, not a request against a live meeting, so there is no meeting
+    // state for it to depend on.
+    //
+    // Entitlement still rules: EnableHDVideo is an opt-IN, not an override. An
+    // account without Group HD stays where it was, which is why the result is
+    // logged with IsHDVideoEnabled() read back rather than assumed — the
+    // read-back is the only way to tell "asked and got it" from "asked and the
+    // account said no", and that distinction is exactly what a soak session
+    // needs in order to interpret the delivered resolutions in the video log.
+    if (ZOOM_SDK_NAMESPACE::IVideoSettingContext* video =
+            settingService->GetVideoSettings()) {
+        ZOOM_SDK_NAMESPACE::SDKError hd = video->EnableHDVideo(true);
+        char buf[160];
+        sprintf_s(buf, "Settings: EnableHDVideo(true) returned %d, HD now %s",
+                  (int)hd, video->IsHDVideoEnabled() ? "ENABLED" : "disabled");
+        if (hd == ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) LogInfo(buf);
+        else                                          LogWarn(buf);
+    } else {
+        LogWarn("Settings: GetVideoSettings returned nullptr — "
+                "cannot opt into HD video");
+    }
+
     ZOOM_SDK_NAMESPACE::IGeneralSettingContext* general =
         settingService->GetGeneralSettings();
     if (!general) {

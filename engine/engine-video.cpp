@@ -348,7 +348,28 @@ public:
         // 360p" rule — but Andy enabled an override on our account that
         // allows 1080p for all feeds up to tier max. For now we just use
         // the tier resolution straight.
-        m_renderer->setRawDataResolution(GetResolutionForCurrentTier());
+        //
+        // The return code used to be discarded, which cost us the one signal
+        // that separates "the meeting/account cannot carry this resolution"
+        // from "bandwidth dipped for this participant". A refusal here means
+        // the request was rejected outright and the SDK will deliver whatever
+        // it picked instead, so the delivered size logged on the first frame
+        // below is the only thing that tells us what we actually got. Not
+        // fatal either way — we keep the subscription and report honestly.
+        m_requestedHeight = (GetCurrentTier() >= 1) ? 1080 : 720;
+        const ZOOM_SDK_NAMESPACE::SDKError resErr =
+            m_renderer->setRawDataResolution(GetResolutionForCurrentTier());
+        {
+            char msg[256];
+            sprintf_s(msg,
+                "Video: source='%s' requested %dp, setRawDataResolution "
+                "returned %d (%s)",
+                m_sourceUuid.c_str(), m_requestedHeight, (int)resErr,
+                resErr == ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS
+                    ? "accepted" : "REFUSED — SDK will pick its own");
+            if (resErr == ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) LogInfo(msg);
+            else                                              LogWarn(msg);
+        }
 
         // Spin up the scaler worker. SDK callbacks stage frames here; the
         // worker libyuv-scales to the tier ceiling and hands the result
@@ -528,18 +549,35 @@ public:
             return;
         }
 
-        // Dimension-change logging — helps diagnose future regressions
-        // around resolution shifts. Skip the first valid frame (no
-        // prior to compare against).
+        // Delivered-resolution visibility. INFO, not DEBUG: this used to log
+        // at debug, which OBS drops from the normal log, so in every real
+        // session the one measurement that says whether a feed is genuinely
+        // 1080p was computed and thrown away. The engine's frame scaler
+        // normalises everything to the tier size before OBS sees it, so a
+        // participant delivering 720p is upscaled and looks like 1080p to
+        // every other part of the system — these two lines are the ONLY place
+        // the true delivered size is observable.
+        //
+        // Bounded by construction: one line on the first frame, then one per
+        // actual change. A steady feed logs twice per session (subscribe +
+        // first frame) and never again.
         if (w != m_lastSrcW || h != m_lastSrcH) {
-            if (m_lastSrcW != 0 && m_lastSrcH != 0) {
-                char msg[256];
+            char msg[256];
+            if (m_lastSrcW == 0 && m_lastSrcH == 0) {
+                // First frame: state what arrived against what was asked for,
+                // so one line answers "did we get the resolution we promised".
+                sprintf_s(msg,
+                    "Video: source='%s' first frame %dx%d (requested %dp)%s",
+                    m_sourceUuid.c_str(), w, h, m_requestedHeight,
+                    (h < m_requestedHeight) ? " — BELOW REQUEST" : "");
+            } else {
                 sprintf_s(msg,
                     "Video: frame dimensions changed for source='%s': "
-                    "%dx%d -> %dx%d",
-                    m_sourceUuid.c_str(), m_lastSrcW, m_lastSrcH, w, h);
-                LogToFile(msg);
+                    "%dx%d -> %dx%d (requested %dp)",
+                    m_sourceUuid.c_str(), m_lastSrcW, m_lastSrcH, w, h,
+                    m_requestedHeight);
             }
+            LogInfo(msg);
             m_lastSrcW = w;
             m_lastSrcH = h;
         }
@@ -605,6 +643,12 @@ private:
     int                m_lastSrcW       = 0;  // last frame's width (0 = none yet)
     int                m_lastSrcH       = 0;
     unsigned int       m_loggedFailures = 0;  // bitfield from validation_failures
+
+    // Requested resolution height (720 / 1080), for the delivered-vs-requested
+    // log lines only — nothing reads it to make a decision. Written once in
+    // Start() before any frame can arrive, then read on the SDK callback
+    // thread, so it needs no synchronisation.
+    int                m_requestedHeight = 0;
 
 public:
     // Delivery-established signal for the per-userId sequencing gate: set true
