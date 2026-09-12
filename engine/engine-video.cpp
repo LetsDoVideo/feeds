@@ -58,14 +58,51 @@ static constexpr unsigned int ACTIVE_SPEAKER_SENTINEL = 1;
 // returned a transient not-ready code (SDKERR_VIDEO_NOTREADY 11 / NO_PERMISSION
 // 12) — the raw-data renderer subsystem isn't up yet, so the caller should keep
 // the request queued and retry. Failed is a real, non-retryable failure.
-enum class SubStart { Started, RetryNotReady, Failed };
+// SubscribeFailed means createRenderer worked but subscribe() was REFUSED by the
+// SDK — the resolution-ladder case; the caller steps the source down a rung and
+// requeues rather than keeping a renderer that will never deliver.
+enum class SubStart { Started, RetryNotReady, Failed, SubscribeFailed };
 
-// Map the current tier to the SDK resolution enum. Same values as v1.0.0.
-// Tier 0 (Free) = 720p, everything else = 1080p.
-static ZOOM_SDK_NAMESPACE::ZoomSDKResolution GetResolutionForCurrentTier() {
-    return (GetCurrentTier() >= 1)
-        ? ZOOM_SDK_NAMESPACE::ZoomSDKResolution_1080P
-        : ZOOM_SDK_NAMESPACE::ZoomSDKResolution_720P;
+// ---------------------------------------------------------------------------
+// Resolution fallback ladder
+//
+// Zoom's raw-data subscription budget is a whole-meeting resource, not a
+// per-renderer one: Zoom publishes "at most 1 Full HD video subscription in a
+// meeting", "at most 2" at HD, and "does not support mixing Full HD and HD".
+// Over-request and the SDK does one of two things — refuse subscribe() outright
+// with SDKERR_WRONG_USAGE (2), or accept it and never deliver a frame. Both used
+// to leave the source permanently black with no recovery.
+//
+// So a subscription now carries a RUNG. It starts at its tier's top rung — the
+// same resolution this code has always requested — and steps DOWN only when an
+// attempt provably fails to deliver. It never steps up, and it never steps down
+// because a feed merely arrived smaller than requested: delivering 720p when
+// 1080p was asked for is the SDK working as designed (and is the normal case on
+// an account without the Full HD entitlement), so it is NOT a ladder trigger.
+// See the trigger notes on kLadderFirstFrameMs below.
+//
+// Consequence worth stating plainly, because it is what makes this safe to ship
+// without an Enhanced-Media account to test on: where no Full HD is available,
+// no over-budget failure can occur, so no rung ever changes and every code path
+// below is inert. The first attempt is byte-identical to the previous release.
+enum : int { kLadderRungs = 3 };
+static const ZOOM_SDK_NAMESPACE::ZoomSDKResolution kLadderRes[kLadderRungs] = {
+    ZOOM_SDK_NAMESPACE::ZoomSDKResolution_1080P,
+    ZOOM_SDK_NAMESPACE::ZoomSDKResolution_720P,
+    ZOOM_SDK_NAMESPACE::ZoomSDKResolution_360P,
+};
+static const int kLadderHeight[kLadderRungs] = { 1080, 720, 360 };
+
+static const char* LadderRungName(int rung) {
+    if (rung < 0 || rung >= kLadderRungs) return "?";
+    return (rung == 0) ? "1080p" : (rung == 1) ? "720p" : "360p";
+}
+
+// Top rung for the current tier. Tier 0 (Free) starts at 720p, tiers 1+ at
+// 1080p — exactly what GetResolutionForCurrentTier() returned before the ladder
+// existed, so a first attempt asks for the same thing it always has.
+static int GetTopRungForCurrentTier() {
+    return (GetCurrentTier() >= 1) ? 0 : 1;
 }
 
 // Output dimensions for the engine-side frame scaler. Matches the tier's
@@ -300,10 +337,12 @@ class ParticipantSubscription
 public:
     ParticipantSubscription(const std::string& sourceUuid,
                             unsigned int userId,
-                            bool followActiveSpeaker)
+                            bool followActiveSpeaker,
+                            int rung)
         : m_sourceUuid(sourceUuid),
           m_userId(userId),
-          m_followActiveSpeaker(followActiveSpeaker) {}
+          m_followActiveSpeaker(followActiveSpeaker),
+          m_rung(rung < 0 ? 0 : (rung >= kLadderRungs ? kLadderRungs - 1 : rung)) {}
 
     ~ParticipantSubscription() {
         TearDown();
@@ -342,12 +381,11 @@ public:
             return SubStart::Failed;
         }
 
-        // Set resolution based on the current tier. Tier 0 caps at 720p;
-        // tiers 1+ get 1080p. Multi-participant support (future commit)
-        // will apply the "first feed gets full resolution, extras drop to
-        // 360p" rule — but Andy enabled an override on our account that
-        // allows 1080p for all feeds up to tier max. For now we just use
-        // the tier resolution straight.
+        // Set resolution from this subscription's ladder rung. A brand-new
+        // source is constructed at the tier's top rung, so the first attempt
+        // requests exactly what it always did (720p on Free, 1080p on paid);
+        // a lower rung is only ever reached after a failed attempt stepped it
+        // down and requeued.
         //
         // The return code used to be discarded, which cost us the one signal
         // that separates "the meeting/account cannot carry this resolution"
@@ -355,10 +393,12 @@ public:
         // the request was rejected outright and the SDK will deliver whatever
         // it picked instead, so the delivered size logged on the first frame
         // below is the only thing that tells us what we actually got. Not
-        // fatal either way — we keep the subscription and report honestly.
-        m_requestedHeight = (GetCurrentTier() >= 1) ? 1080 : 720;
+        // fatal either way — we keep the subscription and report honestly, and
+        // it is deliberately NOT a ladder trigger: the ladder steps down on
+        // absence of delivery, never on small delivery.
+        m_requestedHeight = kLadderHeight[m_rung];
         const ZOOM_SDK_NAMESPACE::SDKError resErr =
-            m_renderer->setRawDataResolution(GetResolutionForCurrentTier());
+            m_renderer->setRawDataResolution(kLadderRes[m_rung]);
         {
             char msg[256];
             sprintf_s(msg,
@@ -394,16 +434,33 @@ public:
             err = m_renderer->subscribe(m_userId,
                                          ZOOM_SDK_NAMESPACE::RAW_DATA_TYPE_VIDEO);
             if (err != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
-                char msg[128];
-                sprintf_s(msg, "Video: subscribe(userId=%u) failed: %d",
-                          m_userId, (int)err);
-                LogError(msg);
-                // Continue anyway — renderer exists, shared memory exists,
-                // we'll just never get frames. Not fatal.
+                // MODE 2 — the SDK refused the subscription outright. The
+                // budget case returns SDKERR_WRONG_USAGE (2): this meeting
+                // already holds as much high-resolution video as it can carry.
+                // This used to be logged and ignored, which left a renderer
+                // that could never deliver and a source that stayed black for
+                // the rest of the show. Report it up so the caller can step
+                // this source down a rung and requeue.
+                char msg[192];
+                sprintf_s(msg,
+                    "Video: LADDER source='%s' userId=%u subscribe REFUSED at "
+                    "%s (code=%d%s)",
+                    m_sourceUuid.c_str(), m_userId, LadderRungName(m_rung),
+                    (int)err,
+                    err == ZOOM_SDK_NAMESPACE::SDKERR_WRONG_USAGE
+                        ? " WRONG_USAGE — over the meeting's resolution budget"
+                        : "");
+                LogWarn(msg);
+                return SubStart::SubscribeFailed;
             } else {
-                char msg[128];
-                sprintf_s(msg, "Video: subscribed source='%s' to userId=%u%s",
+                // Start the establishment clock: the ladder's MODE 3 watchdog
+                // measures from here to the first delivered frame.
+                m_subscribeTick = GetTickCount64();
+                char msg[160];
+                sprintf_s(msg,
+                          "Video: subscribed source='%s' to userId=%u at %s%s",
                           m_sourceUuid.c_str(), m_userId,
+                          LadderRungName(m_rung),
                           m_followActiveSpeaker ? " [follow-speaker]" : "");
                 LogInfo(msg);
             }
@@ -430,9 +487,15 @@ public:
 
     // Re-point this subscription at a different user without tearing down
     // the renderer or shared memory. Used when the plugin changes the
-    // dropdown selection.
-    void Resubscribe(unsigned int newUserId) {
-        if (!m_renderer) return;
+    // dropdown selection, and by the active-speaker retarget loop.
+    //
+    // Returns false ONLY when the SDK refused the subscribe — the caller then
+    // steps this source down a rung and requeues, exactly as it would for a
+    // failed initial Start(). Returns true when the subscribe succeeded or was
+    // intentionally skipped (follow-speaker with no speaker yet), neither of
+    // which is a ladder trigger.
+    bool Resubscribe(unsigned int newUserId) {
+        if (!m_renderer) return true;
 
         // Always unsubscribe first — drops any existing subscription so
         // the source goes black while we wait.
@@ -445,27 +508,52 @@ public:
         // rejected with "invalid user" — log noise. We stay unsubscribed
         // until NotifyActiveSpeakerChanged calls us again with a real ID.
         if (m_followActiveSpeaker && m_userId == ACTIVE_SPEAKER_SENTINEL) {
+            // Not subscribed by choice — stop the establishment clock so the
+            // ladder watchdog does not count this as a missing first frame.
+            m_subscribeTick = 0;
             char msg[128];
             sprintf_s(msg,
                 "Video: source='%s' waiting for active speaker",
                 m_sourceUuid.c_str());
             LogToFile(msg);
-            return;
+            return true;
         }
 
         ZOOM_SDK_NAMESPACE::SDKError err =
             m_renderer->subscribe(m_userId,
                                    ZOOM_SDK_NAMESPACE::RAW_DATA_TYPE_VIDEO);
-        char msg[128];
-        if (err == ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
-            sprintf_s(msg, "Video: resubscribed source='%s' to userId=%u%s",
-                      m_sourceUuid.c_str(), m_userId,
-                      m_followActiveSpeaker ? " [follow-speaker]" : "");
-        } else {
-            sprintf_s(msg, "Video: resubscribe(userId=%u) failed: %d",
-                      m_userId, (int)err);
+        if (err != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
+            // A refused re-point used to log at debug — which OBS drops — and
+            // leave the source black with nothing in the normal log to explain
+            // it. Now it is a WARN and a ladder trigger.
+            char msg[192];
+            sprintf_s(msg,
+                "Video: LADDER source='%s' userId=%u re-point REFUSED at %s "
+                "(code=%d%s)",
+                m_sourceUuid.c_str(), m_userId, LadderRungName(m_rung),
+                (int)err,
+                err == ZOOM_SDK_NAMESPACE::SDKERR_WRONG_USAGE
+                    ? " WRONG_USAGE — over the meeting's resolution budget"
+                    : "");
+            LogWarn(msg);
+            m_subscribeTick = 0;   // caller recreates; no watchdog on a dead sub
+            return false;
         }
+
+        // Fresh target, fresh establishment window. m_gotFirstFrame is atomic,
+        // so clearing it here (pump thread) is safe against the SDK callback
+        // thread that sets it. m_lastSrcW/H are deliberately NOT reset — they
+        // are callback-thread-only, and the dimension-change detector spanning
+        // the re-point is what reveals a re-point that cost resolution.
+        m_gotFirstFrame.store(false, std::memory_order_release);
+        m_subscribeTick = GetTickCount64();
+
+        char msg[160];
+        sprintf_s(msg, "Video: resubscribed source='%s' to userId=%u at %s%s",
+                  m_sourceUuid.c_str(), m_userId, LadderRungName(m_rung),
+                  m_followActiveSpeaker ? " [follow-speaker]" : "");
         LogToFile(msg);
+        return true;
     }
 
     void TearDown() {
@@ -627,10 +715,29 @@ public:
         m_writer.WriteBlankSignal();
     }
 
+public:
+    // --- Resolution-ladder accessors (main/pump thread, under g_subsMutex) ---
+    int          Rung() const { return m_rung; }
+
+    // Establishment clock for the ladder's MODE 3 watchdog: GetTickCount64() at
+    // the moment subscribe() succeeded, or 0 when this subscription is not
+    // currently awaiting a first frame (never subscribed, deliberately skipped,
+    // already delivered, or already judged). Written and read only on the
+    // pump thread under g_subsMutex.
+    ULONGLONG    SubscribeTick() const       { return m_subscribeTick; }
+    void         ClearSubscribeTick()        { m_subscribeTick = 0; }
+
 private:
     std::string  m_sourceUuid;
     unsigned int m_userId;
     bool         m_followActiveSpeaker = false;
+
+    // Current ladder rung (index into kLadderRes/kLadderHeight). Set at
+    // construction and never mutated — a step-down builds a NEW subscription at
+    // the next rung through the pending-render gate rather than re-pointing this
+    // one, so the rung is immutable for the life of the object.
+    int          m_rung = 0;
+    ULONGLONG    m_subscribeTick = 0;
     ZOOM_SDK_NAMESPACE::IZoomSDKRenderer* m_renderer = nullptr;
     SharedMemoryWriter m_writer;
 
@@ -713,6 +820,7 @@ struct PendingRender {
     unsigned int userId;               // resolved id (active-speaker pre-resolved)
     bool         followActiveSpeaker;
     ULONGLONG    deadlineTick;          // GetTickCount64() past which we give up
+    int          rung;                  // resolution ladder rung to create at
 };
 
 // Per-userId in-flight establishment tracking for the delivery gate. One entry
@@ -738,6 +846,18 @@ static const ULONGLONG kRenderGiveUpMs        = 15000;
 // abandoned into timeout-paced creation. Distinct from kRenderGiveUpMs (which is
 // the never-created deadline); this is the created-but-not-yet-delivering clock.
 static const ULONGLONG kEstablishTimeoutMs    = 2000;
+
+// Resolution-ladder MODE 3 timeout: how long a SUBSCRIBED, camera-ON source may
+// go without a first frame before the ladder concludes the SDK accepted the
+// subscription and will never deliver it, and steps the source down a rung.
+//
+// Deliberately much longer than kEstablishTimeoutMs, and NOT a reuse of it.
+// That one is a sibling-sequencing convenience where proceeding early is free;
+// this one is destructive — acting on it tears down a renderer — so it needs
+// real margin over a slow-but-healthy first frame (cold camera, congested
+// uplink, a participant still finishing their join). A feed that takes six
+// seconds to appear is not the bug this is hunting.
+static const ULONGLONG kLadderFirstFrameMs    = 7000;
 
 // Camera-on re-establishment debounce (trailing-edge). A participant's Video_ON
 // posts WM_FEEDS_CAMERA_ON; a flickering camera is coalesced by (re)arming this
@@ -801,13 +921,21 @@ void BlankSubscriptionsForUser(unsigned int userId) {
 // g_subsMutex.
 static void EnqueuePendingRenderLocked(const std::string& sourceId,
                                        unsigned int actualUserId,
-                                       bool followActiveSpeaker) {
+                                       bool followActiveSpeaker,
+                                       int rung) {
+    if (rung < 0) rung = 0;
+    if (rung >= kLadderRungs) rung = kLadderRungs - 1;
     bool replaced = false;
     for (auto& p : g_pendingRenders) {
         if (p.sourceId == sourceId) {
             p.userId              = actualUserId;
             p.followActiveSpeaker = followActiveSpeaker;
             p.deadlineTick        = GetTickCount64() + kRenderGiveUpMs;
+            // Keep the LOWER of the two rungs (higher index). A queued
+            // step-down must not be undone by a plain re-request arriving
+            // behind it, or the ladder would oscillate against whatever keeps
+            // re-queuing the source at the top rung.
+            if (rung > p.rung) p.rung = rung;
             replaced = true;
             break;
         }
@@ -815,13 +943,64 @@ static void EnqueuePendingRenderLocked(const std::string& sourceId,
     if (!replaced) {
         g_pendingRenders.push_back(
             {sourceId, actualUserId, followActiveSpeaker,
-             GetTickCount64() + kRenderGiveUpMs});
+             GetTickCount64() + kRenderGiveUpMs, rung});
     }
 
     if (g_anchorWnd)
         PostMessageW(g_anchorWnd, WM_FEEDS_PROCESS_RENDERERS, 0, 0);
     else
         LogError("Video: no anchor window to drive pending renderer creation");
+}
+
+// Step one source DOWN the resolution ladder and requeue it, or retire it at the
+// terminal rung. Caller MUST hold g_subsMutex.
+//
+// The step-down is deliberately a REQUEUE, not an inline destroy/recreate. The
+// pending-render gate already serialises same-userId creates behind a confirmed
+// first frame, which is exactly the race that makes an immediate recreate
+// dangerous: recreating a renderer while the SDK is still asynchronously
+// releasing the previous one for that participant is what returns WRONG_USAGE
+// and can take out every source sharing the participant. Routing through the
+// queue inherits that protection instead of reimplementing it, and it is the
+// same reason HandleParticipantSourceRecreate always queues.
+//
+// `reason` is a short machine-greppable tag; it lands in the INFO line that is
+// the only field evidence available for this path, because the trigger cannot be
+// reproduced on an account without the Full HD entitlement.
+static void LadderStepDownLocked(const std::string& sourceId,
+                                 ParticipantSubscription* sub,
+                                 const char* reason) {
+    if (!sub) return;
+    const int  cur      = sub->Rung();
+    const int  next     = cur + 1;
+    const unsigned int uid = sub->UserId();
+
+    // Stop the watchdog on the current object either way: it has been judged.
+    sub->ClearSubscribeTick();
+
+    if (next >= kLadderRungs) {
+        char msg[256];
+        sprintf_s(msg,
+            "Video: LADDER source='%s' userId=%u EXHAUSTED at %s "
+            "(reason=%s) — no lower rung; notifying plugin",
+            sourceId.c_str(), uid, LadderRungName(cur), reason);
+        LogWarn(msg);
+        // Tell the plugin once so its subscribed-state guard cannot pin the
+        // source black forever; a later grant or a manual reselect can retry.
+        SendToPlugin("{\"type\":\"participant_source_subscribe_failed\","
+                     "\"source_id\":\"" + sourceId + "\"}");
+        return;
+    }
+
+    char msg[256];
+    sprintf_s(msg,
+        "Video: LADDER source='%s' userId=%u stepping down %s -> %s "
+        "(reason=%s, step %d of %d)",
+        sourceId.c_str(), uid, LadderRungName(cur), LadderRungName(next),
+        reason, next, kLadderRungs - 1);
+    LogInfo(msg);
+
+    EnqueuePendingRenderLocked(sourceId, uid, sub->FollowsActiveSpeaker(), next);
 }
 
 // participant_source_subscribe — plugin requests video for a source.
@@ -870,8 +1049,13 @@ void HandleParticipantSourceSubscribe(const std::string& json) {
         // FollowsActiveSpeaker() and skips subs whose flag is stale).
         it->second->SetFollowsActiveSpeaker(followActiveSpeaker);
 
-        // Existing subscription — just switch the user.
-        it->second->Resubscribe(actualUserId);
+        // Existing subscription — just switch the user. A refused re-point is
+        // a ladder trigger: step down and requeue rather than leaving a live
+        // renderer pointed at a user it will never receive frames for.
+        if (!it->second->Resubscribe(actualUserId)) {
+            LadderStepDownLocked(sourceId, it->second.get(), "repoint_refused");
+            return;
+        }
 
         uint32_t pid = GetCurrentProcessId();
         char resp[512];
@@ -890,8 +1074,10 @@ void HandleParticipantSourceSubscribe(const std::string& json) {
 
     // New subscription. Do NOT create the renderer here: it must wait for the
     // raw-data renderer subsystem to be ready, and creation is sequenced. Queue
-    // it for the gate.
-    EnqueuePendingRenderLocked(sourceId, actualUserId, followActiveSpeaker);
+    // it for the gate, at the tier's top rung — a fresh source always asks for
+    // the full resolution first and only ladders down if that provably fails.
+    EnqueuePendingRenderLocked(sourceId, actualUserId, followActiveSpeaker,
+                               GetTopRungForCurrentTier());
 }
 
 // participant_source_recreate — re-establish a source with a FRESH renderer
@@ -917,7 +1103,11 @@ void HandleParticipantSourceRecreate(const std::string& json) {
     unsigned int actualUserId = followActiveSpeaker
         ? (g_currentActiveSpeaker != 0 ? g_currentActiveSpeaker : ACTIVE_SPEAKER_SENTINEL)
         : userId;
-    EnqueuePendingRenderLocked(sourceId, actualUserId, followActiveSpeaker);
+    // Top rung: a recreate is a fresh start (rejoin / grant / auto-rebind), not
+    // a ladder step, so it re-asks for full resolution. If the budget still
+    // cannot carry it the ladder will step it down again from there.
+    EnqueuePendingRenderLocked(sourceId, actualUserId, followActiveSpeaker,
+                               GetTopRungForCurrentTier());
 }
 
 // ---------------------------------------------------------------------------
@@ -941,6 +1131,7 @@ void ProcessPendingRenderers() {
         unsigned int       uid      = g_pendingRenders[i].userId;
         const bool         follow   = g_pendingRenders[i].followActiveSpeaker;
         const ULONGLONG    deadline = g_pendingRenders[i].deadlineTick;
+        const int          rung     = g_pendingRenders[i].rung;
 
         // Re-resolve a follow-active-speaker request that was queued before any
         // speaker was known, in case one became active during the gate wait.
@@ -1014,7 +1205,7 @@ void ProcessPendingRenderers() {
         }
 
         auto sub = std::make_unique<ParticipantSubscription>(
-            sourceId, uid, follow);
+            sourceId, uid, follow, rung);
         SubStart r = sub->Start();
         if (r == SubStart::Started) {
             g_subs[sourceId] = std::move(sub);
@@ -1037,6 +1228,48 @@ void ProcessPendingRenderers() {
         } else if (r == SubStart::RetryNotReady) {
             // Transient — keep queued; a later tick re-attempts.
             ++i;
+        } else if (r == SubStart::SubscribeFailed) {
+            // MODE 2 — the SDK refused this subscription (the budget case is
+            // SDKERR_WRONG_USAGE). `sub` is discarded here, which tears the
+            // half-built renderer down cleanly via its destructor before we
+            // re-attempt, so the retry does not stack renderers.
+            //
+            // Dequeue FIRST, then step down: LadderStepDownLocked re-enqueues
+            // this same sourceId at the next rung, and leaving the old entry in
+            // place would make that a same-source update of an entry we are
+            // about to erase by index.
+            g_pendingRenders.erase(g_pendingRenders.begin() + i);
+            const int next = rung + 1;
+            if (next >= kLadderRungs) {
+                char msg[256];
+                sprintf_s(msg,
+                    "Video: LADDER source='%s' userId=%u EXHAUSTED at %s "
+                    "(reason=subscribe_refused) — no lower rung; notifying plugin",
+                    sourceId.c_str(), uid, LadderRungName(rung));
+                LogWarn(msg);
+                SendToPlugin("{\"type\":\"participant_source_subscribe_failed\","
+                             "\"source_id\":\"" + sourceId + "\"}");
+            } else {
+                char msg[256];
+                sprintf_s(msg,
+                    "Video: LADDER source='%s' userId=%u stepping down %s -> %s "
+                    "(reason=subscribe_refused, step %d of %d)",
+                    sourceId.c_str(), uid, LadderRungName(rung),
+                    LadderRungName(next), next, kLadderRungs - 1);
+                LogInfo(msg);
+                EnqueuePendingRenderLocked(sourceId, uid, follow, next);
+                // Stop scanning this tick. The requeued entry was appended to
+                // the very vector we are walking, so continuing here would
+                // re-create this source immediately — microseconds after its
+                // failed renderer was destroyed at the end of this iteration,
+                // and with no gate entry to space them (a failed Start never
+                // registers one). That back-to-back destroy/create against the
+                // SDK's asynchronous participant release is the race this whole
+                // design routes around. The next 300ms tick picks it up, which
+                // is also the right pace for retrying into a budget that just
+                // told us it was full.
+                break;
+            }
         } else {
             // Non-retryable failure.
             LogError("Video: subscription Start failed (non-retryable) "
@@ -1047,13 +1280,91 @@ void ProcessPendingRenderers() {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // MODE 3 watchdog — subscribed, camera ON, but no first frame ever arrived.
+    //
+    // The SDK can accept a subscription and simply never deliver it; this
+    // engine proved that in-house (see the SEQUENCING note above: "leaving
+    // createRenderer=success with zero frames"), and it is also how an
+    // over-budget subscribe presents on some platforms instead of an error.
+    // There is no callback for it, so the only detectable signal is absence of
+    // a first frame past a generous deadline.
+    //
+    // THE CAMERA GATE IS LOAD-BEARING. A participant with their camera off
+    // legitimately never sends a frame. Without IsVideoOn() this sweep would
+    // fire on every camera-off person in every show, churning renderers and
+    // ratcheting healthy sources down to 360p — on exactly the accounts where
+    // the real trigger can never occur. Camera-off is ALREADY handled, and
+    // handled correctly, by onUserVideoStatusChange -> QueueCameraOnReestablish,
+    // which re-establishes the source when the camera comes back on. So when
+    // the camera is off we stop watching and defer to that path; if the camera
+    // returns, the recreate builds a fresh subscription with a fresh clock.
+    // ONLY a camera-ON source that never delivered is a ladder trigger.
+    // -----------------------------------------------------------------------
+    {
+        ZOOM_SDK_NAMESPACE::IMeetingParticipantsController* pc = nullptr;
+        if (ZOOM_SDK_NAMESPACE::IMeetingService* ms = GetMeetingService())
+            pc = ms->GetMeetingParticipantsController();
+
+        for (auto& kv : g_subs) {
+            ParticipantSubscription* s = kv.second.get();
+            if (!s) continue;
+
+            const ULONGLONG tick = s->SubscribeTick();
+            if (tick == 0) continue;                    // not awaiting a first frame
+            if (s->m_gotFirstFrame.load(std::memory_order_acquire)) {
+                s->ClearSubscribeTick();                // delivered — stop watching
+                continue;
+            }
+            if (now <= tick || now - tick < kLadderFirstFrameMs) continue;
+
+            // Past the deadline. Decide whether this is a real failure.
+            bool videoOn = false;
+            if (pc) {
+                if (auto* ui = pc->GetUserByUserID(s->UserId()))
+                    videoOn = ui->IsVideoOn();
+            }
+
+            if (!videoOn) {
+                // Camera off, or the participant is gone. Not a failure, and
+                // not ours to act on. Debug-level: this is the common case in a
+                // real show and must not flood the normal log.
+                char msg[192];
+                sprintf_s(msg,
+                    "Video: ladder watchdog stood down for source='%s' "
+                    "userId=%u (video off or user gone) — camera-on path owns "
+                    "recovery",
+                    kv.first.c_str(), s->UserId());
+                LogToFile(msg);
+                s->ClearSubscribeTick();
+                continue;
+            }
+
+            // Camera is ON and nothing has arrived. Step down.
+            char reason[64];
+            sprintf_s(reason, "no_first_frame_%llums",
+                      (unsigned long long)kLadderFirstFrameMs);
+            LadderStepDownLocked(kv.first, s, reason);
+        }
+    }
+
     // Timer lifecycle: tick while anything is still queued (readiness-gated,
-    // retrying, or waiting on a same-userId establishment), stop once the queue
-    // drains. The tick is the poll fallback for the delivery gate — it re-checks
-    // whether an in-flight renderer confirmed or timed out. (A confirmed first
-    // frame also posts WM_FEEDS_PROCESS_RENDERERS directly, so the common case
-    // doesn't wait for a tick.) Owned here so it's only touched on the main thread.
-    if (!g_pendingRenders.empty()) {
+    // retrying, or waiting on a same-userId establishment), OR while any live
+    // subscription is still inside its ladder establishment window — the
+    // watchdog above is polled from this same tick, so it must stay armed even
+    // when the create queue is empty. Stops once both are clear. (A confirmed
+    // first frame also posts WM_FEEDS_PROCESS_RENDERERS directly, so the common
+    // case doesn't wait for a tick.) Owned here so it's only touched on the
+    // main thread.
+    bool ladderWatchPending = false;
+    for (const auto& kv : g_subs) {
+        if (kv.second && kv.second->SubscribeTick() != 0) {
+            ladderWatchPending = true;
+            break;
+        }
+    }
+
+    if (!g_pendingRenders.empty() || ladderWatchPending) {
         if (!g_retryTimerActive && g_anchorWnd) {
             SetTimer(g_anchorWnd, kRenderRetryTimerId, kRenderRetryIntervalMs,
                      nullptr);
@@ -1075,8 +1386,16 @@ void ProcessPendingRenderers() {
 static void ReestablishSourcesForUserLocked(unsigned int userId) {
     for (auto& kv : g_subs) {
         if (kv.second && kv.second->UserId() == userId) {
+            // Preserve the source's CURRENT rung rather than resetting to the
+            // tier top. A camera toggle is not new information about the
+            // meeting's resolution budget, so re-asking for a rung that already
+            // failed would just fail again — and on a camera that flickers it
+            // would ladder down, spring back up, and fail once per toggle. A
+            // source only climbs back to full resolution on a deliberate fresh
+            // start (recreate / rejoin / manual reselect).
             EnqueuePendingRenderLocked(kv.first, userId,
-                                       kv.second->FollowsActiveSpeaker());
+                                       kv.second->FollowsActiveSpeaker(),
+                                       kv.second->Rung());
         }
     }
 }
@@ -1171,10 +1490,18 @@ void NotifyActiveSpeakerChanged(unsigned int newSpeakerId) {
     if (g_currentActiveSpeaker == newSpeakerId) return;
     g_currentActiveSpeaker = newSpeakerId;
 
+    // Retarget every follow-speaker source. A refused re-point is a ladder
+    // trigger, and it is handled by REQUEUEING (LadderStepDownLocked touches
+    // g_pendingRenders, never g_subs) — an inline destroy/recreate here would
+    // mutate the very container this loop is walking.
     int retargeted = 0;
     for (auto& kv : g_subs) {
         if (kv.second->FollowsActiveSpeaker()) {
-            kv.second->Resubscribe(newSpeakerId);
+            if (!kv.second->Resubscribe(newSpeakerId)) {
+                LadderStepDownLocked(kv.first, kv.second.get(),
+                                     "repoint_refused");
+                continue;
+            }
             retargeted++;
         }
     }
