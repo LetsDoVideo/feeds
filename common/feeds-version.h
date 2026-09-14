@@ -13,6 +13,6 @@
 
 namespace feeds_shared {
 
-static constexpr const char* VERSION = "1.6.1";
+static constexpr const char* VERSION = "1.7.0";
 
 } // namespace feeds_shared
