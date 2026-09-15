@@ -1,4 +1,4 @@
-# Feeds — Native Zoom → OBS Plugin
+# Feeds: Native Zoom → OBS Plugin
 
 Feeds is a native OBS Studio plugin for Windows that brings Zoom guests directly into OBS as individual native video sources.
 
@@ -146,11 +146,13 @@ On **Basic tier and up**, Feeds can record isolated source recordings, giving yo
 | Tier | Price | Feeds | Resolution | Highlights |
 |------|-------|-------|------------|------------|
 | **Free** | Free | 1 | 720p | Active Speaker feed, full OBS integration, unlimited duration |
-| **Basic** | $9.99/user/mo | 3 | 1080p | Lower thirds, screenshare, ISO recording, Feeds Chat dock, priority email support |
-| **Streamer** | $24.99/user/mo | 5 | 1080p | Chat overlay + message popup, scene collection starter pack |
-| **Broadcaster** | $79.99/user/mo | 8 | 1080p | Dedicated Discord channel, highest-priority SLA, consulting discount |
+| **Basic** | $9.99/user/mo | 3 | up to 1080p | Lower thirds, screenshare, ISO recording, Feeds Chat dock, priority email support |
+| **Streamer** | $24.99/user/mo | 5 | up to 1080p | Chat overlay + message popup, scene collection starter pack |
+| **Broadcaster** | $79.99/user/mo | 8 | up to 1080p | Dedicated Discord channel, highest-priority SLA, consulting discount |
 
 *Save up to 21% with annual billing. Pricing and subscriptions are managed through the Zoom Marketplace.*
+
+*Resolution up to 1080p depends on your Zoom account's entitlements and network conditions. Feeds automatically delivers the best resolution your account and connection support.*
 
 To upgrade, click the upgrade prompt inside Feeds, or visit [letsdovideo.com/feeds-upgrade](https://letsdovideo.com/feeds-upgrade).
 
