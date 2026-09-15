@@ -9847,8 +9847,11 @@ static void RefreshAllLowerThirdContent() {
 
 // Create this participant's nameplate: one source, plus a scene-item in every
 // scene the participant is currently in, each placed over that scene's copy.
-// Created SHOWN — the user clicked "Create Lower Third" because they want to
-// see it. Never auto-created, and never deleted afterwards: creating and
+// Created HIDDEN, so the operator can type the title before anything goes on
+// screen; the dock button then offers "Show", which slides it in with the title
+// already in place (and re-places it over the participant's current video).
+// Creating it shown put a blank-titled bar on air the instant the button was
+// clicked. Never auto-created, and never deleted afterwards: creating and
 // destroying sources mid-stream risks OBS instability, so the source is made
 // once at setup and only shown/hidden from then on.
 static void CreateLowerThirdFor(const std::string& participantUuid) {
@@ -9889,7 +9892,7 @@ static void CreateLowerThirdFor(const std::string& participantUuid) {
 
     obs_data_t* settings = obs_data_create();
     obs_data_set_string(settings, "participant_uuid", participantUuid.c_str());
-    obs_data_set_bool(settings, "shown", true);
+    obs_data_set_bool(settings, "shown", false);   // hidden until Show
     obs_source_t* lt = obs_source_create("feeds_lower_third", name.c_str(),
                                          settings, nullptr);
     obs_data_release(settings);

@@ -100,9 +100,9 @@ Put a nameplate on any participant (their avatar, their name, and a title you ty
 
 Everything happens on the participant's row in the **Feeds Controls** dock:
 
-1. Click **Create Lower Third**. Feeds adds the nameplate over that participant, in every scene they appear in
+1. Click **Create Lower Third**. Feeds adds the nameplate over that participant, in every scene they appear in. It starts hidden, so nothing appears on screen yet
 2. A title box appears on the row: type the title (job title, location, whatever you want under their name) and press Enter
-3. The button becomes **Hide** / **Show** from then on
+3. Click **Show** to bring it on screen. The button toggles **Hide** / **Show** from then on
 
 The nameplate is its own OBS source, deliberately: it sits *above* the participant, so it draws on top of the finished video and is unaffected by filters on the participant source, background removal included. It appears in your source list as **Feeds Lower Third: [name]**, but you never need to touch it there.
 
