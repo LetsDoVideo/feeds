@@ -14,6 +14,7 @@
 
 #include "feeds-version.h"
 #include "engine-shared.h"
+#include "engine-speaker.h"
 
 // Defined here, declared extern in engine-shared.h so engine-meeting.cpp
 // can post WM_FEEDS_SEND_CHAT to it from the pipe thread. Set inside
@@ -485,8 +486,21 @@ static LRESULT CALLBACK EngineWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         feeds_engine::ProcessPendingRenderers();
         return 0;
     }
+    if (msg == WM_FEEDS_SPEAKER_EVAL) {
+        // An active-speaker input changed. Derive the on-screen target here, on
+        // the pump thread, and re-point follow-speaker sources. See
+        // engine-speaker.cpp.
+        feeds_engine::SpeakerEvaluateOnMainThread();
+        return 0;
+    }
     if (msg == WM_TIMER) {
-        // The engine runs two timers (renderer readiness/retry/gate poll and the
+        // The active-speaker tick is routed first: OnEngineTimer treats any id
+        // that isn't the camera-on debounce as a renderer poll.
+        if ((UINT_PTR)wp == kSpeakerTimerId) {
+            feeds_engine::SpeakerOnTimer();
+            return 0;
+        }
+        // The engine's video timers (renderer readiness/retry/gate poll and the
         // camera-on debounce); OnEngineTimer routes by timer id (wp).
         feeds_engine::OnEngineTimer((UINT_PTR)wp);
         return 0;

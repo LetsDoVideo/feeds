@@ -273,9 +273,13 @@ static std::atomic<bool> g_eventsSessionsPending{false};
 static unsigned int       g_activeSharerUserId   = 0;
 static unsigned int       g_cachedMyUserId       = 0;
 // UI-thread-owned: written only in marshalled lambdas (the active_speaker_changed
-// handler and the meeting-end/left resets), read only by the dock on the UI
-// thread. The dock's Active-Speaker row (participant_id sentinel 1) resolves its
-// mute mark through this. 0 = no active speaker yet -> that row shows no mark.
+// handler and the meeting-end/left resets), read on the UI thread. NOT an
+// independent copy of the active speaker: it mirrors the engine's RESOLVED
+// target (engine-speaker.cpp) — the person an [Active Speaker] source is
+// actually showing, after the engine's Feeds-user / camera-off filtering — so
+// the dock's Active-Speaker row (participant_id sentinel 1) and an
+// Active-Speaker lower third always name the face on screen. The engine re-sends
+// it every 5 s, so it cannot stay stale. 0 = no one on screen yet -> no mark.
 static unsigned int       g_activeSpeakerUserId  = 0;
 
 struct CachedParticipant {
@@ -453,8 +457,16 @@ struct ZpSourceData {
     // runtime ID can coincidentally collide with a different person). Only a
     // session-confirmed binding is trusted for rename-refresh; a stale loaded
     // ID is re-bound by remembered name instead. Reset on meeting_left /
-    // logout / session_expired.
+    // logout / session_expired. The [Active Speaker] sentinel (1) counts as a
+    // confirmed binding (to a role) from the moment it is picked or reconciled.
     bool          bound_this_session = false;
+    // Set by an interactive [Active Speaker] pick (RecordParticipantBinding, UI
+    // thread) and consumed by the deferred zp_update (graphics thread), where it
+    // lets a RE-pick of [Active Speaker] on a source already following send the
+    // subscribe that re-resolves it — without it the "selection unchanged"
+    // guard swallows the operator's recovery gesture. Only ever affects a
+    // selected_id of 1; a specific-participant update ignores it.
+    std::atomic<bool> active_speaker_reselect{false};
     // Runtime-only (never persisted): the participant id we currently have an
     // active engine subscription for (0 = not subscribed). The single guard
     // against double-subscribing the same source/id when more than one of the
@@ -866,7 +878,7 @@ static void ReconcileRememberedParticipants(
         // participant_source_recreate with participant_id 1, and its
         // subscribed_user_id guard makes repeat reconcile passes idempotent (no
         // re-fire, so the follow doesn't churn). Everything downstream — the
-        // engine's recreate -> gate -> Start-in-waiting -> NotifyActiveSpeakerChanged
+        // engine's recreate -> gate -> Start-in-waiting -> RetargetFollowSources
         // -> Resubscribe follow path — already exists; fresh start just never
         // reached it because the source was never marked bound. bound_this_session
         // is harmless for a sentinel (Case A needs current_user_id > 1, and nothing
@@ -6976,12 +6988,25 @@ static void zp_update(void* vdata, obs_data_t* settings) {
         // reach here. Guards against unexpected paths (scripted update,
         // scene-collection import) that would otherwise let a disabled
         // source send subscribe IPC.
+        //
+        // Consume the [Active Speaker] reselect request on every update, even
+        // one that returns early, so a stale request can't outlive this pass.
+        const bool activeSpeakerReselect =
+            data->active_speaker_reselect.exchange(false);
         if (data->tier_disabled) return;
 
         unsigned int selected_id =
             (unsigned int)obs_data_get_int(settings, "participant_id");
 
-        if (selected_id == data->current_user_id) return;
+        // Selection unchanged -> nothing to send. The one exception is an
+        // interactive re-pick of [Active Speaker] on a source already
+        // following: that is the operator asking for a re-resolve, so it falls
+        // through and re-sends the sentinel subscribe, which makes the engine
+        // re-derive the speaker and re-point this source. A specific
+        // participant (selected_id > 1) is never affected by this exception.
+        if (selected_id == data->current_user_id &&
+            !(selected_id == 1 && activeSpeakerReselect))
+            return;
 
         // 0 is "--- Select Participant ---" — no subscription.
         if (selected_id == 0) {
@@ -7001,12 +7026,23 @@ static void zp_update(void* vdata, obs_data_t* settings) {
         // login). A tier-disabled source already returned above, so reaching
         // here means this source is within the tier's active limit and may
         // bind a feed — only up to GetMaxFeedsForTier() sources can.
+        //
+        // Past the guard above, an unchanged selection can only be the
+        // [Active Speaker] re-pick.
+        const bool activeSpeakerRepick = (selected_id == data->current_user_id);
         data->current_user_id = selected_id;
 
         // selected_id == 1 is [Active Speaker] sentinel. Engine handles the
         // follow-speaker routing — we just pass the sentinel through.
         // selected_id > 1 is a real Zoom SDK user ID.
         if (!data->uuid.empty() && g_isInMeeting && g_rawLiveStreamGranted) {
+            if (activeSpeakerRepick) {
+                blog(LOG_INFO, "[feeds] bind-decision: rule=active-speaker-reselect "
+                     "source='%s' uuid=%s — re-sending subscribe so the engine "
+                     "re-resolves the speaker",
+                     data->source ? obs_source_get_name(data->source) : "",
+                     data->uuid.c_str());
+            }
             std::string msg = "{\"type\":\"participant_source_subscribe\","
                               "\"source_id\":\"" + data->uuid + "\","
                               "\"participant_id\":" + std::to_string(selected_id) + "}";
@@ -7136,6 +7172,23 @@ static void RecordParticipantBinding(ZpSourceData* data, obs_data_t* settings) {
              "key='%s' userId=%lld bound_this_session=1",
              (data && data->source) ? obs_source_get_name(data->source) : "",
              name.c_str(), sel);
+    } else if (sel == 1) {
+        // [Active Speaker] binds to a ROLE, so there is no name to remember —
+        // but it IS a confirmed binding, exactly as ReconcileRememberedParticipants'
+        // sentinel branch already treats it. Marking it unbound here (as this
+        // branch used to) left the source refused by SubscribeBoundSourceLocked
+        // and its lower third down until the next roster change happened to
+        // re-mark it.
+        obs_data_set_string(settings, kParticipantNameKey, "");
+        if (data) {
+            data->bound_this_session = true;
+            // Let the deferred zp_update re-send the subscribe even if this
+            // source was already on [Active Speaker] (a reselect).
+            data->active_speaker_reselect.store(true);
+        }
+        blog(LOG_INFO, "[feeds] bind-decision: rule=manual-assign-active-speaker "
+             "source='%s' userId=1 bound_this_session=1",
+             (data && data->source) ? obs_source_get_name(data->source) : "");
     } else {
         obs_data_set_string(settings, kParticipantNameKey, "");
         if (data) data->bound_this_session = false;
@@ -8830,6 +8883,13 @@ static void RegisterEngineHandlers() {
         unsigned int userId = (unsigned int)ExtractJsonNumber(json, "participant_id");
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
             [userId]() {
+                // userId is the engine's RESOLVED target, not the raw SDK
+                // speaker. The engine also re-sends it on its 5 s heartbeat, so
+                // log only an actual change.
+                if (userId != g_activeSpeakerUserId) {
+                    blog(LOG_INFO, "[feeds] active speaker (resolved, on screen): "
+                         "%u -> %u", g_activeSpeakerUserId, userId);
+                }
                 g_activeSpeakerUserId = userId;
                 if (g_participantDock) g_participantDock->RecomputeMuteMarks();
                 // Re-push nameplate content: this is the ONLY signal that moves

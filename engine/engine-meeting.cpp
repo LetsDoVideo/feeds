@@ -3,9 +3,10 @@
 //
 // Ported behavior from plugin-main.cpp v1.0.0. All SDK listeners are stateless
 // callback bridges that forward SDK events to the plugin as IPC messages.
-// State (meeting status, active speaker, active sharer, raw-livestream grant)
-// lives in engine-side globals here; the plugin receives snapshots via
-// messages and keeps its own cache for UI purposes.
+// State (meeting status, active sharer, raw-livestream grant) lives in
+// engine-side globals here; the plugin receives snapshots via messages and
+// keeps its own cache for UI purposes. The active speaker is the exception: it
+// lives in engine-speaker.cpp, which this file only feeds.
 
 #include <windows.h>
 #include <wincred.h>
@@ -28,6 +29,7 @@
 #include "setting_service_interface.h"
 
 #include "engine-shared.h"
+#include "engine-speaker.h"
 
 // Defined elsewhere in the engine
 extern void LogToFile(const char* msg);  // forwards at DEBUG
@@ -58,7 +60,6 @@ bool              FetchEventJoinToken(const std::string& eventId,
 
 // From engine-video.cpp
 void TearDownAllVideoSubscriptions();
-void NotifyActiveSpeakerChanged(unsigned int newSpeakerId);
 void BlankSubscriptionsForUser(unsigned int userId);
 
 // From engine-screenshare.cpp
@@ -79,7 +80,6 @@ void ResetSdkBringupState();
 static ZOOM_SDK_NAMESPACE::IMeetingService* g_meetingService = nullptr;
 
 static bool         g_rawLiveStreamGranted = false;
-static unsigned int g_activeSpeakerUserId  = 0;
 static unsigned int g_activeSharerUserId   = 0;
 static unsigned int g_activeShareSourceId  = 0;
 
@@ -93,9 +93,10 @@ static std::string  g_pendingInstantJoinUrl;
 static std::string  g_pendingInstantPassword;
 
 // ---------------------------------------------------------------------------
-// Accessors exposed to other engine translation units (engine-video.cpp
+// Accessors exposed to other engine translation units (engine-speaker.cpp
 // needs the meeting service to check IsVideoOn() on a prospective active
-// speaker, and needs the Feeds user's own ID to filter them out).
+// speaker, and needs the Feeds user's own ID to filter them out;
+// engine-video.cpp's ladder watchdog uses the meeting service too).
 // ---------------------------------------------------------------------------
 ZOOM_SDK_NAMESPACE::IMeetingService* GetMeetingService() {
     return g_meetingService;
@@ -284,27 +285,19 @@ static void SendParticipantList() {
 }
 
 // ---------------------------------------------------------------------------
-// Audio listener — tracks active speaker so the plugin can use it for the
-// [Active Speaker] participant option.
+// Audio listener — feeds the raw active speaker to engine-speaker.cpp, which
+// decides what the [Active Speaker] participant option shows.
 // ---------------------------------------------------------------------------
 class ZoomAudioListener : public ZOOM_SDK_NAMESPACE::IMeetingAudioCtrlEvent {
 public:
     virtual void onUserActiveAudioChange(
         ZOOM_SDK_NAMESPACE::IList<unsigned int>* plstActiveAudio) override {
         if (!plstActiveAudio || plstActiveAudio->GetCount() == 0) return;
-        unsigned int newSpeaker = plstActiveAudio->GetItem(0);
-        if (newSpeaker == g_activeSpeakerUserId) return;
-        g_activeSpeakerUserId = newSpeaker;
-
-        char buf[128];
-        sprintf_s(buf, "{\"type\":\"active_speaker_changed\",\"participant_id\":%u}",
-                  newSpeaker);
-        SendToPlugin(buf);
-
-        // Let engine-video.cpp retarget any follow-active-speaker
-        // subscriptions. The function filters out the Feeds user and
-        // speakers with video off, so we just pass the raw ID.
-        NotifyActiveSpeakerChanged(newSpeaker);
+        // Record the raw input and nothing else: every event, no dedup, no
+        // filtering. Deciding who goes on screen, and telling the plugin (with
+        // the RESOLVED id), happens on the pump thread in engine-speaker.cpp.
+        // This SDK thread takes no g_subsMutex and calls no SDK getters.
+        SpeakerOnActiveAudio(plstActiveAudio->GetItem(0));
     }
     virtual void onUserAudioStatusChange(
         ZOOM_SDK_NAMESPACE::IList<ZOOM_SDK_NAMESPACE::IUserAudioStatus*>* lst,
@@ -313,8 +306,7 @@ public:
         // updates live. Muted = Audio_Muted/Muted_ByHost/MutedAll_ByHost (1/3/5);
         // unmuted = the UnMuted family (2/4/6). Audio_None (0) is "no audio
         // connected yet / unknown" — skip it so it can't seed a false state.
-        // On the SDK audio thread: no lock, no g_subs work — just the pipe write,
-        // exactly like onUserActiveAudioChange's active_speaker_changed send.
+        // On the SDK audio thread: no lock, no g_subs work — just the pipe write.
         if (!lst) return;
         for (int i = 0; i < lst->GetCount(); ++i) {
             ZOOM_SDK_NAMESPACE::IUserAudioStatus* s = lst->GetItem(i);
@@ -923,6 +915,9 @@ public:
         LogToFile(msg);
 
         if (status == ZOOM_SDK_NAMESPACE::MEETING_STATUS_INMEETING) {
+            // Arm active-speaker evaluation and its heartbeat first, before
+            // anything below can return early.
+            SpeakerMeetingStarted();
             if (!g_meetingService) return;
 
             // Tell the plugin we're in. Meeting number is available from
@@ -1052,7 +1047,7 @@ public:
             g_rawLiveStreamGranted = false;
             g_activeSharerUserId   = 0;
             g_activeShareSourceId  = 0;
-            g_activeSpeakerUserId  = 0;
+            SpeakerMeetingEnded();
             TearDownAllVideoSubscriptions();
             TearDownScreenShare();
             SendToPlugin("{\"type\":\"meeting_left\"}");

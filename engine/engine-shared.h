@@ -44,6 +44,19 @@
 // SDK thread when a participant's camera turns on; WPARAM carries the userId.
 // EngineWndProc hands it to QueueCameraOnReestablish on the main thread.
 #define WM_FEEDS_CAMERA_ON         (WM_APP + 4)
+// WM_FEEDS_SPEAKER_EVAL — posted (no params) whenever an active-speaker input
+// changes: the raw SDK speaker (from the audio listener's SDK thread), meeting
+// start/end, or a follow-speaker subscribe. EngineWndProc calls
+// feeds_engine::SpeakerEvaluateOnMainThread, so the on-screen target is derived
+// on the pump thread, never on the SDK thread that reported it. Coalesced by
+// the poster. See engine-speaker.cpp.
+#define WM_FEEDS_SPEAKER_EVAL      (WM_APP + 5)
+
+// Anchor-window WM_TIMER id for the active-speaker re-evaluation tick and
+// heartbeat (engine-speaker.cpp). engine-video.cpp owns ids 1 (renderer gate
+// poll) and 2 (camera-on debounce). EngineWndProc must route this id BEFORE
+// OnEngineTimer, whose fallthrough branch treats any other id as a renderer poll.
+static constexpr UINT_PTR kSpeakerTimerId = 3;
 
 // Defined in engine-main.cpp. Set right after the anchor window is
 // created in WinMain. NULL before that (which the pipe handler

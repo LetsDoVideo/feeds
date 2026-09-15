@@ -136,6 +136,7 @@ add_executable(FeedsEngine WIN32
     engine/engine-api.cpp
     engine/engine-meeting.cpp
     engine/engine-video.cpp
+    engine/engine-speaker.cpp
     engine/engine-screenshare.cpp
     engine/engine-frame-scaler.cpp
 )

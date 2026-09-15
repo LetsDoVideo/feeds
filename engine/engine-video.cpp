@@ -33,6 +33,7 @@
 
 #include "shared-frame.h"
 #include "engine-frame-scaler.h"
+#include "engine-speaker.h"
 
 // Defined in engine-main.cpp
 extern void LogToFile(const char* msg);  // forwards at DEBUG
@@ -46,9 +47,9 @@ namespace feeds_engine {
 // From engine-api.cpp
 int GetCurrentTier();
 
-// From engine-meeting.cpp — needed for active-speaker filtering.
+// From engine-meeting.cpp — the ladder watchdog's camera check. (Active-speaker
+// filtering lives in engine-speaker.cpp.)
 ZOOM_SDK_NAMESPACE::IMeetingService* GetMeetingService();
-unsigned int GetMySelfUserId();
 
 // The sentinel user ID the plugin sends when a source is set to
 // "[Active Speaker]". Matches the sentinel in plugin-main.cpp.
@@ -480,7 +481,7 @@ public:
     // HandleParticipantSourceSubscribe when the plugin switches an existing
     // source's dropdown into or out of [Active Speaker]. Resubscribe()
     // deliberately leaves the flag alone — it's also called from the
-    // NotifyActiveSpeakerChanged retarget loop, where the flag must not
+    // RetargetFollowSources loop, where the flag must not
     // change (the source is staying in follow mode, we're just pointing
     // it at a new user). So the handler, not Resubscribe, owns mode flips.
     void SetFollowsActiveSpeaker(bool v) { m_followActiveSpeaker = v; }
@@ -506,7 +507,7 @@ public:
         // speaking (newUserId == ACTIVE_SPEAKER_SENTINEL), skip the SDK
         // subscribe call entirely. Passing the sentinel would just get
         // rejected with "invalid user" — log noise. We stay unsubscribed
-        // until NotifyActiveSpeakerChanged calls us again with a real ID.
+        // until RetargetFollowSources calls us again with a real ID.
         if (m_followActiveSpeaker && m_userId == ACTIVE_SPEAKER_SENTINEL) {
             // Not subscribed by choice — stop the establishment clock so the
             // ladder watchdog does not count this as a missing first frame.
@@ -777,10 +778,10 @@ static std::mutex g_subsMutex;
 // Public entry points: teardown hook for meeting end / logout
 // ---------------------------------------------------------------------------
 
-// Current active speaker ID, updated by NotifyActiveSpeakerChanged. 0 if
-// no active speaker is known yet. Guarded by g_subsMutex for consistency
-// with the subscription map.
-static unsigned int g_currentActiveSpeaker = 0;
+// There is deliberately no active-speaker state in this file. The on-screen
+// target for a follow-active-speaker source is read from engine-speaker.cpp
+// (GetResolvedActiveSpeakerTarget) every time it is needed. Lock order:
+// g_subsMutex -> g_speakerMutex, never the reverse.
 
 // ---------------------------------------------------------------------------
 // Raw-render readiness gate + retry backstop (createRenderer-at-grant fix).
@@ -817,7 +818,7 @@ static unsigned int g_currentActiveSpeaker = 0;
 // ---------------------------------------------------------------------------
 struct PendingRender {
     std::string  sourceId;
-    unsigned int userId;               // resolved id (active-speaker pre-resolved)
+    unsigned int userId;               // resolved id (follow entries re-resolved at drain)
     bool         followActiveSpeaker;
     ULONGLONG    deadlineTick;          // GetTickCount64() past which we give up
     int          rung;                  // resolution ladder rung to create at
@@ -875,7 +876,6 @@ void TearDownAllVideoSubscriptions() {
         LogToFile(msg);
     }
     g_subs.clear();
-    g_currentActiveSpeaker = 0;
     // The raw-data subsystem is gone until the next grant re-readies it: reset
     // the gate and drop any queued/retrying requests. The retry WM_TIMER, if
     // running, stops itself on its next tick when it finds the queue empty
@@ -1026,21 +1026,29 @@ void HandleParticipantSourceSubscribe(const std::string& json) {
 
     bool followActiveSpeaker = (userId == ACTIVE_SPEAKER_SENTINEL);
 
+    // A follow-speaker subscribe — including a reselect of [Active Speaker] on a
+    // source that already follows — asks the pump thread for a fresh derivation.
+    // Posted before the lock, so it is dispatched ahead of any renderer drain
+    // this request queues; RetargetFollowSources then corrects this source if
+    // the target read below was out of date.
+    if (followActiveSpeaker) RequestSpeakerEvaluation();
+
     std::lock_guard<std::mutex> lock(g_subsMutex);
 
-    // For follow-active-speaker subscriptions, resolve the actual user ID
-    // we should subscribe to right now. If no speaker is known yet, we
-    // pass the sentinel through and Start()/Resubscribe() will skip the
-    // SDK subscribe call until NotifyActiveSpeakerChanged re-points us.
+    // For follow-active-speaker subscriptions, subscribe to the target
+    // engine-speaker.cpp resolved. It is the sentinel when no one is
+    // displayable yet, and Start()/Resubscribe() then skip the SDK subscribe
+    // until RetargetFollowSources re-points us. A specific-participant
+    // subscription uses its own userId and never reads active-speaker state.
     unsigned int actualUserId = followActiveSpeaker
-        ? (g_currentActiveSpeaker != 0 ? g_currentActiveSpeaker : ACTIVE_SPEAKER_SENTINEL)
+        ? GetResolvedActiveSpeakerTarget()
         : userId;
 
     auto it = g_subs.find(sourceId);
     if (it != g_subs.end()) {
         // Carry the follow-mode flag through. Resubscribe() re-points the
         // user but deliberately leaves m_followActiveSpeaker alone (it's
-        // also called from NotifyActiveSpeakerChanged's retarget loop,
+        // also called from RetargetFollowSources' loop,
         // where the flag must not change). So if the plugin's dropdown
         // was switched into [Active Speaker] on an existing subscription,
         // this is where the follow flag flips on; switching to a specific
@@ -1098,10 +1106,13 @@ void HandleParticipantSourceRecreate(const std::string& json) {
         return;
     }
     bool followActiveSpeaker = (userId == ACTIVE_SPEAKER_SENTINEL);
+    if (followActiveSpeaker) RequestSpeakerEvaluation();   // as in subscribe
 
     std::lock_guard<std::mutex> lock(g_subsMutex);
+    // Follow-speaker: provisional target only — ProcessPendingRenderers
+    // re-resolves it at drain time. Specific participant: userId unchanged.
     unsigned int actualUserId = followActiveSpeaker
-        ? (g_currentActiveSpeaker != 0 ? g_currentActiveSpeaker : ACTIVE_SPEAKER_SENTINEL)
+        ? GetResolvedActiveSpeakerTarget()
         : userId;
     // Top rung: a recreate is a fresh start (rejoin / grant / auto-rebind), not
     // a ladder step, so it re-asks for full resolution. If the budget still
@@ -1133,10 +1144,14 @@ void ProcessPendingRenderers() {
         const ULONGLONG    deadline = g_pendingRenders[i].deadlineTick;
         const int          rung     = g_pendingRenders[i].rung;
 
-        // Re-resolve a follow-active-speaker request that was queued before any
-        // speaker was known, in case one became active during the gate wait.
-        if (follow && uid == ACTIVE_SPEAKER_SENTINEL && g_currentActiveSpeaker != 0)
-            uid = g_currentActiveSpeaker;
+        // A follow-active-speaker request is ALWAYS re-resolved here, not only
+        // when it was queued as the sentinel: the id captured at enqueue time
+        // (by a recreate, a ladder step-down, or a camera-on re-establish) can
+        // be several speakers old after the gate wait, and building the fresh
+        // renderer on it would undo a newer retarget. Specific-participant
+        // entries (follow == false) keep their queued userId untouched.
+        if (follow)
+            uid = GetResolvedActiveSpeakerTarget();
 
         // Past the deadline — give up and tell the plugin so its
         // subscribed_user_id guard can't pin the source black forever.
@@ -1448,70 +1463,55 @@ void NotifyRawRenderReady() {
         PostMessageW(g_anchorWnd, WM_FEEDS_PROCESS_RENDERERS, 0, 0);
 }
 
-// Called from engine-meeting.cpp when the SDK reports an active speaker
-// change. Filters out the Feeds user (virtual-camera loop risk) and
-// speakers with video off (would show black frames — better to keep the
-// last valid speaker on screen). If the new speaker passes filters,
-// re-points all follow-speaker subscriptions to them.
-void NotifyActiveSpeakerChanged(unsigned int newSpeakerId) {
+// Called on the pump thread by engine-speaker.cpp after every active-speaker
+// evaluation (see engine-speaker.h). Deciding WHO to show — the Feeds-user and
+// camera-off filters — happens there; this only applies the result.
+//
+// Level-triggered: re-points every follow-speaker source whose current user
+// differs from the resolved target, rather than acting only when the target
+// changes, so a follow source left on a stale user by any path converges on
+// the next evaluation. A source already on the target is not touched, so a
+// steady state issues no SDK calls. Specific-participant subscriptions are
+// skipped by the FollowsActiveSpeaker() check and never touched.
+//
+// Must be called with g_speakerMutex NOT held (lock order).
+FollowRetargetResult RetargetFollowSources() {
+    FollowRetargetResult result;
     std::lock_guard<std::mutex> lock(g_subsMutex);
 
-    if (newSpeakerId == 0) return;
+    // Read the target UNDER g_subsMutex (g_subsMutex -> g_speakerMutex is the
+    // permitted order), so this always applies the newest committed
+    // resolution, never a value captured before the lock was acquired.
+    const unsigned int target = GetResolvedActiveSpeakerTarget();
+    result.target = target;
 
-    // Filter 1: Never subscribe to the Feeds user themselves. They're
-    // running OBS and likely using virtual camera back to Zoom —
-    // subscribing would create a recursive loop.
-    unsigned int myUserId = GetMySelfUserId();
-    if (myUserId != 0 && newSpeakerId == myUserId) {
-        LogToFile("Video: active speaker is Feeds user, ignoring");
-        return;
-    }
-
-    // Filter 2: Skip speakers with video off. Keeps the last valid
-    // speaker on screen rather than showing a black frame for someone
-    // who can't be displayed anyway.
-    ZOOM_SDK_NAMESPACE::IMeetingService* ms = GetMeetingService();
-    if (ms) {
-        auto* participantCtrl = ms->GetMeetingParticipantsController();
-        if (participantCtrl) {
-            auto* userInfo = participantCtrl->GetUserByUserID(newSpeakerId);
-            if (userInfo && !userInfo->IsVideoOn()) {
-                char msg[128];
-                sprintf_s(msg,
-                    "Video: active speaker userId=%u has video off, keeping previous",
-                    newSpeakerId);
-                LogToFile(msg);
-                return;
-            }
-        }
-    }
-
-    // Speaker passes both filters. Update state and retarget.
-    if (g_currentActiveSpeaker == newSpeakerId) return;
-    g_currentActiveSpeaker = newSpeakerId;
-
-    // Retarget every follow-speaker source. A refused re-point is a ladder
-    // trigger, and it is handled by REQUEUEING (LadderStepDownLocked touches
-    // g_pendingRenders, never g_subs) — an inline destroy/recreate here would
-    // mutate the very container this loop is walking.
-    int retargeted = 0;
+    // A refused re-point is a ladder trigger, and it is handled by REQUEUEING
+    // (LadderStepDownLocked touches g_pendingRenders, never g_subs) — an inline
+    // destroy/recreate here would mutate the very container this loop is walking.
     for (auto& kv : g_subs) {
-        if (kv.second->FollowsActiveSpeaker()) {
-            if (!kv.second->Resubscribe(newSpeakerId)) {
-                LadderStepDownLocked(kv.first, kv.second.get(),
-                                     "repoint_refused");
-                continue;
-            }
-            retargeted++;
+        ParticipantSubscription* s = kv.second.get();
+        if (!s || !s->FollowsActiveSpeaker()) continue;
+        ++result.follow;
+
+        if (s->UserId() != target) {
+            ++result.repointed;
+            if (!s->Resubscribe(target))
+                LadderStepDownLocked(kv.first, s, "repoint_refused");
         }
+
+        if (!result.bound.empty()) result.bound += ",";
+        result.bound += kv.first + "=" + std::to_string(s->UserId());
     }
-    if (retargeted > 0) {
-        char msg[128];
+
+    if (result.repointed > 0) {
+        char msg[160];
         sprintf_s(msg,
-            "Video: active speaker changed to userId=%u, retargeted %d source(s)",
-            newSpeakerId, retargeted);
-        LogToFile(msg);
+            "Video: active speaker target userId=%u — re-pointed %d of %d "
+            "follow source(s)",
+            target, result.repointed, result.follow);
+        LogInfo(msg);
     }
+    return result;
 }
 
 // participant_source_unsubscribe — plugin no longer needs frames for this

@@ -263,7 +263,7 @@ Sent as a response to `get_participants`, and also unsolicited after `raw_livest
 ```
 
 #### `active_speaker_changed` (E→P)
-Active speaker changed in the meeting. Plugin caches this for use with the [Active Speaker] dropdown option.
+The on-screen target for [Active Speaker] sources. `participant_id` is the engine's RESOLVED target, not the raw SDK speaker: the person follow-speaker sources are actually showing after the engine skips the Feeds user and camera-off speakers (it keeps the current target until the raw speaker is displayable). `0` means no one is on screen yet. Sent when the resolved target changes and re-sent every 5 seconds while in a meeting, so the plugin's mirror (dock Active-Speaker row, Active-Speaker lower third) cannot stay stale.
 
 ```json
 {"type": "active_speaker_changed", "participant_id": 12345679}
