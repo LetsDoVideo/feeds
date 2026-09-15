@@ -328,6 +328,14 @@ static constexpr int kMaxParticipantSourcesEver = 8;
 // FINISHED_LOADING / SCENE_COLLECTION_CHANGED.
 static std::atomic<bool> g_sceneCollectionLoading{true};
 
+// True from SCENE_COLLECTION_CLEANUP (fired inside EVERY collection clear:
+// switch, rename, new, remove) until SCENE_COLLECTION_CHANGED /
+// FINISHED_LOADING. Used ONLY to skip the initial-placement poll for sources a
+// load is restoring (see OnSourceCreated). Deliberately separate from
+// g_sceneCollectionLoading: a rename fires no CHANGING, so that flag misses
+// rename reloads, and widening it would also change the 9th-source block.
+static std::atomic<bool> g_sceneCollectionReloading{false};
+
 void OnLoginClick();
 void OnLogoutClick();
 void OnConnectClick();
@@ -987,6 +995,41 @@ static void ReconcileRememberedParticipants(
         SubscribeBoundSourceLocked(s);
         obs_data_release(settings);
     }
+}
+
+// The binding sweep: re-derive every participant source's binding from the live
+// roster, then (re)subscribe every bound source through the engine's paced
+// recreate path. UI thread only. This is the raw_livestream_granted sequence
+// (see that handler for why each step is there), moved here verbatim so a
+// second caller runs exactly the same proven path:
+//   - raw_livestream_granted: the engine holds no subscriptions on (re)entry.
+//   - SCENE_COLLECTION_CHANGED while in a meeting with privilege: a collection
+//     switch or rename destroyed every Feeds source (each one unsubscribed as it
+//     went) and re-created them UNBOUND. libobs does not replay settings
+//     through zp_update at creation, and neither a roster change nor a grant
+//     fires mid-meeting, so without this sweep they stay blank until someone
+//     re-picks a participant. Reconcile re-binds by remembered display name
+//     (exactly one match only — an ambiguous name stays unbound, by design) and
+//     re-binds [Active Speaker] sources by role.
+static void RebindAllBoundSources(const char* reason) {
+    {
+        std::lock_guard<std::mutex> lock(g_sourcesMutex);
+        for (ZpSourceData* s : g_allParticipantSources)
+            if (s) s->subscribed_user_id = 0;
+    }
+    // No join delta here (the sweep below subscribes everything); pass an empty
+    // joinedIds so reconcile's Case A doesn't force-recreate. The sweep's
+    // SubscribeBoundSourceLocked then sends recreate for every bound source,
+    // sequenced by the engine gate.
+    ReconcileRememberedParticipants({});
+    {
+        std::lock_guard<std::mutex> lock(g_sourcesMutex);
+        blog(LOG_INFO, "[feeds] bind-decision: grant sweep — "
+             "(re)subscribing all bound sources after %s", reason);
+        for (ZpSourceData* s : g_allParticipantSources)
+            SubscribeBoundSourceLocked(s);
+    }
+    RefreshAllSourceProperties();
 }
 
 // ---------------------------------------------------------------------------
@@ -8631,25 +8674,10 @@ static void RegisterEngineHandlers() {
         // sweep every source through SubscribeBoundSourceLocked to catch those
         // bound before the grant. The guard now only prevents double-subscribing
         // within this single grant cycle (reconcile subscribes, the sweep skips).
+        // The sequence lives in RebindAllBoundSources, shared with the
+        // scene-collection reload.
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
-            {
-                std::lock_guard<std::mutex> lock(g_sourcesMutex);
-                for (ZpSourceData* s : g_allParticipantSources)
-                    if (s) s->subscribed_user_id = 0;
-            }
-            // No join delta at grant (the sweep below subscribes everything);
-            // pass an empty joinedIds so reconcile's Case A doesn't force-
-            // recreate. The sweep's SubscribeBoundSourceLocked then sends
-            // recreate for every bound source, sequenced by the engine gate.
-            ReconcileRememberedParticipants({});
-            {
-                std::lock_guard<std::mutex> lock(g_sourcesMutex);
-                blog(LOG_INFO, "[feeds] bind-decision: grant sweep — "
-                     "(re)subscribing all bound sources after raw_livestream_granted");
-                for (ZpSourceData* s : g_allParticipantSources)
-                    SubscribeBoundSourceLocked(s);
-            }
-            RefreshAllSourceProperties();
+            RebindAllBoundSources("raw_livestream_granted");
         });
     });
 
@@ -9069,16 +9097,41 @@ static void ApplyFitCenterGeometry(obs_sceneitem_t* item, obs_source_t* source) 
 // set earlier. obs_data_has_user_value is false on fresh creation and true
 // for a source restored from a saved scene collection (the sentinel is
 // serialized with it), same trick ApplyChatOverlayDefaults uses for width.
-static void ApplyParticipantPlacement(obs_source_t* source) {
-    if (!source) return;
+//
+// REFERENCE DISCIPLINE (the "Source Cleanup Error" fix). This runs on a
+// detached thread for up to ~10 s, and it must never keep the source alive for
+// that long. It used to hold a STRONG reference across the whole poll; a
+// scene-collection switch or rename in that window could not destroy the
+// source, OBS listed it as a leftover, and OBS showed "Source Cleanup Error"
+// and exited. So it takes only the WEAK reference, promotes it for one short
+// step at a time (never across a sleep), and stops as soon as the source is
+// removed or gone. The source stays destroyable at every moment.
+
+// Promote the weak reference for one short step. Null when the source has been
+// destroyed OR merely removed (a collection clear removes first, destroys once
+// the last reference drops) — either way this poll must stop touching it.
+static obs_source_t* PromoteLiveSource(obs_weak_source_t* weak) {
+    obs_source_t* s = obs_weak_source_get_source(weak);
+    if (s && obs_source_removed(s)) {
+        obs_source_release(s);
+        return nullptr;
+    }
+    return s;
+}
+
+static void ApplyParticipantPlacement(obs_weak_source_t* weak) {
+    if (!weak) return;
 
     // Skip if we've already placed this source in a previous session — the
     // user's saved scene-item geometry (including any crop) wins on reload.
     {
+        obs_source_t* source = PromoteLiveSource(weak);
+        if (!source) return;
         obs_data_t* settings = obs_source_get_settings(source);
         bool alreadyPlaced = settings &&
             obs_data_has_user_value(settings, "feeds_initial_placement_done");
         if (settings) obs_data_release(settings);
+        obs_source_release(source);
         if (alreadyPlaced) return;
     }
 
@@ -9088,16 +9141,24 @@ static void ApplyParticipantPlacement(obs_source_t* source) {
     // Bounded to ~10s (100 × 100ms): comfortably covers the first frame and
     // a "turn the camera on after adding the source" delay, but a source
     // that never produces frames just stays at OBS defaults rather than
-    // leaking a polling thread.
+    // leaking a polling thread. The reference is held only for the size read.
     uint32_t srcW = 0;
     uint32_t srcH = 0;
     for (int i = 0; i < 100; ++i) {
+        obs_source_t* source = PromoteLiveSource(weak);
+        if (!source) return;   // removed/destroyed (e.g. collection switch): stop
         srcW = obs_source_get_width(source);
         srcH = obs_source_get_height(source);
+        obs_source_release(source);
         if (srcW > 0 && srcH > 0) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     if (srcW == 0 || srcH == 0) return;
+
+    // Short-lived strong reference for the placement itself (a scene walk and
+    // a settings write — milliseconds), re-checked for removal first.
+    obs_source_t* source = PromoteLiveSource(weak);
+    if (!source) return;
 
     // Apply the shared fit-center geometry to every scene-item backed by this
     // source (the add-source flow adds exactly one, but a source already
@@ -9125,6 +9186,7 @@ static void ApplyParticipantPlacement(obs_source_t* source) {
         obs_source_update(source, settings);
         obs_data_release(settings);
     }
+    obs_source_release(source);
 }
 
 // Resolve the scene the Source dock edits: preview scene in Studio Mode, current
@@ -10097,29 +10159,46 @@ static void OnSourceCreated(void* /*data*/, calldata_t* cd) {
         }
     }
 
-    // Hold a weak reference; promote to strong reference inside the
-    // deferred callback. This avoids holding the source alive if the user
-    // (or OBS during shutdown) removes it in the interim.
+    // Initial placement is for a source the user just ADDED. A participant or
+    // screenshare source restored by a collection load (startup, switch,
+    // rename) already carries the user's saved geometry, so don't start the
+    // placement poll for it at all. In practice the poll already never placed a
+    // restored source — it has no frames within the window, because at startup
+    // there is no meeting and a mid-meeting reload used to come back unbound —
+    // but a mid-meeting reload now re-binds within seconds
+    // (RebindAllBoundSources on SCENE_COLLECTION_CHANGED). Without this skip,
+    // a restored source that never got the placement sentinel would have its
+    // layout reset to fit-center mid-show. Chat popup/overlay keep their
+    // existing one-shot defaults (not a poll, and unaffected by binding).
+    if ((isParticipant || isScreenshare) &&
+        (g_sceneCollectionLoading.load() || g_sceneCollectionReloading.load()))
+        return;
+
+    // Hold only a weak reference for the life of the thread; see the
+    // REFERENCE DISCIPLINE note above ApplyParticipantPlacement.
     obs_weak_source_t* weak = obs_source_get_weak_source(source);
     if (!weak) return;
 
     std::thread([weak, isChatPopup, isChatOverlay]() {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-        obs_source_t* strong = obs_weak_source_get_source(weak);
-        if (strong) {
-            if (isChatPopup) {
-                ApplyChatPopupDefaultPosition(strong);
-            } else if (isChatOverlay) {
-                ApplyChatOverlayDefaults(strong);
-            } else {
-                // Participant OR screenshare: Automatic bounds + fill-canvas-
-                // centered initial placement (screenshare joined this path with
-                // the engine scaler change; see ApplyParticipantPlacement). No
-                // other Feeds type reaches here — the guard above filtered them.
-                ApplyParticipantPlacement(strong);
+        if (isChatPopup || isChatOverlay) {
+            // One-shot defaults, no waiting: a strong reference for just this
+            // call.
+            obs_source_t* strong = obs_weak_source_get_source(weak);
+            if (strong) {
+                if (isChatPopup) ApplyChatPopupDefaultPosition(strong);
+                else             ApplyChatOverlayDefaults(strong);
+                obs_source_release(strong);
             }
-            obs_source_release(strong);
+        } else {
+            // Participant OR screenshare: Automatic bounds + fill-canvas-
+            // centered initial placement (screenshare joined this path with
+            // the engine scaler change; see ApplyParticipantPlacement). No
+            // other Feeds type reaches here — the guard above filtered them.
+            // It polls for up to ~10 s, so it takes the WEAK reference and
+            // promotes per step rather than holding the source alive.
+            ApplyParticipantPlacement(weak);
         }
         obs_weak_source_release(weak);
     }).detach();
@@ -10221,11 +10300,32 @@ bool obs_module_load(void) {
         case OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGING:
             g_sceneCollectionLoading.store(true);
             break;
+        // Fired inside every collection clear, rename included (which fires no
+        // CHANGING). Marks the sources about to be created as restored, so
+        // OnSourceCreated skips their initial-placement poll.
+        case OBS_FRONTEND_EVENT_SCENE_COLLECTION_CLEANUP:
+            g_sceneCollectionReloading.store(true);
+            break;
         case OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED:
             g_sceneCollectionLoading.store(false);
+            g_sceneCollectionReloading.store(false);
+            // A switch or rename (both end here) re-created every Feeds source
+            // unbound, and mid-meeting nothing else re-binds them. Run the same
+            // binding sweep a grant runs. Deferred one turn so OBS finishes
+            // activating the collection first; re-checked because the meeting
+            // can end in between. Outside a meeting there is nothing to bind:
+            // the next grant runs the sweep.
+            if (g_isInMeeting && g_rawLiveStreamGranted) {
+                QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
+                    []() {
+                        if (g_isInMeeting && g_rawLiveStreamGranted)
+                            RebindAllBoundSources("scene collection change");
+                    });
+            }
             break;
         case OBS_FRONTEND_EVENT_FINISHED_LOADING:
             g_sceneCollectionLoading.store(false);   // startup load done
+            g_sceneCollectionReloading.store(false);
             SetupPluginMenu();
             QTimer::singleShot(5000,
                 (QObject*)obs_frontend_get_main_window(),
