@@ -119,15 +119,23 @@ jobs:
             Feeds-*-windows-x64.zip
             Feeds-*-Setup.exe
 
-  # macOS plugin shell: the plugin alone (no FeedsEngine, which is Windows-only
-  # for now), built through the OBS plugin template's own macOS scripts
+  # macOS build: the plugin plus FeedsEngine.app (the Zoom Meeting SDK host),
+  # built through the OBS plugin template's own macOS scripts
   # (.github/scripts/build-macos / package-macos, the macos-ci preset) into an
   # installable, unsigned .pkg. Deliberately independent of the Windows job:
   # nothing needs it, so a macOS failure never blocks the Windows build or a
   # release, and releases still ship Windows assets only.
+  #
+  # The engine needs the licensed macOS Zoom SDK, which is NOT in this repo (it
+  # is ~600 MB and not ours to redistribute). It is fetched below from a DRAFT
+  # release asset; when that asset is absent the job still builds and packages
+  # the plugin, just without an engine.
   macos-build:
-    name: Build Feeds (macOS plugin shell)
+    name: Build Feeds (macOS)
     runs-on: macos-14
+    environment: release
+    env:
+      FEEDS_ZOOM_CLIENT_ID: ${{ secrets.FEEDS_ZOOM_CLIENT_ID }}
     defaults:
       run:
         shell: zsh --no-rcs --errexit --pipefail {0}
@@ -158,6 +166,65 @@ jobs:
             "$(jq -r '. | {name, version} | join(" ")' buildspec.json)"
           print "pluginName=${product_name}" >> $GITHUB_OUTPUT
           print "pluginVersion=${product_version}" >> $GITHUB_OUTPUT
+      # The macOS Zoom Meeting SDK is licensed and ~600 MB, so it is kept as an
+      # asset on a DRAFT release ("SDK assets — DO NOT PUBLISH"): invisible to
+      # the public, downloadable by this workflow's own token. Never commit it
+      # and never publish that release.
+      #
+      # A missing asset is NOT an error: the plugin still builds and loads, and
+      # the CMake warning plus the engine-client log line say why Zoom features
+      # are unavailable. That keeps macOS CI green before the SDK is uploaded.
+      # NEVER fetch by tag or by a browser_download_url. A draft release has no
+      # finalized tag: the URL carries a throwaway "untagged-<hash>" that changes
+      # whenever the draft is edited, so anything built on it breaks silently
+      # later. The release is found through the API instead — by its NAME, with
+      # the asset's filename as the fallback — and the asset is downloaded by its
+      # numeric id, which is stable.
+      - name: Fetch the macOS Zoom SDK (private draft-release asset)
+        id: zoom_sdk
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          asset_name="zoom-sdk-macos-7.1.5.84750.zip"
+          release_name="SDK assets"   # substring of "SDK assets — DO NOT PUBLISH"
+
+          # Drafts are only listed for a token with write access; the job's
+          # permissions provide that. Match the release by name first so the
+          # intended draft wins even if another draft ever carries a copy.
+          releases="$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate)"
+          asset_id="$(printf '%s' "${releases}" | jq -r --arg name "${release_name}" --arg asset "${asset_name}" \
+              '[.[] | select(.draft) | select((.name // "") | contains($name)) | .assets[] | select(.name == $asset) | .id] | first // empty')"
+          matched_by="name"
+          if [ -z "${asset_id}" ]; then
+              asset_id="$(printf '%s' "${releases}" | jq -r --arg asset "${asset_name}" \
+                  '[.[] | select(.draft) | .assets[] | select(.name == $asset) | .id] | first // empty')"
+              matched_by="asset filename"
+          fi
+
+          if [ -z "${asset_id}" ]; then
+              echo "::warning::${asset_name} not found on any draft release; building the plugin WITHOUT the engine."
+              printf '%s' "${releases}" | jq -r '.[] | select(.draft) | "draft release: name=\(.name // "(none)") assets=[\([.assets[].name] | join(", "))]"' || true
+              exit 0
+          fi
+          echo "Found the SDK asset by ${matched_by} (asset id ${asset_id})"
+          gh api -H "Accept: application/octet-stream" \
+              "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" > "${RUNNER_TEMP}/zoom-sdk.zip"
+          mkdir -p "${RUNNER_TEMP}/zoom-sdk-extracted"
+          unzip -q "${RUNNER_TEMP}/zoom-sdk.zip" -d "${RUNNER_TEMP}/zoom-sdk-extracted"
+          # The archive holds <root>/ZoomSDK/ZoomSDK.framework plus the sibling
+          # frameworks and bundles the SDK loads at auth time. The engine needs
+          # that whole directory, not just the framework.
+          sdk_dir="$(find "${RUNNER_TEMP}/zoom-sdk-extracted" -maxdepth 3 -type d -name ZoomSDK \
+              -exec test -d '{}/ZoomSDK.framework' ';' -print | head -1)"
+          if [ -z "${sdk_dir}" ]; then
+              echo "::error::No ZoomSDK/ZoomSDK.framework inside ${asset_name}"
+              find "${RUNNER_TEMP}/zoom-sdk-extracted" -maxdepth 3 -type d | head -20
+              exit 1
+          fi
+          echo "FEEDS_MAC_ZOOM_SDK_DIR=${sdk_dir}" >> "$GITHUB_ENV"
+          echo "Zoom macOS SDK ready at ${sdk_dir}"
       - name: Build Plugin
         uses: ./.github/actions/build-plugin
         with:

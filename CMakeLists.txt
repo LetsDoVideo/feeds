@@ -81,12 +81,13 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     src/feeds-iso-recorder.cpp
 )
 
-# The engine client launches FeedsEngine.exe over named pipes — Windows only.
-# Other platforms (the macOS plugin shell) link an inert stub with the same API.
+# The engine client: same four entry points either way, different transport.
+# Windows launches FeedsEngine.exe over two named pipes; POSIX (macOS) spawns
+# FeedsEngine.app over a socketpair. See src/engine-client-posix.cpp.
 if(WIN32)
     target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/engine-client.cpp)
 else()
-    target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/engine-client-stub.cpp)
+    target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/engine-client-posix.cpp)
 endif()
 
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
@@ -114,6 +115,118 @@ if(MSVC)
         DESTINATION ${OBS_PLUGIN_DESTINATION}
         OPTIONAL
     )
+endif()
+
+# ---------------------------------------------------------------------------
+# macOS engine (increment 1a): FeedsEngine.app, the process that hosts the Zoom
+# Meeting SDK. Objective-C++ against ZoomSDK.framework — a rewrite of the
+# Windows engine's SDK calls, not a port of those files (the macOS SDK shares no
+# API with the C++ one). See engine/mac/feeds-engine-mac.mm.
+#
+# The SDK is licensed and ~600 MB, so it is NOT in this repo: point
+# FEEDS_MAC_ZOOM_SDK_DIR at the directory that holds ZoomSDK.framework and its
+# sibling frameworks/bundles (the "ZoomSDK" folder of Zoom's macOS SDK archive),
+# by -D or by environment variable. Without it the plugin still builds and
+# loads; it simply has no engine, and says so at runtime.
+# ---------------------------------------------------------------------------
+if(APPLE)
+    if(NOT DEFINED FEEDS_MAC_ZOOM_SDK_DIR OR FEEDS_MAC_ZOOM_SDK_DIR STREQUAL "")
+        set(FEEDS_MAC_ZOOM_SDK_DIR "$ENV{FEEDS_MAC_ZOOM_SDK_DIR}")
+    endif()
+
+    if(FEEDS_MAC_ZOOM_SDK_DIR AND EXISTS "${FEEDS_MAC_ZOOM_SDK_DIR}/ZoomSDK.framework")
+        message(STATUS "Feeds: building the macOS engine against ${FEEDS_MAC_ZOOM_SDK_DIR}")
+        enable_language(OBJCXX)
+
+        add_executable(FeedsEngine MACOSX_BUNDLE engine/mac/feeds-engine-mac.mm)
+
+        set_target_properties(
+            FeedsEngine
+            PROPERTIES
+                OUTPUT_NAME FeedsEngine
+                OBJCXX_STANDARD 17
+                OBJCXX_STANDARD_REQUIRED TRUE
+                MACOSX_BUNDLE_INFO_PLIST
+                    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/macos/FeedsEngine-Info.plist.in"
+                XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER com.letsdovideo.feeds.engine
+                # The SDK lives in the app's own Frameworks at runtime; the build
+                # tree resolves it where it was unpacked. BUILD_RPATH is required,
+                # not optional: the framework is linked through raw -F/-framework
+                # flags rather than an imported target, so CMake can infer no
+                # build-tree rpath and the binary would ship with none at all.
+                BUILD_WITH_INSTALL_RPATH OFF
+                BUILD_RPATH "${FEEDS_MAC_ZOOM_SDK_DIR}"
+                INSTALL_RPATH "@executable_path/../Frameworks"
+        )
+
+        target_include_directories(FeedsEngine PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/common"
+        )
+        target_compile_definitions(FeedsEngine PRIVATE
+            FEEDS_ZOOM_CLIENT_ID="${FEEDS_ZOOM_CLIENT_ID}"
+        )
+        # -F has to be on BOTH lines: the compile line so `#import <ZoomSDK/...>`
+        # resolves through the framework's Headers, the link line so
+        # `-framework ZoomSDK` finds the binary.
+        target_compile_options(FeedsEngine PRIVATE "-F${FEEDS_MAC_ZOOM_SDK_DIR}")
+        target_link_libraries(FeedsEngine PRIVATE
+            "-F${FEEDS_MAC_ZOOM_SDK_DIR}"
+            "-framework ZoomSDK"
+            "-framework Cocoa"
+        )
+
+        # The SDK runtime must sit in the ENGINE APP's Frameworks directory.
+        # ZoomSDK.framework is not self-contained: at auth time it loads sibling
+        # bundles through the MAIN BUNDLE's Frameworks path, not through rpath.
+        # Without them initSDK still reports success and sdkAuth then fails with
+        # no callback at all — so this copy is a runtime requirement, not
+        # packaging tidiness. ditto preserves the frameworks' symlinks, which a
+        # plain copy would flatten.
+        add_custom_command(
+            TARGET FeedsEngine
+            POST_BUILD
+            COMMAND "${CMAKE_COMMAND}" -E make_directory
+                    "$<TARGET_BUNDLE_DIR:FeedsEngine>/Contents"
+            COMMAND ditto "${FEEDS_MAC_ZOOM_SDK_DIR}"
+                    "$<TARGET_BUNDLE_DIR:FeedsEngine>/Contents/Frameworks"
+            COMMENT "Copying the Zoom macOS SDK runtime into FeedsEngine.app"
+            VERBATIM
+        )
+
+        # Ship the engine inside the plugin bundle, beside the loaded module:
+        # <plugin>.plugin/Contents/MacOS/FeedsEngine.app. That is exactly where
+        # engine-client-posix.cpp looks for it.
+        add_dependencies(${CMAKE_PROJECT_NAME} FeedsEngine)
+        add_custom_command(
+            TARGET ${CMAKE_PROJECT_NAME}
+            POST_BUILD
+            COMMAND ditto "$<TARGET_BUNDLE_DIR:FeedsEngine>"
+                    "$<TARGET_BUNDLE_DIR:${CMAKE_PROJECT_NAME}>/Contents/MacOS/FeedsEngine.app"
+            COMMENT "Staging FeedsEngine.app inside the plugin bundle"
+            VERBATIM
+        )
+
+        # Belt and braces for the installed artifact (the .pkg is built from the
+        # install tree). The POST_BUILD copy above already put the engine inside
+        # the built bundle, and installing a bundle target copies it wholesale —
+        # but that leaves the engine's presence in the shipped package depending
+        # on an implementation detail. Install it explicitly so the packaged
+        # plugin cannot silently come out engine-less, which looks completely
+        # correct right up until it cannot connect to Zoom.
+        install(
+            DIRECTORY "$<TARGET_BUNDLE_DIR:FeedsEngine>"
+            DESTINATION "${_name}.plugin/Contents/MacOS"
+            USE_SOURCE_PERMISSIONS
+        )
+    else()
+        message(
+            WARNING
+            "Feeds: FEEDS_MAC_ZOOM_SDK_DIR is unset or has no ZoomSDK.framework, "
+            "so the macOS engine will NOT be built. The plugin will load and show "
+            "its UI, but Zoom features stay unavailable. Set it to the SDK's "
+            "ZoomSDK directory to build the engine."
+        )
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------

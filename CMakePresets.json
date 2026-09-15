@@ -33,7 +33,9 @@
         "CODESIGN_IDENTITY": "$penv{CODESIGN_IDENT}",
         "CODESIGN_TEAM": "$penv{CODESIGN_TEAM}",
         "ENABLE_FRONTEND_API": true,
-        "ENABLE_QT": true
+        "ENABLE_QT": true,
+        "FEEDS_ZOOM_CLIENT_ID": "$penv{FEEDS_ZOOM_CLIENT_ID}",
+        "FEEDS_MAC_ZOOM_SDK_DIR": "$penv{FEEDS_MAC_ZOOM_SDK_DIR}"
       }
     },
     {

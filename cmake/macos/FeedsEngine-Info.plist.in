@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Info.plist for FeedsEngine.app — the process that hosts the Zoom Meeting SDK.
+  The plugin bundle has its own plist; this one is the engine's, and the engine
+  is a separate process precisely so the SDK's run loop, its nested frameworks
+  and its crashes stay out of OBS.
+
+  LSUIElement: the engine is a background helper with no Dock icon. The code
+  sets the accessory activation policy to match. If the SDK's meeting window is
+  ever shown (joining, a later increment) this may have to become a regular app,
+  because an accessory app has no menu bar and cannot make its windows key.
+
+  The two usage strings are REQUIRED before the SDK may touch a camera or a
+  microphone. macOS does not merely refuse an access with no usage string in the
+  requesting bundle: it terminates the process. Feeds joins with audio and video
+  off and only receives other participants' media, so it may never trigger
+  either prompt — but the strings cost nothing and their absence is fatal rather
+  than degraded. They are deliberately written from the operator's point of
+  view, because whatever is here is what the macOS prompt shows them.
+-->
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>FeedsEngine</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.letsdovideo.feeds.engine</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>FeedsEngine</string>
+    <key>CFBundleDisplayName</key>
+    <string>Feeds Engine</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>${PLUGIN_VERSION}</string>
+    <key>CFBundleVersion</key>
+    <string>${PLUGIN_VERSION}</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>12.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSCameraUsageDescription</key>
+    <string>Feeds connects to Zoom meetings so OBS can use the video.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Feeds connects to Zoom meetings so OBS can use the audio.</string>
+</dict>
+</plist>
