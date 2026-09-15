@@ -32,8 +32,14 @@
 
 #pragma once
 
+#ifdef _WIN32
 #include <windows.h>
 #include <winhttp.h>
+#else
+// Non-Windows plugin shell: WinHTTP is stubbed to fail, so ResolveProxyForUrl
+// returns DIRECT and OpenProxiedSession returns null. See feeds-win32-stub.h.
+#include "feeds-win32-stub.h"
+#endif
 #include <string>
 
 // TLS 1.3 secure-protocol flag is absent from older Windows SDK headers.

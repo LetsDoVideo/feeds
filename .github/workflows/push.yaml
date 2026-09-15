@@ -119,6 +119,63 @@ jobs:
             Feeds-*-windows-x64.zip
             Feeds-*-Setup.exe
 
+  # macOS plugin shell: the plugin alone (no FeedsEngine, which is Windows-only
+  # for now), built through the OBS plugin template's own macOS scripts
+  # (.github/scripts/build-macos / package-macos, the macos-ci preset) into an
+  # installable, unsigned .pkg. Deliberately independent of the Windows job:
+  # nothing needs it, so a macOS failure never blocks the Windows build or a
+  # release, and releases still ship Windows assets only.
+  macos-build:
+    name: Build Feeds (macOS plugin shell)
+    runs-on: macos-14
+    defaults:
+      run:
+        shell: zsh --no-rcs --errexit --pipefail {0}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - name: Set Up Environment
+        id: setup
+        run: |
+          # OBS 31's plugin CMake requires Xcode 16 and the macOS 15 SDK
+          # (cmake/macos/compilerconfig.cmake). The macos-14 image ships Xcode 16
+          # alongside an older default, so select the newest Xcode 16 present.
+          local -a xcodes=(/Applications/Xcode_16*.app(N))
+          if (( ! ${#xcodes} )) {
+            print "::error::No Xcode 16 found on this runner"
+            exit 1
+          }
+          local xcode=${${(nO)xcodes}[1]}
+          print "Selecting ${xcode}"
+          sudo xcode-select --switch "${xcode}/Contents/Developer"
+          xcodebuild -version
+
+          local product_name product_version
+          read -r product_name product_version <<< \
+            "$(jq -r '. | {name, version} | join(" ")' buildspec.json)"
+          print "pluginName=${product_name}" >> $GITHUB_OUTPUT
+          print "pluginVersion=${product_version}" >> $GITHUB_OUTPUT
+      - name: Build Plugin
+        uses: ./.github/actions/build-plugin
+        with:
+          target: macos-universal
+          config: RelWithDebInfo
+      - name: Package Plugin
+        uses: ./.github/actions/package-plugin
+        with:
+          target: macos-universal
+          config: RelWithDebInfo
+          package: 'true'
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Feeds-${{ github.ref_name }}-macos
+          path: ${{ github.workspace }}/release/${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-macos-universal*.*
+          if-no-files-found: error
+
   release:
     name: Create Release
     needs: build

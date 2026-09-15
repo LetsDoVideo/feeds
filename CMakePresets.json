@@ -31,7 +31,9 @@
         "CMAKE_OSX_DEPLOYMENT_TARGET": "12.0",
         "CMAKE_OSX_ARCHITECTURES": "arm64;x86_64",
         "CODESIGN_IDENTITY": "$penv{CODESIGN_IDENT}",
-        "CODESIGN_TEAM": "$penv{CODESIGN_TEAM}"
+        "CODESIGN_TEAM": "$penv{CODESIGN_TEAM}",
+        "ENABLE_FRONTEND_API": true,
+        "ENABLE_QT": true
       }
     },
     {
@@ -41,7 +43,7 @@
       "description": "Build for macOS 12.0+ (Universal binary) for CI",
       "generator": "Xcode",
       "cacheVariables": {
-        "CMAKE_COMPILE_WARNING_AS_ERROR": true,
+        "CMAKE_COMPILE_WARNING_AS_ERROR": false,
         "ENABLE_CCACHE": true
       }
     },

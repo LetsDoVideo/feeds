@@ -29,9 +29,18 @@ set_target_properties(
 # concern raised by Zoom's developer relations team. We fail loudly when
 # missing rather than baking a fallback into the source tree.
 if(NOT DEFINED FEEDS_ZOOM_CLIENT_ID OR FEEDS_ZOOM_CLIENT_ID STREQUAL "")
-    message(FATAL_ERROR "FEEDS_ZOOM_CLIENT_ID is required at build time. Set via -D or env variable.")
+    if(WIN32)
+        message(FATAL_ERROR "FEEDS_ZOOM_CLIENT_ID is required at build time. Set via -D or env variable.")
+    else()
+        # macOS plugin shell: no engine is built and nothing in the plugin reads
+        # the client ID, so it isn't required here. The Mac engine port will
+        # restore the requirement for the platform that builds an engine.
+        set(FEEDS_ZOOM_CLIENT_ID "not-used-by-the-plugin-shell")
+        message(STATUS "FEEDS_ZOOM_CLIENT_ID not required: no engine on this platform")
+    endif()
+else()
+    message(STATUS "FEEDS_ZOOM_CLIENT_ID provided via build configuration")
 endif()
-message(STATUS "FEEDS_ZOOM_CLIENT_ID provided via build configuration")
 
 find_package(libobs REQUIRED)
 
@@ -40,7 +49,10 @@ if(MSVC)
 endif()
 
 # Core libraries
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs ws2_32 crypt32 winhttp shlwapi)
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
+if(WIN32)
+    target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ws2_32 crypt32 winhttp shlwapi)
+endif()
 
 if(ENABLE_FRONTEND_API)
     find_package(obs-frontend-api REQUIRED)
@@ -62,13 +74,20 @@ endif()
 
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     src/plugin-main.cpp
-    src/engine-client.cpp
     src/feeds-card-render.cpp
     src/feeds-chat-popup-source.cpp
     src/feeds-chat-overlay-source.cpp
     src/feeds-lower-third-source.cpp
     src/feeds-iso-recorder.cpp
 )
+
+# The engine client launches FeedsEngine.exe over named pipes — Windows only.
+# Other platforms (the macOS plugin shell) link an inert stub with the same API.
+if(WIN32)
+    target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/engine-client.cpp)
+else()
+    target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/engine-client-stub.cpp)
+endif()
 
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/common"
@@ -80,10 +99,15 @@ target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
 
-install(TARGETS ${CMAKE_PROJECT_NAME}
-    LIBRARY DESTINATION ${OBS_PLUGIN_DESTINATION}
-    RUNTIME DESTINATION ${OBS_PLUGIN_DESTINATION}
-)
+# macOS installs the .plugin bundle (and builds the .pkg) from
+# set_target_properties_plugin in cmake/macos/helpers.cmake; this Windows-layout
+# install would drop a second copy under obs-plugins/64bit.
+if(NOT APPLE)
+    install(TARGETS ${CMAKE_PROJECT_NAME}
+        LIBRARY DESTINATION ${OBS_PLUGIN_DESTINATION}
+        RUNTIME DESTINATION ${OBS_PLUGIN_DESTINATION}
+    )
+endif()
 
 if(MSVC)
     install(FILES $<TARGET_PDB_FILE:${CMAKE_PROJECT_NAME}>
@@ -91,6 +115,13 @@ if(MSVC)
         OPTIONAL
     )
 endif()
+
+# ---------------------------------------------------------------------------
+# FeedsEngine (Zoom Meeting SDK host) and its libyuv dependency: Windows only.
+# The macOS plugin shell builds the plugin alone; the Mac engine port comes
+# later. The block below is unchanged apart from this WIN32 guard.
+# ---------------------------------------------------------------------------
+if(WIN32)
 
 # libyuv for the engine's frame scaler. Pulled in via FetchContent rather
 # than vcpkg / git submodule so no new tooling lands on the CI runner —
@@ -154,11 +185,14 @@ target_compile_definitions(FeedsEngine PRIVATE
     FEEDS_ZOOM_CLIENT_ID="${FEEDS_ZOOM_CLIENT_ID}"
 )
 
+endif()  # WIN32 — FeedsEngine
+
 # Unit tests — standalone console exes covering the shared IPC helpers
 # (>4KB E2P reader reassembly + string-aware JSON parsing). No libobs/Qt/SDK,
 # so they build and run in CI as the "parsing-test target" on the roadmap.
+# Windows only: the E2P reader test drives the Win32 named-pipe reader.
 option(FEEDS_BUILD_TESTS "Build Feeds unit tests" ON)
-if(FEEDS_BUILD_TESTS)
+if(FEEDS_BUILD_TESTS AND WIN32)
     enable_testing()
     add_subdirectory(tests)
 endif()

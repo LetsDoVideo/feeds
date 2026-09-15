@@ -31,8 +31,15 @@
 #include <cstring>
 #include <cctype>
 #include <cstdio>
+#ifdef _WIN32
 #include <windows.h>
 #include <winhttp.h>
+#else
+// macOS plugin shell: the Win32 surface this file uses (WinHTTP, events, file
+// mappings) comes from a stub that fails networking and shared memory and
+// implements events for real. See common/feeds-win32-stub.h.
+#include "feeds-win32-stub.h"
+#endif
 
 #include <QMainWindow>
 #include <QMenuBar>

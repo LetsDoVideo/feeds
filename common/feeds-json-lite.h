@@ -62,7 +62,9 @@ inline std::string JsonEscape(const std::string& s) {
             default:
                 if (c < 0x20) {
                     char buf[8];
-                    sprintf_s(buf, "\\u%04x", c);
+                    // snprintf, not MSVC's sprintf_s: this header is also
+                    // compiled by the macOS plugin shell. Same output.
+                    snprintf(buf, sizeof(buf), "\\u%04x", c);
                     out += buf;
                 } else {
                     out += (char)c;
