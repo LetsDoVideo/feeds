@@ -47,10 +47,22 @@ typedef void*          PVOID;
 typedef unsigned long  DWORD;
 typedef DWORD*         LPDWORD;
 typedef uintptr_t      DWORD_PTR;
-typedef int            BOOL;
 typedef unsigned char  BYTE;
 typedef unsigned short INTERNET_PORT;
 
+// BOOL is a platform type on Apple: <objc/objc.h> defines it (signed char on
+// x86_64, bool on arm64), and OBS's own graphics/graphics.h already pulls that
+// in through obs-module.h, so re-typedef'ing it collides. Include it explicitly
+// so this header doesn't depend on include order. Everything here uses BOOL
+// only as a boolean (FALSE / TRUE / != FALSE), which all three types handle.
+// Elsewhere (no Objective-C runtime) there is no BOOL, so define the Win32 one.
+#ifdef __APPLE__
+#include <objc/objc.h>
+#else
+typedef int BOOL;
+#endif
+
+// TRUE / FALSE may already exist (e.g. <mach/boolean.h> on macOS, as 1 / 0).
 #ifndef TRUE
 #define TRUE 1
 #endif
