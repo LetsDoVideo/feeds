@@ -63,11 +63,15 @@
 #include <mutex>
 #include <string>
 
+// Same order as engine-video.cpp. meeting_audio_interface.h MUST precede
+// meeting_participants_ctrl_interface.h: the latter uses AudioType
+// (IUserInfo::GetAudioJoinType) without including the header that defines it.
+#include "engine-shared.h"
 #include "zoom_sdk.h"
 #include "meeting_service_interface.h"
+#include "meeting_service_components/meeting_audio_interface.h"
 #include "meeting_service_components/meeting_participants_ctrl_interface.h"
 
-#include "engine-shared.h"
 #include "engine-speaker.h"
 
 // Defined in engine-main.cpp
