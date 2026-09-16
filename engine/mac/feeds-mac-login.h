@@ -1,0 +1,62 @@
+// feeds-mac-login.h — Zoom login and REST for the macOS engine.
+//
+// The same flow the Windows engine runs in engine-oauth.cpp + engine-api.cpp,
+// rewritten against macOS APIs (feeds-mac-net.h). The messages sent to the
+// plugin are identical, so the plugin's existing login UI needs no macOS
+// special case:
+//
+//   login_succeeded {display_name, pmi, tier}   a usable session exists
+//   sdk_authenticated                            "ready to connect"
+//   login_failed    {error}                      no_stored_token /
+//                                                session_restore_unreachable /
+//                                                login_timeout /
+//                                                token_exchange_failed
+//   session_expired                              stored credentials are dead
+//   tier_unreachable                             tier unknown AND never cached
+//   token_refreshed                              a silent refresh succeeded
+//
+// The Zoom SDK is deliberately NOT involved here. As on Windows, a logged-in
+// but not-connected Feeds holds no SDK and no Zoom session; the SDK comes up on
+// the first connect.
+
+#pragma once
+
+#include <string>
+
+namespace feeds_mac {
+
+// Implemented in feeds-engine-mac.mm: the engine's IPC writer and log sink.
+// Declared here so this translation unit can report without depending on the
+// engine's internals.
+void EngineSend(const std::string& json);
+void EngineLog(const char* level, const std::string& message);
+
+// Startup: if a refresh token is stored, restore the logged-in appearance over
+// REST and announce it; otherwise tell the plugin there is nothing to restore
+// (login_failed / no_stored_token, which the plugin treats as "logged out", not
+// as an error). Returns immediately; the work runs on its own thread.
+void RestoreSessionFromStoredToken();
+
+// Begin the OAuth PKCE flow: open the browser, poll the Feeds worker for the
+// auth code, exchange it for tokens, store them, announce the login. Returns
+// false when a login is already in flight. Returns immediately; the flow runs
+// on its own thread.
+bool StartLoginFlow();
+
+// Ask an in-flight login to stop. The poll loop checks this every iteration and
+// exits without sending login_failed — the user already knows they cancelled.
+void CancelLoginFlow();
+
+// Forget everything: both tokens and the cached tier, in memory and in the
+// Keychain. The caller owns logging out of the SDK and sending logout_complete.
+void ClearStoredCredentials();
+
+// A fresh ZAK for a join. BLOCKS on the network: background threads only, never
+// the main queue. Empty means the join must not proceed.
+std::string FetchZak();
+
+// The account display name from the last successful user-info fetch, or "" —
+// the join path needs it and refuses to join without one.
+std::string UserDisplayName();
+
+} // namespace feeds_mac

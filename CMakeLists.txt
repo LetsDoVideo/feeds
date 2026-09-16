@@ -138,7 +138,12 @@ if(APPLE)
         message(STATUS "Feeds: building the macOS engine against ${FEEDS_MAC_ZOOM_SDK_DIR}")
         enable_language(OBJCXX)
 
-        add_executable(FeedsEngine MACOSX_BUNDLE engine/mac/feeds-engine-mac.mm)
+        add_executable(
+            FeedsEngine MACOSX_BUNDLE
+            engine/mac/feeds-engine-mac.mm   # process, IPC, SDK, join, roster
+            engine/mac/feeds-mac-login.mm    # OAuth + Zoom REST (the login path)
+            engine/mac/feeds-mac-net.mm      # HTTPS, PKCE crypto, Keychain, browser
+        )
 
         set_target_properties(
             FeedsEngine
@@ -197,6 +202,9 @@ if(APPLE)
             "-F${FEEDS_MAC_ZOOM_SDK_DIR}"
             "-framework ZoomSDK"
             "-framework Cocoa"
+            # Keychain (SecItem*) and SecRandomCopyBytes, for the login path.
+            # CommonCrypto's SHA-256 needs no framework — it is in libSystem.
+            "-framework Security"
         )
 
         # The SDK runtime must sit in the ENGINE APP's Frameworks directory.
