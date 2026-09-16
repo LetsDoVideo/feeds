@@ -12,12 +12,15 @@
 // ── INCREMENT 1b — WHAT THIS DOES AND DOES NOT DO ────────────────────────────
 // Does: everything up to a joined meeting with a populated roster. Zoom login
 // over OAuth (feeds-mac-login.mm), session restore at startup, lazy SDK
-// bring-up on the first connect, join by meeting number or link, and the
-// participant list — sent on join and kept current as people come and go.
+// bring-up on the first connect, join by meeting number or link, the
+// participant list — sent on join and kept current as people come and go — and
+// the raw-livestream PRIVILEGE request, which is what un-greys the plugin's
+// dock and source-properties dialog.
 //
-// Does NOT: deliver any video. No raw-livestream privilege request, no renderer
-// subscription, no shared-memory frame transport; those are increment 2. A
-// source placed in OBS on macOS will show nothing yet, by design.
+// Does NOT: deliver any video. The privilege is requested but not yet used:
+// no startRawLiveStreaming, no renderer subscription, no shared-memory frame
+// transport; those are increment 2. A source placed in OBS on macOS will show
+// nothing yet, by design — it will simply be pickable rather than greyed.
 //
 // ── Threading: the constraint that shapes this file ──────────────────────────
 // The macOS SDK is an AppKit client: it delivers every result through
@@ -215,8 +218,9 @@ static std::vector<std::function<void()>> g_pendingSdkActions;
 
 static ZoomSDKMeetingService* g_meetingService = nil;   // owned by the SDK
 
-static void BringUpSdk();          // main queue only
-static void SendParticipantList(); // main queue only
+static void BringUpSdk();                    // main queue only
+static void SendParticipantList();           // main queue only
+static void RequestRawLiveStreamPrivilege(); // main queue only
 
 // Auth succeeded: flip the ready flag and replay the queued join(s), which
 // re-enter their handler and this time sail past EnsureSdkUpThen. On a detached
@@ -307,6 +311,10 @@ static bool EnsureSdkUpThen(std::function<void()> action)
         // Seed the dock immediately. onUserJoin keeps it current afterwards,
         // but the people already in the meeting generate no join event.
         SendParticipantList();
+        // The roster alone does not light the dock up: it stays greyed until
+        // the raw-livestream privilege is reported. Ask for it now, exactly
+        // where the Windows engine asks.
+        RequestRawLiveStreamPrivilege();
         break;
     }
 
@@ -419,6 +427,76 @@ static bool EnsureSdkUpThen(std::function<void()> action)
 @end
 
 // ---------------------------------------------------------------------------
+// Live-stream delegate — the raw-livestream PRIVILEGE, and only the privilege
+//
+// This is what unlocks the plugin's UI. The dock and the source-properties
+// dialog both gate on it: until raw_livestream_granted arrives they render
+// "Waiting for participants…" and offer no participant picker, however full the
+// roster is, because a picker that cannot produce video would be a lie.
+//
+// Note what is NOT here. Windows' granted callback also calls
+// StartRawLiveStreaming and wires up the share and audio listeners; that is the
+// step that actually moves frames, and it stays in increment 2 along with the
+// renderer subscription and the frame transport. Asking for the privilege is
+// separable from using it, and it is a prerequisite either way.
+//
+// RECORDING IS NOT THE MECHANISM. Raw data is unlocked by the raw-LIVESTREAM
+// privilege, the same one the Windows engine requests — not by local recording
+// and not by the deprecated account-level raw-data license.
+// ---------------------------------------------------------------------------
+
+// The broadcast URL and name the host sees when they are asked to allow this.
+// Same two strings the Windows engine sends, so one meeting host sees one
+// consistent request whichever platform the user is on.
+static NSString* const kRawBroadcastUrl  = @"https://letsdovideo.com/feeds-support/";
+static NSString* const kRawBroadcastName = @"Feeds";
+
+@interface FeedsLiveStreamDelegate : NSObject <ZoomSDKLiveStreamHelperDelegate>
+@end
+
+@implementation FeedsLiveStreamDelegate
+
+- (void)onRawLiveStreamPrivilegeChanged:(BOOL)bHasPrivilege
+{
+    if (!bHasPrivilege) {
+        // The host declined, or revoked a privilege we already had. Either way
+        // frames stop, so the plugin swaps its "waiting" messaging for denied.
+        LogWarn("Mac engine: raw livestream privilege DENIED");
+        SendToPlugin("{\"type\":\"raw_livestream_denied\"}");
+        return;
+    }
+
+    LogInfo("Mac engine: raw livestream privilege GRANTED");
+    // The signal the plugin's dock and properties dialog are waiting on. In
+    // increment 2 this is also where startRawLiveStreaming goes.
+    SendToPlugin("{\"type\":\"raw_livestream_granted\"}");
+}
+
+- (void)onRawLiveStreamPrivilegeRequestTimeout
+{
+    // The host never answered the prompt. Distinct from a denial: nothing was
+    // refused, so the plugin offers a retry rather than an explanation.
+    LogWarn("Mac engine: raw livestream privilege request TIMED OUT");
+    SendToPlugin("{\"type\":\"raw_livestream_timeout\"}");
+}
+
+// ── @required, and nothing to do with this increment ─────────────────────────
+- (void)onLiveStreamStatusChange:(LiveStreamStatus)status {}
+- (void)onUserRawLiveStreamPrivilegeChanged:(unsigned int)userID
+                               hasPrivilege:(BOOL)bHasPrivilege {}
+// Fires on the HOST's side when someone else asks for the privilege. Feeds
+// never runs as the approver, so there is nothing to answer here.
+- (void)onRawLiveStreamPrivilegeRequested:
+    (ZoomSDKRequestRawLiveStreamPrivilegeHandler*_Nullable)handler {}
+- (void)onUserRawLiveStreamingStatusChanged:
+    (NSArray<ZoomSDKRawLiveStreamInfo*>*_Nullable)liveStreamList {}
+- (void)onLiveStreamReminderStatusChanged:(BOOL)enable {}
+- (void)onLiveStreamReminderStatusChangeFailed {}
+- (void)onUserThresholdReachedForLiveStream:(int)percent {}
+
+@end
+
+// ---------------------------------------------------------------------------
 // Auth delegate
 // ---------------------------------------------------------------------------
 @class FeedsAuthDelegate;
@@ -429,9 +507,10 @@ static bool EnsureSdkUpThen(std::function<void()> action)
 // weak zeroing to catch it. These file-scope statics are strong references that
 // live for the process, which is the simplest lifetime that outlives the
 // services — the engine owns exactly one of each and never replaces it.
-static FeedsAuthDelegate*    g_authDelegate    = nil;
-static FeedsMeetingDelegate* g_meetingDelegate = nil;
-static FeedsActionDelegate*  g_actionDelegate  = nil;
+static FeedsAuthDelegate*       g_authDelegate       = nil;
+static FeedsMeetingDelegate*    g_meetingDelegate    = nil;
+static FeedsActionDelegate*     g_actionDelegate     = nil;
+static FeedsLiveStreamDelegate* g_liveStreamDelegate = nil;
 
 @interface FeedsAuthDelegate : NSObject <ZoomSDKAuthDelegate>
 @end
@@ -545,6 +624,69 @@ static void SendParticipantList()
         msg += "]}";
         SendToPlugin(msg);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Ask for the raw-livestream privilege (main queue only)
+//
+// Called once, from the InMeeting status change — the same point the Windows
+// engine asks. Two paths, and the difference is who we are in the meeting:
+//
+//   host / already privileged   canStartRawLiveStream reports success and the
+//                               SDK fires onRawLiveStreamPrivilegeChanged on
+//                               its own; we just wait for it.
+//   everyone else               request it, which puts a prompt in front of the
+//                               HOST, and tell the plugin we are waiting so it
+//                               can say "waiting for host" instead of showing a
+//                               picker that does not work yet.
+//
+// Either way we wait for the real callback rather than assuming the answer.
+// Windows learned that the hard way: firing the granted path manually let the
+// plugin subscribe before the SDK's own state was ready, and createRenderer
+// then failed with a permission error.
+// ---------------------------------------------------------------------------
+static void RequestRawLiveStreamPrivilege()
+{
+    if (!g_meetingService) return;
+
+    ZoomSDKLiveStreamHelper* helper = [g_meetingService getLiveStreamHelper];
+    if (!helper) {
+        // Nothing is sent to the plugin here, deliberately, and the same goes
+        // for the rejected-request path below. Neither existing message fits:
+        // raw_livestream_denied renders as "Host denied use of Feeds", which
+        // would blame a host who was never asked. The engine log carries the
+        // real reason, which is where a support bundle looks — and this matches
+        // what the Windows engine does with the same failure.
+        LogError("Mac engine: live-stream helper unavailable; the raw-livestream "
+                 "privilege cannot be requested, so participant video will not "
+                 "become available in this meeting");
+        return;
+    }
+
+    if (!g_liveStreamDelegate)
+        g_liveStreamDelegate = [[FeedsLiveStreamDelegate alloc] init];
+    helper.delegate = g_liveStreamDelegate;
+
+    if ([helper canStartRawLiveStream] == ZoomSDKError_Success) {
+        LogInfo("Mac engine: raw livestream privilege already available; "
+                "waiting for the SDK to confirm it");
+        return;
+    }
+
+    LogInfo("Mac engine: requesting raw livestream privilege from the host");
+    const ZoomSDKError err = [helper requestRawLiveStreaming:kRawBroadcastUrl
+                                               broadcastName:kRawBroadcastName];
+    if (err != ZoomSDKError_Success) {
+        // A synchronous rejection means no callback will follow. Reported to
+        // the log only, for the reason given above: the host declined nothing.
+        LogError("Mac engine: requestRawLiveStreaming was rejected (code " +
+                 std::to_string((int)err) + "); no privilege callback will arrive");
+        return;
+    }
+
+    // The host now has a prompt in front of them. This is what turns the
+    // plugin's messaging into "waiting for host".
+    SendToPlugin("{\"type\":\"raw_livestream_pending\"}");
 }
 
 // ---------------------------------------------------------------------------
