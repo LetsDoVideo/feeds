@@ -54,17 +54,20 @@ HttpResponse PerformRequest(NSMutableURLRequest* request, int timeoutSeconds)
     config.timeoutIntervalForResource = (NSTimeInterval)timeoutSeconds;
     NSURLSession* session = [NSURLSession sessionWithConfiguration:config];
 
-    __block NSData*       blockData     = nil;
+    // Under ARC a __block object pointer is a strong reference, so simply
+    // assigning inside the handler keeps the result alive until this function
+    // returns; the handler's own parameters die with it either way.
+    __block NSData*        blockData     = nil;
     __block NSURLResponse* blockResponse = nil;
-    __block NSError*      blockError    = nil;
+    __block NSError*       blockError    = nil;
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
 
     NSURLSessionDataTask* task = [session
         dataTaskWithRequest:request
           completionHandler:^(NSData* data, NSURLResponse* response, NSError* error) {
-              blockData     = [data retain];
-              blockResponse = [response retain];
-              blockError    = [error retain];
+              blockData     = data;
+              blockResponse = response;
+              blockError    = error;
               dispatch_semaphore_signal(done);
           }];
     [task resume];
@@ -78,7 +81,6 @@ HttpResponse PerformRequest(NSMutableURLRequest* request, int timeoutSeconds)
         [task cancel];
         [session invalidateAndCancel];
         out.error = "request timed out";
-        dispatch_release(done);
         return out;
     }
 
@@ -94,10 +96,6 @@ HttpResponse PerformRequest(NSMutableURLRequest* request, int timeoutSeconds)
         out.error = "no HTTP response";
     }
 
-    [blockData release];
-    [blockResponse release];
-    [blockError release];
-    dispatch_release(done);
     [session finishTasksAndInvalidate];
     return out;
 }
@@ -212,12 +210,17 @@ std::string Sha256Base64Url(const std::string& input)
 
 namespace {
 
+// The kSec* constants are CFStringRefs, so every use as a dictionary key or
+// value crosses the CoreFoundation/Objective-C line. __bridge is the right
+// annotation throughout: these are immortal process-lifetime constants, nothing
+// is being handed to or taken from ARC, and a transferring cast would hand ARC
+// a release it does not own.
 NSMutableDictionary* KeychainQuery(const std::string& account)
 {
     NSMutableDictionary* query = [NSMutableDictionary dictionary];
-    query[(id)kSecClass]       = (id)kSecClassGenericPassword;
-    query[(id)kSecAttrService] = kKeychainService;
-    query[(id)kSecAttrAccount] = NsFrom(account);
+    query[(__bridge id)kSecClass]       = (__bridge id)kSecClassGenericPassword;
+    query[(__bridge id)kSecAttrService] = kKeychainService;
+    query[(__bridge id)kSecAttrAccount] = NsFrom(account);
     return query;
 }
 
@@ -232,19 +235,18 @@ bool KeychainSet(const std::string& account, const std::string& value)
         // Update an existing item in place when there is one: deleting and
         // re-adding would drop the user's "always allow" decision and prompt
         // them again on every token refresh.
-        NSDictionary* update = @{ (id)kSecValueData : data };
-        OSStatus st = SecItemUpdate((CFDictionaryRef)query,
-                                    (CFDictionaryRef)update);
+        NSDictionary* update = @{ (__bridge id)kSecValueData : data };
+        OSStatus st = SecItemUpdate((__bridge CFDictionaryRef)query,
+                                    (__bridge CFDictionaryRef)update);
         if (st == errSecItemNotFound) {
             NSMutableDictionary* add = [query mutableCopy];
-            add[(id)kSecValueData] = data;
+            add[(__bridge id)kSecValueData] = data;
             // After first unlock, so a refresh can run before the user has
             // touched the machine, but never synced to iCloud or another Mac:
             // these are this device's tokens.
-            add[(id)kSecAttrAccessible] =
-                (id)kSecAttrAccessibleAfterFirstUnlock;
-            st = SecItemAdd((CFDictionaryRef)add, NULL);
-            [add release];
+            add[(__bridge id)kSecAttrAccessible] =
+                (__bridge id)kSecAttrAccessibleAfterFirstUnlock;
+            st = SecItemAdd((__bridge CFDictionaryRef)add, NULL);
         }
         return st == errSecSuccess;
     }
@@ -254,18 +256,24 @@ std::string KeychainGet(const std::string& account)
 {
     @autoreleasepool {
         NSMutableDictionary* query = KeychainQuery(account);
-        query[(id)kSecReturnData]  = @YES;
-        query[(id)kSecMatchLimit]  = (id)kSecMatchLimitOne;
+        query[(__bridge id)kSecReturnData] = @YES;
+        query[(__bridge id)kSecMatchLimit] = (__bridge id)kSecMatchLimitOne;
 
         CFTypeRef result = NULL;
-        const OSStatus st = SecItemCopyMatching((CFDictionaryRef)query,
+        const OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)query,
                                                 &result);
-        if (st != errSecSuccess || !result) return {};
 
-        NSData* data = (NSData*)result;
+        // SecItemCopyMatching follows the Copy rule: it hands back a +1
+        // reference. __bridge_transfer moves that straight into ARC, before the
+        // checks below, so no early return can leak it and nothing has to
+        // remember a matching CFRelease — which under ARC would be a double
+        // release, not a fix.
+        id item = (__bridge_transfer id)result;
+        if (st != errSecSuccess || ![item isKindOfClass:[NSData class]]) return {};
+
+        NSData* data = (NSData*)item;
         std::string out;
         if (data.length > 0) out.assign((const char*)data.bytes, data.length);
-        CFRelease(result);
         return out;
     }
 }
@@ -273,7 +281,7 @@ std::string KeychainGet(const std::string& account)
 void KeychainDelete(const std::string& account)
 {
     @autoreleasepool {
-        SecItemDelete((CFDictionaryRef)KeychainQuery(account));
+        SecItemDelete((__bridge CFDictionaryRef)KeychainQuery(account));
     }
 }
 

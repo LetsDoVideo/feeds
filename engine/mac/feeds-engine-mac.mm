@@ -39,9 +39,13 @@
 // in a later increment) it must be written from the main queue, or it would
 // vouch for a main thread that is actually wedged.
 //
-// ── Memory management: this target is MRC, not ARC ───────────────────────────
-// No -fobjc-arc, so alloc/init objects are released explicitly. The two
-// delegates are the deliberate exception and say why at their definitions.
+// ── Memory management: ARC ───────────────────────────────────────────────────
+// The OBS template turns ARC on for the whole project (CLANG_ENABLE_OBJC_ARC in
+// cmake/macos/xcode.cmake), so it is on here too and explicit retain/release is
+// a compile error, not a style choice. One memory model across the engine: no
+// per-file opt-out. What this file still has to be deliberate about is the
+// delegates' LIFETIME, because the SDK's delegate properties are unowned — see
+// the note at their definitions.
 //
 // ── The SDK runtime must be inside this app bundle ───────────────────────────
 // ZoomSDK.framework is not self-contained: at auth time it loads sibling
@@ -419,11 +423,12 @@ static bool EnsureSdkUpThen(std::function<void()> action)
 // ---------------------------------------------------------------------------
 @class FeedsAuthDelegate;
 
-// All three delegate properties the SDK exposes are `assign` (unowned): it does
-// not retain what it is given, so anything shorter-lived than the service would
-// leave a dangling pointer the first time a callback fires. Deliberately
-// never-released globals are the simplest lifetime that outlives them, and the
-// engine process owns exactly one of each.
+// All three delegate properties the SDK exposes are `assign` (unowned, and
+// under ARC that means __unsafe_unretained): handing one an object nothing else
+// holds would leave a dangling pointer the first time a callback fires, with no
+// weak zeroing to catch it. These file-scope statics are strong references that
+// live for the process, which is the simplest lifetime that outlives the
+// services — the engine owns exactly one of each and never replaces it.
 static FeedsAuthDelegate*    g_authDelegate    = nil;
 static FeedsMeetingDelegate* g_meetingDelegate = nil;
 static FeedsActionDelegate*  g_actionDelegate  = nil;
@@ -585,7 +590,6 @@ static void BringUpSdk()
     LogInfo("Mac engine: calling initSDKWithParams (this blocks for several "
             "seconds by design)");
     const ZoomSDKError initErr = [[ZoomSDK sharedSDK] initSDKWithParams:params];
-    [params release];
     if (initErr != ZoomSDKError_Success) {
         LogError("Mac engine: initSDKWithParams FAILED (code " +
                  std::to_string((int)initErr) + ")");
@@ -626,7 +630,6 @@ static void BringUpSdk()
     ctx.jwtToken     = nil;
 
     const ZoomSDKError authErr = [authService sdkAuth:ctx];
-    [ctx release];
     if (authErr != ZoomSDKError_Success) {
         // A synchronous rejection means onZoomSDKAuthReturn will never fire, so
         // report here or nothing would ever be said about it.
@@ -795,12 +798,8 @@ static void HandleJoinMeeting(const std::string& json)
             std::string(webinarToken.empty() ? "absent" : "present") + ")");
 
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (!g_meetingService) {
-            [elements release];
-            return;
-        }
+        if (!g_meetingService) return;
         const ZoomSDKError err = [g_meetingService joinMeeting:elements];
-        [elements release];
         if (err != ZoomSDKError_Success) {
             // A synchronous rejection means no status change will follow, so
             // this is the only chance to report it.
