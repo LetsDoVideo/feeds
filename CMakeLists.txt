@@ -157,7 +157,31 @@ if(APPLE)
                 BUILD_WITH_INSTALL_RPATH OFF
                 BUILD_RPATH "${FEEDS_MAC_ZOOM_SDK_DIR}"
                 INSTALL_RPATH "@executable_path/../Frameworks"
+                # See cmake/macos/FeedsEngine.entitlements: the engine loads a
+                # framework signed by ZOOM, and library validation refuses any
+                # library whose Team ID differs from the process's. Only this
+                # binary gets the exception; the plugin (and so OBS) must not.
+                XCODE_ATTRIBUTE_CODE_SIGN_ENTITLEMENTS
+                    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/macos/FeedsEngine.entitlements"
         )
+
+        # Ad-hoc builds additionally drop the hardened runtime for THIS target.
+        # The template turns it on for every non-Debug configuration
+        # (cmake/macos/xcode.cmake), and the hardened runtime is what switches
+        # library validation on in the first place. Belt and braces: the
+        # entitlement above is the real fix and is what a notarized build (which
+        # must keep the hardened runtime) will rely on, while dropping it here
+        # means an ad-hoc CI build does not depend on entitlements being honored
+        # for a signature with no team behind it at all.
+        if(CODESIGN_IDENTITY STREQUAL "-")
+            set_target_properties(
+                FeedsEngine
+                PROPERTIES XCODE_ATTRIBUTE_ENABLE_HARDENED_RUNTIME NO
+            )
+            set(_feeds_engine_hardened_args "")
+        else()
+            set(_feeds_engine_hardened_args "--options;runtime")
+        endif()
 
         target_include_directories(FeedsEngine PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/common"
@@ -189,7 +213,26 @@ if(APPLE)
                     "$<TARGET_BUNDLE_DIR:FeedsEngine>/Contents"
             COMMAND ditto "${FEEDS_MAC_ZOOM_SDK_DIR}"
                     "$<TARGET_BUNDLE_DIR:FeedsEngine>/Contents/Frameworks"
-            COMMENT "Copying the Zoom macOS SDK runtime into FeedsEngine.app"
+            # Re-sign AFTER the SDK lands inside the app. Xcode signed this
+            # bundle at the end of its own build phase, i.e. before the copy
+            # above, so that signature no longer describes the bundle's
+            # contents. Re-signing here also guarantees the entitlement is
+            # attached to the artifact that actually ships, rather than
+            # depending on when Xcode chose to sign.
+            #
+            # Zoom's own nested frameworks keep THEIR signatures: this signs the
+            # app, not its contents (no --deep), which is exactly the
+            # different-Team-ID arrangement the entitlement exists to permit. A
+            # notarized build will additionally have to re-sign every nested
+            # item with our Developer ID, deepest first; that belongs with the
+            # signing/notarization work, not here.
+            COMMAND codesign --force --sign "${CODESIGN_IDENTITY}"
+                    ${_feeds_engine_hardened_args}
+                    --entitlements
+                    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/macos/FeedsEngine.entitlements"
+                    --timestamp=none
+                    "$<TARGET_BUNDLE_DIR:FeedsEngine>"
+            COMMENT "Copying the Zoom macOS SDK runtime into FeedsEngine.app and re-signing it"
             VERBATIM
         )
 
@@ -202,7 +245,13 @@ if(APPLE)
             POST_BUILD
             COMMAND ditto "$<TARGET_BUNDLE_DIR:FeedsEngine>"
                     "$<TARGET_BUNDLE_DIR:${CMAKE_PROJECT_NAME}>/Contents/MacOS/FeedsEngine.app"
-            COMMENT "Staging FeedsEngine.app inside the plugin bundle"
+            # Same reason as the engine: the plugin bundle was signed before the
+            # engine was copied into it. Deliberately NO entitlements here — the
+            # plugin loads no Zoom framework, and library validation must stay
+            # on for the bundle OBS loads into its own process.
+            COMMAND codesign --force --sign "${CODESIGN_IDENTITY}" --timestamp=none
+                    "$<TARGET_BUNDLE_DIR:${CMAKE_PROJECT_NAME}>"
+            COMMENT "Staging FeedsEngine.app inside the plugin bundle and re-signing it"
             VERBATIM
         )
 

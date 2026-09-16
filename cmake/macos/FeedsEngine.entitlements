@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for FeedsEngine.app, the process that hosts the Zoom Meeting SDK.
+
+  NOT for the plugin bundle, and therefore not for OBS. Only the engine loads
+  ZoomSDK.framework; the plugin reaches the engine over a socket. An entitlement
+  a binary does not need is attack surface it should not carry, and this one in
+  particular weakens a protection OBS should keep.
+
+  WHY disable library validation. Library validation requires every library
+  loaded into a process to be signed by the SAME Team ID as the process (or by
+  Apple). ZoomSDK.framework arrives pre-signed by Zoom, and Feeds is signed by
+  us, so the two Team IDs differ by construction and dyld refuses the load:
+
+    Termination Reason: Namespace DYLD, Code 1 Library missing
+    Library not loaded: @rpath/ZoomSDK.framework/Versions/A/ZoomSDK
+    Reason: code signature not valid for use in process: mapping process and
+            mapped file (non-platform) have different Team IDs
+
+  That is the crash this file fixes. Apple's documented mechanism for an app
+  that loads a bundled framework signed by another team is exactly this
+  entitlement. Library validation is switched on by the hardened runtime, which
+  the OBS plugin template enables for every non-Debug configuration (see
+  cmake/macos/xcode.cmake), and which notarization will require later anyway.
+
+  STYLE NOTE: no double hyphen anywhere in this comment. XML forbids it inside
+  comments and Apple's entitlements parser enforces that strictly, failing the
+  codesign call with a bare "syntax error near line N" that names this file and
+  nothing else.
+
+  Camera and microphone are deliberately NOT requested. Feeds joins with audio
+  and video off and only receives other participants' media. If the SDK ever
+  needs a local device, the entitlement AND the matching usage string in
+  FeedsEngine-Info.plist have to be added together.
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+</dict>
+</plist>
