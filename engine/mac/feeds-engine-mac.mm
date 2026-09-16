@@ -168,8 +168,10 @@ static void ReportRawDataLicense()
 
 @end
 
-// The delegate property is `assign` (unowned), so this must outlive the auth
-// service: a deliberately never-released global, as the SDK's own samples do.
+// The delegate property is `assign` (unowned): the auth service does not retain
+// it, so anything shorter-lived than the service would leave a dangling pointer
+// the first time a callback fires. A deliberately never-released global is the
+// simplest lifetime that outlives it, and the engine process owns exactly one.
 static FeedsAuthDelegate* g_authDelegate = nil;
 
 // ---------------------------------------------------------------------------
