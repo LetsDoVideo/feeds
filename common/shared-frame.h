@@ -50,6 +50,10 @@
 #include <stdint.h>
 #include <string>
 
+#ifndef _WIN32
+#include <cstdio>
+#endif
+
 namespace feeds_shared {
 
 // Ring depth. 3 slots is the minimum that allows the writer to be writing
@@ -138,6 +142,43 @@ static constexpr uint32_t REGION_VERSION = 2; // bumped from 1 in v1.0.4 to enla
 static constexpr size_t REGION_SIZE =
     sizeof(SharedFrameHeader) + (RING_SLOTS * sizeof(FrameSlot));
 
+// POSIX shared-memory names have a HARD length cap, and it is a short one.
+//
+// macOS caps a POSIX shm object name at 31 characters INCLUDING the leading
+// '/', and shm_open fails with ENAMETOOLONG one character past it. The logical
+// names below are built from an engine PID and an OBS source UUID and run to
+// roughly 55 characters, so on macOS every region would fail to open and not
+// one frame could ever be delivered — silently, because nothing downstream can
+// tell a region that was never created from a participant who is not sending.
+//
+// Shortening the UUID is not a fix: the literal prefix alone eats a third of
+// the budget, and a truncated UUID stops being unique. So on POSIX the whole
+// logical name is collapsed to a fixed 22-character form: '/' + "Feeds" + 16
+// hex digits of an FNV-1a 64 hash of the logical name. It is deterministic, so
+// the engine and the plugin derive byte-identical object names from the same
+// inputs without either side knowing the mapping happened, and it is applied
+// inside the two Make*Name functions below so no call site can forget it or
+// drift from the other side.
+//
+// Collision risk is a 64-bit hash over a handful of names per session, well
+// below every other failure mode in this path — and a collision would need two
+// live sources within one engine, since the engine PID is part of the hashed
+// input. Windows keeps its existing names untouched.
+#ifndef _WIN32
+inline std::string PosixShmName(const std::string& logicalName)
+{
+    uint64_t hash = 1469598103934665603ULL;          // FNV-1a 64 offset basis
+    for (unsigned char c : logicalName) {
+        hash ^= (uint64_t)c;
+        hash *= 1099511628211ULL;                    // FNV-1a 64 prime
+    }
+    char buf[24];
+    std::snprintf(buf, sizeof(buf), "/Feeds%016llx",
+                  (unsigned long long)hash);
+    return std::string(buf);
+}
+#endif
+
 // Construct the shared memory name. Must be identical between engine
 // and plugin for a given subscription. Format:
 //   Local\FeedsFrames_<engine_pid>_<source_uuid>
@@ -145,10 +186,19 @@ static constexpr size_t REGION_SIZE =
 // The "Local\" prefix scopes the name to the current session, which is
 // what we want. Multiple OBS instances with different engine PIDs can
 // coexist. The source UUID makes it unique within one engine.
+//
+// On POSIX the same logical name is hashed down to fit the platform's 31-char
+// shm-name cap; see PosixShmName above.
 inline std::string MakeFrameRegionName(uint32_t enginePid,
                                         const std::string& sourceUuid)
 {
-    return "Local\\FeedsFrames_" + std::to_string(enginePid) + "_" + sourceUuid;
+    const std::string logical =
+        "Local\\FeedsFrames_" + std::to_string(enginePid) + "_" + sourceUuid;
+#ifdef _WIN32
+    return logical;
+#else
+    return PosixShmName(logical);
+#endif
 }
 
 // Shared memory name for the screenshare region. Unlike participant feeds
@@ -164,7 +214,12 @@ inline std::string MakeFrameRegionName(uint32_t enginePid,
 // write_index unchanged and output nothing.
 inline std::string MakeScreenShareRegionName(uint32_t enginePid)
 {
-    return "Local\\FeedsShare_" + std::to_string(enginePid);
+    const std::string logical = "Local\\FeedsShare_" + std::to_string(enginePid);
+#ifdef _WIN32
+    return logical;
+#else
+    return PosixShmName(logical);
+#endif
 }
 
 } // namespace feeds_shared

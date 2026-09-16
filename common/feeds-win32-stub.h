@@ -11,18 +11,23 @@
 //     code). Each caller already treats that as "request failed", so the update
 //     check finds nothing and the chat readers stay disconnected. Not available
 //     on this platform yet.
-//   * Shared memory (OpenFileMappingA / MapViewOfFile): always fails. There is
-//     no engine on this platform, so no region ever exists to map.
+//   * Shared memory (OpenFileMappingA / MapViewOfFile / UnmapViewOfFile):
+//     REAL, implemented with POSIX shm_open + mmap. The engine writes frames
+//     into a named shm object and the plugin's pump threads read them, so a
+//     stub here means a permanently black participant source.
+//   * Memory barrier (MemoryBarrier): REAL. It orders the pump thread's read
+//     of the ring's write_index against its read of the frame slot, and on
+//     arm64 that ordering is not free.
 //   * Events (CreateEventW / SetEvent / WaitForSingleObject / CloseHandle):
 //     REAL, implemented with std::mutex + std::condition_variable. The chat and
 //     pump threads block on these and are woken by SetEvent at shutdown; a
 //     fake would either spin a CPU or hang OBS's exit.
 //   * Time (Sleep / GetTickCount / GetTickCount64): real.
 //
-// This is a bridge for the shell milestone, not the Mac port. The port replaces
-// each group with a native implementation (shared memory with POSIX shm,
-// networking with a real HTTP/WebSocket client) and this header shrinks away.
-// The Windows build never includes it.
+// This is a bridge, not the Mac port: each group is replaced with a native
+// implementation as that part of the port lands (shared memory now; networking
+// still to come) and this header shrinks away. The Windows build never
+// includes it.
 
 #pragma once
 
@@ -30,12 +35,20 @@
 #error "feeds-win32-stub.h is for non-Windows builds; include <windows.h> instead"
 #endif
 
+#include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <mutex>
+#include <string>
 #include <thread>
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 // ---------------------------------------------------------------------------
 // Types and constants
@@ -143,7 +156,21 @@ enum WINHTTP_WEB_SOCKET_BUFFER_TYPE {
 // ---------------------------------------------------------------------------
 // Kernel: errors, time, memory barrier
 // ---------------------------------------------------------------------------
-inline DWORD GetLastError() { return ERROR_NOT_SUPPORTED; }
+
+// Callers log GetLastError() after a failed call, so it has to carry something
+// worth logging. The shared-memory functions below record their errno here;
+// everything else in this header fails for the one structural reason
+// ERROR_NOT_SUPPORTED already states. Per-thread, like the Win32 original.
+namespace feeds_win32_stub {
+inline DWORD& LastErrorSlot()
+{
+    static thread_local DWORD value = ERROR_NOT_SUPPORTED;
+    return value;
+}
+inline void SetLastErrorFromErrno() { LastErrorSlot() = (DWORD)errno; }
+}  // namespace feeds_win32_stub
+
+inline DWORD GetLastError() { return feeds_win32_stub::LastErrorSlot(); }
 
 inline void Sleep(DWORD ms)
 {
@@ -159,7 +186,14 @@ inline uint64_t GetTickCount64()
 
 inline DWORD GetTickCount() { return (DWORD)(GetTickCount64() & 0xFFFFFFFFull); }
 
-inline void MemoryBarrier() {}
+// Real, not a no-op. The frame ring's whole correctness argument is "the reader
+// that sees the new write_index is guaranteed to see the new slot contents",
+// and on arm64 — every Apple Silicon Mac — nothing enforces that ordering for
+// free. An empty body here would compile and then tear frames under load.
+inline void MemoryBarrier()
+{
+    std::atomic_thread_fence(std::memory_order_acq_rel);
+}
 
 // ---------------------------------------------------------------------------
 // Events — a real implementation (see the header note for why).
@@ -176,8 +210,10 @@ struct Event {
     std::condition_variable cv;
 };
 
-// Every non-null HANDLE this header can hand out is an Event (file mappings and
-// WinHTTP always fail), so the magic check is a guard, not a type system.
+// A HANDLE from this header is either an Event or a Mapping, and CloseHandle
+// takes both, so each carries its own magic as the discriminator. The first
+// word of both structs is the magic, which is what makes the probe below safe
+// to run against either.
 inline Event* AsEvent(HANDLE h)
 {
     Event* e = static_cast<Event*>(h);
@@ -227,22 +263,129 @@ inline DWORD WaitForSingleObject(HANDLE h, DWORD ms)
     return WAIT_OBJECT_0;
 }
 
-// Callers join their waiting thread before closing the event (as on Windows).
+// ---------------------------------------------------------------------------
+// Shared memory — POSIX shm, read side.
+//
+// The plugin only ever OPENS regions; the engine creates and sizes them. So
+// these three are deliberately open-only: there is no CreateFileMapping here
+// and nothing in this header calls ftruncate.
+//
+// Mapping the region read-WRITE when FILE_MAP_WRITE is asked for is not
+// incidental. The participant pump thread writes last_read_index back into the
+// shared header, so a read-only view would fault on the first frame it
+// delivered. The screenshare source asks for FILE_MAP_READ only and gets a
+// read-only view, matching what it does on Windows.
+//
+// UnmapViewOfFile takes only a pointer, while munmap also needs the length, so
+// each live mapping's length is recorded when it is made. The map is keyed by
+// the mapped address, which is unique for as long as the mapping exists.
+// ---------------------------------------------------------------------------
+namespace feeds_win32_stub {
+
+constexpr uint32_t kMappingMagic = 0x4645454du;  // 'FEEM'
+
+struct Mapping {
+    uint32_t    magic = kMappingMagic;
+    int         fd    = -1;
+    std::string name;
+};
+
+inline Mapping* AsMapping(HANDLE h)
+{
+    Mapping* m = static_cast<Mapping*>(h);
+    return (m && h != INVALID_HANDLE_VALUE && m->magic == kMappingMagic) ? m
+                                                                        : nullptr;
+}
+
+inline std::mutex& ViewMutex()
+{
+    static std::mutex m;
+    return m;
+}
+inline std::map<const void*, size_t>& ViewSizes()
+{
+    static std::map<const void*, size_t> sizes;
+    return sizes;
+}
+
+}  // namespace feeds_win32_stub
+
+inline HANDLE OpenFileMappingA(DWORD desiredAccess, BOOL /*inheritHandle*/,
+                               const char* name)
+{
+    if (!name) return nullptr;
+
+    const int flags = (desiredAccess & FILE_MAP_WRITE) ? O_RDWR : O_RDONLY;
+    const int fd    = shm_open(name, flags, 0600);
+    if (fd < 0) {
+        feeds_win32_stub::SetLastErrorFromErrno();
+        return nullptr;
+    }
+
+    auto* m = new feeds_win32_stub::Mapping();
+    m->fd   = fd;
+    m->name = name;
+    return m;
+}
+
+inline LPVOID MapViewOfFile(HANDLE h, DWORD desiredAccess, DWORD /*offsetHigh*/,
+                            DWORD /*offsetLow*/, size_t size)
+{
+    feeds_win32_stub::Mapping* m = feeds_win32_stub::AsMapping(h);
+    if (!m || size == 0) return nullptr;
+
+    const int prot = (desiredAccess & FILE_MAP_WRITE) ? (PROT_READ | PROT_WRITE)
+                                                      : PROT_READ;
+    void* p = mmap(nullptr, size, prot, MAP_SHARED, m->fd, 0);
+    if (p == MAP_FAILED) {
+        feeds_win32_stub::SetLastErrorFromErrno();
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lk(feeds_win32_stub::ViewMutex());
+    feeds_win32_stub::ViewSizes()[p] = size;
+    return p;
+}
+
+inline BOOL UnmapViewOfFile(const void* p)
+{
+    if (!p) return FALSE;
+
+    size_t size = 0;
+    {
+        std::lock_guard<std::mutex> lk(feeds_win32_stub::ViewMutex());
+        auto& sizes = feeds_win32_stub::ViewSizes();
+        auto  it    = sizes.find(p);
+        if (it == sizes.end()) return FALSE;
+        size = it->second;
+        sizes.erase(it);
+    }
+    return munmap(const_cast<void*>(p), size) == 0 ? TRUE : FALSE;
+}
+
+// Closes either an event or a shared-memory handle. Callers join their waiting
+// thread before closing an event (as on Windows), and unmap their view before
+// closing a mapping — but closing the descriptor first would be harmless
+// either way, because a POSIX mapping stays valid after its fd is closed.
+//
+// Note what is NOT here: shm_unlink. The plugin is the reader and does not own
+// the name; unlinking it would pull the region out from under a second source
+// reading the same share region, and out from under the engine's own writer.
 inline BOOL CloseHandle(HANDLE h)
 {
     if (feeds_win32_stub::Event* e = feeds_win32_stub::AsEvent(h)) {
         e->magic = 0;
         delete e;
+        return TRUE;
+    }
+    if (feeds_win32_stub::Mapping* m = feeds_win32_stub::AsMapping(h)) {
+        if (m->fd >= 0) close(m->fd);
+        m->magic = 0;
+        delete m;
+        return TRUE;
     }
     return TRUE;
 }
-
-// ---------------------------------------------------------------------------
-// Shared memory — always unavailable (no engine on this platform).
-// ---------------------------------------------------------------------------
-inline HANDLE OpenFileMappingA(DWORD, BOOL, const char*) { return nullptr; }
-inline LPVOID MapViewOfFile(HANDLE, DWORD, DWORD, DWORD, size_t) { return nullptr; }
-inline BOOL   UnmapViewOfFile(const void*) { return TRUE; }
 
 // ---------------------------------------------------------------------------
 // Strings / memory used by feeds-http.h

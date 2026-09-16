@@ -9,18 +9,20 @@
 // those files. What IS shared is the contract: the same JSON messages, so
 // PROTOCOL.md describes both platforms.
 //
-// ── INCREMENT 1b — WHAT THIS DOES AND DOES NOT DO ────────────────────────────
-// Does: everything up to a joined meeting with a populated roster. Zoom login
-// over OAuth (feeds-mac-login.mm), session restore at startup, lazy SDK
-// bring-up on the first connect, join by meeting number or link, the
-// participant list — sent on join and kept current as people come and go — and
-// the raw-livestream PRIVILEGE request, which is what un-greys the plugin's
-// dock and source-properties dialog.
+// ── WHAT LIVES WHERE ─────────────────────────────────────────────────────────
+// This file: the process, the IPC, the SDK's bring-up and authentication, the
+// meeting (join / leave / status), the roster, and the raw-livestream privilege
+// request that un-greys the plugin's dock and source-properties dialog.
 //
-// Does NOT: deliver any video. The privilege is requested but not yet used:
-// no startRawLiveStreaming, no renderer subscription, no shared-memory frame
-// transport; those are increment 2. A source placed in OBS on macOS will show
-// nothing yet, by design — it will simply be pickable rather than greyed.
+// feeds-mac-login.mm: the whole Zoom login path — OAuth, session restore, the
+// ZAK fetch a join begins with.
+//
+// feeds-mac-video.mm: everything downstream of the privilege — starting raw
+// livestreaming, the renderers, the shared-memory frame transport, the
+// active-speaker target and screenshare. This file feeds it the SDK events it
+// needs (privilege granted, meeting started/ended, active audio, camera state,
+// departures) and hands it the plugin's source messages; it owns all of the
+// state behind them.
 //
 // ── Threading: the constraint that shapes this file ──────────────────────────
 // The macOS SDK is an AppKit client: it delivers every result through
@@ -74,6 +76,7 @@
 #include "feeds-ipc-posix.h"
 #include "feeds-json-lite.h"
 #include "feeds-mac-login.h"
+#include "feeds-mac-video.h"
 #include "feeds-version.h"
 
 // ---------------------------------------------------------------------------
@@ -311,6 +314,10 @@ static bool EnsureSdkUpThen(std::function<void()> action)
         // Seed the dock immediately. onUserJoin keeps it current afterwards,
         // but the people already in the meeting generate no join event.
         SendParticipantList();
+        // Arm the video module before asking for the privilege: the grant can
+        // come back immediately when we are the host, and it drains a queue
+        // this call is what creates.
+        feeds_mac::VideoMeetingStarted();
         // The roster alone does not light the dock up: it stays greyed until
         // the raw-livestream privilege is reported. Ask for it now, exactly
         // where the Windows engine asks.
@@ -319,12 +326,17 @@ static bool EnsureSdkUpThen(std::function<void()> action)
     }
 
     case ZoomSDKMeetingStatus_Failed:
+        feeds_mac::VideoMeetingEnded();
         SendToPlugin("{\"type\":\"meeting_failed\",\"code\":" +
                      std::to_string((int)error) + ",\"message\":\"" +
                      feeds::JsonEscape(MeetingErrorMessage(error)) + "\"}");
         break;
 
     case ZoomSDKMeetingStatus_Ended:
+        // Renderers first: they hold SDK objects belonging to the meeting that
+        // is going away, and the plugin's sources must be released before it is
+        // told the meeting is over.
+        feeds_mac::VideoMeetingEnded();
         SendToPlugin("{\"type\":\"meeting_left\"}");
         // The roster is gone with the meeting; say so rather than leaving the
         // dock showing people who are no longer reachable.
@@ -366,26 +378,62 @@ static bool EnsureSdkUpThen(std::function<void()> action)
 
 // ── the roster ───────────────────────────────────────────────────────────────
 - (void)onUserJoin:(NSArray*)array                      { SendParticipantList(); }
-- (void)onUserLeft:(NSArray*)array                      { SendParticipantList(); }
 - (void)onUserNamesChanged:(NSArray<NSNumber*>*)userList { SendParticipantList(); }
 - (void)onInMeetingUserAvatarPathUpdated:(unsigned int)userID { SendParticipantList(); }
 
-// ── @required, and nothing to do with this increment ─────────────────────────
+- (void)onUserLeft:(NSArray*)array
+{
+    // Zoom fires no raw-data-off for a user who LEAVES, only for one whose
+    // video stops while they stay, so a source bound to them would freeze on
+    // their last frame. Tell the video module before the roster goes out.
+    for (id entry in array) {
+        if (![entry isKindOfClass:[NSNumber class]]) continue;
+        feeds_mac::VideoOnUserLeft([(NSNumber*)entry unsignedIntValue]);
+    }
+    SendParticipantList();
+}
+
+// ── video ────────────────────────────────────────────────────────────────────
+// A camera coming back on is how a source that was subscribed to a camera-off
+// participant recovers; a camera going off changes who is displayable as the
+// active speaker.
+- (void)onVideoStatusChange:(ZoomSDKVideoStatus)videoStatus UserID:(unsigned int)userID
+{
+    feeds_mac::VideoOnUserVideoStatusChanged(
+        userID, videoStatus == ZoomSDKVideoStatus_On);
+}
+
+// The active-speaker INPUT. Item 0 is the current talker; the video module
+// stores it raw and derives the on-screen target from it, which is the same
+// split the Windows engine makes for the same reason (a filter applied here
+// would throw away a speaker who becomes displayable a moment later).
+- (void)onUserActiveAudioChange:(NSArray*)useridArray
+{
+    for (id entry in useridArray) {
+        if (![entry isKindOfClass:[NSNumber class]]) continue;
+        feeds_mac::VideoOnActiveAudio([(NSNumber*)entry unsignedIntValue]);
+        break;
+    }
+}
+
+// ── @required, and nothing this engine acts on ───────────────────────────────
 - (void)onUserAudioStatusChange:(NSArray*)userAudioStatusArray {}
 - (void)onVirtualNameTagStatusChanged:(BOOL)bOn userID:(unsigned int)userID {}
 - (void)onVirtualNameTagRosterInfoUpdated:(unsigned int)userID {}
 - (void)onHostChange:(unsigned int)userID {}
 - (void)onMeetingCoHostChanged:(unsigned int)userID isCoHost:(BOOL)isCoHost {}
 - (void)onSpotlightVideoUserChange:(NSArray*_Nullable)spotlightedUserList {}
-- (void)onVideoStatusChange:(ZoomSDKVideoStatus)videoStatus UserID:(unsigned int)userID {}
 - (void)onLowOrRaiseHandStatusChange:(BOOL)raise UserID:(unsigned int)userID {}
 - (void)onJoinMeetingResponse:(ZoomSDKJoinMeetingHelper*_Nullable)joinMeetingHelper {}
 - (void)onMultiToSingleShareNeedConfirm:(ZoomSDKMultiToSingleShareConfirmHandler*_Nullable)confirmHandle {}
+// Deliberately NOT the active-speaker input. These two report Zoom's own
+// video-layout choices, which lag the talker and latch on a pinned or
+// spotlighted user; the audio callback above is what tracks who is actually
+// speaking, and is the same input the Windows engine uses.
 - (void)onActiveVideoUserChanged:(unsigned int)userID {}
 - (void)onActiveSpeakerVideoUserChanged:(unsigned int)userID {}
 - (void)onHostAskUnmute {}
 - (void)onHostAskStartVideo {}
-- (void)onUserActiveAudioChange:(NSArray*)useridArray {}
 - (void)onInvalidReclaimHostKey {}
 - (void)onHostVideoOrderUpdated:(NSArray*)orderList {}
 - (void)onLocalVideoOrderUpdated:(NSArray*)localOrderList {}
@@ -434,11 +482,10 @@ static bool EnsureSdkUpThen(std::function<void()> action)
 // "Waiting for participants…" and offer no participant picker, however full the
 // roster is, because a picker that cannot produce video would be a lie.
 //
-// Note what is NOT here. Windows' granted callback also calls
-// StartRawLiveStreaming and wires up the share and audio listeners; that is the
-// step that actually moves frames, and it stays in increment 2 along with the
-// renderer subscription and the frame transport. Asking for the privilege is
-// separable from using it, and it is a prerequisite either way.
+// The privilege is separable from USING it. Granting it moves no pixels: the
+// call that turns raw-data delivery on is startRawLiveStreaming, which the
+// granted path below hands to the video module, exactly where the Windows
+// engine calls it.
 //
 // RECORDING IS NOT THE MECHANISM. Raw data is unlocked by the raw-LIVESTREAM
 // privilege, the same one the Windows engine requests — not by local recording
@@ -467,8 +514,14 @@ static NSString* const kRawBroadcastName = @"Feeds";
     }
 
     LogInfo("Mac engine: raw livestream privilege GRANTED");
-    // The signal the plugin's dock and properties dialog are waiting on. In
-    // increment 2 this is also where startRawLiveStreaming goes.
+
+    // Start raw livestreaming BEFORE telling the plugin. This is the call that
+    // actually unlocks frame delivery, and raw_livestream_granted is what makes
+    // the plugin start sending subscribes — announcing first would invite a
+    // burst of requests at an SDK that is not yet delivering anything.
+    feeds_mac::VideoStartRawLiveStream();
+
+    // The signal the plugin's dock and properties dialog are waiting on.
     SendToPlugin("{\"type\":\"raw_livestream_granted\"}");
 }
 
@@ -488,8 +541,19 @@ static NSString* const kRawBroadcastName = @"Feeds";
 // never runs as the approver, so there is nothing to answer here.
 - (void)onRawLiveStreamPrivilegeRequested:
     (ZoomSDKRequestRawLiveStreamPrivilegeHandler*_Nullable)handler {}
+
+// Our own user appearing in this list is the SDK's only reliable "the raw-data
+// renderer subsystem is up" signal. createRenderer before it returns a
+// transient not-ready error, so the video module holds subscribe requests
+// queued until this arrives.
 - (void)onUserRawLiveStreamingStatusChanged:
-    (NSArray<ZoomSDKRawLiveStreamInfo*>*_Nullable)liveStreamList {}
+    (NSArray<ZoomSDKRawLiveStreamInfo*>*_Nullable)liveStreamList
+{
+    for (ZoomSDKRawLiveStreamInfo* info in liveStreamList) {
+        if (![info isKindOfClass:[ZoomSDKRawLiveStreamInfo class]]) continue;
+        feeds_mac::VideoNotifyRawRenderReady(info.userID);
+    }
+}
 - (void)onLiveStreamReminderStatusChanged:(BOOL)enable {}
 - (void)onLiveStreamReminderStatusChangeFailed {}
 - (void)onUserThresholdReachedForLiveStream:(int)percent {}
@@ -728,6 +792,16 @@ static void BringUpSdk()
     params.needCustomizedUI = NO;
     params.enableLog        = YES;
     params.zoomDomain       = @"https://zoom.us";
+
+    // Raw-data memory mode is configured on the ZoomSDK SINGLETON here, not on
+    // the init params — unlike Windows, where it lives inside InitParam. It has
+    // to be set before initSDKWithParams or it is ignored. Heap mode matches
+    // what the Windows engine asks for, so the frame buffers handed to the
+    // shared-memory writer have the same lifetime rules on both platforms:
+    // valid for the duration of the callback and freed after it unless
+    // explicitly retained.
+    [ZoomSDK sharedSDK].videoRawDataMode = ZoomSDKRawDataMemoryMode_Heap;
+    [ZoomSDK sharedSDK].shareRawDataMode = ZoomSDKRawDataMemoryMode_Heap;
 
     LogInfo("Mac engine: calling initSDKWithParams (this blocks for several "
             "seconds by design)");
@@ -983,6 +1057,10 @@ static void HandleLeaveMeeting()
 
 static void HandleLogout()
 {
+    // Renderers and regions belong to the meeting, and the meeting is about to
+    // end without necessarily producing a status change we would see.
+    feeds_mac::VideoMeetingEnded();
+
     if (g_meetingService) {
         const ZoomSDKMeetingStatus status = [g_meetingService getMeetingStatus];
         if (status != ZoomSDKMeetingStatus_Idle &&
@@ -1041,11 +1119,26 @@ static void HandleCommand(const std::string& line)
     if (type == "leave_meeting")   { HandleLeaveMeeting();  return; }
     if (type == "get_participants") { SendParticipantList(); return; }
 
+    // Video. A subscribe re-points an existing renderer where it can; a
+    // recreate always rebuilds one, because a kept renderer loses SDK delivery
+    // across a participant's drop and rejoin.
+    if (type == "participant_source_subscribe") {
+        feeds_mac::VideoHandleSubscribe(line, /*recreate=*/false);
+        return;
+    }
+    if (type == "participant_source_recreate") {
+        feeds_mac::VideoHandleSubscribe(line, /*recreate=*/true);
+        return;
+    }
+    if (type == "participant_source_unsubscribe") {
+        feeds_mac::VideoHandleUnsubscribe(line);
+        return;
+    }
+
     // Everything else belongs to a later increment. Say so plainly rather than
     // dropping it silently, so a premature message is visible in the log.
     LogWarn("Mac engine: ignoring '" + type +
-            "' — not implemented in this build (participant video is a later "
-            "increment)");
+            "' — not implemented in this build");
 }
 
 // ---------------------------------------------------------------------------
