@@ -6737,6 +6737,14 @@ void SetupPluginMenu() {
 
     feedsMenu->addSeparator();
     QAction* aboutAction = feedsMenu->addAction("About / Tier Status");
+    // On macOS, Qt inspects every QAction's text and relocates the ones that
+    // look like standard application commands into the application menu. A
+    // caption beginning with "About" is detected as the about-the-app item and
+    // merged into that menu, which takes it out of the menu we built it in —
+    // so the item silently vanishes from Feeds on Mac. This is the Feeds about
+    // box, not the host application's, so opt out of the relocation and keep
+    // it where it was added. No-op on Windows, where the role is never read.
+    aboutAction->setMenuRole(QAction::NoRole);
 
     // Sync menu action states to the current plugin state. If the engine
     // has already finished authenticating (common on startup when a valid

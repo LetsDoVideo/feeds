@@ -27,11 +27,25 @@ namespace feeds_mac {
 
 namespace {
 
-// Keychain account names. Deliberately the same words as the Windows credential
-// targets, so the two platforms describe the same three secrets identically.
-const char* const kAccessTokenItem  = "Feeds_AccessToken";
-const char* const kRefreshTokenItem = "Feeds_RefreshToken";
+// Keychain account names. The two OAuth tokens share one Keychain item: they
+// are one lifecycle unit — written together, read together, deleted together —
+// and every item carries its own access-control list, so storing them
+// separately made macOS ask the user for permission twice in a row, two
+// identical panels stacked on top of each other with no way to tell them
+// apart. One item is one authorization.
+//
+// The access and refresh tokens are separated by a newline. Both are URL-safe
+// OAuth token strings and cannot contain one, and the split takes the FIRST
+// newline as the boundary, so nothing unexpected in the refresh token can
+// corrupt the access token.
+const char* const kSessionItem      = "Feeds_Session";
 const char* const kCachedTierItem   = "Feeds_CachedTier";
+
+// Superseded by kSessionItem. Read once to migrate an existing login, then
+// deleted; a user who already signed in keeps their session across the change
+// instead of being silently logged out.
+const char* const kLegacyAccessItem  = "Feeds_AccessToken";
+const char* const kLegacyRefreshItem = "Feeds_RefreshToken";
 
 const char* const kRedirectUri = "https://letsdovideo.com/loginsuccess";
 
@@ -103,8 +117,60 @@ void SaveTokens()
         access  = g_accessToken;
         refresh = g_refreshToken;
     }
-    if (!access.empty())  KeychainSet(kAccessTokenItem, access);
-    if (!refresh.empty()) KeychainSet(kRefreshTokenItem, refresh);
+    // One item means one write, so it is the whole session that gets stored or
+    // nothing. A session with no refresh token cannot be restored anyway, and
+    // writing one would replace a good stored refresh token with nothing — a
+    // silent logout on the next start. Both callers hold both tokens by the
+    // time they get here; this keeps that a guarantee rather than a habit.
+    if (refresh.empty()) return;
+    KeychainSet(kSessionItem, access + "\n" + refresh);
+}
+
+// Both tokens in one Keychain read, so the user is asked once.
+//
+// A login stored by an earlier build lives in the two separate items; read
+// those once, rewrite them as the single item, and remove them. That migration
+// still costs the old two prompts, but only on the first run after the change.
+// Returns false when there is no usable stored session, which is the ordinary
+// state of a user who has not logged in yet, not an error. On true, refresh is
+// non-empty: that is the token a restore actually needs.
+bool LoadStoredTokens(std::string& access, std::string& refresh)
+{
+    access.clear();
+    refresh.clear();
+
+    const std::string blob = KeychainGet(kSessionItem);
+    if (!blob.empty()) {
+        const size_t nl = blob.find('\n');
+        if (nl == std::string::npos) {
+            // SaveTokens never writes a value without the separator, so this is
+            // a truncated or hand-edited item. There is no way to tell which
+            // token it holds, so treat the session as unusable and let the user
+            // sign in again rather than guess.
+            LogWarn("Login: the stored session is malformed; ignoring it");
+            return false;
+        }
+        access  = blob.substr(0, nl);
+        refresh = blob.substr(nl + 1);
+        return !refresh.empty();
+    }
+
+    access  = KeychainGet(kLegacyAccessItem);
+    refresh = KeychainGet(kLegacyRefreshItem);
+    if (refresh.empty()) {
+        // Nothing worth carrying over: without the refresh token there is no
+        // session to restore. Leave the old items alone — the next successful
+        // login writes the single item and this fallback stops running.
+        access.clear();
+        return false;
+    }
+
+    LogDebug("Login: migrating the stored session to a single Keychain item");
+    if (KeychainSet(kSessionItem, access + "\n" + refresh)) {
+        KeychainDelete(kLegacyAccessItem);
+        KeychainDelete(kLegacyRefreshItem);
+    }
+    return true;
 }
 
 // The last-known-good tier lives beside the tokens on purpose: it inherits
@@ -138,8 +204,8 @@ bool RefreshAccessToken()
         refresh = g_refreshToken;
     }
     if (refresh.empty()) {
-        refresh = KeychainGet(kRefreshTokenItem);
-        if (refresh.empty()) return false;
+        std::string storedAccess;
+        if (!LoadStoredTokens(storedAccess, refresh)) return false;
         std::lock_guard<std::mutex> lock(g_stateMutex);
         g_refreshToken = refresh;
     }
@@ -508,8 +574,11 @@ void LoginThread()
 void RestoreSessionFromStoredToken()
 {
     std::thread([]() {
-        const std::string refresh = KeychainGet(kRefreshTokenItem);
-        if (refresh.empty()) {
+        // One Keychain read for both tokens: two reads here meant two identical
+        // permission panels stacked on top of each other, and the one in front
+        // looked like the one behind it had failed.
+        std::string access, refresh;
+        if (!LoadStoredTokens(access, refresh)) {
             LogDebug("Login: no stored token; waiting for the user to sign in");
             // Not a failure — the user simply has not logged in yet — but the
             // plugin needs the signal to stop waiting. It special-cases this
@@ -520,7 +589,7 @@ void RestoreSessionFromStoredToken()
         {
             std::lock_guard<std::mutex> lock(g_stateMutex);
             g_refreshToken = refresh;
-            g_accessToken  = KeychainGet(kAccessTokenItem);
+            g_accessToken  = access;
         }
         LogInfo("Login: restoring the stored session");
         AnnounceLoginSucceeded();
@@ -561,8 +630,11 @@ void ClearStoredCredentials()
         g_pmi.clear();
         g_currentTier = 0;
     }
-    KeychainDelete(kAccessTokenItem);
-    KeychainDelete(kRefreshTokenItem);
+    KeychainDelete(kSessionItem);
+    // Harmless no-ops once the migration in LoadStoredTokens has run, but a
+    // logout must not be the one path that leaves an old token behind.
+    KeychainDelete(kLegacyAccessItem);
+    KeychainDelete(kLegacyRefreshItem);
     // The cached tier is per-account and must die with the tokens, or the next
     // user to sign in on this Mac inherits the previous user's entitlement
     // until their own tier query lands.
