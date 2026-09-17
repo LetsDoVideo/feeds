@@ -657,4 +657,10 @@ std::string UserDisplayName()
     return g_displayName;
 }
 
+int GetCurrentTier()
+{
+    std::lock_guard<std::mutex> lock(g_stateMutex);
+    return g_currentTier;
+}
+
 } // namespace feeds_mac

@@ -55,6 +55,14 @@ void ClearStoredCredentials();
 // the main queue. Empty means the join must not proceed.
 std::string FetchZak();
 
+// The entitlement tier this session resolved to: 0 Free, 1 Basic, 2 Streamer,
+// 3 Broadcaster. The video path reads it to decide the resolution ceiling a
+// feed may ask Zoom for, so a Free account cannot be served paid-tier quality.
+// Counterpart of the Windows engine's GetCurrentTier (engine-api.cpp).
+// 0 until a login resolves, which is the correct conservative default: an
+// unresolved tier must cap DOWN, never up.
+int GetCurrentTier();
+
 // The account display name from the last successful user-info fetch, or "" —
 // the join path needs it and refuses to join without one.
 std::string UserDisplayName();

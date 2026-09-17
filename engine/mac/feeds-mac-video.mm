@@ -77,8 +77,9 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include "engine-frame-scaler.h"   // shared with the Windows engine
 #include "feeds-json-lite.h"
-#include "feeds-mac-login.h"   // EngineSend / EngineLog
+#include "feeds-mac-login.h"   // EngineSend / EngineLog / GetCurrentTier
 #include "feeds-mac-video.h"
 #include "shared-frame.h"
 
@@ -91,6 +92,30 @@ void LogInfo(const std::string& m)  { feeds_mac::EngineLog("info", m); }
 void LogWarn(const std::string& m)  { feeds_mac::EngineLog("warning", m); }
 void LogError(const std::string& m) { feeds_mac::EngineLog("error", m); }
 void Send(const std::string& j)     { feeds_mac::EngineSend(j); }
+
+// ---------------------------------------------------------------------------
+// Tier -> resolution policy
+// ---------------------------------------------------------------------------
+// One rule, two uses: what a feed may ASK Zoom for, and what size it PRESENTS
+// to OBS. Both come from the entitlement tier, and both mirror the Windows
+// engine exactly (engine-video.cpp GetTopRungForCurrentTier /
+// GetScalerTargetForCurrentTier, engine-screenshare.cpp GetShareResolution /
+// GetShareScalerTarget). Free is 720p; every paid tier is 1080p.
+//
+// This is a licence boundary, not a performance tuning knob. It is read fresh
+// on every subscription rather than cached, so a tier that resolves after the
+// first feed was built applies to the next one without a restart.
+bool IsPaidTier() { return feeds_mac::GetCurrentTier() >= 1; }
+
+// Fixed size every feed presents to OBS, whatever Zoom happens to be
+// delivering. Constant dimensions are the point: without them a bandwidth-
+// driven resolution change alters the OBS source's size mid-meeting and the
+// user's scene-item scaling and cropping shift under them.
+void ScalerTargetForCurrentTier(int& w, int& h)
+{
+    if (IsPaidTier()) { w = 1920; h = 1080; }
+    else              { w = 1280; h = 720;  }
+}
 
 uint64_t NowMs()
 {
@@ -276,16 +301,15 @@ public:
     // Copy one I420 frame into the ring. Called on the SDK's frame-callback
     // thread.
     //
-    // srcW/srcH are what the SDK delivered; the frame is CROPPED to even
-    // dimensions before it is written. That is not cosmetic. The slot's payload
-    // is laid out as width*height + two (width/2)*(height/2) planes, which only
-    // describes an I420 frame whose dimensions are both even — for an odd width
-    // the real chroma planes are ceil(w/2) wide, and the reader's stride
-    // arithmetic would walk off by a column per row. Camera video is always
-    // even so this is a no-op there, but a shared WINDOW is whatever size the
-    // window happens to be, and on macOS that is routinely odd. Dropping those
-    // frames as invalid would leave screenshare permanently black; cropping one
-    // row and column is imperceptible.
+    // Frames reach here from the scaler worker, already at the tier's fixed
+    // output size, so srcW/srcH are even and constant for the life of the
+    // source. The even-crop below is therefore a no-op on that path and is kept
+    // as defence: the slot's payload is laid out as width*height + two
+    // (width/2)*(height/2) planes, which only describes an I420 frame whose
+    // dimensions are both even — for an odd width the real chroma planes are
+    // ceil(w/2) wide and the reader's stride arithmetic would walk off by a
+    // column per row. Odd SOURCE frames (a shared macOS window is routinely
+    // odd) are handled upstream in SinkOnFrame, before the scaler sees them.
     void WriteFrame(const uint8_t* y, const uint8_t* u, const uint8_t* v,
                     uint32_t srcW, uint32_t srcH)
     {
@@ -403,6 +427,20 @@ struct FrameSink {
     int          lastH          = 0;
     unsigned int loggedFailures = 0;
     int          requestedHeight = 0;
+
+    // Scratch for the odd-width repack in SinkOnFrame. Frame-callback thread
+    // only, like the fields above, and grown once rather than per frame.
+    std::vector<uint8_t> evenPack;
+
+    // The scaler worker, and the reason this member is LAST.
+    //
+    // Members destruct in reverse declaration order, so declaring the worker
+    // after `writer` is what guarantees it is stopped and joined BEFORE the
+    // writer it writes through is destroyed. Reorder these two and a worker
+    // thread can be mid-WriteFrame while the writer unmaps underneath it.
+    // TearDownRenderer enforces the same order explicitly for the normal path;
+    // this covers the destruction path.
+    std::unique_ptr<feeds_engine::FrameScalerWorker> scaler;
 };
 
 enum : unsigned int {
@@ -472,8 +510,52 @@ void SinkOnFrame(const std::shared_ptr<FrameSink>& sink,
 
     // Copy now, inside the callback. The frame is freed the moment this returns
     // unless it was addRef'd, and in heap memory mode a stashed pointer is a
-    // use-after-free rather than a stale read.
-    sink->writer.WriteFrame(y, u, v, (uint32_t)w, (uint32_t)h);
+    // use-after-free rather than a stale read. StageFrame is that copy: it
+    // takes the frame under a brief lock and hands it to the scaler worker,
+    // which does the expensive part off this thread and writes the fixed-size
+    // result to the ring. The SDK callback stays a validate-and-copy.
+    // Reading `scaler` from this thread is safe for the same reason the rest of
+    // the teardown is: nothing clears it until after destroyRender has returned,
+    // and past that point the SDK cannot call us at all. It is checked rather
+    // than assumed because a renderer that failed to build tears its sink down
+    // without ever having had one.
+    if (!sink->scaler) return;
+
+    // The scaler reads its source tightly packed at EVEN dimensions. Camera
+    // video is always even, so the SDK's own buffers go straight through. A
+    // shared WINDOW is whatever size the window happens to be, and on macOS
+    // that is routinely odd; those get repacked into an even tightly packed
+    // copy first, because the delivered chroma stride for an odd width is
+    // (w+1)/2 and a scaler reading w/2 would walk a column short on every row.
+    const int we = w & ~1;
+    const int he = h & ~1;
+    if (we <= 0 || he <= 0) return;
+
+    if (w == we) {
+        // Even width: the planes are already tight at `we`. An odd HEIGHT needs
+        // no repack either — it only means the last row goes unread, and u/v
+        // are the SDK's own plane pointers, so dropping it cannot shift them.
+        sink->scaler->StageFrame(y, u, v, we, he);
+        return;
+    }
+
+    const size_t srcCStride = (size_t)(w + 1) / 2;
+    const size_t dstCStride = (size_t)we / 2;
+    const size_t ySize      = (size_t)we * he;
+    const size_t cSize      = dstCStride * (size_t)(he / 2);
+    if (sink->evenPack.size() < ySize + 2 * cSize)
+        sink->evenPack.resize(ySize + 2 * cSize);
+
+    uint8_t* py = sink->evenPack.data();
+    uint8_t* pu = py + ySize;
+    uint8_t* pv = pu + cSize;
+    for (int r = 0; r < he; ++r)
+        memcpy(py + (size_t)r * we, y + (size_t)r * w, (size_t)we);
+    for (int r = 0; r < he / 2; ++r) {
+        memcpy(pu + (size_t)r * dstCStride, u + (size_t)r * srcCStride, dstCStride);
+        memcpy(pv + (size_t)r * dstCStride, v + (size_t)r * srcCStride, dstCStride);
+    }
+    sink->scaler->StageFrame(py, pu, pv, we, he);
 }
 
 }  // namespace
@@ -568,11 +650,10 @@ std::map<std::string, std::unique_ptr<MacSubscription>> g_subs;
 // the previous one is exactly the race the gate exists to avoid, and an inline
 // ladder walk would reintroduce it one rung at a time.
 //
-// Unlike Windows this does not start from the licence tier, because the macOS
-// engine has no tier plumbing yet: every source asks for 1080p first and lets
-// the refusals settle it. On an account with no Full HD entitlement the first
-// rung simply succeeds at whatever the SDK negotiates, exactly as 720p would
-// have, and nothing below ever runs.
+// Where the ladder STARTS is the licence tier's ceiling, as on Windows: a Free
+// account may not ask Zoom for 1080p at all, and must not be handed it if the
+// meeting happens to have the budget spare. Stepping DOWN from there is a
+// bandwidth decision; the top rung is an entitlement decision.
 enum : int { kLadderRungs = 3 };
 const ZoomSDKResolution kLadderRes[kLadderRungs] = {
     ZoomSDKResolution_1080P,
@@ -586,6 +667,10 @@ const char* LadderRungName(int rung)
     if (rung < 0 || rung >= kLadderRungs) return "?";
     return (rung == 0) ? "1080p" : (rung == 1) ? "720p" : "360p";
 }
+
+// Rung 0 is 1080p, rung 1 is 720p. Mirrors GetTopRungForCurrentTier in
+// engine-video.cpp.
+int TopRungForCurrentTier() { return IsPaidTier() ? 0 : 1; }
 
 // ── The gate ────────────────────────────────────────────────────────────────
 // Renderer creation is never inline. Two things have to be true first, and
@@ -670,7 +755,10 @@ void EvaluateActiveSpeaker(bool heartbeat);
 //      first removes the re-entry entirely.
 //   2. unSubscribe, then destroyRender. After destroyRender returns the SDK
 //      can no longer deliver a frame to this renderer.
-//   3. Close the writer LAST. Any frame callback still in flight when we
+//   3. Stop the scaler worker. The SDK can no longer stage a frame by now, so
+//      this drains what is already staged and joins. Synchronous, so no worker
+//      thread can still be inside WriteFrame when the writer closes.
+//   4. Close the writer LAST. Any frame callback still in flight when we
 //      started holds the writer's mutex, so Close waits for it — which is the
 //      right way round, and is only ever one frame's copy.
 void TearDownRenderer(ZoomSDKRenderer* __strong* renderer,
@@ -685,7 +773,13 @@ void TearDownRenderer(ZoomSDKRenderer* __strong* renderer,
         *renderer = nil;
     }
     if (delegate) *delegate = nil;
-    if (sink) sink->writer.Close();
+    if (sink) {
+        if (sink->scaler) {
+            sink->scaler->Stop();
+            sink->scaler.reset();
+        }
+        sink->writer.Close();
+    }
 }
 
 void TearDownSubscription(const std::string& sourceId)
@@ -730,7 +824,12 @@ void SendSubscribeFailed(const std::string& sourceId)
 void EnqueuePendingRender(const std::string& sourceId, unsigned int userId,
                           bool follow, int rung)
 {
-    if (rung < 0) rung = 0;
+    // The tier's top rung is the FLOOR here, not just the starting value. Every
+    // path into the ladder passes through this one function, so clamping it
+    // here is what makes "a Free account never asks for 1080p" structural
+    // rather than something each call site has to remember.
+    const int topRung = TopRungForCurrentTier();
+    if (rung < topRung) rung = topRung;
     if (rung >= kLadderRungs) rung = kLadderRungs - 1;
 
     for (auto& p : g_pending) {
@@ -790,6 +889,33 @@ SubStart StartSubscription(const std::string& sourceId, unsigned int userId,
         feeds_shared::MakeFrameRegionName((uint32_t)getpid(), sourceId);
     if (!sub->sink->writer.Open(regionName, sourceId)) return SubStart::Failed;
 
+    // Then the scaler, before the renderer exists and so before any frame can
+    // be staged. It scales whatever Zoom delivers to the tier's fixed output
+    // size and writes that, so the OBS source keeps one size for its whole
+    // life no matter how the meeting's bandwidth moves.
+    //
+    // The output lambda captures the sink by raw pointer, not by shared_ptr: a
+    // shared_ptr here would be a cycle (sink -> worker -> sink) and the sink
+    // would never be freed. It is safe because the worker is a member of the
+    // very object it points at, and is joined before that object's writer is
+    // closed or destroyed — see TearDownRenderer and the member order note.
+    {
+        int targetW, targetH;
+        ScalerTargetForCurrentTier(targetW, targetH);
+        FrameSink* rawSink = sub->sink.get();
+        sub->sink->scaler = std::make_unique<feeds_engine::FrameScalerWorker>(
+            targetW, targetH,
+            [rawSink](const uint8_t* y, const uint8_t* u, const uint8_t* v,
+                      int outW, int outH) {
+                rawSink->writer.WriteFrame(y, u, v, (uint32_t)outW, (uint32_t)outH);
+            },
+            sourceId);
+        sub->sink->scaler->Start();
+        LogInfo("Video: source='" + sourceId + "' output fixed at " +
+                std::to_string(targetW) + "x" + std::to_string(targetH) +
+                " (tier " + std::to_string(feeds_mac::GetCurrentTier()) + ")");
+    }
+
     ZoomSDKRenderer* renderer = nil;
     const ZoomSDKError createErr = [rdc createRender:&renderer];
     if (createErr != ZoomSDKError_Success || !renderer) {
@@ -802,7 +928,7 @@ SubStart StartSubscription(const std::string& sourceId, unsigned int userId,
                     "' (code " + std::to_string((int)createErr) +
                     "); staying queued until the raw-data subsystem is ready");
         }
-        sub->sink->writer.Close();
+        TearDownRenderer(nullptr, nullptr, sub->sink);
         return SubStart::RetryLater;
     }
 
@@ -1260,6 +1386,27 @@ void ShareSubscribe(unsigned int shareSourceId)
             return;
         }
     }
+    // Ensure the scaler, whether the sink was just made or carried over from
+    // the previous share. Done here rather than beside the writer above because
+    // a share SWITCH reuses the sink and rebuilds only the renderer, and this
+    // has to hold on every path that leads to a live renderer.
+    if (!g_shareSink->scaler) {
+        int targetW, targetH;
+        ScalerTargetForCurrentTier(targetW, targetH);
+        FrameSink* rawSink = g_shareSink.get();
+        g_shareSink->scaler = std::make_unique<feeds_engine::FrameScalerWorker>(
+            targetW, targetH,
+            [rawSink](const uint8_t* y, const uint8_t* u, const uint8_t* v,
+                      int outW, int outH) {
+                rawSink->writer.WriteFrame(y, u, v, (uint32_t)outW, (uint32_t)outH);
+            },
+            "screenshare");
+        g_shareSink->scaler->Start();
+        LogInfo("Share: output fixed at " + std::to_string(targetW) + "x" +
+                std::to_string(targetH) + " (tier " +
+                std::to_string(feeds_mac::GetCurrentTier()) + ")");
+    }
+
     // A new share is a new stream: let the first frame of it be logged (and
     // measured) as one.
     g_shareSink->gotFirstFrame.store(false, std::memory_order_release);
@@ -1277,10 +1424,15 @@ void ShareSubscribe(unsigned int shareSourceId)
     renderer.delegate = delegate;
 
     // Screenshare is not subject to the participant resolution budget in the
-    // same way, and a shared screen's own size is what matters, so it asks for
-    // the top rung and takes whatever the SDK negotiates.
-    [renderer setResolution:ZoomSDKResolution_1080P];
-    g_shareSink->requestedHeight = 1080;
+    // same way, so it asks for the best its tier allows and takes whatever the
+    // SDK negotiates from there — but the tier ceiling still applies, because a
+    // Free account is a Free account whether the pixels are a face or a slide
+    // deck. Same split as the participant ladder's top rung, and the same one
+    // the Windows engine applies in GetShareResolution.
+    const bool sharePaid = IsPaidTier();
+    [renderer setResolution:(sharePaid ? ZoomSDKResolution_1080P
+                                       : ZoomSDKResolution_720P)];
+    g_shareSink->requestedHeight = sharePaid ? 1080 : 720;
 
     // NOTE the argument: for a share subscription the SDK's subscribeID is the
     // SHARE SOURCE id, not a user id. Passing the sharer's user id here is a
@@ -1318,7 +1470,21 @@ void ShareUnsubscribe()
     // Blank rather than close: the plugin's screenshare sources stay mapped to
     // this region for the life of the meeting and would otherwise freeze on the
     // last frame of the share that just ended.
-    if (g_shareSink) g_shareSink->writer.WriteBlankSignal();
+    //
+    // The scaler has to be stopped FIRST, and that is not tidiness. destroyRender
+    // above stops new frames being staged, but a frame staged a moment earlier
+    // can still be mid-scale in the worker; letting it land after the blank
+    // would write a stale share frame over the blank and leave the source
+    // showing the share that just ended. Stop drains and joins, so the blank is
+    // provably the last write. ShareSubscribe rebuilds the worker for the next
+    // share, which is why it ensures the scaler rather than assuming one.
+    if (g_shareSink) {
+        if (g_shareSink->scaler) {
+            g_shareSink->scaler->Stop();
+            g_shareSink->scaler.reset();
+        }
+        g_shareSink->writer.WriteBlankSignal();
+    }
     LogInfo("Share: unsubscribed (no viewable share)");
 }
 
@@ -1464,11 +1630,12 @@ void VideoHandleSubscribe(const std::string& json, bool recreate)
             return;
         }
 
-        // New source, or a recreate. Always through the gate, at the top rung:
-        // a recreate is a fresh start (rejoin, grant, auto-rebind), not a
-        // ladder step, so it re-asks for full resolution and ladders down again
-        // from there if the budget still cannot carry it.
-        EnqueuePendingRender(sourceId, actualUserId, follow, 0);
+        // New source, or a recreate. Always through the gate, at the tier's top
+        // rung: a recreate is a fresh start (rejoin, grant, auto-rebind), not a
+        // ladder step, so it re-asks for the best resolution the licence allows
+        // and ladders down again from there if the budget cannot carry it.
+        EnqueuePendingRender(sourceId, actualUserId, follow,
+                             TopRungForCurrentTier());
         ProcessPendingRenderers();
     });
 }

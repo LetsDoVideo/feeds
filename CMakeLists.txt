@@ -118,6 +118,53 @@ if(MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
+# libyuv for the engine's frame scaler. BOTH engines need it: engine-frame-
+# scaler.cpp is shared source, so the dependency is declared once here and
+# pulled in by whichever engine target is being built. A macro rather than a
+# function so the variables FetchContent sets (libyuv_SOURCE_DIR) land in the
+# caller's scope, and guarded on the target so a second call is a no-op.
+#
+# Pulled in via FetchContent rather than vcpkg / git submodule so no new
+# tooling lands on the CI runner: the runners already have network access for
+# the buildspec.json prebuilt downloads, and FetchContent piggy-backs on that.
+# EXCLUDE_FROM_ALL keeps libyuv's tests/tools out of the default build target.
+#
+# GIT_TAG is pinned to upstream 94417b9d (2025-09-26, "Pass rgbconstants
+# via struct pointer"). libyuv doesn't publish semver tags. This pin
+# predates upstream f2ac6db (2026-04-29, "RAWToNV21 using SME ..."),
+# which adds `__attribute__((no_sanitize("cfi-icall")))` to
+# source/row_win.cc — a Clang-only attribute MSVC rejects with no
+# workaround short of patching libyuv.
+#
+# Warnings: even on this older pin, MSVC's C4244 trips on libyuv's
+# integer-truncation patterns under /WX. Rather than hunt further back
+# (older commits have other issues, and any new pin will likely
+# re-introduce something), we accept libyuv's warnings as upstream's
+# problem. libyuv defines several targets (yuv, yuv_common_objects,
+# possibly more depending on build options) so enumerating them with
+# set_target_properties is brittle — instead, save / clear /
+# CMAKE_COMPILE_WARNING_AS_ERROR around FetchContent_MakeAvailable so
+# every target libyuv creates inherits the OFF default. Our own targets
+# are defined after the restore, so they pick the original strict value
+# back up.
+# ---------------------------------------------------------------------------
+macro(feeds_require_libyuv)
+    if(NOT TARGET yuv)
+        include(FetchContent)
+        FetchContent_Declare(
+            libyuv
+            GIT_REPOSITORY https://chromium.googlesource.com/libyuv/libyuv.git
+            GIT_TAG        94417b9d213364905ce849c25719b819b8dbbaaa
+            EXCLUDE_FROM_ALL
+        )
+        set(_FEEDS_SAVED_WAE ${CMAKE_COMPILE_WARNING_AS_ERROR})
+        set(CMAKE_COMPILE_WARNING_AS_ERROR OFF)
+        FetchContent_MakeAvailable(libyuv)
+        set(CMAKE_COMPILE_WARNING_AS_ERROR ${_FEEDS_SAVED_WAE})
+    endif()
+endmacro()
+
+# ---------------------------------------------------------------------------
 # macOS engine (increment 1a): FeedsEngine.app, the process that hosts the Zoom
 # Meeting SDK. Objective-C++ against ZoomSDK.framework — a rewrite of the
 # Windows engine's SDK calls, not a port of those files (the macOS SDK shares no
@@ -137,6 +184,7 @@ if(APPLE)
     if(FEEDS_MAC_ZOOM_SDK_DIR AND EXISTS "${FEEDS_MAC_ZOOM_SDK_DIR}/ZoomSDK.framework")
         message(STATUS "Feeds: building the macOS engine against ${FEEDS_MAC_ZOOM_SDK_DIR}")
         enable_language(OBJCXX)
+        feeds_require_libyuv()
 
         add_executable(
             FeedsEngine MACOSX_BUNDLE
@@ -144,6 +192,11 @@ if(APPLE)
             engine/mac/feeds-mac-login.mm    # OAuth + Zoom REST (the login path)
             engine/mac/feeds-mac-net.mm      # HTTPS, PKCE crypto, Keychain, browser
             engine/mac/feeds-mac-video.mm    # renderers, frame transport, share
+            # Shared with the Windows engine, not a Mac copy of it: the same
+            # fixed-output I420 scaler gives both platforms the same per-tier
+            # frame size and the same letterbox behaviour. Plain C++, compiled
+            # here as C++ alongside the .mm files.
+            engine/engine-frame-scaler.cpp   # fixed-output scaler + its worker
         )
 
         set_target_properties(
@@ -191,6 +244,14 @@ if(APPLE)
 
         target_include_directories(FeedsEngine PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/common"
+            # engine/ so feeds-mac-video.mm resolves "engine-frame-scaler.h";
+            # it sits a directory above the .mm files, so the compiler's
+            # relative-to-includer lookup does not find it on its own.
+            "${CMAKE_CURRENT_SOURCE_DIR}/engine"
+            # libyuv: belt-and-braces, matching the Windows target. Modern
+            # libyuv CMake propagates this through target_link_libraries, but
+            # older or custom builds may not.
+            "${libyuv_SOURCE_DIR}/include"
         )
         target_compile_definitions(FeedsEngine PRIVATE
             FEEDS_ZOOM_CLIENT_ID="${FEEDS_ZOOM_CLIENT_ID}"
@@ -206,6 +267,8 @@ if(APPLE)
             # Keychain (SecItem*) and SecRandomCopyBytes, for the login path.
             # CommonCrypto's SHA-256 needs no framework — it is in libSystem.
             "-framework Security"
+            # The frame scaler's I420Scale.
+            yuv
         )
 
         # The SDK runtime must sit in the ENGINE APP's Frameworks directory.
@@ -288,48 +351,13 @@ if(APPLE)
 endif()
 
 # ---------------------------------------------------------------------------
-# FeedsEngine (Zoom Meeting SDK host) and its libyuv dependency: Windows only.
-# The macOS plugin shell builds the plugin alone; the Mac engine port comes
-# later. The block below is unchanged apart from this WIN32 guard.
+# FeedsEngine (Zoom Meeting SDK host): the WINDOWS build of the engine. The
+# macOS one is built from engine/mac/ further up. Both share the frame scaler,
+# so both call feeds_require_libyuv.
 # ---------------------------------------------------------------------------
 if(WIN32)
 
-# libyuv for the engine's frame scaler. Pulled in via FetchContent rather
-# than vcpkg / git submodule so no new tooling lands on the CI runner —
-# the obsproject Windows runner already has network access for the
-# buildspec.json prebuilt downloads, and FetchContent piggy-backs on
-# that. EXCLUDE_FROM_ALL keeps libyuv's tests/tools out of the default
-# build target.
-#
-# GIT_TAG is pinned to upstream 94417b9d (2025-09-26, "Pass rgbconstants
-# via struct pointer"). libyuv doesn't publish semver tags. This pin
-# predates upstream f2ac6db (2026-04-29, "RAWToNV21 using SME ..."),
-# which adds `__attribute__((no_sanitize("cfi-icall")))` to
-# source/row_win.cc — a Clang-only attribute MSVC rejects with no
-# workaround short of patching libyuv.
-#
-# Warnings: even on this older pin, MSVC's C4244 trips on libyuv's
-# integer-truncation patterns under /WX. Rather than hunt further back
-# (older commits have other issues, and any new pin will likely
-# re-introduce something), we accept libyuv's warnings as upstream's
-# problem. libyuv defines several targets (yuv, yuv_common_objects,
-# possibly more depending on build options) so enumerating them with
-# set_target_properties is brittle — instead, save / clear /
-# CMAKE_COMPILE_WARNING_AS_ERROR around FetchContent_MakeAvailable so
-# every target libyuv creates inherits the OFF default. Our own targets
-# are defined below, after the restore, so they pick the original
-# strict value back up.
-include(FetchContent)
-FetchContent_Declare(
-    libyuv
-    GIT_REPOSITORY https://chromium.googlesource.com/libyuv/libyuv.git
-    GIT_TAG        94417b9d213364905ce849c25719b819b8dbbaaa
-    EXCLUDE_FROM_ALL
-)
-set(_FEEDS_SAVED_WAE ${CMAKE_COMPILE_WARNING_AS_ERROR})
-set(CMAKE_COMPILE_WARNING_AS_ERROR OFF)
-FetchContent_MakeAvailable(libyuv)
-set(CMAKE_COMPILE_WARNING_AS_ERROR ${_FEEDS_SAVED_WAE})
+feeds_require_libyuv()
 
 add_executable(FeedsEngine WIN32
     engine/engine-main.cpp

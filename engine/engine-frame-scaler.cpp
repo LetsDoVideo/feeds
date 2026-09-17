@@ -5,12 +5,22 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <utility>
 
 #include <libyuv/scale.h>  // libyuv::I420Scale, libyuv::kFilterBilinear
 
-// Logging hook from engine-main.cpp.
+// Logging hook. The Windows engine exports LogToFile from engine-main.cpp; the
+// macOS engine has no such symbol and routes engine logs to the plugin through
+// EngineLog instead. Same one line, same place, either way.
+#ifdef _WIN32
 extern void LogToFile(const char* msg);
+#else
+namespace feeds_mac {
+void EngineLog(const char* level, const std::string& message);
+}
+static void LogToFile(const char* msg) { feeds_mac::EngineLog("info", msg); }
+#endif
 
 namespace feeds_engine {
 
@@ -172,8 +182,16 @@ void FrameScalerWorker::WorkerLoop() {
             std::unique_lock<std::mutex> lock(m_mutex);
             m_cv.wait(lock, [&]{ return m_hasStaged || m_shutdown; });
             if (m_shutdown) {
+                // sprintf_s is MSVC-only; the portable spelling is kept off the
+                // Windows path so this shared file changes nothing there.
+#ifdef _WIN32
                 sprintf_s(logbuf, "Video: scaler worker exiting for source='%s'",
                           m_label.c_str());
+#else
+                snprintf(logbuf, sizeof(logbuf),
+                         "Video: scaler worker exiting for source='%s'",
+                         m_label.c_str());
+#endif
                 LogToFile(logbuf);
                 return;
             }
