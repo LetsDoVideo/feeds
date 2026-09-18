@@ -7,10 +7,13 @@
 // this header in place of <windows.h> / <winhttp.h>. It declares exactly the
 // Win32 surface the plugin uses, with these behaviors:
 //
-//   * Networking (WinHttp*): every call FAILS (null handle / FALSE / an error
-//     code). Each caller already treats that as "request failed", so the update
-//     check finds nothing and the chat readers stay disconnected. Not available
-//     on this platform yet.
+//   * Networking (WinHttp*): REAL on macOS, over NSURLSession in
+//     src/feeds-mac-http.mm. The plugin's update check and its YouTube and
+//     Twitch chat readers run through this surface, so a stub here is three
+//     dead features. On any other non-Windows platform every call still FAILS
+//     (null handle / FALSE / an error code); each caller already treats that as
+//     "request failed", so the update check finds nothing and the chat readers
+//     stay disconnected.
 //   * Shared memory (OpenFileMappingA / MapViewOfFile / UnmapViewOfFile):
 //     REAL, implemented with POSIX shm_open + mmap. The engine writes frames
 //     into a named shm object and the plugin's pump threads read them, so a
@@ -25,9 +28,8 @@
 //   * Time (Sleep / GetTickCount / GetTickCount64): real.
 //
 // This is a bridge, not the Mac port: each group is replaced with a native
-// implementation as that part of the port lands (shared memory now; networking
-// still to come) and this header shrinks away. The Windows build never
-// includes it.
+// implementation as that part of the port lands (shared memory and networking
+// so far) and this header shrinks away. The Windows build never includes it.
 
 #pragma once
 
@@ -405,8 +407,47 @@ inline int WideCharToMultiByte(unsigned, DWORD, const wchar_t* src, int srcLen,
 }
 
 // ---------------------------------------------------------------------------
-// WinHTTP — every operation fails.
+// WinHTTP
+//
+// On macOS these are REAL, implemented over NSURLSession in
+// src/feeds-mac-http.mm: the plugin's update check and its YouTube and Twitch
+// chat readers all run through this surface, so a failing stub here is three
+// dead features rather than a missing nicety. Only the subset those callers
+// actually use is implemented; the proxy-resolution pair below stays a failure,
+// which resolves to DIRECT and is the behaviour macOS wants anyway (the system
+// proxy is applied by NSURLSession itself).
+//
+// Everywhere else that is not Windows, they still all fail. Each caller already
+// treats that as "request failed", so the update check finds nothing and the
+// chat readers stay disconnected.
 // ---------------------------------------------------------------------------
+#ifdef __APPLE__
+HINTERNET WinHttpOpen(const wchar_t* userAgent, DWORD accessType,
+                      const wchar_t* proxy, const wchar_t* proxyBypass, DWORD flags);
+BOOL WinHttpCloseHandle(HINTERNET h);
+BOOL WinHttpSetTimeouts(HINTERNET h, int resolve, int connect, int send, int receive);
+BOOL WinHttpSetOption(HINTERNET h, DWORD option, LPVOID value, DWORD length);
+HINTERNET WinHttpConnect(HINTERNET session, const wchar_t* host,
+                         INTERNET_PORT port, DWORD reserved);
+HINTERNET WinHttpOpenRequest(HINTERNET connect, const wchar_t* verb,
+                             const wchar_t* objectName, const wchar_t* version,
+                             const wchar_t* referrer, const wchar_t** acceptTypes,
+                             DWORD flags);
+BOOL WinHttpAddRequestHeaders(HINTERNET request, const wchar_t* headers,
+                              DWORD length, DWORD modifiers);
+BOOL WinHttpSendRequest(HINTERNET request, const wchar_t* extraHeaders,
+                        DWORD headersLength, LPVOID optional, DWORD optionalLength,
+                        DWORD totalLength, DWORD_PTR context);
+BOOL WinHttpReceiveResponse(HINTERNET request, LPVOID reserved);
+BOOL WinHttpQueryHeaders(HINTERNET request, DWORD infoLevel, const wchar_t* name,
+                         LPVOID buffer, LPDWORD bufferLength, LPDWORD index);
+BOOL WinHttpReadData(HINTERNET request, LPVOID buffer, DWORD toRead, LPDWORD read);
+HINTERNET WinHttpWebSocketCompleteUpgrade(HINTERNET request, DWORD_PTR context);
+DWORD WinHttpWebSocketSend(HINTERNET ws, WINHTTP_WEB_SOCKET_BUFFER_TYPE type,
+                           PVOID buffer, DWORD length);
+DWORD WinHttpWebSocketReceive(HINTERNET ws, PVOID buffer, DWORD length,
+                              LPDWORD read, WINHTTP_WEB_SOCKET_BUFFER_TYPE* type);
+#else
 inline HINTERNET WinHttpOpen(const wchar_t*, DWORD, const wchar_t*, const wchar_t*, DWORD) { return nullptr; }
 inline BOOL WinHttpCloseHandle(HINTERNET) { return TRUE; }
 inline BOOL WinHttpSetTimeouts(HINTERNET, int, int, int, int) { return FALSE; }
@@ -423,8 +464,6 @@ inline BOOL WinHttpReadData(HINTERNET, LPVOID, DWORD, LPDWORD read)
     if (read) *read = 0;
     return FALSE;
 }
-inline BOOL WinHttpGetIEProxyConfigForCurrentUser(WINHTTP_CURRENT_USER_IE_PROXY_CONFIG*) { return FALSE; }
-inline BOOL WinHttpGetProxyForUrl(HINTERNET, const wchar_t*, WINHTTP_AUTOPROXY_OPTIONS*, WINHTTP_PROXY_INFO*) { return FALSE; }
 inline HINTERNET WinHttpWebSocketCompleteUpgrade(HINTERNET, DWORD_PTR) { return nullptr; }
 inline DWORD WinHttpWebSocketSend(HINTERNET, WINHTTP_WEB_SOCKET_BUFFER_TYPE, PVOID, DWORD) { return ERROR_NOT_SUPPORTED; }
 inline DWORD WinHttpWebSocketReceive(HINTERNET, PVOID, DWORD, LPDWORD read, WINHTTP_WEB_SOCKET_BUFFER_TYPE*)
@@ -432,3 +471,11 @@ inline DWORD WinHttpWebSocketReceive(HINTERNET, PVOID, DWORD, LPDWORD read, WINH
     if (read) *read = 0;
     return ERROR_NOT_SUPPORTED;
 }
+#endif  // __APPLE__
+
+// Proxy resolution stays unimplemented on every non-Windows platform: a FALSE
+// here makes feeds-http.h resolve DIRECT, and on macOS NSURLSession applies the
+// system proxy configuration itself, so DIRECT is the correct answer rather
+// than a limitation.
+inline BOOL WinHttpGetIEProxyConfigForCurrentUser(WINHTTP_CURRENT_USER_IE_PROXY_CONFIG*) { return FALSE; }
+inline BOOL WinHttpGetProxyForUrl(HINTERNET, const wchar_t*, WINHTTP_AUTOPROXY_OPTIONS*, WINHTTP_PROXY_INFO*) { return FALSE; }

@@ -100,6 +100,7 @@ static void Log(const char* level, const std::string& message)
                  "\",\"message\":\"" + feeds::JsonEscape(message) + "\"}");
 }
 static void LogInfo(const std::string& m)  { Log("info", m); }
+static void LogDebug(const std::string& m) { Log("debug", m); }
 static void LogWarn(const std::string& m)  { Log("warning", m); }
 static void LogError(const std::string& m) { Log("error", m); }
 
@@ -366,6 +367,27 @@ static bool EnsureSdkUpThen(std::function<void()> action)
 @interface FeedsActionDelegate : NSObject <ZoomSDKMeetingActionControllerDelegate>
 @end
 
+// ---------------------------------------------------------------------------
+// Chat delegate
+//
+// Receives in-meeting chat from the SDK and forwards PUBLIC messages to the
+// plugin as chat_message, the same field-for-field shape the Windows engine
+// emits, because one plugin parses both.
+//
+// The privacy filter is the point of this class, not a detail of it. Anything
+// that is not addressed to everyone — a DM, a panelist-only message, a waiting
+// room message — is dropped HERE, at the engine boundary, and never crosses the
+// IPC. The plugin cannot leak private chat to an overlay or a popup because it
+// never receives any. Windows expresses the same rule as IsChatToAll(); the
+// macOS SDK has no such helper, so the equivalent is an explicit test for
+// To_All against the message type, which is the same set of messages.
+//
+// ZoomSDKMeetingChatControllerDelegate declares no @optional section, so every
+// method is @required; the file-transfer ones are deliberate empty stubs.
+// ---------------------------------------------------------------------------
+@interface FeedsChatDelegate : NSObject <ZoomSDKMeetingChatControllerDelegate>
+@end
+
 @implementation FeedsActionDelegate
 
 // Implementing a method the SDK has deprecated is not a call to it; the warning
@@ -474,6 +496,87 @@ static bool EnsureSdkUpThen(std::function<void()> action)
 
 @end
 
+@implementation FeedsChatDelegate
+
+- (void)onChatMessageNotification:(ZoomSDKChatInfo*)chatInfo
+{
+    if (!chatInfo) {
+        LogWarn("Chat: notification with no message");
+        return;
+    }
+
+    // THE PRIVACY FILTER. Everything that is not To_All stops here: DMs
+    // (To_Individual), panelist traffic (To_All_Panelist,
+    // To_Individual_Panelist) and waiting-room messages (To_WaitingRoomUsers).
+    // The type is the only thing logged about a filtered message — never its
+    // content or its sender — so the engine log cannot leak a DM either.
+    const ZoomSDKChatMessageType type = [chatInfo getChatMessageType];
+    if (type != ZoomSDKChatMessageType_To_All) {
+        LogDebug("Chat: filtered non-public message (type=" +
+                 std::to_string((int)type) + ")");
+        return;
+    }
+
+    @autoreleasepool {
+        NSString* messageId  = [chatInfo getMessageID];
+        NSString* senderName = [chatInfo getSenderDisplayName];
+        NSString* content    = [chatInfo getMsgContent];
+        const unsigned int senderId = [chatInfo getSenderUserID];
+        const time_t timestamp      = [chatInfo getTimeStamp];
+
+        // The avatar travels as a path, not as bytes: the SDK writes profile
+        // pictures into its own data directory and both processes can read it.
+        // Same arrangement the roster uses. Empty when the sender has no
+        // picture, and the plugin falls back to the bundled Feeds logo.
+        NSString* avatar = nil;
+        ZoomSDKMeetingActionController* action =
+            g_meetingService ? [g_meetingService getMeetingActionController] : nil;
+        if (action) {
+            ZoomSDKUserInfo* info = [action getUserByUserID:senderId];
+            if (info) avatar = [info getAvatarPath];
+        }
+
+        auto utf8 = [](NSString* s) -> std::string {
+            return (s && s.UTF8String) ? std::string(s.UTF8String) : std::string();
+        };
+
+        const std::string contentStr = utf8(content);
+        const std::string nameStr    = utf8(senderName);
+
+        SendToPlugin(
+            std::string("{\"type\":\"chat_message\",\"message_id\":\"") +
+            feeds::JsonEscape(utf8(messageId)) +
+            "\",\"sender_id\":" + std::to_string(senderId) +
+            ",\"sender_name\":\"" + feeds::JsonEscape(nameStr) +
+            "\",\"content\":\"" + feeds::JsonEscape(contentStr) +
+            "\",\"avatar_path\":\"" + feeds::JsonEscape(utf8(avatar)) +
+            "\",\"timestamp\":" + std::to_string((long long)timestamp) + "}");
+
+        // Visibility only; the message itself already went over the IPC. The
+        // preview is truncated so one long paste cannot flood the log.
+        const std::string preview = contentStr.size() > 40
+            ? contentStr.substr(0, 40) + "..."
+            : contentStr;
+        LogDebug("Chat: public message from " + nameStr + ": " + preview);
+    }
+}
+
+- (void)onChatMessageEditNotification:(ZoomSDKChatInfo*)chatInfo
+{
+    // Not surfaced. The plugin's chat model has no edit path on either
+    // platform, and an edited message arriving as a new one would duplicate it
+    // on every overlay. Windows logs and drops this too.
+    (void)chatInfo;
+}
+
+// File transfer is not a Feeds feature on either platform. Required by the
+// protocol, which declares no @optional section.
+- (void)onFileSendStart:(ZoomSDKFileSender*)sender          { (void)sender; }
+- (void)onFileReceived:(ZoomSDKFileReceiver*)receiver       { (void)receiver; }
+- (void)onFileTransferProgress:(ZoomSDKFileTransferInfo*)info { (void)info; }
+
+@end
+
 // ---------------------------------------------------------------------------
 // Live-stream delegate — the raw-livestream PRIVILEGE, and only the privilege
 //
@@ -564,6 +667,7 @@ static NSString* const kRawBroadcastName = @"Feeds";
 // Auth delegate
 // ---------------------------------------------------------------------------
 @class FeedsAuthDelegate;
+@class FeedsChatDelegate;
 
 // All three delegate properties the SDK exposes are `assign` (unowned, and
 // under ARC that means __unsafe_unretained): handing one an object nothing else
@@ -574,6 +678,7 @@ static NSString* const kRawBroadcastName = @"Feeds";
 static FeedsAuthDelegate*       g_authDelegate       = nil;
 static FeedsMeetingDelegate*    g_meetingDelegate    = nil;
 static FeedsActionDelegate*     g_actionDelegate     = nil;
+static FeedsChatDelegate*       g_chatDelegate       = nil;
 static FeedsLiveStreamDelegate* g_liveStreamDelegate = nil;
 
 @interface FeedsAuthDelegate : NSObject <ZoomSDKAuthDelegate>
@@ -618,6 +723,18 @@ static FeedsLiveStreamDelegate* g_liveStreamDelegate = nil;
         // meeting has nobody in it".
         LogWarn("Mac engine: meeting action controller unavailable; the "
                 "participant list will not update");
+    }
+
+    ZoomSDKMeetingChatController* chat =
+        [g_meetingService getMeetingChatController];
+    if (chat) {
+        chat.delegate = g_chatDelegate;
+    } else {
+        // Fail soft, exactly as on Windows: the meeting is still perfectly
+        // usable, the chat dock simply stays empty. Worth one line so an empty
+        // dock is not mistaken for a meeting where nobody is talking.
+        LogWarn("Mac engine: meeting chat controller unavailable; in-meeting "
+                "chat will not be received or sent");
     }
 
     DrainPendingSdkActions();
@@ -826,6 +943,7 @@ static void BringUpSdk()
     if (!g_authDelegate)    g_authDelegate    = [[FeedsAuthDelegate alloc] init];
     if (!g_meetingDelegate) g_meetingDelegate = [[FeedsMeetingDelegate alloc] init];
     if (!g_actionDelegate)  g_actionDelegate  = [[FeedsActionDelegate alloc] init];
+    if (!g_chatDelegate)   g_chatDelegate   = [[FeedsChatDelegate alloc] init];
     authService.delegate = g_authDelegate;
 
     // The same credential the Windows engine authenticates with: the public app
@@ -1087,6 +1205,95 @@ static void HandleLogout()
 }
 
 // ---------------------------------------------------------------------------
+// Send one public chat message.
+//
+// Replies with chat_send_result either way. The plugin shows the error string
+// verbatim, so the failure text here is written to be read by a user rather
+// than by us.
+//
+// Threading is the one place this is simpler than Windows. There, the chat send
+// has to be marshalled to the thread that owns the SDK window: sending from the
+// pipe-reader thread returns success, echoes locally, and never reaches anyone
+// else. Here HandleCommand already runs on the main queue, which is the queue
+// the macOS SDK dispatches on, so the send happens inline and needs no hop.
+// ---------------------------------------------------------------------------
+static void ReplyChatSendResult(bool ok, const std::string& error)
+{
+    if (ok) {
+        SendToPlugin("{\"type\":\"chat_send_result\",\"success\":true}");
+    } else {
+        SendToPlugin("{\"type\":\"chat_send_result\",\"success\":false,\"error\":\"" +
+                     feeds::JsonEscape(error) + "\"}");
+    }
+}
+
+static void HandleSendChatMessage(const std::string& line)
+{
+    const std::string content = feeds::ExtractJsonString(line, "content");
+    if (content.empty()) {
+        ReplyChatSendResult(false, "Nothing to send");
+        return;
+    }
+
+    if (!g_meetingService ||
+        [g_meetingService getMeetingStatus] != ZoomSDKMeetingStatus_InMeeting) {
+        LogWarn("Chat: send requested while not in a meeting");
+        ReplyChatSendResult(false, "Not in a meeting");
+        return;
+    }
+
+    @autoreleasepool {
+        ZoomSDKMeetingChatController* chat =
+            [g_meetingService getMeetingChatController];
+        if (!chat) {
+            LogWarn("Chat: send requested but the chat controller is unavailable");
+            ReplyChatSendResult(false, "Chat is unavailable in this meeting");
+            return;
+        }
+
+        ZoomSDKChatMsgInfoBuilder* builder =
+            [[ZoomSDKChatMsgInfoBuilder alloc] init];
+        if (!builder) {
+            LogWarn("Chat: could not create a message builder");
+            ReplyChatSendResult(false, "Chat is unavailable in this meeting");
+            return;
+        }
+
+        NSString* text = [NSString stringWithUTF8String:content.c_str()];
+        if (!text) {
+            ReplyChatSendResult(false, "Message could not be encoded");
+            return;
+        }
+
+        // Receiver 0 AND To_All. Both are required: the type says what kind of
+        // message this is, and a zero receiver is what the SDK reads as
+        // "everyone". Same pair the Windows engine sets.
+        [builder setContent:text];
+        [builder setReceiver:0];
+        [builder setMessageType:ZoomSDKChatMessageType_To_All];
+
+        ZoomSDKChatInfo* message = [builder build];
+        if (!message) {
+            LogWarn("Chat: builder produced no message");
+            ReplyChatSendResult(false, "Failed to build chat message");
+            return;
+        }
+
+        const ZoomSDKError err = [chat sendChatMsgTo:message];
+        if (err != ZoomSDKError_Success) {
+            LogWarn("Chat: sendChatMsgTo failed (code " +
+                    std::to_string((int)err) + ")");
+            ReplyChatSendResult(
+                false, "Failed to send (SDK error " + std::to_string((int)err) + ")");
+            return;
+        }
+
+        LogDebug("Chat: message sent");
+        ReplyChatSendResult(true, "");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Command handling (main queue — see the reader thread in main)
 // ---------------------------------------------------------------------------
 static void HandleCommand(const std::string& line)
@@ -1118,6 +1325,7 @@ static void HandleCommand(const std::string& line)
     }
     if (type == "leave_meeting")   { HandleLeaveMeeting();  return; }
     if (type == "get_participants") { SendParticipantList(); return; }
+    if (type == "send_chat_message") { HandleSendChatMessage(line); return; }
 
     // Video. A subscribe re-points an existing renderer where it can; a
     // recreate always rebuilds one, because a kept renderer loses SDK delivery

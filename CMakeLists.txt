@@ -90,6 +90,20 @@ else()
     target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/engine-client-posix.cpp)
 endif()
 
+# macOS networking for the PLUGIN (not the engine). plugin-main.cpp is written
+# against WinHTTP; on macOS that surface is backed by NSURLSession here rather
+# than stubbed to fail, which is what makes the update check and the YouTube and
+# Twitch chat readers work. Objective-C++, so the language has to be enabled for
+# the plugin target too — the engine's own enable_language call is inside the
+# "is the Zoom SDK present" branch and a plugin-only build never reaches it.
+if(APPLE)
+    enable_language(OBJCXX)
+    target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/feeds-mac-http.mm)
+    # ARC is on project-wide (CLANG_ENABLE_OBJC_ARC in cmake/macos/xcode.cmake),
+    # which is what the engine's .mm files already rely on. Nothing to set here.
+    target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE "-framework Foundation")
+endif()
+
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/common"
 )
