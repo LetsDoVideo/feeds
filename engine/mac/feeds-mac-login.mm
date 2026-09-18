@@ -382,6 +382,56 @@ std::string ZoomApiGet(const std::string& path, int& outStatus)
     return body;
 }
 
+// Authenticated JSON POST, same refresh-and-retry contract as ZoomApiGet above.
+// Split out rather than folded into it because the two differ in three places
+// (method, body, content type) and a combined helper would need a mode flag at
+// every call site to say which one it was.
+std::string ZoomApiPost(const std::string& path, const std::string& jsonBody,
+                        int& outStatus)
+{
+    auto once = [&](int& status) -> std::string {
+        std::string token;
+        {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            token = g_accessToken;
+        }
+        const HttpResponse r = HttpPostForm(
+            "https://api.zoom.us" + path, jsonBody,
+            {{"Authorization", "Bearer " + token},
+             {"Content-Type", "application/json"}}, 20);
+        status = r.reached ? r.status : 0;
+        if (!r.reached) LogDebug("API: POST " + path + " failed: " + r.error);
+        return r.body;
+    };
+
+    bool needRefresh = false;
+    {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        needRefresh = g_accessToken.empty();
+    }
+    if (needRefresh && !RefreshAccessToken()) {
+        NotifySessionExpired();
+        outStatus = 401;
+        return {};
+    }
+
+    int status = 0;
+    std::string body = once(status);
+    if (status == 401) {
+        LogDebug("API: 401 on POST, attempting a token refresh");
+        if (RefreshAccessToken()) {
+            body = once(status);
+        } else {
+            LogWarn("API: refresh failed, the session has expired");
+            NotifySessionExpired();
+            outStatus = 401;
+            return {};
+        }
+    }
+    outStatus = status;
+    return body;
+}
+
 enum class UserInfoResult { Ok, SessionExpired, Unreachable };
 
 // Ok is the ONLY result that proves the stored credentials work. The two
@@ -764,6 +814,190 @@ std::string FetchZak()
     const std::string zak = feeds::ExtractJsonString(response, "token");
     if (zak.empty()) LogWarn("API: the ZAK request returned nothing");
     return zak;
+}
+
+// Provision a BRAND NEW meeting on Zoom's servers and hand back its id.
+//
+// This is what makes Instant Meeting different from a PMI join: a PMI join
+// reuses the one permanent room the account owns, while this creates a fresh
+// meeting with a new number every time. The number is not known until Zoom
+// answers, which is why this is a REST call and not just an SDK call.
+//
+// use_pmi:false is load-bearing — without it Zoom happily hands back the
+// account's PMI and "new meeting each time" quietly stops being true. An
+// account-level "Use PMI for instant meetings" setting can still override it,
+// in which case the user has to turn that off at zoom.us/profile/setting.
+//
+// approval_type 2 means no registration required.
+//
+// Needs the meeting:write:meeting OAuth scope. Without it Zoom answers 403 and
+// this returns false, which the caller turns into a readable message.
+bool CreateInstantMeeting(const std::string& topic,
+                          unsigned long long& outId,
+                          std::string& outPassword,
+                          std::string& outJoinUrl)
+{
+    outId = 0;
+    outPassword.clear();
+    outJoinUrl.clear();
+
+    const std::string body =
+        "{\"type\":1,\"topic\":\"" + feeds::JsonEscape(topic) + "\","
+        "\"settings\":{\"approval_type\":2,\"use_pmi\":false}}";
+
+    LogDebug("API: creating an instant meeting");
+    int status = 0;
+    const std::string response = ZoomApiPost("/v2/users/me/meetings", body, status);
+    if (response.empty()) {
+        LogError("API: instant meeting creation returned nothing (status " +
+                 std::to_string(status) + ")");
+        return false;
+    }
+
+    const std::string idStr = ExtractNumberText(response, "id");
+    if (idStr.empty()) {
+        // Almost always a 403 for the missing meeting:write:meeting scope. Log
+        // the status and a short snippet; never the whole body, which can carry
+        // account details.
+        LogError("API: instant meeting response had no id (status " +
+                 std::to_string(status) + "): " + response.substr(0, 160));
+        return false;
+    }
+
+    outId       = strtoull(idStr.c_str(), nullptr, 10);
+    outPassword = feeds::ExtractJsonString(response, "password");
+    outJoinUrl  = feeds::ExtractJsonString(response, "join_url");
+
+    // The id only. Never the password, and not even whether one exists — this
+    // lands in the shared OBS log.
+    LogInfo("API: instant meeting created, id " + idStr);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Zoom Events
+//
+// Not a separate login, despite how it looks from the outside. These are the
+// same OAuth access token the rest of Feeds uses, against a different family of
+// endpoints under /v2/zoom_events/. What can go wrong is the SCOPE: a token
+// authorized before the Events scopes were added answers 401/403 here, and the
+// fix is for the user to log out and back in to re-consent — which is what
+// authFailed reports upwards.
+//
+// The JSON array helpers are the shared ones from common/feeds-json-lite.h, the
+// same code the Windows engine uses, so the two platforms normalise these
+// payloads identically rather than by two similar-looking parsers.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// One role_type's upcoming events, appended to `out` as normalized objects.
+// Follows next_page_token. Sets authFailed on 401/403 and stops.
+void FetchEventsForRole(const std::string& roleType, std::string& out,
+                        bool& authFailed)
+{
+    std::string nextToken;
+    // The page cap is defensive: a server that kept handing back the same
+    // next_page_token would otherwise spin here forever.
+    for (int page = 0; page < 20; ++page) {
+        std::string path =
+            "/v2/zoom_events/events?event_status_type=upcoming&role_type=" + roleType;
+        if (!nextToken.empty()) path += "&next_page_token=" + UrlEncode(nextToken);
+
+        int status = 0;
+        const std::string resp = ZoomApiGet(path, status);
+        if (status == 401 || status == 403) { authFailed = true; return; }
+        if (resp.empty()) return;
+
+        const std::string body = feeds::JsonExtractArrayBody(resp, "events");
+        for (const std::string& obj : feeds::SplitJsonObjects(body)) {
+            const std::string id = feeds::ExtractJsonString(obj, "event_id");
+            if (id.empty()) continue;
+            const std::string name  = feeds::ExtractJsonString(obj, "name");
+            const std::string etype = feeds::ExtractJsonString(obj, "event_type");
+            if (!out.empty()) out += ",";
+            out += "{\"event_id\":\""  + feeds::JsonEscape(id)    + "\","
+                    "\"name\":\""       + feeds::JsonEscape(name)  + "\","
+                    "\"event_type\":\"" + feeds::JsonEscape(etype) + "\","
+                    "\"role\":\""       + roleType                 + "\"}";
+        }
+
+        nextToken = feeds::ExtractJsonString(resp, "next_page_token");
+        if (nextToken.empty()) return;
+    }
+    LogWarn("Events: stopped paging at the 20-page cap");
+}
+
+}  // namespace
+
+std::string FetchEventsArray(bool& authFailed)
+{
+    authFailed = false;
+    LogDebug("Events: fetching the event list");
+    std::string out;
+    // Both roles, because the two lists are disjoint: an event the user is
+    // hosting does not appear in their attendee list and vice versa, and Feeds
+    // can legitimately capture either.
+    FetchEventsForRole("attendee", out, authFailed);
+    if (authFailed) return "";
+    FetchEventsForRole("host", out, authFailed);
+    if (authFailed) return "";
+    return "[" + out + "]";
+}
+
+std::string FetchEventSessionsArray(const std::string& eventId)
+{
+    LogDebug("Events: fetching the session list");
+    int status = 0;
+    const std::string resp =
+        ZoomApiGet("/v2/zoom_events/events/" + UrlEncode(eventId) + "/sessions",
+                   status);
+    if (resp.empty()) return "[]";
+
+    std::string out;
+    const std::string body = feeds::JsonExtractArrayBody(resp, "sessions");
+    for (const std::string& obj : feeds::SplitJsonObjects(body)) {
+        const std::string id = feeds::ExtractJsonString(obj, "session_id");
+        if (id.empty()) continue;
+        const std::string name  = feeds::ExtractJsonString(obj, "name");
+        const std::string start = feeds::ExtractJsonString(obj, "start_time");
+        // type: 0 = meeting, 2 = webinar, 4 = neither. Informational only; the
+        // join never uses it, and never uses the meeting_id/webinar_id that sit
+        // beside it either — an Events session is joined by token or not at all.
+        std::string type = ExtractNumberText(obj, "type");
+        if (type.empty()) type = "4";
+        if (!out.empty()) out += ",";
+        out += "{\"session_id\":\"" + feeds::JsonEscape(id)    + "\","
+                "\"name\":\""        + feeds::JsonEscape(name)  + "\","
+                "\"start_time\":\""  + feeds::JsonEscape(start) + "\","
+                "\"type\":"          + type                     + "}";
+    }
+    return "[" + out + "]";
+}
+
+bool FetchEventJoinToken(const std::string& eventId, const std::string& sessionId,
+                         int& code, std::string& joinToken,
+                         std::string& errorMessage)
+{
+    LogDebug("Events: fetching a join token");
+    code = -1;
+    joinToken.clear();
+    errorMessage.clear();
+
+    int status = 0;
+    const std::string resp =
+        ZoomApiGet("/v2/zoom_events/events/" + UrlEncode(eventId) +
+                   "/sessions/" + UrlEncode(sessionId) + "/join_token", status);
+    if (resp.empty()) {
+        errorMessage = "No response from Zoom Events.";
+        return false;
+    }
+
+    const std::string codeStr = ExtractNumberText(resp, "code");
+    code         = codeStr.empty() ? -1 : atoi(codeStr.c_str());
+    joinToken    = feeds::ExtractJsonString(resp, "join_token");
+    errorMessage = feeds::ExtractJsonString(resp, "error_message");
+    return code == 0 && !joinToken.empty();
 }
 
 std::string UserDisplayName()

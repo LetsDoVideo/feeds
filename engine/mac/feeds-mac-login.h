@@ -55,6 +55,42 @@ void ClearStoredCredentials();
 // the main queue. Empty means the join must not proceed.
 std::string FetchZak();
 
+// Provision a NEW meeting and return its number, password and join URL. This is
+// what separates Instant Meeting from a PMI join: a fresh meeting number every
+// time rather than the account's one permanent room. BLOCKS on the network, so
+// background threads only. False means nothing was created and the caller must
+// tell the user; the most common cause is the meeting:write:meeting OAuth scope
+// not being granted.
+bool CreateInstantMeeting(const std::string& topic,
+                          unsigned long long& outId,
+                          std::string& outPassword,
+                          std::string& outJoinUrl);
+
+// ---------------------------------------------------------------------------
+// Zoom Events
+//
+// Same OAuth token as everything else, against /v2/zoom_events/ endpoints — not
+// a separate login. All three BLOCK on the network, so background threads only.
+// ---------------------------------------------------------------------------
+
+// The user's upcoming events as a JSON array, across both roles they can hold.
+// authFailed means 401/403: the token predates the Events scopes and the user
+// has to log out and back in to re-consent. The returned array is empty then.
+std::string FetchEventsArray(bool& authFailed);
+
+// The sessions of one event, as a JSON array. "[]" on any failure — a session
+// list that cannot be fetched is indistinguishable, to the user, from an event
+// with no sessions, and neither is worth an error dialog.
+std::string FetchEventSessionsArray(const std::string& eventId);
+
+// The just-in-time token for joining one session. Zoom documents no TTL for it,
+// so it must be fetched immediately before the join and never cached. True only
+// when code == 0 and a token came back; otherwise code carries Zoom's reason
+// (1130 = no valid ticket, 1150 = revoked) for the caller to translate.
+bool FetchEventJoinToken(const std::string& eventId, const std::string& sessionId,
+                         int& code, std::string& joinToken,
+                         std::string& errorMessage);
+
 // The entitlement tier this session resolved to: 0 Free, 1 Basic, 2 Streamer,
 // 3 Broadcaster. The video path reads it to decide the resolution ceiling a
 // feed may ask Zoom for, so a Free account cannot be served paid-tier quality.

@@ -220,6 +220,14 @@ static bool                               g_sdkAuthenticated     = false;
 static bool                               g_sdkBringupInProgress = false;
 static std::vector<std::function<void()>> g_pendingSdkActions;
 
+// Set by the instant-meeting flow between creating the meeting and the SDK
+// reporting that we are in it, then consumed by meeting_joined. Guarded because
+// the creation runs on a worker thread and the status change arrives on the
+// main queue.
+static std::mutex  g_instantMutex;
+static std::string g_pendingInstantJoinUrl;
+static std::string g_pendingInstantPassword;
+
 static ZoomSDKMeetingService* g_meetingService = nil;   // owned by the SDK
 
 static void BringUpSdk();                    // main queue only
@@ -310,8 +318,23 @@ static bool EnsureSdkUpThen(std::function<void()> action)
                 [g_meetingService getMeetingProperty:MeetingPropertyCmd_MeetingNumber];
             if (number) meetingNumber = (unsigned long long)number.longLongValue;
         }
+        // join_url and password ride along ONLY for the instant-meeting flow,
+        // which is how the plugin knows to offer the share-this-meeting popup;
+        // an ordinary join omits them and the popup stays away. Taken and
+        // cleared in one step so a later ordinary join cannot inherit them.
+        std::string instantExtras;
+        {
+            std::lock_guard<std::mutex> lock(g_instantMutex);
+            if (!g_pendingInstantJoinUrl.empty() || !g_pendingInstantPassword.empty()) {
+                instantExtras =
+                    ",\"join_url\":\"" + feeds::JsonEscape(g_pendingInstantJoinUrl) +
+                    "\",\"password\":\"" + feeds::JsonEscape(g_pendingInstantPassword) + "\"";
+            }
+            g_pendingInstantJoinUrl.clear();
+            g_pendingInstantPassword.clear();
+        }
         SendToPlugin("{\"type\":\"meeting_joined\",\"meeting_number\":\"" +
-                     std::to_string(meetingNumber) + "\"}");
+                     std::to_string(meetingNumber) + "\"" + instantExtras + "}");
         // Seed the dock immediately. onUserJoin keeps it current afterwards,
         // but the people already in the meeting generate no join event.
         SendParticipantList();
@@ -1205,6 +1228,250 @@ static void HandleLogout()
 }
 
 // ---------------------------------------------------------------------------
+// Create and start an instant meeting.
+//
+// Two steps, and they are not interchangeable:
+//   1. REST provisions a NEW meeting and returns its number. This is the whole
+//      difference from a PMI join, which reuses one permanent number.
+//   2. The SDK STARTS that meeting, as host. Not joins it — a meeting that has
+//      just been created sits waiting for its host, so a join would either be
+//      refused outright or, with join-before-host on, put us in as an ordinary
+//      participant with no host rights.
+//
+// Runs on a worker thread: step 1 blocks on the network.
+// ---------------------------------------------------------------------------
+static void HandleCreateInstantMeeting(const std::string& json)
+{
+    // Same lazy bring-up gate the join path uses. It must come BEFORE the REST
+    // call, or a queued-then-replayed attempt would provision a second meeting
+    // and abandon the first.
+    if (EnsureSdkUpThen([json]() { HandleCreateInstantMeeting(json); }))
+        return;
+
+    if (!g_meetingService) {
+        SendToPlugin("{\"type\":\"meeting_failed\",\"code\":-1,\"message\":\"Zoom SDK "
+                     "is not ready. Please try logging in again.\"}");
+        return;
+    }
+
+    const std::string customName = feeds::ExtractJsonString(json, "display_name");
+
+    const std::string zak         = feeds_mac::FetchZak();
+    const std::string displayName = feeds_mac::UserDisplayName();
+    if (zak.empty() || displayName.empty()) {
+        LogWarn("Mac engine: could not retrieve the ZAK or the account display name");
+        SendToPlugin("{\"type\":\"meeting_failed\",\"code\":-3,\"message\":\"Could not "
+                     "retrieve your Zoom account details. Please log out and log in "
+                     "again.\"}");
+        return;
+    }
+
+    unsigned long long meetingId = 0;
+    std::string meetingPassword, joinUrl;
+    if (!feeds_mac::CreateInstantMeeting("Feeds Instant Meeting",
+                                         meetingId, meetingPassword, joinUrl)) {
+        LogError("Mac engine: instant meeting creation failed");
+        SendToPlugin("{\"type\":\"meeting_failed\",\"code\":-4,\"message\":\"Could not "
+                     "create the instant meeting. Your Zoom account may not grant "
+                     "Feeds permission to create meetings.\"}");
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_instantMutex);
+        g_pendingInstantJoinUrl  = joinUrl;
+        g_pendingInstantPassword = meetingPassword;
+    }
+
+    const std::string& effectiveName = customName.empty() ? displayName : customName;
+
+    ZoomSDKStartMeetingUseZakElements* elements =
+        [[ZoomSDKStartMeetingUseZakElements alloc] init];
+    // NOT the same enum the join path uses. Join elements take ZoomSDKUserType
+    // (…_WithoutLogin); these take SDKUserType, a different type entirely, and
+    // the value that matches what the Windows engine sets for the start path is
+    // the API-user one. Passing the join enum here compiles to a number that
+    // means something else.
+    elements.userType      = SDKUserType_APIUser;
+    elements.zak           = [NSString stringWithUTF8String:zak.c_str()];
+    elements.displayName   = [NSString stringWithUTF8String:effectiveName.c_str()];
+    // The real number from step 1, NOT zero. Zero would ask the SDK to start a
+    // meeting of its own choosing and the meeting we just provisioned would be
+    // left stranded.
+    elements.meetingNumber = (long long)meetingId;
+    elements.isNoVideo     = YES;
+    elements.isNoAudio     = YES;
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!g_meetingService) return;
+        const ZoomSDKError err = [g_meetingService startMeetingWithZAK:elements];
+        if (err != ZoomSDKError_Success) {
+            // Clear the stash: no status change is coming, and leaving it set
+            // would attach this meeting's URL to whatever joins next.
+            {
+                std::lock_guard<std::mutex> lock(g_instantMutex);
+                g_pendingInstantJoinUrl.clear();
+                g_pendingInstantPassword.clear();
+            }
+            LogError("Mac engine: startMeetingWithZAK was rejected immediately (code " +
+                     std::to_string((int)err) + ")");
+            SendToPlugin("{\"type\":\"meeting_failed\",\"code\":" +
+                         std::to_string((int)err) +
+                         ",\"message\":\"Could not start the instant meeting. "
+                         "SDK error: " + std::to_string((int)err) + "\"}");
+            return;
+        }
+        LogInfo("Mac engine: instant meeting starting, waiting for status events");
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Zoom Events
+//
+// Three commands, and the third is a join unlike any other in this engine.
+//
+//   request_events      -> events_list, or events_auth_required
+//   request_sessions    -> sessions_list
+//   join_event_session  -> a token-only join, or meeting_failed
+//
+// All three block on REST, so all three run off the main queue.
+// ---------------------------------------------------------------------------
+static void HandleRequestEvents()
+{
+    bool authFailed = false;
+    const std::string events = feeds_mac::FetchEventsArray(authFailed);
+    if (authFailed) {
+        // Not an error the user can act on directly, and not a failed join
+        // either: their token simply predates the Events scopes. The plugin
+        // turns this into a re-consent prompt.
+        LogWarn("Events: the event list returned 401/403; the Events scope is "
+                "not granted on this token");
+        SendToPlugin("{\"type\":\"events_auth_required\"}");
+        return;
+    }
+    SendToPlugin("{\"type\":\"events_list\",\"events\":" + events + "}");
+}
+
+static void HandleRequestSessions(const std::string& json)
+{
+    const std::string eventId = feeds::ExtractJsonString(json, "event_id");
+    if (eventId.empty()) {
+        SendToPlugin("{\"type\":\"sessions_list\",\"event_id\":\"\",\"sessions\":[]}");
+        return;
+    }
+    const std::string sessions = feeds_mac::FetchEventSessionsArray(eventId);
+    SendToPlugin("{\"type\":\"sessions_list\",\"event_id\":\"" +
+                 feeds::JsonEscape(eventId) + "\",\"sessions\":" + sessions + "}");
+}
+
+static void HandleJoinEventSession(const std::string& json)
+{
+    // Same lazy bring-up gate the other join paths use.
+    if (EnsureSdkUpThen([json]() { HandleJoinEventSession(json); }))
+        return;
+
+    if (!g_meetingService) {
+        SendToPlugin("{\"type\":\"meeting_failed\",\"code\":-1,\"message\":\"Zoom SDK "
+                     "is not ready. Please try logging in again.\"}");
+        return;
+    }
+
+    const std::string eventId    = feeds::ExtractJsonString(json, "event_id");
+    const std::string sessionId  = feeds::ExtractJsonString(json, "session_id");
+    const std::string customName = feeds::ExtractJsonString(json, "display_name");
+    if (eventId.empty() || sessionId.empty()) {
+        SendToPlugin("{\"type\":\"meeting_failed\",\"code\":-2,\"message\":\"No Zoom "
+                     "Events session was selected.\"}");
+        return;
+    }
+
+    // Fetched here and nowhere else, immediately before the join: Zoom
+    // documents no lifetime for this token, so caching one is a join that fails
+    // later for no visible reason.
+    int code = -1;
+    std::string joinToken, errorMessage;
+    if (!feeds_mac::FetchEventJoinToken(eventId, sessionId, code, joinToken,
+                                        errorMessage)) {
+        // Zoom's own error_message is never shown to the user: the documented
+        // codes come back with text like "system busy", which tells them
+        // nothing about the actual problem (usually a ticket they do not hold).
+        // The raw code and message go to the log; the user gets the translation.
+        std::string friendly;
+        switch (code) {
+            case 1120:
+                friendly = "Zoom couldn't process the request to join this "
+                           "session.";
+                break;
+            case 1130:
+                friendly = "You don't have a valid ticket for this Zoom Events "
+                           "session, so it can't be joined.";
+                break;
+            case 1140:
+                friendly = "This Zoom Events session can't be joined: it may "
+                           "have already ended, or Zoom is temporarily busy. "
+                           "Try again, or pick a session that's currently live "
+                           "or upcoming.";
+                break;
+            case 1150:
+                friendly = "Your ticket for this Zoom Events session has been "
+                           "revoked, so it can't be joined.";
+                break;
+            default:
+                friendly = "This Zoom Events session couldn't be joined. "
+                           "Please try again, or choose a different session.";
+                break;
+        }
+        LogWarn("Events: join-token fetch failed, code=" + std::to_string(code) +
+                ", message=" + errorMessage);
+        SendToPlugin("{\"type\":\"meeting_failed\",\"code\":" + std::to_string(code) +
+                     ",\"message\":\"" + feeds::JsonEscape(friendly) + "\"}");
+        return;
+    }
+
+    const std::string zak         = feeds_mac::FetchZak();
+    const std::string displayName = feeds_mac::UserDisplayName();
+    if (zak.empty() || displayName.empty()) {
+        LogWarn("Mac engine: could not retrieve the ZAK or the account display name");
+        SendToPlugin("{\"type\":\"meeting_failed\",\"code\":-3,\"message\":\"Could not "
+                     "retrieve your Zoom account details. Please log out and log in "
+                     "again.\"}");
+        return;
+    }
+
+    const std::string& effectiveName = customName.empty() ? displayName : customName;
+
+    // TOKEN-ONLY. No meeting number, no password, no vanity id: an Events
+    // session id is a different identifier space entirely, and the token is the
+    // only thing that addresses it. Setting a meeting number here does not help
+    // and is what makes a pasted Events link fail as "meeting not found".
+    ZoomSDKJoinMeetingElements* elements =
+        [[ZoomSDKJoinMeetingElements alloc] init];
+    elements.userType      = ZoomSDKUserType_WithoutLogin;
+    elements.zak           = [NSString stringWithUTF8String:zak.c_str()];
+    elements.displayName   = [NSString stringWithUTF8String:effectiveName.c_str()];
+    elements.meetingNumber = 0;
+    elements.join_token    = [NSString stringWithUTF8String:joinToken.c_str()];
+    elements.isNoVideo     = YES;
+    elements.isNoAudio     = YES;
+
+    LogInfo("Events: joining a session by token");
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!g_meetingService) return;
+        const ZoomSDKError err = [g_meetingService joinMeeting:elements];
+        if (err != ZoomSDKError_Success) {
+            LogError("Events: joinMeeting was rejected immediately (code " +
+                     std::to_string((int)err) + ")");
+            SendToPlugin("{\"type\":\"meeting_failed\",\"code\":" +
+                         std::to_string((int)err) +
+                         ",\"message\":\"Could not join the Zoom Events session. "
+                         "SDK error: " + std::to_string((int)err) + "\"}");
+            return;
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Send one public chat message.
 //
 // Replies with chat_send_result either way. The plugin shows the error string
@@ -1327,6 +1594,28 @@ static void HandleCommand(const std::string& line)
     if (type == "get_participants") { SendParticipantList(); return; }
     if (type == "send_chat_message") { HandleSendChatMessage(line); return; }
 
+    if (type == "create_instant_meeting") {
+        // Off the main thread: provisioning blocks on the network, exactly like
+        // the join path.
+        std::thread([line]() { HandleCreateInstantMeeting(line); }).detach();
+        return;
+    }
+
+    // Zoom Events. All three block on REST, so none of them may run here on the
+    // main queue — that queue is what the SDK dispatches its own callbacks on.
+    if (type == "request_events") {
+        std::thread([]() { HandleRequestEvents(); }).detach();
+        return;
+    }
+    if (type == "request_sessions") {
+        std::thread([line]() { HandleRequestSessions(line); }).detach();
+        return;
+    }
+    if (type == "join_event_session") {
+        std::thread([line]() { HandleJoinEventSession(line); }).detach();
+        return;
+    }
+
     // Video. A subscribe re-points an existing renderer where it can; a
     // recreate always rebuilds one, because a kept renderer loses SDK delivery
     // across a participant's drop and rejoin.
@@ -1343,8 +1632,40 @@ static void HandleCommand(const std::string& line)
         return;
     }
 
-    // Everything else belongs to a later increment. Say so plainly rather than
-    // dropping it silently, so a premature message is visible in the log.
+    // ------------------------------------------------------------------
+    // Anything not handled above.
+    //
+    // Dropping a command silently was a real bug, not untidiness. The plugin's
+    // Connect flow disables its menu item the moment it sends a request and
+    // re-enables it only when a reply arrives; a command the engine ignored
+    // therefore left that item disabled for the rest of the OBS session, with
+    // no error shown and no way back short of a restart. Two clicks to an
+    // unrecoverable state, silently.
+    //
+    // Every command that puts the UI into that waiting state is now handled
+    // above, so nothing should reach here that the Connect flow is waiting on.
+    // This stays as the backstop for the next one that is added to the plugin
+    // before it exists here: it answers with meeting_failed, which the plugin
+    // already treats as the end of an attempt — it clears its pending flags,
+    // re-enables the menu, and shows the message verbatim. No plugin change is
+    // needed for that, which is why Windows is untouched by the fix.
+    //
+    // Matched by PREFIX rather than by an exact list, deliberately. Every verb
+    // the plugin uses to start something it then waits on begins with join_,
+    // request_ or create_, and the failure mode being guarded against is a verb
+    // nobody remembered to add here. Over-answering costs a visible error
+    // dialog; under-answering costs a disabled menu and a restart, which is the
+    // bug this exists for. Anything else is still just logged.
+    // ------------------------------------------------------------------
+    if (type.rfind("join_", 0) == 0 || type.rfind("request_", 0) == 0 ||
+        type.rfind("create_", 0) == 0) {
+        LogWarn("Mac engine: '" + type + "' is not implemented in this build; "
+                "answering so the Connect menu does not stay disabled");
+        SendToPlugin("{\"type\":\"meeting_failed\",\"code\":-100,\"message\":\"That "
+                     "option is not available in the macOS version of Feeds yet.\"}");
+        return;
+    }
+
     LogWarn("Mac engine: ignoring '" + type +
             "' — not implemented in this build");
 }
