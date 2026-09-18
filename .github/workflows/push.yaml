@@ -228,19 +228,19 @@ jobs:
       - name: Build Plugin
         uses: ./.github/actions/build-plugin
         with:
-          target: macos-universal
+          target: macos-arm64
           config: RelWithDebInfo
       - name: Package Plugin
         uses: ./.github/actions/package-plugin
         with:
-          target: macos-universal
+          target: macos-arm64
           config: RelWithDebInfo
           package: 'true'
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: Feeds-${{ github.ref_name }}-macos
-          path: ${{ github.workspace }}/release/${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-macos-universal*.*
+          path: ${{ github.workspace }}/release/${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-macos-arm64*.*
           if-no-files-found: error
 
   release:

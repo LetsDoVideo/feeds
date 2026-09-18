@@ -97,7 +97,10 @@ package() {
   read -r product_name product_version <<< \
     "$(jq -r '. | {name, version} | join(" ")' ${buildspec_file})"
 
-  local output_name="${product_name}-${product_version}-${host_os}-universal"
+  # arm64, not universal: the build produces a single-architecture binary (see
+  # build-macos), and a file named "universal" that is not one sends people
+  # looking for an Intel slice that was never there.
+  local output_name="${product_name}-${product_version}-${host_os}-arm64"
 
   if [[ ! -d ${project_root}/release/${config}/${product_name}.plugin ]] {
     log_error 'No release artifact found. Run the build script or the CMake install procedure first.'

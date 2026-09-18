@@ -16,8 +16,8 @@
     },
     {
       "name": "macos",
-      "displayName": "macOS Universal",
-      "description": "Build for macOS 12.0+ (Universal binary)",
+      "displayName": "macOS (Apple Silicon)",
+      "description": "Build for macOS 12.0+ on Apple Silicon. arm64 only: the macOS Zoom Meeting SDK ships no Intel slice, so an x86_64 build could never run a meeting.",
       "inherits": ["template"],
       "binaryDir": "${sourceDir}/build_macos",
       "condition": {
@@ -29,7 +29,7 @@
       "warnings": {"dev": true, "deprecated": true},
       "cacheVariables": {
         "CMAKE_OSX_DEPLOYMENT_TARGET": "12.0",
-        "CMAKE_OSX_ARCHITECTURES": "arm64;x86_64",
+        "CMAKE_OSX_ARCHITECTURES": "arm64",
         "CODESIGN_IDENTITY": "$penv{CODESIGN_IDENT}",
         "CODESIGN_TEAM": "$penv{CODESIGN_TEAM}",
         "ENABLE_FRONTEND_API": true,
@@ -41,8 +41,8 @@
     {
       "name": "macos-ci",
       "inherits": ["macos"],
-      "displayName": "macOS Universal CI build",
-      "description": "Build for macOS 12.0+ (Universal binary) for CI",
+      "displayName": "macOS (Apple Silicon) CI build",
+      "description": "Build for macOS 12.0+ on Apple Silicon for CI. Inherits arm64-only from the macos preset.",
       "generator": "Xcode",
       "cacheVariables": {
         "CMAKE_COMPILE_WARNING_AS_ERROR": false,
@@ -108,15 +108,15 @@
     {
       "name": "macos",
       "configurePreset": "macos",
-      "displayName": "macOS Universal",
-      "description": "macOS build for Universal architectures",
+      "displayName": "macOS (Apple Silicon)",
+      "description": "macOS build for arm64",
       "configuration": "RelWithDebInfo"
     },
     {
       "name": "macos-ci",
       "configurePreset": "macos-ci",
-      "displayName": "macOS Universal CI",
-      "description": "macOS CI build for Universal architectures",
+      "displayName": "macOS (Apple Silicon) CI",
+      "description": "macOS CI build for arm64",
       "configuration": "RelWithDebInfo"
     },
     {

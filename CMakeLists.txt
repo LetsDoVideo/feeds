@@ -162,30 +162,34 @@ macro(feeds_require_libyuv)
         FetchContent_MakeAvailable(libyuv)
         set(CMAKE_COMPILE_WARNING_AS_ERROR ${_FEEDS_SAVED_WAE})
 
-        # macOS ships a UNIVERSAL binary (CMAKE_OSX_ARCHITECTURES arm64;x86_64),
-        # and libyuv's own CMakeLists decides its AArch64 kernels from
-        # CMAKE_SYSTEM_PROCESSOR alone. On an Apple Silicon runner it therefore
-        # puts -march=armv8.2-a+dotprod+i8mm on its neon64 objects and
-        # -march=armv8.5-a+i8mm+sve2 on its sve objects with no architecture
-        # condition attached, and those flags then reach the x86_64 half of the
-        # build, where clang rejects them outright:
+        # Apple Silicon has NEON and does not have SVE. libyuv builds an SVE
+        # kernel object (row_sve.cc) for every aarch64 target regardless, with
+        # -march=armv8.5-a+i8mm+sve2 on it, and that does not compile for this
+        # target. Its SME kernels are in the same position.
         #
-        #     error: unknown target CPU 'armv8.5-a+i8mm+sve2'
+        # Both are gated in libyuv's own sources on LIBYUV_DISABLE_SVE /
+        # LIBYUV_DISABLE_SME (source/row_sve.cc, include/libyuv/row.h), which
+        # blank the kernels AND the declarations and dispatch that reach them.
+        # Defining them on every libyuv target, not just the kernel ones, is
+        # what keeps that consistent: define it on row_sve.cc alone and the
+        # other objects still expect the SVE entry points to exist and fail at
+        # link instead.
         #
-        # (the CPU list it prints is the x86-64 one, which is the tell). Nothing
-        # is wrong with the flags; they are on the wrong slice.
+        # The -march flags are stripped from those two targets as well, because
+        # the define makes the file empty but leaves the flag on the compile
+        # line, and the flag is half the problem.
         #
-        # -Xarch_arm64 is the driver's answer to exactly that: apply the next
-        # argument only when compiling for arm64. Rewriting the options rather
-        # than clearing them keeps libyuv's NEON kernels on Apple Silicon, which
-        # is the half of the universal binary whose scaling cost we care about;
-        # clearing them would drop every arm64 scale kernel to portable C.
+        # NEON is deliberately LEFT ALONE. -march=armv8.2-a+dotprod+i8mm on the
+        # neon64 objects is what gives us scale_neon64.cc, and I420Scale's
+        # bilinear path (InterpolateRow_NEON) is the per-frame hot path for
+        # every Mac feed. Disabling NEON here would quietly drop every Mac
+        # source to the portable C scaler.
         #
-        # Done by walking libyuv's own targets rather than naming them, so a
-        # later pin that renames or adds an object library is still covered.
-        # Only -march= is rewritten: -mfpu=neon belongs to libyuv's 32-bit Arm
-        # target, which macOS never builds, and mapping it to arm64 would be
-        # wrong rather than merely unnecessary.
+        # This build is arm64 only (CMakePresets.json, .github/scripts/build-macos),
+        # so there is no second architecture slice for these flags to leak onto.
+        # If a universal build is ever restored, the leak comes back: the flags
+        # below are attached to a target, not to an architecture, and would need
+        # scoping with -Xarch_arm64 to survive an x86_64 slice.
         if(APPLE)
             get_property(
                 _feeds_ly_targets
@@ -193,21 +197,23 @@ macro(feeds_require_libyuv)
                 PROPERTY BUILDSYSTEM_TARGETS
             )
             foreach(_feeds_ly_target IN LISTS _feeds_ly_targets)
+                target_compile_definitions(
+                    ${_feeds_ly_target} PRIVATE LIBYUV_DISABLE_SVE LIBYUV_DISABLE_SME
+                )
                 get_target_property(_feeds_ly_opts ${_feeds_ly_target} COMPILE_OPTIONS)
                 if(NOT _feeds_ly_opts)
                     continue()
                 endif()
-                set(_feeds_ly_fixed "")
+                set(_feeds_ly_kept "")
                 foreach(_feeds_ly_opt IN LISTS _feeds_ly_opts)
-                    if(_feeds_ly_opt MATCHES "^-march=")
-                        list(APPEND _feeds_ly_fixed "-Xarch_arm64" "${_feeds_ly_opt}")
-                    else()
-                        list(APPEND _feeds_ly_fixed "${_feeds_ly_opt}")
+                    if(_feeds_ly_opt MATCHES "^-march=.*(sve|sme)")
+                        continue()
                     endif()
+                    list(APPEND _feeds_ly_kept "${_feeds_ly_opt}")
                 endforeach()
                 set_target_properties(
                     ${_feeds_ly_target}
-                    PROPERTIES COMPILE_OPTIONS "${_feeds_ly_fixed}"
+                    PROPERTIES COMPILE_OPTIONS "${_feeds_ly_kept}"
                 )
             endforeach()
         endif()
