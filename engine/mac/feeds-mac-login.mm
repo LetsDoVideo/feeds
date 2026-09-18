@@ -39,7 +39,13 @@ namespace {
 // newline as the boundary, so nothing unexpected in the refresh token can
 // corrupt the access token.
 const char* const kSessionItem      = "Feeds_Session";
-const char* const kCachedTierItem   = "Feeds_CachedTier";
+
+// NOT a Keychain item any more. The tier is not a secret — this file's own
+// history called the Keychain "lifecycle, not confidentiality" for it — and
+// every Keychain touch can cost a password prompt. It lives in per-user
+// preferences now, which keeps the property that actually mattered (a second
+// macOS user cannot inherit the first user's entitlement) at no prompt cost.
+const char* const kCachedTierPref   = "cached_tier";
 
 // Superseded by kSessionItem. Read once to migrate an existing login, then
 // deleted; a user who already signed in keeps their session across the change
@@ -63,6 +69,26 @@ bool        g_tierUnresolved = false;
 std::mutex g_loginMutex;
 bool       g_loginInProgress = false;
 bool       g_loginCancelled  = false;
+
+// Two different questions, and conflating them is how a subtle bug gets in.
+//
+//   g_loadedRefresh    what the Keychain gave us, so a second caller is
+//                      answered from memory instead of reading again. Guarded
+//                      by g_sessionRead rather than by emptiness, because "we
+//                      looked and there was nothing" is also an answer worth
+//                      remembering.
+//   g_persistedRefresh what we believe is actually IN the Keychain right now,
+//                      which is what SaveTokens compares against to decide
+//                      whether a write is needed. It only advances when a write
+//                      really succeeded — if a write fails, the next SaveTokens
+//                      must try again rather than assume it landed.
+//
+// Together they are what keeps a session to one Keychain read and to writes
+// that change something.
+std::mutex  g_storageMutex;
+std::string g_loadedRefresh;
+std::string g_persistedRefresh;
+bool        g_sessionRead = false;
 
 // session_expired is announced from deep inside an API call, so a caller that
 // later decides to fail closed cannot otherwise tell whether the user has
@@ -108,78 +134,138 @@ bool IsLoginCancelled()
 
 // ---------------------------------------------------------------------------
 // Token storage
+//
+// ONLY THE REFRESH TOKEN IS STORED, and that is the point rather than an
+// economy. The access token used to be stored beside it, and Zoom issues a new
+// access token on every single refresh, so the stored value changed every time
+// and every refresh became a Keychain write — which on an unsigned build is a
+// password prompt. The stored access token bought nothing for that: it is an
+// hour-lived token that has always expired by the time the engine next starts,
+// so the restore path throws it away and refreshes regardless.
+//
+// With only the refresh token stored, a refresh that hands back the same
+// refresh token writes nothing at all.
 // ---------------------------------------------------------------------------
 void SaveTokens()
 {
-    std::string access, refresh;
+    std::string refresh;
     {
         std::lock_guard<std::mutex> lock(g_stateMutex);
-        access  = g_accessToken;
         refresh = g_refreshToken;
     }
-    // One item means one write, so it is the whole session that gets stored or
-    // nothing. A session with no refresh token cannot be restored anyway, and
-    // writing one would replace a good stored refresh token with nothing — a
-    // silent logout on the next start. Both callers hold both tokens by the
+    // Writing nothing would replace a good stored refresh token with a blank —
+    // a silent logout on the next start. Callers hold a refresh token by the
     // time they get here; this keeps that a guarantee rather than a habit.
     if (refresh.empty()) return;
-    KeychainSet(kSessionItem, access + "\n" + refresh);
+
+    {
+        std::lock_guard<std::mutex> lock(g_storageMutex);
+        // A write is an authorization, and an authorization is a password
+        // prompt. This comparison is what stops the prompts multiplying: the
+        // item is only touched when the refresh token has genuinely changed.
+        if (g_persistedRefresh == refresh) {
+            LogDebug("Login: stored refresh token unchanged; not rewriting");
+            return;
+        }
+    }
+    if (KeychainSet(kSessionItem, refresh)) {
+        std::lock_guard<std::mutex> lock(g_storageMutex);
+        g_persistedRefresh = refresh;
+        g_loadedRefresh    = refresh;
+    }
 }
 
-// Both tokens in one Keychain read, so the user is asked once.
+// The stored refresh token, read from the Keychain at most once per process.
 //
-// A login stored by an earlier build lives in the two separate items; read
-// those once, rewrite them as the single item, and remove them. That migration
-// still costs the old two prompts, but only on the first run after the change.
+// Two older shapes are still accepted, neither costing an extra prompt:
+//   * one item holding access, a newline, then refresh — the format this file
+//     used before the access token was dropped. The refresh half is taken and
+//     the access half discarded, which is what would have happened anyway.
+//   * the two separate legacy items — read once and migrated.
+//
 // Returns false when there is no usable stored session, which is the ordinary
-// state of a user who has not logged in yet, not an error. On true, refresh is
-// non-empty: that is the token a restore actually needs.
-bool LoadStoredTokens(std::string& access, std::string& refresh)
+// state of a user who has not logged in yet, not an error.
+bool LoadStoredRefreshToken(std::string& refresh)
 {
-    access.clear();
     refresh.clear();
+
+    // AT MOST ONE Keychain read per process, ever.
+    //
+    // Two callers reach this: the startup restore, and RefreshAccessToken's
+    // cold path when it has no refresh token in memory. Both used to be able to
+    // read, so a session could pay for two prompts on two different items at
+    // two different moments and look like the prompt "coming back". The first
+    // read's answer is remembered here — including the answer "there is
+    // nothing stored", which is why the flag is separate from the value.
+    {
+        std::lock_guard<std::mutex> lock(g_storageMutex);
+        if (g_sessionRead) {
+            refresh = g_loadedRefresh;
+            return !refresh.empty();
+        }
+    }
 
     const std::string blob = KeychainGet(kSessionItem);
     if (!blob.empty()) {
+        // A newline means the older two-field value; everything after it is the
+        // refresh token. No newline means the current format, which is the
+        // refresh token on its own.
         const size_t nl = blob.find('\n');
-        if (nl == std::string::npos) {
-            // SaveTokens never writes a value without the separator, so this is
-            // a truncated or hand-edited item. There is no way to tell which
-            // token it holds, so treat the session as unusable and let the user
-            // sign in again rather than guess.
-            LogWarn("Login: the stored session is malformed; ignoring it");
-            return false;
+        refresh = (nl == std::string::npos) ? blob : blob.substr(nl + 1);
+        {
+            std::lock_guard<std::mutex> lock(g_storageMutex);
+            g_sessionRead   = true;
+            g_loadedRefresh = refresh;
+            // Deliberately the REFRESH TOKEN, not the raw value read. An older
+            // two-field value would otherwise never compare equal to what
+            // SaveTokens builds now, and the first refresh would rewrite the
+            // item for no reason — one gratuitous prompt per upgrade.
+            g_persistedRefresh = refresh;
         }
-        access  = blob.substr(0, nl);
-        refresh = blob.substr(nl + 1);
         return !refresh.empty();
     }
+    {
+        std::lock_guard<std::mutex> lock(g_storageMutex);
+        g_sessionRead = true;
+        g_loadedRefresh.clear();
+        g_persistedRefresh.clear();
+    }
 
-    access  = KeychainGet(kLegacyAccessItem);
+    // ONLY the legacy refresh item is read. The legacy access item is never
+    // read at all any more: its value is an expired hour-lived token that
+    // nothing would keep, and reading it would cost a prompt to learn nothing.
+    // It is still deleted below, which costs no read.
     refresh = KeychainGet(kLegacyRefreshItem);
     if (refresh.empty()) {
         // Nothing worth carrying over: without the refresh token there is no
         // session to restore. Leave the old items alone — the next successful
         // login writes the single item and this fallback stops running.
-        access.clear();
         return false;
     }
 
+    {
+        // The token is ours from here regardless of whether the rewrite below
+        // lands, so remember it as loaded before attempting the write.
+        std::lock_guard<std::mutex> lock(g_storageMutex);
+        g_loadedRefresh = refresh;
+    }
     LogDebug("Login: migrating the stored session to a single Keychain item");
-    if (KeychainSet(kSessionItem, access + "\n" + refresh)) {
+    if (KeychainSet(kSessionItem, refresh)) {
+        std::lock_guard<std::mutex> lock(g_storageMutex);
+        g_persistedRefresh = refresh;   // so SaveTokens does not rewrite it
         KeychainDelete(kLegacyAccessItem);
         KeychainDelete(kLegacyRefreshItem);
     }
     return true;
 }
 
-// The last-known-good tier lives beside the tokens on purpose: it inherits
-// their per-user scope and dies with them on logout, so a second macOS user on
-// the same machine can never inherit the first user's entitlement. The tier is
-// not a secret; the Keychain is used here for lifecycle, not confidentiality.
+// The last-known-good tier still dies with the tokens on logout, so a second
+// macOS user on this machine can never inherit the first user's entitlement.
+// What changed is where it lives: per-user preferences rather than the
+// Keychain, because it is not a secret and a Keychain item costs prompts.
 void SaveCachedTier(int tier)
 {
-    KeychainSet(kCachedTierItem, std::to_string(tier));
+    PrefsSetInt(kCachedTierPref, tier);
 }
 
 // -1 means "never cached": the brand-new user who has not once reached the
@@ -187,11 +273,10 @@ void SaveCachedTier(int tier)
 // must still suppress the "couldn't reach licensing" warning.
 int LoadCachedTier()
 {
-    const std::string v = KeychainGet(kCachedTierItem);
-    if (v.empty()) return -1;
-    const int tier = atoi(v.c_str());
+    const int tier = PrefsGetInt(kCachedTierPref, -1);
     return (tier >= 0 && tier <= 3) ? tier : -1;
 }
+
 
 // ---------------------------------------------------------------------------
 // OAuth token refresh
@@ -204,8 +289,7 @@ bool RefreshAccessToken()
         refresh = g_refreshToken;
     }
     if (refresh.empty()) {
-        std::string storedAccess;
-        if (!LoadStoredTokens(storedAccess, refresh)) return false;
+        if (!LoadStoredRefreshToken(refresh)) return false;
         std::lock_guard<std::mutex> lock(g_stateMutex);
         g_refreshToken = refresh;
     }
@@ -258,6 +342,26 @@ std::string ZoomApiGet(const std::string& path, int& outStatus)
         if (!r.reached) LogDebug("API: GET " + path + " failed: " + r.error);
         return r.body;
     };
+
+    // A restore reads only the refresh token, so the first authenticated call
+    // of a session starts with no access token at all. Refresh BEFORE spending
+    // a request rather than relying on the 401 path below: an empty bearer
+    // header is not reliably a 401 — a 400 would skip the retry entirely and
+    // turn a perfectly good stored session into a failed restore.
+    bool needRefresh = false;
+    {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        needRefresh = g_accessToken.empty();
+    }
+    if (needRefresh) {
+        LogDebug("API: no access token in memory; refreshing before the request");
+        if (!RefreshAccessToken()) {
+            LogWarn("API: refresh failed, the session has expired");
+            NotifySessionExpired();
+            outStatus = 401;
+            return {};
+        }
+    }
 
     int status = 0;
     std::string body = once(status);
@@ -577,8 +681,8 @@ void RestoreSessionFromStoredToken()
         // One Keychain read for both tokens: two reads here meant two identical
         // permission panels stacked on top of each other, and the one in front
         // looked like the one behind it had failed.
-        std::string access, refresh;
-        if (!LoadStoredTokens(access, refresh)) {
+        std::string refresh;
+        if (!LoadStoredRefreshToken(refresh)) {
             LogDebug("Login: no stored token; waiting for the user to sign in");
             // Not a failure — the user simply has not logged in yet — but the
             // plugin needs the signal to stop waiting. It special-cases this
@@ -589,7 +693,9 @@ void RestoreSessionFromStoredToken()
         {
             std::lock_guard<std::mutex> lock(g_stateMutex);
             g_refreshToken = refresh;
-            g_accessToken  = access;
+            // No stored access token to restore: ZoomApiGet refreshes on the
+            // first authenticated call because this is empty.
+            g_accessToken.clear();
         }
         LogInfo("Login: restoring the stored session");
         AnnounceLoginSucceeded();
@@ -630,15 +736,24 @@ void ClearStoredCredentials()
         g_pmi.clear();
         g_currentTier = 0;
     }
+    {
+        // Forget the memo too, or a login straight after a logout would restore
+        // from a blob this process still remembers rather than from nothing.
+        std::lock_guard<std::mutex> lock(g_storageMutex);
+        g_loadedRefresh.clear();
+        g_persistedRefresh.clear();
+        g_sessionRead = true;   // we know what is there now: nothing
+    }
     KeychainDelete(kSessionItem);
-    // Harmless no-ops once the migration in LoadStoredTokens has run, but a
+    // Harmless no-ops once the migration in LoadStoredRefreshToken has run, but a
     // logout must not be the one path that leaves an old token behind.
     KeychainDelete(kLegacyAccessItem);
     KeychainDelete(kLegacyRefreshItem);
     // The cached tier is per-account and must die with the tokens, or the next
     // user to sign in on this Mac inherits the previous user's entitlement
-    // until their own tier query lands.
-    KeychainDelete(kCachedTierItem);
+    // until their own tier query lands. It is a preference now, not a Keychain
+    // item, so removing it costs no prompt.
+    PrefsRemove(kCachedTierPref);
 }
 
 std::string FetchZak()

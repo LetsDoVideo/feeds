@@ -74,6 +74,22 @@ std::string KeychainGet(const std::string& account);   // "" when absent
 void        KeychainDelete(const std::string& account);
 
 // ---------------------------------------------------------------------------
+// Preferences — per-user storage for things that are NOT secrets
+//
+// Every Keychain touch can cost the user a password prompt, so anything that
+// does not need confidentiality does not belong there. These are NSUserDefaults
+// under the engine's own domain: per-macOS-user, which is the property the
+// cached tier actually needs (a second user on this Mac must not inherit the
+// first user's entitlement), without the authorization cost.
+//
+// PrefsGetInt returns `fallback` when the key has never been set, which is how
+// callers tell "never stored" from a stored zero.
+// ---------------------------------------------------------------------------
+void PrefsSetInt(const std::string& key, int value);
+int  PrefsGetInt(const std::string& key, int fallback);
+void PrefsRemove(const std::string& key);
+
+// ---------------------------------------------------------------------------
 // Browser
 // ---------------------------------------------------------------------------
 // Hands the URL to the user's default browser (the Windows engine's

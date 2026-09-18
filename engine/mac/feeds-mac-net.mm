@@ -208,7 +208,30 @@ std::string Sha256Base64Url(const std::string& input)
 // Keychain
 // ---------------------------------------------------------------------------
 
+// Defined in feeds-engine-mac.mm and declared in feeds-mac-login.h, which this
+// file deliberately does not include: the net layer sits under the login
+// module, not beside it. One declaration is cheaper than the dependency.
+//
+// NOTE the placement: this has to sit in namespace feeds_mac, NOT in the
+// anonymous namespace below, or it would declare a different symbol with
+// internal linkage and nothing would define it.
+void EngineLog(const char* level, const std::string& message);
+
 namespace {
+
+// EVERY Keychain touch is logged, with the item and the operation.
+//
+// This exists because a prompt is not observable from inside the process: macOS
+// shows it, the user answers it, and SecItem* simply returns. The only way to
+// know how many prompts a session really costs is to count the accesses that
+// can cause one, so the log does the counting. A previous attempt at reducing
+// these prompts was reasoned about rather than measured, and reduced the wrong
+// ones; this makes the next run answer the question directly.
+void LogKeychain(const char* op, const std::string& account, OSStatus st)
+{
+    EngineLog("debug", std::string("Keychain: ") + op + " '" + account +
+                       "' -> " + std::to_string((int)st));
+}
 
 // The kSec* constants are CFStringRefs, so every use as a dictionary key or
 // value crosses the CoreFoundation/Objective-C line. __bridge is the right
@@ -247,6 +270,9 @@ bool KeychainSet(const std::string& account, const std::string& value)
             add[(__bridge id)kSecAttrAccessible] =
                 (__bridge id)kSecAttrAccessibleAfterFirstUnlock;
             st = SecItemAdd((__bridge CFDictionaryRef)add, NULL);
+            LogKeychain("add", account, st);
+        } else {
+            LogKeychain("update", account, st);
         }
         return st == errSecSuccess;
     }
@@ -269,6 +295,7 @@ std::string KeychainGet(const std::string& account)
         // remember a matching CFRelease — which under ARC would be a double
         // release, not a fix.
         id item = (__bridge_transfer id)result;
+        LogKeychain("read", account, st);
         if (st != errSecSuccess || ![item isKindOfClass:[NSData class]]) return {};
 
         NSData* data = (NSData*)item;
@@ -281,7 +308,47 @@ std::string KeychainGet(const std::string& account)
 void KeychainDelete(const std::string& account)
 {
     @autoreleasepool {
-        SecItemDelete((__bridge CFDictionaryRef)KeychainQuery(account));
+        const OSStatus st =
+            SecItemDelete((__bridge CFDictionaryRef)KeychainQuery(account));
+        LogKeychain("delete", account, st);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Preferences (see the header for why these are not Keychain items)
+// ---------------------------------------------------------------------------
+namespace {
+NSString* PrefsKey(const std::string& key)
+{
+    return [NSString stringWithFormat:@"com.letsdovideo.feeds.%s", key.c_str()];
+}
+}  // namespace
+
+void PrefsSetInt(const std::string& key, int value)
+{
+    @autoreleasepool {
+        [[NSUserDefaults standardUserDefaults] setInteger:value
+                                                   forKey:PrefsKey(key)];
+    }
+}
+
+int PrefsGetInt(const std::string& key, int fallback)
+{
+    @autoreleasepool {
+        NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+        NSString* k = PrefsKey(key);
+        // objectForKey distinguishes "never set" from "set to 0"; integerForKey
+        // alone would collapse the two, and a cached tier of 0 (Free) is a real
+        // answer that must not look like "never cached".
+        if ([defaults objectForKey:k] == nil) return fallback;
+        return (int)[defaults integerForKey:k];
+    }
+}
+
+void PrefsRemove(const std::string& key)
+{
+    @autoreleasepool {
+        [[NSUserDefaults standardUserDefaults] removeObjectForKey:PrefsKey(key)];
     }
 }
 
