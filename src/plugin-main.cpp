@@ -45,6 +45,7 @@
 #include <QMenuBar>
 #include <QMenu>
 #include <QAction>
+#include <QDockWidget>
 #include <QSignalBlocker>
 #include <QDateTime>
 #include <QInputDialog>
@@ -5202,6 +5203,7 @@ static const char* kCfgConnectOnStartup      = "ConnectOnStartup";
 static const char* kCfgYouTubeHandle         = "YouTubeChannelHandle";
 static const char* kCfgYouTubeVideoId        = "YouTubeVideoId";  // pinned stream (exclusive with handle)
 static const char* kCfgTwitchChannel         = "TwitchChannel";   // bare lowercase login
+static const char* kCfgFirstRunDockShown     = "FirstRunDockShown";  // set once, never cleared
 
 static bool LoadConnectOnStartupSetting() {
     config_t* cfg = obs_frontend_get_user_config();
@@ -5257,6 +5259,199 @@ static void SaveTwitchChannelSetting(const std::string& channel) {
     if (!cfg) return;
     config_set_string(cfg, kFeedsConfigSection, kCfgTwitchChannel, channel.c_str());
     config_save(cfg);
+}
+
+// ---------------------------------------------------------------------------
+// Dock lookup + first-run dock reveal
+// ---------------------------------------------------------------------------
+// obs_frontend_add_dock_by_id wraps the widget we hand it in an OBS-owned
+// QDockWidget whose objectName is the id we registered, and parents it to the
+// main window. We kept pointers to the inner widgets (g_participantDock /
+// g_chatDock) but not to those wrappers, so look them up by id when we need
+// the dock itself rather than its contents.
+static QDockWidget* FindFeedsDock(const char* id) {
+    QMainWindow* mainWindow = (QMainWindow*)obs_frontend_get_main_window();
+    if (!mainWindow) return nullptr;
+    return mainWindow->findChild<QDockWidget*>(QString::fromUtf8(id));
+}
+
+// Has the first-run reveal of the Controls dock already happened?
+//
+// The flag lives in OBS's user config, the same file as the other Feeds
+// preferences. That file is in OBS's own config directory and is never touched
+// by a plugin install, so an update or a reinstall cannot make a returning
+// user look new, and someone who closed the dock never gets it reopened.
+static bool HasFirstRunDockFlag() {
+    config_t* cfg = obs_frontend_get_user_config();
+    // No config to read or write means we could never record that the reveal
+    // happened, and an unrecordable reveal would repeat on every launch.
+    // Report it as already done so the auto-open stays a one-time event.
+    if (!cfg) return true;
+    return config_has_user_value(cfg, kFeedsConfigSection, kCfgFirstRunDockShown);
+}
+
+static void SetFirstRunDockFlag() {
+    config_t* cfg = obs_frontend_get_user_config();
+    if (!cfg) return;
+    config_set_bool(cfg, kFeedsConfigSection, kCfgFirstRunDockShown, true);
+    config_save(cfg);
+}
+
+// Does OBS's saved dock layout already mention the Feeds docks?
+//
+// This is the "returning user" test, and it is what keeps an update from
+// behaving like a fresh install. The flag key above is new in this version, so
+// on the first launch after updating it is absent for everyone — existing users
+// included. Their saved layout, however, names these docks: the docks are
+// registered at module load in every session they have ever run, so the state
+// OBS wrote on exit lists them whether they left the dock open or closed. A
+// genuinely fresh install has never contributed a Feeds dock to that blob.
+//
+// The blob is a QMainWindow::saveState() stream whose layout is a Qt internal,
+// so we do not parse it; we only ask whether the dock id appears anywhere in
+// it. QDataStream writes QString as UTF-16 and its byte order is not something
+// worth depending on, so we test both orders plus plain ASCII and accept any
+// hit. A false positive would require the literal dock id to occur by chance;
+// a false negative costs one auto-open and nothing else.
+static bool SavedDockLayoutKnowsFeeds() {
+    config_t* cfg = obs_frontend_get_user_config();
+    if (!cfg) return true;   // unreadable: prefer leaving the layout alone
+
+    const char* dockStateStr = config_get_string(cfg, "BasicWindow", "DockState");
+    if (!dockStateStr || !*dockStateStr) return false;   // no layout at all
+
+    const QByteArray state = QByteArray::fromBase64(QByteArray(dockStateStr));
+    if (state.isEmpty()) return false;
+
+    static const char* const kDockIds[] = {
+        "feeds_participant_dock", "feeds_chat_dock"
+    };
+    for (const char* id : kDockIds) {
+        const QString name = QString::fromUtf8(id);
+        QByteArray le, be;
+        for (const QChar ch : name) {
+            const ushort u = ch.unicode();
+            le.append(char(u & 0xFF)); le.append(char((u >> 8) & 0xFF));
+            be.append(char((u >> 8) & 0xFF)); be.append(char(u & 0xFF));
+        }
+        if (state.contains(le) || state.contains(be) ||
+            state.contains(QByteArray(id)))
+            return true;
+    }
+    return false;
+}
+
+// Is anything already sitting in the right-hand dock area?
+//
+// "Occupied" means a dock that is actually in that area and drawing. Two kinds
+// are filtered out first, because QMainWindow::dockWidgetArea() still reports
+// an area for both and would otherwise read as occupancy:
+//   - floating docks, which are their own top-level windows and take up no
+//     area at all (both Feeds docks are floating at registration, so this is
+//     the common case, not an edge case)
+//   - hidden docks, which a user closed while docked; the area they are
+//     assigned to still reads as empty on screen, which is the question we are
+//     actually asking
+//
+// excludeDock is the dock we are about to place. obs_frontend_add_dock_by_id
+// registers it into the right area before floating it, so leaving it in would
+// let it count as its own blocker.
+//
+// This is plain Qt Widgets layout state, with no platform-specific paths in
+// Qt's implementation, so the answer is the same on Windows and macOS.
+static bool IsRightDockAreaOccupied(QMainWindow* mainWindow,
+                                    QDockWidget* excludeDock) {
+    if (!mainWindow) return true;   // can't tell; caller should float
+    const QList<QDockWidget*> docks = mainWindow->findChildren<QDockWidget*>();
+    for (QDockWidget* d : docks) {
+        if (!d || d == excludeDock) continue;
+        if (d->isFloating() || d->isHidden()) continue;
+        if (mainWindow->dockWidgetArea(d) == Qt::RightDockWidgetArea)
+            return true;
+    }
+    return false;
+}
+
+// First install only: reveal the Controls dock so a brand-new user can see it
+// exists. Discoverability fix — the dock was previously reachable only from
+// OBS's generic Docks menu, which is not where anyone looks for a Feeds
+// feature.
+//
+// Must run at FINISHED_LOADING. OBSBasic::OBSInit calls restoreState() before
+// this point, and anything we showed earlier would be overwritten by the
+// restored layout.
+//
+// Controls only, never Chat: two windows appearing at once on a first launch
+// reads as clutter rather than as a pointer to the feature.
+//
+// Placement: docked into the right-hand area when that area is empty, floating
+// only when it is not. A docked panel reads as part of the UI and tends to be
+// left alone; a floating window reads as a popup and gets dismissed on reflex,
+// which is the failure this whole change exists to prevent. An occupied right
+// area means the user already has a layout there, and neither of the ways Qt
+// could join it is acceptable: stacking gives both docks a cramped half
+// height, and tabbing hides one of them, which defeats the discovery this is
+// for. So occupied falls back to floating, which is what this did before.
+static void MaybeOpenControlsDockOnFirstRun() {
+    if (HasFirstRunDockFlag()) return;   // already revealed once; respect saved state
+
+    if (SavedDockLayoutKnowsFeeds()) {
+        // Returning user on their first launch after an update. Record the flag
+        // so this check is skipped from now on, and leave the layout untouched.
+        SetFirstRunDockFlag();
+        blog(LOG_INFO,
+             "[feeds] existing dock layout found; leaving dock state as saved");
+        return;
+    }
+
+    // Record before showing. If anything below fails, the reveal is still
+    // marked done rather than retried on every subsequent launch.
+    SetFirstRunDockFlag();
+
+    QDockWidget* dock = FindFeedsDock("feeds_participant_dock");
+    if (!dock) {
+        blog(LOG_WARNING,
+             "[feeds] first run: Controls dock not found, not opening");
+        return;
+    }
+
+    QMainWindow* mainWindow = (QMainWindow*)obs_frontend_get_main_window();
+
+    if (!IsRightDockAreaOccupied(mainWindow, dock)) {
+        // Empty right area: dock it there. Height is left to OBS's own corner
+        // configuration (its "side docks" preference decides whether the
+        // vertical areas own the corners), so this fills the right edge the
+        // same way any other right-hand dock would instead of overriding a
+        // layout preference that belongs to the user.
+        mainWindow->addDockWidget(Qt::RightDockWidgetArea, dock);
+        // addDockWidget is documented to move an already-added dock into the
+        // given area, but the dock is floating at this point and clearing that
+        // is the part that must not be left to inference. setFloating(false)
+        // re-docks into the area just assigned, and is a no-op if
+        // addDockWidget already handled it.
+        dock->setFloating(false);
+        dock->show();
+
+        // Confirm it actually landed. Qt's dock layout is cross-platform, but
+        // this is the one step verified by reading rather than by running on
+        // both platforms, and a dock left half-placed would be worse than the
+        // floating behavior this replaced. Fall back rather than ship a
+        // broken-looking panel.
+        if (!dock->isFloating() &&
+            mainWindow->dockWidgetArea(dock) == Qt::RightDockWidgetArea) {
+            blog(LOG_INFO,
+                 "[feeds] first run: docked Feeds Controls to the right area");
+            return;
+        }
+        blog(LOG_WARNING,
+             "[feeds] first run: right-area docking did not take, floating instead");
+    }
+
+    // Right area occupied, or docking did not take: float, as before.
+    dock->setFloating(true);
+    dock->show();
+    dock->raise();
+    blog(LOG_INFO, "[feeds] first run: opened Feeds Controls dock (floating)");
 }
 
 // ===========================================================================
@@ -6734,6 +6929,25 @@ void SetupPluginMenu() {
       twChannel = g_twChannel; }
     if (g_chatDock) g_chatDock->SetTwitchTargetDisplay(twChannel);
     TwWakePoller();
+
+    // Dock toggles, mirrored from OBS's Docks menu so the docks are reachable
+    // from both places. Users look for Feeds things in the Feeds menu; the
+    // generic Docks menu is not an intuitive home for a Feeds feature, and a
+    // customer reported being unable to find the Controls dock because of it.
+    //
+    // These are the same QAction objects OBS put in its Docks menu
+    // (QDockWidget::toggleViewAction), not copies. A QAction can appear in
+    // several menus at once, so the checkmark and the show/hide behavior stay
+    // in sync with the Docks menu for free, with no second code path to keep
+    // correct. A QMenu does not take ownership of actions added to it, so the
+    // actions remain owned by their dock widgets and the lifetime OBS already
+    // manages is unchanged. Their captions come from the dock titles, which
+    // keeps the two menus reading identically.
+    feedsMenu->addSeparator();
+    if (QDockWidget* controlsDock = FindFeedsDock("feeds_participant_dock"))
+        feedsMenu->addAction(controlsDock->toggleViewAction());
+    if (QDockWidget* chatDock = FindFeedsDock("feeds_chat_dock"))
+        feedsMenu->addAction(chatDock->toggleViewAction());
 
     feedsMenu->addSeparator();
     QAction* aboutAction = feedsMenu->addAction("About / Tier Status");
@@ -10342,6 +10556,10 @@ bool obs_module_load(void) {
             g_sceneCollectionLoading.store(false);   // startup load done
             g_sceneCollectionReloading.store(false);
             SetupPluginMenu();
+            // After SetupPluginMenu so the Feeds menu's dock toggle picks up
+            // the resulting visibility, and after OBSInit's restoreState so a
+            // saved layout is not overwritten. No-op except on a fresh install.
+            MaybeOpenControlsDockOnFirstRun();
             QTimer::singleShot(5000,
                 (QObject*)obs_frontend_get_main_window(),
                 []() { CheckForUpdateAsync(); });
