@@ -23,7 +23,6 @@
 #include "meeting_service_components/meeting_chat_interface.h"
 #include "meeting_service_components/meeting_configuration_interface.h"
 #include "meeting_service_components/meeting_participants_ctrl_interface.h"
-#include "meeting_service_components/meeting_production_studio_ctrl_interface.h"
 #include "meeting_service_components/meeting_video_interface.h"
 #include "meeting_service_components/meeting_live_stream_interface.h"
 #include "meeting_service_components/meeting_sharing_interface.h"
@@ -979,24 +978,6 @@ public:
                 pc->SetEvent(&g_participantsListener);
             } else {
                 LogToFile("Meeting: participants controller unavailable at join");
-            }
-
-            // Production Studio availability probe. Both calls are pure
-            // queries: IsSupportPSMode() reports whether this meeting and
-            // account carry the entitlement, CanStartPSMode() whether our
-            // current role may start it (host or co-host only). Neither
-            // starts anything. Logged at info so it lands in the OBS log
-            // without a debug-level build.
-            ZOOM_SDK_NAMESPACE::IMeetingProductionStudioController* psc =
-                g_meetingService->GetMeetingProductionStudioController();
-            if (psc) {
-                char buf[128];
-                sprintf_s(buf, "PS probe: IsSupportPSMode=%d CanStartPSMode=%d",
-                          psc->IsSupportPSMode() ? 1 : 0,
-                          psc->CanStartPSMode() ? 1 : 0);
-                LogInfo(buf);
-            } else {
-                LogInfo("PS probe: production studio controller unavailable");
             }
 
             // Attach the chat listener. Independent of livestream

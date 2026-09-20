@@ -89,6 +89,7 @@
 #include <QEnterEvent>
 #include <QResizeEvent>
 #include <QScrollArea>
+#include <QFont>
 #include <QFontMetrics>
 #include <QUrl>
 #include <QUrlQuery>
@@ -178,25 +179,21 @@ namespace feeds {
 // ---------------------------------------------------------------------------
 // Globals — menu actions
 // ---------------------------------------------------------------------------
+static QMenu*   g_feedsMenu             = nullptr;
 static QAction* g_loginLogoutAction     = nullptr;
 static QAction* g_connectAction         = nullptr;
 static QAction* g_isoRecordingAction    = nullptr;
-static QAction* g_connectOnStartupAction = nullptr;
+// The Feeds menu's own dock toggles. Separate QActions from the ones OBS put
+// in its Docks menu, because the two menus show different captions for them
+// (see AddFeedsDockMenuItem).
+static QAction* g_controlsDockMenuAction = nullptr;
+static QAction* g_chatDockMenuAction     = nullptr;
 
 // Global ISO recording toggle. When true (and tier >= 1), every participant
 // source's recorder is enabled — they all start writing when OBS main
 // recording starts. Driven by the Feeds menu item; replaces the old
 // per-source checkbox.
 static bool g_isoRecordingEnabled = false;
-
-// "Connect to Zoom on Startup" toggle. Unlike the ISO toggle (runtime-only),
-// this persists across OBS sessions in the user-level frontend config (see
-// LoadConnectOnStartupSetting / SaveConnectOnStartupSetting). When enabled,
-// the join dialog is auto-opened once per session after login completes.
-static bool g_connectOnStartupEnabled = false;
-// One-shot guard so the startup auto-open fires at most once per OBS session
-// — a mid-session logout/login must not re-pop the dialog.
-static bool g_startupConnectDone = false;
 
 // ---------------------------------------------------------------------------
 // Globals — cached state from engine
@@ -3582,12 +3579,50 @@ private:
         QPushButton* btn = new QPushButton(
             loggedIn ? "Logged in. Click to Connect to Zoom Meeting."
                      : "Not logged in to Zoom. Click to Login.");
+        StylePrimaryCtaButton(btn);
         if (loggedIn)
             QObject::connect(btn, &QPushButton::clicked, []() { OnConnectClick(); });
         else
             QObject::connect(btn, &QPushButton::clicked, []() { OnLoginClick(); });
         m_headerTopLayout->addWidget(btn);
         m_headerTopSlot->setVisible(true);
+    }
+
+    // Style the header top slot's button as the dock's primary call to action.
+    //
+    // Whenever this button exists at all the user is either logged out or not
+    // yet in a meeting, so it is what they came to the dock for; the rest of
+    // the dock does nothing useful until it has been pressed. A themed default
+    // button looks like every other button in OBS and does not say that, so
+    // this one gets a filled accent instead: the same blue triad the Connect
+    // dialog uses for its primary tiles, so "Feeds primary action" reads as one
+    // colour across the plugin.
+    //
+    // The fill, text colour and border are all stated explicitly rather than
+    // inherited, so the button looks the same under OBS's dark theme, its light
+    // theme, and a user's custom theme, where an inherited button colour would
+    // drift. Bold text and the pointing-hand cursor complete the affordance.
+    //
+    // Horizontal padding is deliberately tighter than the vertical: the label
+    // is a whole sentence and this slot sits OUTSIDE the dock's scroll area, so
+    // the button's width demand is a floor on the dock's own width. Trading
+    // side padding for the extra width that bold costs keeps that floor where
+    // it was.
+    static void StylePrimaryCtaButton(QPushButton* b) {
+        if (!b) return;
+        QFont f = b->font();
+        f.setBold(true);
+        b->setFont(f);
+        b->setCursor(Qt::PointingHandCursor);
+        b->setStyleSheet(
+            "QPushButton {"
+            " background-color: #3a6fe0; color: #ffffff;"
+            " border: 1px solid #3a6fe0; border-radius: 4px;"
+            " padding: 8px 10px; }"
+            "QPushButton:hover {"
+            " background-color: #5285ea; border-color: #5285ea; }"
+            "QPushButton:pressed {"
+            " background-color: #2f5cc0; border-color: #2f5cc0; }");
     }
 
     QWidget* BuildHeaderBar() {
@@ -5086,6 +5121,48 @@ static void UpdateIsoMenuItemForTier() {
         : "ISO Recording is a Paid Feature");
 }
 
+// Bold one Feeds menu item, or return it to the menu's normal weight. The
+// font is seeded from the menu's own font so weight is the ONLY difference
+// from the item's neighbours: family and point size stay whatever the
+// platform and theme give the menu.
+//
+// Bold is the one emphasis a menu item carries reliably on both platforms.
+// On Windows the item is a QMenu row, which paints with the action's font;
+// on macOS the menu is a native NSMenu and Qt forwards the action's font to
+// the native item as an attributed title. Colour, size and capitalisation
+// are NOT portable here: a native menu item ignores a widget stylesheet, and
+// a taller item breaks the uniform row metrics the native menu lays out with.
+static void SetMenuItemBold(QAction* action, bool bold) {
+    if (!action || !g_feedsMenu) return;
+    // Already right: skip the setFont, which would otherwise re-sync the
+    // native menu item on every menu open for no visible change.
+    if (action->font().bold() == bold) return;
+    QFont f = g_feedsMenu->font();
+    f.setBold(bold);
+    action->setFont(f);
+}
+
+// Emphasise the one Feeds menu item that is the user's next step, so the menu
+// answers "what do I do now?" at a glance:
+//   not logged in           -> Login to Zoom (nothing else works first)
+//   logged in, no meeting   -> Connect to Zoom Meeting
+//   otherwise               -> neither, i.e. in a meeting (both steps done),
+//                              or an auth round-trip is in flight, where the
+//                              item reads "Cancel login" and cancelling is
+//                              not the step forward.
+// Enabled/greyed state is untouched; this only adds weight to the live item.
+//
+// Called from two places, both idempotent. UpdateLoginLogoutMenuItem is the
+// funnel every login-state change already runs through, and the menu's
+// aboutToShow covers everything else (meeting state, and any path that
+// changes state without touching the login item) by recomputing immediately
+// before the menu is drawn.
+static void UpdateFeedsMenuEmphasis() {
+    const bool settled = !g_authInProgress;
+    SetMenuItemBold(g_loginLogoutAction, settled && !g_isLoggedIn);
+    SetMenuItemBold(g_connectAction,     settled && g_isLoggedIn && !g_isInMeeting);
+}
+
 // Sync the collapsed Login/Logout item's label and enabled state.
 // Settled labels follow g_isLoggedIn. While an auth round-trip is in
 // flight (g_authInProgress):
@@ -5105,10 +5182,12 @@ static void UpdateLoginLogoutMenuItem() {
             g_loginLogoutAction->setText("Cancel login");
             g_loginLogoutAction->setEnabled(true);
         }
+        UpdateFeedsMenuEmphasis();
         return;
     }
     g_loginLogoutAction->setText(g_isLoggedIn ? "Logout of Zoom" : "Login to Zoom");
     g_loginLogoutAction->setEnabled(true);
+    UpdateFeedsMenuEmphasis();
 }
 
 // Build and exec the About dialog. Stack-allocated; exec() blocks until the
@@ -5194,30 +5273,16 @@ static void ShowAboutDialog() {
 // Persistent global preferences
 // ---------------------------------------------------------------------------
 // Stored in OBS's user-level (global) frontend config, NOT the per-profile
-// config — "Connect to Zoom on Startup" is a global preference. OBS 30+
-// renamed the accessor from obs_frontend_get_global_config (now deprecated)
-// to obs_frontend_get_user_config; Feeds builds against OBS 31, so we use the
-// new one. This is Feeds' first persisted non-source preference.
+// config — these are global preferences that follow the user across profiles,
+// not per-profile scene settings. OBS 30+ renamed the accessor from
+// obs_frontend_get_global_config (now deprecated) to
+// obs_frontend_get_user_config; Feeds builds against OBS 31, so we use the
+// new one.
 static const char* kFeedsConfigSection      = "Feeds";
-static const char* kCfgConnectOnStartup      = "ConnectOnStartup";
 static const char* kCfgYouTubeHandle         = "YouTubeChannelHandle";
 static const char* kCfgYouTubeVideoId        = "YouTubeVideoId";  // pinned stream (exclusive with handle)
 static const char* kCfgTwitchChannel         = "TwitchChannel";   // bare lowercase login
 static const char* kCfgFirstRunDockShown     = "FirstRunDockShown";  // set once, never cleared
-
-static bool LoadConnectOnStartupSetting() {
-    config_t* cfg = obs_frontend_get_user_config();
-    if (!cfg) return false;
-    // config_get_bool returns false for an absent key, which is our default.
-    return config_get_bool(cfg, kFeedsConfigSection, kCfgConnectOnStartup);
-}
-
-static void SaveConnectOnStartupSetting(bool enabled) {
-    config_t* cfg = obs_frontend_get_user_config();
-    if (!cfg) return;
-    config_set_bool(cfg, kFeedsConfigSection, kCfgConnectOnStartup, enabled);
-    config_save(cfg);
-}
 
 static std::string LoadYouTubeHandleSetting() {
     config_t* cfg = obs_frontend_get_user_config();
@@ -5273,6 +5338,58 @@ static QDockWidget* FindFeedsDock(const char* id) {
     QMainWindow* mainWindow = (QMainWindow*)obs_frontend_get_main_window();
     if (!mainWindow) return nullptr;
     return mainWindow->findChild<QDockWidget*>(QString::fromUtf8(id));
+}
+
+// Add one dock toggle to the Feeds menu, under a caption of our own.
+//
+// OBS already lists each dock's QDockWidget::toggleViewAction in its Docks
+// menu, where the parent menu supplies the "these are docks" context and the
+// caption is simply "Feeds Controls". The Feeds menu gives no such context,
+// so its entries spell it out: "Feeds Controls Dock" / "Feeds Chat Dock". A
+// single QAction cannot carry two captions, so the Feeds menu gets its own
+// action instead of a second reference to OBS's, and the Docks menu keeps the
+// wording it has.
+//
+// The new action is a thin remote for the dock's own toggle: a click triggers
+// OBS's action, so showing and hiding runs the exact path the Docks menu
+// runs, with no second implementation of the toggle to keep correct. It has
+// to be trigger(), not setChecked(): QDockWidget wires its toggle action's
+// triggered(bool), not toggled(bool), to the show/hide slot, so setChecked
+// alone would move the checkmark and leave the dock where it was.
+//
+// The checkmark is refreshed by SyncFeedsDockMenuItems just before the menu
+// is shown, which is the only moment it can be seen.
+static QAction* AddFeedsDockMenuItem(QMenu* menu, const char* dockId,
+                                     const char* label) {
+    QDockWidget* dock = FindFeedsDock(dockId);
+    if (!dock) return nullptr;
+    QAction* item = menu->addAction(QString::fromUtf8(label));
+    item->setCheckable(true);
+    item->setChecked(dock->toggleViewAction()->isChecked());
+    // `dock` as the connection context: if the dock is ever destroyed, the
+    // connection goes with it rather than firing at a dangling pointer.
+    QObject::connect(item, &QAction::triggered, dock, [dock](bool wanted) {
+        QAction* source = dock->toggleViewAction();
+        if (source->isChecked() != wanted) source->trigger();
+    });
+    return item;
+}
+
+// Point the Feeds menu's dock checkmarks at the docks' real visibility. The
+// user can have closed a dock by its X, or toggled it from the Docks menu,
+// since this menu was last open. setChecked emits toggled, not triggered, and
+// the item above is wired to triggered, so this cannot bounce back into the
+// dock as a toggle.
+static void SyncFeedsDockMenuItems() {
+    const struct { QAction* item; const char* dockId; } items[] = {
+        { g_controlsDockMenuAction, "feeds_participant_dock" },
+        { g_chatDockMenuAction,     "feeds_chat_dock"        },
+    };
+    for (const auto& it : items) {
+        if (!it.item) continue;
+        if (QDockWidget* dock = FindFeedsDock(it.dockId))
+            it.item->setChecked(dock->toggleViewAction()->isChecked());
+    }
 }
 
 // Has the first-run reveal of the Controls dock already happened?
@@ -6898,6 +7015,10 @@ void SetupPluginMenu() {
     QMenuBar*    menuBar    = mainWindow->menuBar();
     QMenu*       feedsMenu  = new QMenu("Feeds", menuBar);
     menuBar->addMenu(feedsMenu);
+    g_feedsMenu = feedsMenu;
+    // QMenu suppresses item tooltips unless this is set. Needed for the ISO
+    // item's explanation below.
+    feedsMenu->setToolTipsVisible(true);
 
     g_loginLogoutAction  = feedsMenu->addAction("Login to Zoom");
     g_connectAction      = feedsMenu->addAction("Connect to Zoom Meeting");
@@ -6905,10 +7026,13 @@ void SetupPluginMenu() {
     g_isoRecordingAction = feedsMenu->addAction("ISO Recording (All Participants)");
     g_isoRecordingAction->setCheckable(true);
     g_isoRecordingAction->setChecked(g_isoRecordingEnabled);
-    g_connectOnStartupAction = feedsMenu->addAction("Connect to Zoom on Startup");
-    g_connectOnStartupAction->setCheckable(true);
-    g_connectOnStartupEnabled = LoadConnectOnStartupSetting();
-    g_connectOnStartupAction->setChecked(g_connectOnStartupEnabled);
+    // Ticking this item arms ISO recording; it does not begin one. The
+    // checkmark has been read as "recording now", so say when the files
+    // actually start. Constant in every tier state, so it is set once here
+    // and never touched by UpdateIsoMenuItemForTier.
+    g_isoRecordingAction->setToolTip(
+        "When enabled, ISO recordings start automatically when you start "
+        "your OBS recording.");
 
     // YouTube live chat is configured from the Feeds Chat dock header now (no
     // menu items). Load the persisted target into the poller globals here
@@ -6935,19 +7059,14 @@ void SetupPluginMenu() {
     // generic Docks menu is not an intuitive home for a Feeds feature, and a
     // customer reported being unable to find the Controls dock because of it.
     //
-    // These are the same QAction objects OBS put in its Docks menu
-    // (QDockWidget::toggleViewAction), not copies. A QAction can appear in
-    // several menus at once, so the checkmark and the show/hide behavior stay
-    // in sync with the Docks menu for free, with no second code path to keep
-    // correct. A QMenu does not take ownership of actions added to it, so the
-    // actions remain owned by their dock widgets and the lifetime OBS already
-    // manages is unchanged. Their captions come from the dock titles, which
-    // keeps the two menus reading identically.
+    // Each entry is the Feeds menu's own QAction, spelling out "Dock" in its
+    // caption, and driving OBS's toggle action underneath so the behaviour and
+    // the checkmark match the Docks menu exactly. See AddFeedsDockMenuItem.
     feedsMenu->addSeparator();
-    if (QDockWidget* controlsDock = FindFeedsDock("feeds_participant_dock"))
-        feedsMenu->addAction(controlsDock->toggleViewAction());
-    if (QDockWidget* chatDock = FindFeedsDock("feeds_chat_dock"))
-        feedsMenu->addAction(chatDock->toggleViewAction());
+    g_controlsDockMenuAction =
+        AddFeedsDockMenuItem(feedsMenu, "feeds_participant_dock", "Feeds Controls Dock");
+    g_chatDockMenuAction =
+        AddFeedsDockMenuItem(feedsMenu, "feeds_chat_dock", "Feeds Chat Dock");
 
     feedsMenu->addSeparator();
     QAction* aboutAction = feedsMenu->addAction("About / Tier Status");
@@ -6970,6 +7089,15 @@ void SetupPluginMenu() {
     UpdateLoginLogoutMenuItem();
     UpdateIsoMenuItemForTier();
 
+    // Everything in this menu whose appearance depends on state outside the
+    // menu is recomputed the moment before it is drawn. That is one place
+    // that cannot go stale, rather than a call to remember at each of the
+    // scattered points where login, meeting or dock state changes.
+    QObject::connect(feedsMenu, &QMenu::aboutToShow, feedsMenu, []() {
+        UpdateFeedsMenuEmphasis();
+        SyncFeedsDockMenuItems();
+    });
+
     QObject::connect(g_loginLogoutAction, &QAction::triggered, []() {
         if (g_authInProgress && !g_isLoggedIn) {
             // User clicked "Cancel login". Tell the engine first so it sets
@@ -6990,10 +7118,6 @@ void SetupPluginMenu() {
     QObject::connect(g_isoRecordingAction, &QAction::toggled, [](bool checked) {
         g_isoRecordingEnabled = checked;
         ApplyIsoRecordingStateToAllSources();
-    });
-    QObject::connect(g_connectOnStartupAction, &QAction::toggled, [](bool checked) {
-        g_connectOnStartupEnabled = checked;
-        SaveConnectOnStartupSetting(checked);
     });
     QObject::connect(aboutAction, &QAction::triggered, []() {
         ShowAboutDialog();
@@ -8502,22 +8626,6 @@ static void RegisterEngineHandlers() {
             if (g_connectAction) g_connectAction->setEnabled(true);
             RefreshAllSourceProperties();
             if (g_chatDock) g_chatDock->RefreshPlaceholder();
-
-            // "Connect to Zoom on Startup": the first time we reach an
-            // authenticated state this OBS session, auto-open the join dialog
-            // if the user enabled the setting. This point — g_isLoggedIn just
-            // set true on the UI thread — implies the engine is connected and
-            // login succeeded. The one-shot guard ensures a mid-session
-            // logout/login can't re-pop it. Skipped when a user-initiated join
-            // is already pending (handled just below). Deferred with
-            // singleShot(0) so the dialog opens cleanly after this handler
-            // returns rather than reentrantly inside it.
-            if (!g_startupConnectDone) {
-                g_startupConnectDone = true;
-                if (g_connectOnStartupEnabled && !g_pendingMeetingJoin) {
-                    QTimer::singleShot(0, []() { OnConnectClick(); });
-                }
-            }
 
             if (g_pendingMeetingJoin) {
                 g_pendingMeetingJoin = false;
