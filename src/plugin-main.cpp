@@ -3150,11 +3150,31 @@ static std::map<unsigned int, ConnQualityLegs> g_connQualityByUserId;
 // always present (paint-only toggle, no reflow); 14px reads the mic glyph clearly.
 static constexpr int kMuteSlotPx = 14;
 
-// Width (px) of a source box's on-air tally stripe — the full-height bar pinned
-// to the box's left edge that marks the source as live on the program output.
-// Always present (transparent when off air), so the box's left content margin is
-// reduced by exactly this much and the header text sits where it always did.
-static constexpr int kOnAirBarPx = 4;
+// --- On-air (live on program) emphasis dials --------------------------------
+// A source box takes one of two looks, driven by obs_source_active():
+//
+//   OFF AIR   the soft grey frame it has always had, plus every text element in
+//             the box dimmed — present and fully usable, just not the thing to
+//             look at.
+//   ON AIR    text left at the theme's own colour, plus a more defined frame.
+//
+// Both values are plain constants so the look can be tuned without touching any
+// of the logic that decides when to apply it.
+
+// The de-emphasis grey. NOT a new colour: this is the same #7a7d80 the dock
+// already uses for "Waiting for participants...", for tier-locked and cooling
+// buttons, and for the combo's "already used" entries — so an off-air row lands
+// in the tone the dock already reads as "there, but not in play".
+static constexpr const char* kOnAirDimTextColor = "#7a7d80";
+
+// The on-air frame. Deliberately the SAME mid-grey the off-air frame uses, at a
+// much higher opacity, rather than a literally brighter colour: mid-grey gains
+// contrast against a dark theme and a light one alike as the alpha rises, where
+// a lighter tone would gain definition on OBS's dark theme and lose it on the
+// light one. Thickness stays 1px in both states — the QSS box model insets a
+// box's children by its border width, so a 2px on-air frame would shift every
+// row's contents by a pixel on every scene change.
+static constexpr const char* kOnAirBorderRgba = "rgba(128,128,128,0.90)";
 
 // ---------------------------------------------------------------------------
 // Read-only participant dock — lists every participant source and its current
@@ -4042,15 +4062,20 @@ private:
     };
     std::map<std::string, RowIndicators> m_rowIndicators;
 
-    // On-air tally stripes, keyed by source uuid. Borrowed pointers like
-    // m_rowIndicators (each bar is owned by its box) and cleared in the same
-    // place, but kept as a SEPARATE map because it is registered for EVERY box,
-    // live or not: "on the program output" is a scene-graph fact, independent of
-    // whether a meeting is connected. A source parked on the program scene with
-    // no meeting is genuinely on air, showing the audience nothing — which is
-    // exactly the case the stripe exists to make visible.
+    // On-air marks, keyed by source uuid. Borrowed pointers like m_rowIndicators
+    // (the box belongs to the layout) and cleared in the same place, but kept as
+    // a SEPARATE map because it is registered for EVERY box, live or not: "on the
+    // program output" is a scene-graph fact, independent of whether a meeting is
+    // connected. A source parked on the program scene with no meeting is
+    // genuinely on air, showing the audience nothing — exactly the case worth
+    // surfacing.
+    //
+    // The whole box is the mark: one stylesheet on it carries both the frame and
+    // the text de-emphasis, so a state flip is a single setStyleSheet and no
+    // child widget has to be reached into or tracked.
     struct OnAirMark {
-        QFrame* bar   = nullptr;   // the fixed-width stripe (kOnAirBarPx)
+        QFrame* box   = nullptr;   // the source box, restyled whole on a flip
+        bool    live  = false;     // its meeting-live frame alpha, used off air
         int     state = -1;        // last-applied: -1 none yet, 0 off air, 1 on air
     };
     std::map<std::string, OnAirMark> m_rowOnAir;
@@ -4187,7 +4212,7 @@ private:
     // Deliberately NOT obs_source_showing(), which counts the same source as
     // shown when it is merely in the preview, in a projector window, or in the
     // properties dialog's preview. None of those are what the audience sees,
-    // and "the audience sees this" is the only claim the stripe makes.
+    // and "the audience sees this" is the only claim the emphasis makes.
     //
     // UI thread. Takes libobs' source list briefly (obs_get_source_by_uuid);
     // no Feeds mutex is held at any call site, so no lock-ordering interaction.
@@ -4199,33 +4224,54 @@ private:
         return active;
     }
 
-    // Paint (or clear) a row's on-air tally stripe. The bar is always present and
-    // fixed-width, so the off-air case paints transparent rather than hiding —
-    // paint-only, no row reflow, the same rule the dot and mute slots follow.
+    // The complete look of a source box for one on-air state, as a single
+    // stylesheet set on the box itself.
     //
-    // Tally red: the broadcast convention for "this is what is going out". Semi-
-    // transparent rather than a flat colour so it reads without shouting on OBS's
-    // dark theme and stays legible on the light one, with no pure white or black
-    // anywhere that a custom theme could wash out or blow out.
+    // Both halves of the emphasis live here, which is what keeps a state flip to
+    // one setStyleSheet call: the frame rule restyles the box, and the descendant
+    // rules reach the box's text without any child having to be tracked, reached
+    // into, or have its own stylesheet rewritten.
     //
-    // Deliberately an edge STRIPE rather than another round dot. The dot in the
-    // header's status cluster answers a different question — "are frames arriving
-    // from Zoom for this feed" — and the two are orthogonal: a feed can be
-    // receiving perfectly while sitting on no program scene, or be on air with its
-    // camera off. Two round marks side by side would invite reading the second as
-    // a variant of the first, so this one differs in shape, in position (outside
-    // the cluster, on the box edge) and in scale (full box height).
-    // The left corners are rounded to 3px so the stripe nests inside the box's
-    // own 4px radius (less the 1px border) instead of poking square shoulders
-    // past the curve; the right edge stays square where it meets the content.
-    static void ApplyOnAirBar(QFrame* bar, bool onAir) {
-        if (!bar) return;
-        bar->setStyleSheet(onAir
-            ? "QFrame { background: rgba(214,72,72,0.90);"
-              " border-top-left-radius: 3px; border-bottom-left-radius: 3px; }"
-            : "QFrame { background: transparent; }");
-        bar->setToolTip(onAir ? QStringLiteral("On air: visible on the program output")
-                              : QString());
+    // `live` is the dock's EXISTING meeting-live flag (in a meeting, granted, at
+    // least one other participant present), not an on-air concept. It only picks
+    // the off-air frame alpha, exactly as it did before there was an on-air
+    // state; on air the frame is the same either way, because being on the
+    // program output is the stronger statement of the two.
+    //
+    // Off-air de-emphasis is colour ONLY, and only on classes that render text:
+    //  - the box background, the frame and every icon are untouched. The status
+    //    dot, the mic and the warning triangle are QLabels carrying a pixmap or a
+    //    background, and `color` moves neither, so they read identically in both
+    //    states — the "is this feed arriving" indicator goes on saying exactly
+    //    what it said, independently of what is on program.
+    //  - nothing is disabled. The row stays fully readable and every control
+    //    stays live; this is de-emphasis, not a lock.
+    //  - the combo's greyed "already used" entries carry a per-item foreground
+    //    brush on the model, which the view honours over a widget stylesheet, so
+    //    the dropdown's own guidance survives the dim.
+    // On air, no colour rule is emitted at all, so an on-air box renders exactly
+    // as every box did before any of this existed.
+    static QString BoxStyleSheet(bool onAir, bool live) {
+        const QString frame = onAir
+            ? QString(kOnAirBorderRgba)
+            : QString("rgba(128,128,128,%1)").arg(live ? "0.40" : "0.22");
+
+        QString css = QString("QFrame#feedsSourceBox { border: 1px solid %1;"
+                              " border-radius: 4px; }").arg(frame);
+        if (!onAir) {
+            css += QString(" QFrame#feedsSourceBox QLabel,"
+                           " QFrame#feedsSourceBox QComboBox,"
+                           " QFrame#feedsSourceBox QPushButton"
+                           " { color: %1; }").arg(kOnAirDimTextColor);
+        }
+        return css;
+    }
+
+    // Apply a box's on-air look. Split from BoxStyleSheet so the initial build
+    // and the in-place flip can never drift apart.
+    static void ApplyOnAirStyle(QFrame* box, bool onAir, bool live) {
+        if (!box) return;
+        box->setStyleSheet(BoxStyleSheet(onAir, live));
     }
 
     // Connection-dot poll (UI thread, ~every 400ms). Reads per-source
@@ -4411,7 +4457,7 @@ public:
         }
     }
 
-    // Recompute every row's on-air stripe in place from libobs' current activate
+    // Recompute every row's on-air look in place from libobs' current activate
     // refcounts. No Refresh(), no rebuild; O(rows), same shape as the mute pass.
     //
     // Every trigger RE-QUERIES rather than trusting what the trigger said: the
@@ -4428,7 +4474,7 @@ public:
         for (auto& kv : m_rowOnAir) {
             const int state = SourceIsOnAir(kv.first) ? 1 : 0;
             if (state != kv.second.state) {
-                ApplyOnAirBar(kv.second.bar, state == 1);
+                ApplyOnAirStyle(kv.second.box, state == 1, kv.second.live);
                 kv.second.state = state;
             }
         }
@@ -4582,35 +4628,16 @@ private:
                            const std::map<long long, int>& livePidCount) {
         QFrame* box = new QFrame();
         box->setObjectName("feedsSourceBox");
-        box->setStyleSheet(QString(
-            "QFrame#feedsSourceBox { border: 1px solid rgba(128,128,128,%1);"
-            " border-radius: 4px; }").arg(live ? "0.40" : "0.22"));
-
-        // Box root is a two-column strip: the on-air tally stripe pinned flush to
-        // the left edge, then everything else. The stripe is always present, so
-        // going on/off air is a repaint of a fixed-width column and never moves a
-        // row. Its width comes straight back off the content's left margin
-        // (8 - kOnAirBarPx), so the header text, dot and mic sit at exactly the x
-        // they did before the stripe existed.
-        QHBoxLayout* boxOuter = new QHBoxLayout(box);
-        boxOuter->setContentsMargins(0, 0, 0, 0);
-        boxOuter->setSpacing(0);
-
-        QFrame* tally = new QFrame();
-        tally->setFixedWidth(kOnAirBarPx);
-        tally->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Expanding);
+        // Frame + text emphasis in one sheet, seeded from the source's current
+        // program state. Registered for live and non-live boxes alike (see
+        // m_rowOnAir) so the in-place flip can restyle it without a rebuild;
+        // borrowed pointer, the layout owns the box.
         const bool onAir = SourceIsOnAir(r.uuid);
-        ApplyOnAirBar(tally, onAir);
-        boxOuter->addWidget(tally);
-        // Registered for live and non-live boxes alike — see m_rowOnAir. Borrowed
-        // pointer; the box owns the bar.
-        m_rowOnAir[r.uuid] = { tally, onAir ? 1 : 0 };
+        ApplyOnAirStyle(box, onAir, live);
+        m_rowOnAir[r.uuid] = { box, live, onAir ? 1 : 0 };
 
-        QWidget* boxContent = new QWidget();
-        boxOuter->addWidget(boxContent, 1);
-
-        QVBoxLayout* boxL = new QVBoxLayout(boxContent);
-        boxL->setContentsMargins(8 - kOnAirBarPx, 6, 8, 8);
+        QVBoxLayout* boxL = new QVBoxLayout(box);
+        boxL->setContentsMargins(8, 6, 8, 8);
         boxL->setSpacing(4);   // tight header <-> combo so the box reads as one unit
 
         // Shared header state. collides drives the reserved warning slot; dotCode
@@ -5007,8 +5034,8 @@ private:
         // Drop borrowed indicator pointers BEFORE deleting the boxes that own
         // them, so the poll can never touch a freed dot between clear and rebuild.
         m_rowIndicators.clear();
-        // Same for the on-air stripes: the marshalled recompute must not find a
-        // bar whose box is already on its way out.
+        // Same for the on-air marks: the marshalled recompute must not find a
+        // box that is already on its way out.
         m_rowOnAir.clear();
         // Row "+" pointers are borrowed too (their boxes own them); the cooldown
         // SET (m_cdRows) is deliberately NOT cleared here, so a row's cooldown
@@ -5120,8 +5147,8 @@ static void PostParticipantDockRefresh() {
 // Deliberately NOT PostParticipantDockRefresh: that rebuilds every box, and a
 // single program-scene switch fires an activate or deactivate for every source
 // in the outgoing and incoming scenes — a burst of full rebuilds for a change
-// that moves nothing but the colour of one 4px column. It would also fight an
-// inline rename, which defers a Refresh() but has nothing to defer here.
+// that repaints one frame and one text colour. It would also fight an inline
+// rename, which defers a Refresh() but has nothing to defer here.
 //
 // The dock is the context object, so the queued call auto-cancels if OBS
 // destroys the widget; no dock means there is nothing to restyle, so unlike the
@@ -10770,8 +10797,8 @@ bool obs_module_load(void) {
         // Participant dock reacts to OBS source renames (create/destroy are
         // driven from zp_create/zp_destroy directly). Disconnected in unload.
         signal_handler_connect(sh, "source_rename", OnSourceRenamed, nullptr);
-        // On-air tally: one global subscription for the whole dock, rather than a
-        // per-source one that would have to be maintained as sources come and go.
+        // On-air emphasis: one global subscription for the whole dock, rather
+        // than a per-source one to maintain as sources come and go.
         // Disconnected in unload.
         signal_handler_connect(sh, "source_activate", OnSourceActivationChanged, nullptr);
         signal_handler_connect(sh, "source_deactivate", OnSourceActivationChanged, nullptr);
