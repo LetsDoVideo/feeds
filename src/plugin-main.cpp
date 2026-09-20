@@ -3150,6 +3150,12 @@ static std::map<unsigned int, ConnQualityLegs> g_connQualityByUserId;
 // always present (paint-only toggle, no reflow); 14px reads the mic glyph clearly.
 static constexpr int kMuteSlotPx = 14;
 
+// Width (px) of a source box's on-air tally stripe — the full-height bar pinned
+// to the box's left edge that marks the source as live on the program output.
+// Always present (transparent when off air), so the box's left content margin is
+// reduced by exactly this much and the header text sits where it always did.
+static constexpr int kOnAirBarPx = 4;
+
 // ---------------------------------------------------------------------------
 // Read-only participant dock — lists every participant source and its current
 // assignment, live-reacting to roster / source / tier changes. Phase 1: no
@@ -3576,9 +3582,14 @@ private:
         }
         if (inMeeting) { m_headerTopSlot->setVisible(false); return; }
 
+        // Labels are trimmed to the ACTION alone. The button only ever exists in
+        // the state it names, so the leading status clause ("Logged in.", "Not
+        // logged in to Zoom.") restated what the button's own presence already
+        // says — and the connect label was long enough that it overran the slot
+        // at the dock's minimum width and painted clipped at both ends.
         QPushButton* btn = new QPushButton(
-            loggedIn ? "Logged in. Click to Connect to Zoom Meeting."
-                     : "Not logged in to Zoom. Click to Login.");
+            loggedIn ? "Click to Connect to Zoom Meeting"
+                     : "Click to Login to Zoom");
         StylePrimaryCtaButton(btn);
         if (loggedIn)
             QObject::connect(btn, &QPushButton::clicked, []() { OnConnectClick(); });
@@ -4031,6 +4042,19 @@ private:
     };
     std::map<std::string, RowIndicators> m_rowIndicators;
 
+    // On-air tally stripes, keyed by source uuid. Borrowed pointers like
+    // m_rowIndicators (each bar is owned by its box) and cleared in the same
+    // place, but kept as a SEPARATE map because it is registered for EVERY box,
+    // live or not: "on the program output" is a scene-graph fact, independent of
+    // whether a meeting is connected. A source parked on the program scene with
+    // no meeting is genuinely on air, showing the audience nothing — which is
+    // exactly the case the stripe exists to make visible.
+    struct OnAirMark {
+        QFrame* bar   = nullptr;   // the fixed-width stripe (kOnAirBarPx)
+        int     state = -1;        // last-applied: -1 none yet, 0 off air, 1 on air
+    };
+    std::map<std::string, OnAirMark> m_rowOnAir;
+
     // "Live" = a real frame within this window. 500ms comfortably spans a 30fps
     // (~33ms) or 60fps gap; a camera-off or stall stops advancing the tick and
     // the dot flips off within ~this window plus one poll interval.
@@ -4148,6 +4172,60 @@ private:
         }
         dot->setStyleSheet(css);
         dot->setToolTip(tip);
+    }
+
+    // Is this source rendered into the PROGRAM output right now?
+    //
+    // obs_source_active is libobs' own activate refcount: non-zero iff the
+    // source reaches the program mix, through any depth of nested scenes and
+    // groups, and zero the moment the eye is switched off at ANY level of that
+    // chain (a scene item's visibility toggle adds/removes the child from its
+    // parent's active tree, which walks the refcount down the whole subtree).
+    // So there is nothing to traverse by hand and no per-level visibility to
+    // re-check — the refcount already is the answer.
+    //
+    // Deliberately NOT obs_source_showing(), which counts the same source as
+    // shown when it is merely in the preview, in a projector window, or in the
+    // properties dialog's preview. None of those are what the audience sees,
+    // and "the audience sees this" is the only claim the stripe makes.
+    //
+    // UI thread. Takes libobs' source list briefly (obs_get_source_by_uuid);
+    // no Feeds mutex is held at any call site, so no lock-ordering interaction.
+    static bool SourceIsOnAir(const std::string& uuid) {
+        obs_source_t* src = obs_get_source_by_uuid(uuid.c_str());
+        if (!src) return false;
+        const bool active = obs_source_active(src);
+        obs_source_release(src);
+        return active;
+    }
+
+    // Paint (or clear) a row's on-air tally stripe. The bar is always present and
+    // fixed-width, so the off-air case paints transparent rather than hiding —
+    // paint-only, no row reflow, the same rule the dot and mute slots follow.
+    //
+    // Tally red: the broadcast convention for "this is what is going out". Semi-
+    // transparent rather than a flat colour so it reads without shouting on OBS's
+    // dark theme and stays legible on the light one, with no pure white or black
+    // anywhere that a custom theme could wash out or blow out.
+    //
+    // Deliberately an edge STRIPE rather than another round dot. The dot in the
+    // header's status cluster answers a different question — "are frames arriving
+    // from Zoom for this feed" — and the two are orthogonal: a feed can be
+    // receiving perfectly while sitting on no program scene, or be on air with its
+    // camera off. Two round marks side by side would invite reading the second as
+    // a variant of the first, so this one differs in shape, in position (outside
+    // the cluster, on the box edge) and in scale (full box height).
+    // The left corners are rounded to 3px so the stripe nests inside the box's
+    // own 4px radius (less the 1px border) instead of poking square shoulders
+    // past the curve; the right edge stays square where it meets the content.
+    static void ApplyOnAirBar(QFrame* bar, bool onAir) {
+        if (!bar) return;
+        bar->setStyleSheet(onAir
+            ? "QFrame { background: rgba(214,72,72,0.90);"
+              " border-top-left-radius: 3px; border-bottom-left-radius: 3px; }"
+            : "QFrame { background: transparent; }");
+        bar->setToolTip(onAir ? QStringLiteral("On air: visible on the program output")
+                              : QString());
     }
 
     // Connection-dot poll (UI thread, ~every 400ms). Reads per-source
@@ -4332,6 +4410,29 @@ public:
             }
         }
     }
+
+    // Recompute every row's on-air stripe in place from libobs' current activate
+    // refcounts. No Refresh(), no rebuild; O(rows), same shape as the mute pass.
+    //
+    // Every trigger RE-QUERIES rather than trusting what the trigger said: the
+    // activate/deactivate signals only report that something changed somewhere in
+    // the scene graph, and the source they carry is usually a parent scene or
+    // group rather than a Feeds source at all. The refcount is the truth, so ask
+    // it. That also makes the pass idempotent, which is what lets the signal, the
+    // frontend scene-change event and Refresh() all route through one function
+    // without coordinating.
+    //
+    // UI thread only (mutates widgets). Off-thread callers marshal via
+    // PostParticipantDockOnAirRefresh.
+    void RecomputeOnAirMarks() {
+        for (auto& kv : m_rowOnAir) {
+            const int state = SourceIsOnAir(kv.first) ? 1 : 0;
+            if (state != kv.second.state) {
+                ApplyOnAirBar(kv.second.bar, state == 1);
+                kv.second.state = state;
+            }
+        }
+    }
 private:
 
     // --- Inline source-box rename (double-click the header) --------------------
@@ -4485,8 +4586,31 @@ private:
             "QFrame#feedsSourceBox { border: 1px solid rgba(128,128,128,%1);"
             " border-radius: 4px; }").arg(live ? "0.40" : "0.22"));
 
-        QVBoxLayout* boxL = new QVBoxLayout(box);
-        boxL->setContentsMargins(8, 6, 8, 8);
+        // Box root is a two-column strip: the on-air tally stripe pinned flush to
+        // the left edge, then everything else. The stripe is always present, so
+        // going on/off air is a repaint of a fixed-width column and never moves a
+        // row. Its width comes straight back off the content's left margin
+        // (8 - kOnAirBarPx), so the header text, dot and mic sit at exactly the x
+        // they did before the stripe existed.
+        QHBoxLayout* boxOuter = new QHBoxLayout(box);
+        boxOuter->setContentsMargins(0, 0, 0, 0);
+        boxOuter->setSpacing(0);
+
+        QFrame* tally = new QFrame();
+        tally->setFixedWidth(kOnAirBarPx);
+        tally->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Expanding);
+        const bool onAir = SourceIsOnAir(r.uuid);
+        ApplyOnAirBar(tally, onAir);
+        boxOuter->addWidget(tally);
+        // Registered for live and non-live boxes alike — see m_rowOnAir. Borrowed
+        // pointer; the box owns the bar.
+        m_rowOnAir[r.uuid] = { tally, onAir ? 1 : 0 };
+
+        QWidget* boxContent = new QWidget();
+        boxOuter->addWidget(boxContent, 1);
+
+        QVBoxLayout* boxL = new QVBoxLayout(boxContent);
+        boxL->setContentsMargins(8 - kOnAirBarPx, 6, 8, 8);
         boxL->setSpacing(4);   // tight header <-> combo so the box reads as one unit
 
         // Shared header state. collides drives the reserved warning slot; dotCode
@@ -4883,6 +5007,9 @@ private:
         // Drop borrowed indicator pointers BEFORE deleting the boxes that own
         // them, so the poll can never touch a freed dot between clear and rebuild.
         m_rowIndicators.clear();
+        // Same for the on-air stripes: the marshalled recompute must not find a
+        // bar whose box is already on its way out.
+        m_rowOnAir.clear();
         // Row "+" pointers are borrowed too (their boxes own them); the cooldown
         // SET (m_cdRows) is deliberately NOT cleared here, so a row's cooldown
         // survives an unrelated rebuild and re-applies when the row is rebuilt.
@@ -4985,6 +5112,25 @@ static void PostParticipantDockRefresh() {
         // routes through here, so there is no separate mechanism to maintain.
         RefreshAllLowerThirdContent();
         if (g_participantDock) g_participantDock->Refresh();
+    });
+}
+
+// Marshal an on-air recompute onto the UI thread.
+//
+// Deliberately NOT PostParticipantDockRefresh: that rebuilds every box, and a
+// single program-scene switch fires an activate or deactivate for every source
+// in the outgoing and incoming scenes — a burst of full rebuilds for a change
+// that moves nothing but the colour of one 4px column. It would also fight an
+// inline rename, which defers a Refresh() but has nothing to defer here.
+//
+// The dock is the context object, so the queued call auto-cancels if OBS
+// destroys the widget; no dock means there is nothing to restyle, so unlike the
+// full refresh (which also drives the lower thirds) there is no main-window
+// fallback to fall back to.
+static void PostParticipantDockOnAirRefresh() {
+    if (!g_participantDock) return;
+    QTimer::singleShot(0, g_participantDock, []() {
+        if (g_participantDock) g_participantDock->RecomputeOnAirMarks();
     });
 }
 
@@ -10553,6 +10699,25 @@ static void OnSourceRenamed(void* /*data*/, calldata_t* cd) {
     PostParticipantDockRefresh();
 }
 
+// Global source_activate / source_deactivate: some source entered or left the
+// PROGRAM output. libobs raises these whenever a source's activate refcount
+// crosses zero, which covers every way a Feeds source can go on or off air — a
+// program-scene switch, an eye toggled at any nesting depth, a source added to
+// or removed from a scene that is currently on program.
+//
+// Deliberately NOT filtered to our source type, unlike the rename handler above.
+// The source that crosses zero is very often a parent scene or group, not the
+// Feeds source nested inside it, so a type filter would drop exactly the events
+// that matter. The recompute re-queries every row's refcount anyway, so it does
+// not care which source the signal named; the extra wakeups cost one coalesced
+// trip through the event loop.
+//
+// Fires on libobs' graphics thread (from obs_source_video_tick), so it must not
+// touch Qt here — PostParticipantDockOnAirRefresh marshals to the UI thread.
+static void OnSourceActivationChanged(void* /*data*/, calldata_t* /*cd*/) {
+    PostParticipantDockOnAirRefresh();
+}
+
 // ---------------------------------------------------------------------------
 // Module load/unload
 // ---------------------------------------------------------------------------
@@ -10605,6 +10770,11 @@ bool obs_module_load(void) {
         // Participant dock reacts to OBS source renames (create/destroy are
         // driven from zp_create/zp_destroy directly). Disconnected in unload.
         signal_handler_connect(sh, "source_rename", OnSourceRenamed, nullptr);
+        // On-air tally: one global subscription for the whole dock, rather than a
+        // per-source one that would have to be maintained as sources come and go.
+        // Disconnected in unload.
+        signal_handler_connect(sh, "source_activate", OnSourceActivationChanged, nullptr);
+        signal_handler_connect(sh, "source_deactivate", OnSourceActivationChanged, nullptr);
     }
 
     feeds::StartEngine();
@@ -10672,6 +10842,14 @@ bool obs_module_load(void) {
                 (QObject*)obs_frontend_get_main_window(),
                 []() { CheckForUpdateAsync(); });
             break;
+        // Program scene changed. The activate/deactivate signals already cover
+        // this, but they are raised from the graphics tick as each source's
+        // refcount crosses zero, and during a transition both scenes are briefly
+        // on program. This is the settled-state re-query once the switch is done,
+        // and it costs one idempotent pass over the rows.
+        case OBS_FRONTEND_EVENT_SCENE_CHANGED:
+            PostParticipantDockOnAirRefresh();
+            break;
         // Accelerator (not a gate): when OBS starts streaming to YouTube, re-check
         // /live immediately instead of waiting out the slow bootstrap cadence.
         case OBS_FRONTEND_EVENT_STREAMING_STARTED:
@@ -10694,6 +10872,8 @@ void obs_module_unload(void) {
         // the g_participantDock null-check, this closes the shutdown-time
         // use-after-free window as OBS destroys every source in a burst.
         signal_handler_disconnect(sh, "source_rename", OnSourceRenamed, nullptr);
+        signal_handler_disconnect(sh, "source_activate", OnSourceActivationChanged, nullptr);
+        signal_handler_disconnect(sh, "source_deactivate", OnSourceActivationChanged, nullptr);
     }
     if (g_updateCheckThread.joinable()) g_updateCheckThread.join();
 
