@@ -51,6 +51,12 @@
 // on the pump thread, never on the SDK thread that reported it. Coalesced by
 // the poster. See engine-speaker.cpp.
 #define WM_FEEDS_SPEAKER_EVAL      (WM_APP + 5)
+// WM_FEEDS_AUDIO_PROBE — TEMPORARY (raw-audio probe, logging only). Posted
+// when raw data becomes ready, and again when an audio status change arrives
+// while the probe is waiting for this client to join computer audio.
+// EngineWndProc calls feeds_engine::RunAudioProbeOnMainThread. See
+// engine-meeting.cpp.
+#define WM_FEEDS_AUDIO_PROBE       (WM_APP + 6)
 
 // Anchor-window WM_TIMER id for the active-speaker re-evaluation tick and
 // heartbeat (engine-speaker.cpp). engine-video.cpp owns ids 1 (renderer gate
@@ -116,5 +122,9 @@ void OnEngineTimer(UINT_PTR timerId);
 // turning on: debounces, then re-establishes that userId's sources through the
 // delivery-gated recreate path. Invoked by EngineWndProc on WM_FEEDS_CAMERA_ON.
 void QueueCameraOnReestablish(unsigned int userId);
+
+// Defined in engine-meeting.cpp. TEMPORARY raw-audio probe (logging only).
+// Invoked by EngineWndProc on WM_FEEDS_AUDIO_PROBE.
+void RunAudioProbeOnMainThread();
 
 } // namespace feeds_engine

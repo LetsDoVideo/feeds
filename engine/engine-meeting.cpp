@@ -14,9 +14,13 @@
 #include <sstream>
 #include <functional>
 #include <cstdio>
+#include <atomic>
+#include <mutex>
+#include <vector>
 
 #include "zoom_sdk.h"
 #include "zoom_sdk_def.h"
+#include "zoom_sdk_raw_data_def.h"
 #include "meeting_service_interface.h"
 #include "auth_service_interface.h"
 #include "meeting_service_components/meeting_audio_interface.h"
@@ -26,7 +30,10 @@
 #include "meeting_service_components/meeting_video_interface.h"
 #include "meeting_service_components/meeting_live_stream_interface.h"
 #include "meeting_service_components/meeting_sharing_interface.h"
+#include "meeting_service_components/meeting_recording_interface.h"
 #include "setting_service_interface.h"
+#include "rawdata/rawdata_audio_helper_interface.h"
+#include "rawdata/zoom_rawdata_api.h"
 
 #include "engine-shared.h"
 #include "engine-speaker.h"
@@ -285,6 +292,222 @@ static void SendParticipantList() {
 }
 
 // ---------------------------------------------------------------------------
+// Raw-audio probe — TEMPORARY, logging only. Answers two questions for the
+// ISO-audio design without changing any behavior:
+//
+//   1. Does the per-participant raw audio subscribe work under the raw-
+//      livestream grant Feeds already holds? Once raw data is ready we
+//      subscribe and log the return code, then the first few callbacks.
+//   2. What does the raw-recording privilege path report for this user?
+//      Query-only: CanStartRawRecording and
+//      IsSupportRequestLocalRecordingPrivilege. This never calls
+//      StartRawRecording or RequestLocalRecordingPrivilege, so it starts no
+//      recording and puts no prompt in front of the host.
+//
+// The subscribe needs this client to have joined computer audio
+// (SDKERR_NOT_JOIN_AUDIO otherwise). If that's why it failed, the next audio
+// status change re-posts the probe, a few times at most. The subscription is
+// dropped at meeting end with a one-line callback summary. All SDK calls run
+// on the pump thread via WM_FEEDS_AUDIO_PROBE; the audio callbacks only touch
+// atomics and a small mutex-guarded list of seen user ids.
+// ---------------------------------------------------------------------------
+static constexpr int      kAudioProbeMaxAttempts  = 5;
+static constexpr unsigned kAudioProbeOneWayLogged = 5;
+static constexpr size_t   kAudioProbeMaxUsers     = 16;
+
+static bool              g_audioProbeSubscribed      = false;
+static bool              g_audioProbeRecordingLogged = false;
+static int               g_audioProbeAttempts        = 0;
+static std::atomic<bool> g_audioProbeAwaitingAudio{false};
+static DWORD             g_audioProbeMainThreadId    = 0;
+
+static const char* AudioProbeErrName(ZOOM_SDK_NAMESPACE::SDKError e) {
+    switch (e) {
+        case ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS:        return "SUCCESS";
+        case ZOOM_SDK_NAMESPACE::SDKERR_NO_PERMISSION:  return "NO_PERMISSION";
+        case ZOOM_SDK_NAMESPACE::SDKERR_NOT_JOIN_AUDIO: return "NOT_JOIN_AUDIO";
+        case ZOOM_SDK_NAMESPACE::SDKERR_WRONG_USAGE:    return "WRONG_USAGE";
+        default:                                        return "OTHER";
+    }
+}
+
+static const char* AudioProbeJoinTypeName(ZOOM_SDK_NAMESPACE::AudioType t) {
+    switch (t) {
+        case ZOOM_SDK_NAMESPACE::AUDIOTYPE_NONE:  return "NONE (not joined)";
+        case ZOOM_SDK_NAMESPACE::AUDIOTYPE_VOIP:  return "VOIP (computer audio)";
+        case ZOOM_SDK_NAMESPACE::AUDIOTYPE_PHONE: return "PHONE";
+        default:                                  return "UNKNOWN";
+    }
+}
+
+static void LogAudioProbeBuffer(const char* kind, AudioRawData* d,
+                                unsigned int userId) {
+    if (!d) return;
+    char buf[320];
+    sprintf_s(buf,
+        "AudioProbe: %s callback user_id=%u rate=%u channels=%u len=%u "
+        "sdk_ts=%llu thread=%lu main_thread=%lu",
+        kind, userId, d->GetSampleRate(), d->GetChannelNum(),
+        d->GetBufferLen(), d->GetTimeStamp(),
+        (unsigned long)GetCurrentThreadId(),
+        (unsigned long)g_audioProbeMainThreadId);
+    LogInfo(buf);
+}
+
+class AudioProbeDelegate
+    : public ZOOM_SDK_NAMESPACE::IZoomSDKAudioRawDataDelegate {
+public:
+    void Reset() {
+        m_oneWay = 0;
+        m_mixed  = 0;
+        m_share  = 0;
+        std::lock_guard<std::mutex> lk(m_usersMutex);
+        m_users.clear();
+    }
+
+    void LogSummary() {
+        size_t users;
+        {
+            std::lock_guard<std::mutex> lk(m_usersMutex);
+            users = m_users.size();
+        }
+        char buf[200];
+        sprintf_s(buf,
+            "AudioProbe: summary one_way=%u (distinct users=%zu) mixed=%u "
+            "share=%u", m_oneWay.load(), users, m_mixed.load(), m_share.load());
+        LogInfo(buf);
+    }
+
+    virtual void onMixedAudioRawDataReceived(AudioRawData* d) override {
+        if (m_mixed.fetch_add(1) == 0) LogAudioProbeBuffer("first mixed", d, 0);
+    }
+
+    virtual void onOneWayAudioRawDataReceived(AudioRawData* d,
+                                              uint32_t userId) override {
+        const unsigned n = m_oneWay.fetch_add(1);
+        bool newUser = false;
+        {
+            std::lock_guard<std::mutex> lk(m_usersMutex);
+            bool seen = false;
+            for (uint32_t u : m_users) if (u == userId) { seen = true; break; }
+            if (!seen && m_users.size() < kAudioProbeMaxUsers) {
+                m_users.push_back(userId);
+                newUser = true;
+            }
+        }
+        if (newUser)
+            LogAudioProbeBuffer("one-way (new user)", d, userId);
+        else if (n < kAudioProbeOneWayLogged)
+            LogAudioProbeBuffer("one-way", d, userId);
+    }
+
+    virtual void onShareAudioRawDataReceived(AudioRawData* d,
+                                             uint32_t userId) override {
+        if (m_share.fetch_add(1) == 0) LogAudioProbeBuffer("first share", d, userId);
+    }
+
+    virtual void onOneWayInterpreterAudioRawDataReceived(
+        AudioRawData*, const zchar_t*) override {}
+
+private:
+    std::atomic<unsigned> m_oneWay{0};
+    std::atomic<unsigned> m_mixed{0};
+    std::atomic<unsigned> m_share{0};
+    std::mutex            m_usersMutex;
+    std::vector<uint32_t> m_users;
+};
+static AudioProbeDelegate g_audioProbeDelegate;
+
+static void PostAudioProbe() {
+    if (g_anchorWnd)
+        PostMessageW(g_anchorWnd, WM_FEEDS_AUDIO_PROBE, 0, 0);
+}
+
+void RunAudioProbeOnMainThread() {
+    if (!g_meetingService || g_audioProbeSubscribed) return;
+    if (g_audioProbeAttempts >= kAudioProbeMaxAttempts) return;
+    ++g_audioProbeAttempts;
+    g_audioProbeAwaitingAudio = false;
+    g_audioProbeMainThreadId  = GetCurrentThreadId();
+
+    char buf[320];
+
+    // This client's own audio connection. The subscribe needs VOIP.
+    unsigned int myId = 0;
+    ZOOM_SDK_NAMESPACE::AudioType joinType = ZOOM_SDK_NAMESPACE::AUDIOTYPE_UNKNOWN;
+    bool myMuted = true;
+    if (auto* pc = g_meetingService->GetMeetingParticipantsController()) {
+        if (auto* me = pc->GetMySelfUser()) {
+            myId     = me->GetUserID();
+            joinType = me->GetAudioJoinType();
+            myMuted  = me->IsAudioMuted();
+        }
+    }
+    sprintf_s(buf,
+        "AudioProbe: attempt %d, raw_livestream_granted=%d, self user_id=%u "
+        "audio_join_type=%s muted=%d",
+        g_audioProbeAttempts, g_rawLiveStreamGranted ? 1 : 0, myId,
+        AudioProbeJoinTypeName(joinType), myMuted ? 1 : 0);
+    LogInfo(buf);
+
+    // Recording privilege path, query only, once per meeting.
+    if (!g_audioProbeRecordingLogged) {
+        g_audioProbeRecordingLogged = true;
+        if (auto* rc = g_meetingService->GetMeetingRecordingController()) {
+            ZOOM_SDK_NAMESPACE::SDKError can = rc->CanStartRawRecording();
+            ZOOM_SDK_NAMESPACE::SDKError sup =
+                rc->IsSupportRequestLocalRecordingPrivilege();
+            sprintf_s(buf,
+                "AudioProbe: recording path (query only) "
+                "CanStartRawRecording=%d (%s) "
+                "IsSupportRequestLocalRecordingPrivilege=%d (%s)",
+                (int)can, AudioProbeErrName(can), (int)sup, AudioProbeErrName(sup));
+            LogInfo(buf);
+        } else {
+            LogWarn("AudioProbe: GetMeetingRecordingController returned null");
+        }
+    }
+
+    // Per-participant audio subscribe under the current (livestream) grant.
+    ZOOM_SDK_NAMESPACE::IZoomSDKAudioRawDataHelper* helper =
+        ZOOM_SDK_NAMESPACE::GetAudioRawdataHelper();
+    if (!helper) {
+        LogWarn("AudioProbe: GetAudioRawdataHelper returned null");
+        return;
+    }
+    g_audioProbeDelegate.Reset();
+    ZOOM_SDK_NAMESPACE::SDKError err = helper->subscribe(&g_audioProbeDelegate);
+    sprintf_s(buf, "AudioProbe: audio subscribe returned %d (%s)",
+              (int)err, AudioProbeErrName(err));
+    if (err == ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
+        g_audioProbeSubscribed = true;
+        LogInfo(buf);
+        LogInfo("AudioProbe: subscribed; watch for 'one-way' callback lines");
+    } else if (err == ZOOM_SDK_NAMESPACE::SDKERR_NOT_JOIN_AUDIO) {
+        LogWarn(buf);
+        LogWarn("AudioProbe: this client has not joined computer audio "
+                "(not a privilege failure); will retry on the next audio "
+                "status change");
+        g_audioProbeAwaitingAudio = true;
+    } else {
+        LogWarn(buf);
+    }
+}
+
+// Meeting end: drop the probe subscription and log what arrived.
+static void AudioProbeMeetingEnded() {
+    if (g_audioProbeSubscribed) {
+        g_audioProbeDelegate.LogSummary();
+        if (auto* helper = ZOOM_SDK_NAMESPACE::GetAudioRawdataHelper())
+            helper->unSubscribe();
+    }
+    g_audioProbeSubscribed      = false;
+    g_audioProbeRecordingLogged = false;
+    g_audioProbeAttempts        = 0;
+    g_audioProbeAwaitingAudio   = false;
+}
+
+// ---------------------------------------------------------------------------
 // Audio listener — feeds the raw active speaker to engine-speaker.cpp, which
 // decides what the [Active Speaker] participant option shows.
 // ---------------------------------------------------------------------------
@@ -307,6 +530,9 @@ public:
         // unmuted = the UnMuted family (2/4/6). Audio_None (0) is "no audio
         // connected yet / unknown" — skip it so it can't seed a false state.
         // On the SDK audio thread: no lock, no g_subs work — just the pipe write.
+        // TEMPORARY audio probe: if it's waiting for this client to join
+        // computer audio, re-run it on the pump thread (coalesced by the flag).
+        if (g_audioProbeAwaitingAudio.exchange(false)) PostAudioProbe();
         if (!lst) return;
         for (int i = 0; i < lst->GetCount(); ++i) {
             ZOOM_SDK_NAMESPACE::IUserAudioStatus* s = lst->GetItem(i);
@@ -755,7 +981,10 @@ public:
             ZOOM_SDK_NAMESPACE::RawLiveStreamInfo info = liveStreamList->GetItem(i);
             if (mySelf != 0 && info.userId == mySelf) { selfPresent = true; break; }
         }
-        if (selfPresent) NotifyRawRenderReady();
+        if (selfPresent) {
+            NotifyRawRenderReady();
+            PostAudioProbe();  // TEMPORARY raw-audio probe (logging only)
+        }
     }
     virtual void onLiveStreamReminderStatusChanged(bool) override {}
     virtual void onLiveStreamReminderStatusChangeFailed() override {}
@@ -1048,6 +1277,7 @@ public:
             g_activeSharerUserId   = 0;
             g_activeShareSourceId  = 0;
             SpeakerMeetingEnded();
+            AudioProbeMeetingEnded();  // TEMPORARY raw-audio probe
             TearDownAllVideoSubscriptions();
             TearDownScreenShare();
             SendToPlugin("{\"type\":\"meeting_left\"}");

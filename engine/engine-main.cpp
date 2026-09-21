@@ -512,6 +512,11 @@ static LRESULT CALLBACK EngineWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         feeds_engine::QueueCameraOnReestablish((unsigned int)wp);
         return 0;
     }
+    if (msg == WM_FEEDS_AUDIO_PROBE) {
+        // TEMPORARY raw-audio probe (logging only). See engine-meeting.cpp.
+        feeds_engine::RunAudioProbeOnMainThread();
+        return 0;
+    }
     return DefWindowProc(hwnd, msg, wp, lp);
 }
 
