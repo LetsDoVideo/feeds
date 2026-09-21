@@ -34,6 +34,7 @@
 #include "shared-frame.h"
 #include "engine-frame-scaler.h"
 #include "engine-speaker.h"
+#include "engine-audio.h"
 
 // Defined in engine-main.cpp
 extern void LogToFile(const char* msg);  // forwards at DEBUG
@@ -362,6 +363,10 @@ public:
             return SubStart::Failed;
         }
 
+        // This source's isolated-audio ring, routed to the same user as the
+        // video (re-pointed in Resubscribe). Non-fatal if it can't open.
+        m_audioSink = OpenIsolatedAudioSink(m_sourceUuid, m_userId);
+
         // Create the SDK renderer with this object as the delegate.
         ZOOM_SDK_NAMESPACE::SDKError err =
             ZOOM_SDK_NAMESPACE::createRenderer(&m_renderer, this);
@@ -370,6 +375,8 @@ public:
             sprintf_s(msg, "Video: createRenderer failed: %d", (int)err);
             LogError(msg);
             m_writer.Close();
+            CloseIsolatedAudioSink(m_audioSink);
+            m_audioSink = 0;
             m_renderer = nullptr;
             // 11 (VIDEO_NOTREADY) / 12 (NO_PERMISSION) are the transient
             // raw-data-subsystem-not-ready codes seen at/just after the grant —
@@ -502,6 +509,9 @@ public:
         // the source goes black while we wait.
         m_renderer->unSubscribe();
         m_userId = newUserId;
+        // Audio follows the video's user. For a follow-speaker source still
+        // waiting on a speaker this is the sentinel, which matches no one.
+        SetIsolatedAudioSinkUser(m_audioSink, m_userId);
 
         // If this is a follow-speaker source and we don't yet know who's
         // speaking (newUserId == ACTIVE_SPEAKER_SENTINEL), skip the SDK
@@ -567,6 +577,9 @@ public:
         //      Synchronous join means no risk of the worker touching
         //      m_writer after Close.
         //   3. Writer close — releases the file mapping.
+        // The isolated-audio sink is independent of all three (its writer is
+        // the SDK audio callback, serialised inside engine-audio.cpp), so it
+        // just closes last.
         if (m_renderer) {
             try {
                 m_renderer->unSubscribe();
@@ -581,6 +594,8 @@ public:
             m_worker.reset();
         }
         m_writer.Close();
+        CloseIsolatedAudioSink(m_audioSink);
+        m_audioSink = 0;
     }
 
     // IZoomSDKRendererDelegate callbacks. Called by the SDK on its
@@ -741,6 +756,11 @@ private:
     ULONGLONG    m_subscribeTick = 0;
     ZOOM_SDK_NAMESPACE::IZoomSDKRenderer* m_renderer = nullptr;
     SharedMemoryWriter m_writer;
+
+    // Token for this source's isolated-audio sink (engine-audio.h); 0 = none.
+    // Set in Start, re-pointed in Resubscribe, closed in TearDown: the same
+    // call sites (and locking) as the rest of this object's lifecycle.
+    uint64_t           m_audioSink = 0;
 
     // Frame-scaler worker. Owns its own thread; SDK callback stages
     // frames here. Lives only while the subscription is active.

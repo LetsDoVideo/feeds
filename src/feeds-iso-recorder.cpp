@@ -3,15 +3,16 @@
 // C:\Dev\iso-recording-investigation.md for the full design rationale.
 //
 // This adopts Exeldro's Source Record patterns (C:\Dev\obs-source-record\
-// source-record.c) — a private obs_view for video and an obs_output muxer,
-// with audio taken from OBS's program mix (obs_get_audio(), per Source
-// Record's program-audio path) — used DIRECTLY inside the participant source
-// rather than as an OBS filter, with the six known Source Record bugs fixed:
+// source-record.c) — a private obs_view for video, a private audio_output
+// for audio, and an obs_output muxer — used DIRECTLY inside the participant
+// source rather than as an OBS filter, with the six known Source Record bugs
+// fixed:
 //
-//   Bug 1: use-after-release in Source Record's audio callback. Not
-//          applicable to Feeds: the audio encoder binds directly to OBS's
-//          program mix (obs_get_audio()), so there is no per-source audio
-//          callback here and the buggy code path doesn't exist.
+//   Bug 1: use-after-release in Source Record's audio callback. Our audio
+//          callback never touches the OBS source at all: it only reads this
+//          recorder's own timeline buffer, under audio_m, and the
+//          audio_output is closed (its thread joined) before that buffer or
+//          the recorder is freed.
 //   Bug 2: unprotected global filter DARRAY. Our recorder registry is
 //          mutex-protected.
 //   Bug 3: encoder release racing the output release. Our teardown runs the
@@ -26,14 +27,30 @@
 //          checkbox is enabled and start immediately if OBS is already
 //          recording.
 //
+// Audio (Windows, FEEDS_ISO_ISOLATED_AUDIO): each file carries only its
+// participant's isolated voice. The engine delivers that participant's Zoom
+// one-way audio stamped with its arrival time on the QPC clock, which on
+// Windows is the clock os_gettime_ns() reads, so audio and video timestamps
+// share one timeline. push_audio places each chunk on a per-recording
+// timeline buffer by that timestamp; the private audio_output's callback
+// serves that buffer a fixed ISO_AUDIO_LATENCY_NS behind real time (so
+// late-arriving chunks have landed) and reports the true timestamp via
+// new_ts; obs_output then interleaves A/V by timestamp exactly as it does
+// for OBS's own mix. Gaps (silence, a muted participant: Zoom sends nothing)
+// are simply never written and read out as silence. There is deliberately
+// no mixing of any kind: one participant, passed through.
+// macOS keeps the program mix (obs_get_audio()) until its engine delivers
+// participant audio; see FEEDS_ISO_ISOLATED_AUDIO.
+//
 // Threading: source lifecycle + frontend events arrive on the OBS UI thread;
 // tick runs on the graphics thread. Both mutate the recorder, so the state
-// machine is guarded by feeds_iso_recorder::lock. Audio needs no per-source
-// callback and no lock: the audio encoder is bound directly to OBS's program
-// mix (obs_get_audio()), so libobs's own audio plumbing routes the samples
-// into the recording. The output's "stop" signal fires on an internal OBS
-// thread and only sets an atomic flag + notifies a CV; the actual release
-// happens on a core thread (tick, or destroy after a bounded wait).
+// machine is guarded by feeds_iso_recorder::lock. The isolated-audio state
+// (timeline buffer, resampler, positions) is shared between push_audio (the
+// source's pump thread) and the audio_output callback (a libobs audio
+// thread), and is guarded by feeds_iso_recorder::audio_m instead; neither of
+// those threads ever takes lock. The output's "stop" signal fires on an
+// internal OBS thread and only sets an atomic flag + notifies a CV; the actual
+// release happens on a core thread (tick, or destroy after a bounded wait).
 
 #include "feeds-iso-recorder.h"
 
@@ -41,6 +58,9 @@
 #include <obs-frontend-api.h>
 #include <util/config-file.h>
 #include <util/platform.h>
+#include <util/util_uint64.h>
+#include <media-io/audio-io.h>
+#include <media-io/audio-resampler.h>
 
 #include <atomic>
 #include <chrono>
@@ -63,9 +83,25 @@ constexpr int TEARDOWN_TIMEOUT_MS = 5000;
 // Ultimate filename fallback when no usable name is available.
 constexpr const char *NAME_FALLBACK = "Feeds ISO";
 
-// Audio bitrate (kbps) for the AAC track. The track carries OBS's full program
-// mix (Phase 1.1), so this is a real, audible bitrate.
+// Audio bitrate (kbps) for the AAC track: the participant's isolated voice
+// (Windows) or the program mix (macOS).
 constexpr int AUDIO_BITRATE_KBPS = 160;
+
+// Isolated-audio timing (see the file header).
+//   LATENCY: how far behind real time the audio_output serves the timeline.
+//            Chunks arrive within a few tens of ms of their stamp; this only
+//            has to cover that, and it costs nothing in sync because packets
+//            carry their true timestamps.
+//   SMOOTH:  a chunk whose stamp is within this of where the previous chunk
+//            ended continues it seamlessly (absorbs arrival jitter). Further
+//            ahead = a gap, left silent. Further behind = we're running ahead
+//            of the clock (burst or drift), so the chunk is dropped to let
+//            the stamps catch up. The timeline never rewinds.
+//   BUFFER:  timeline buffer length; must exceed LATENCY plus any plausible
+//            arrival skew.
+constexpr uint64_t ISO_AUDIO_LATENCY_NS = 150000000ULL;   // 150 ms
+constexpr uint64_t ISO_AUDIO_SMOOTH_NS  = 50000000ULL;    // 50 ms
+constexpr uint64_t ISO_AUDIO_BUFFER_NS  = 2000000000ULL;  // >= 2 s
 
 }  // namespace
 
@@ -108,9 +144,36 @@ struct feeds_iso_recorder {
 	bool enabled = false;       // checkbox state
 	bool want_record = false;   // OBS main recording active and we should record
 	bool paused = false;        // desired pause state, mirrors main recording
-	std::atomic<bool> closing{false};  // teardown in progress (read by audio thread)
+	std::atomic<bool> closing{false};  // teardown in progress (short-circuits tick)
 	int tier = 0;
 	int last_frontend_event = -1;  // -1 == "none" sentinel (Bug 6)
+
+	// --- Isolated participant audio (FEEDS_ISO_ISOLATED_AUDIO) --------------
+	// Everything below is guarded by audio_m (push_audio on the pump thread vs
+	// the audio_output callback), except audio_name, which start_output sets
+	// before the pipeline opens and which is only read (for log lines) while it
+	// is open. audio is non-null exactly while a recording's audio pipeline is
+	// open; push_audio drops chunks when it is null.
+	//
+	// The timeline: sample position p (mono, audio_rate) is the instant
+	// audio_base_ts + p / audio_rate. audio_ring holds positions modulo its
+	// (power-of-two) size; unwritten positions are zero, and the callback
+	// zeroes each position after emitting it.
+	std::mutex audio_m;
+	audio_t *audio = nullptr;
+	std::string audio_name;
+	uint32_t audio_rate = 0;
+	uint64_t audio_base_ts = 0;
+	std::vector<float> audio_ring;
+	int64_t audio_next_pos = -1;  // where the next contiguous chunk lands; -1 = no anchor
+	int64_t audio_emit_pos = -1;  // next position the callback emits; -1 = not started
+	audio_resampler_t *resampler = nullptr;  // SDK format -> audio_rate float mono
+	uint32_t rs_rate = 0;
+	uint32_t rs_channels = 0;
+	bool audio_logged_first = false;
+	uint64_t audio_received_ns = 0;  // stats, logged when the recording closes
+	uint64_t audio_late_frames = 0;
+	uint64_t audio_ahead_frames = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -375,6 +438,252 @@ static std::string build_filepath(feeds_iso_recorder *rec, const char *dir, cons
 	return out;
 }
 
+// ---------------------------------------------------------------------------
+// Isolated participant audio (see the file header for the model).
+// ---------------------------------------------------------------------------
+
+// Timeline position of an os_gettime_ns() instant. Caller holds audio_m.
+static int64_t iso_audio_pos_of(const feeds_iso_recorder *rec, uint64_t ts)
+{
+	if (ts <= rec->audio_base_ts)
+		return 0;
+	return (int64_t)util_mul_div64(ts - rec->audio_base_ts, rec->audio_rate, 1000000000ULL);
+}
+
+static int64_t iso_audio_frames_of(const feeds_iso_recorder *rec, uint64_t ns)
+{
+	return (int64_t)util_mul_div64(ns, rec->audio_rate, 1000000000ULL);
+}
+
+// audio_output input callback (libobs audio thread). Emits the next block of
+// the timeline, ISO_AUDIO_LATENCY_NS behind real time, then zeroes it so the
+// buffer slot reads as silence when it comes round again. The audio thread
+// advances start_ts by exactly one block per call, so emit_pos advancing by
+// one block keeps the two in lockstep; the true time of the block goes back
+// through new_ts.
+static bool iso_audio_input(void *param, uint64_t start_ts, uint64_t end_ts, uint64_t *new_ts,
+			    uint32_t active_mixers, struct audio_output_data *mixes)
+{
+	UNUSED_PARAMETER(end_ts);
+	auto *rec = static_cast<feeds_iso_recorder *>(param);
+	const uint64_t ts = start_ts - ISO_AUDIO_LATENCY_NS;
+	*new_ts = ts;
+
+	std::lock_guard<std::mutex> lk(rec->audio_m);
+	if (rec->audio_ring.empty())
+		return true;  // output is silence (mix buffers arrive zeroed)
+	if (rec->audio_emit_pos < 0)
+		rec->audio_emit_pos = iso_audio_pos_of(rec, ts);
+
+	const size_t mask = rec->audio_ring.size() - 1;
+	float *dst = (active_mixers & 1) ? mixes[0].data[0] : nullptr;
+	for (size_t i = 0; i < (size_t)AUDIO_OUTPUT_FRAMES; i++) {
+		float &s = rec->audio_ring[(size_t)(rec->audio_emit_pos + (int64_t)i) & mask];
+		if (dst)
+			dst[i] = s;
+		s = 0.0f;
+	}
+	rec->audio_emit_pos += AUDIO_OUTPUT_FRAMES;
+	return true;
+}
+
+// Write resampled samples at timeline position pos, clipped to the part of
+// the buffer that is still ahead of the callback. Caller holds audio_m.
+static void iso_audio_write_locked(feeds_iso_recorder *rec, const float *src, uint32_t n, int64_t pos)
+{
+	const int64_t cap = (int64_t)rec->audio_ring.size();
+	const int64_t floor_pos = rec->audio_emit_pos >= 0
+					  ? rec->audio_emit_pos
+					  : iso_audio_pos_of(rec, os_gettime_ns() - ISO_AUDIO_LATENCY_NS);
+
+	if (pos < floor_pos) {  // already emitted (or about to be): too late
+		const int64_t skip = floor_pos - pos;
+		if (skip >= (int64_t)n) {
+			rec->audio_late_frames += n;
+			return;
+		}
+		rec->audio_late_frames += (uint64_t)skip;
+		src += skip;
+		n -= (uint32_t)skip;
+		pos = floor_pos;
+	}
+	if (pos + (int64_t)n > floor_pos + cap) {  // beyond the buffer: can't hold it
+		const int64_t room = floor_pos + cap - pos;
+		const uint32_t keep = room > 0 ? (uint32_t)room : 0;
+		rec->audio_ahead_frames += n - keep;
+		n = keep;
+	}
+
+	const size_t mask = rec->audio_ring.size() - 1;
+	for (uint32_t i = 0; i < n; i++)
+		rec->audio_ring[(size_t)(pos + (int64_t)i) & mask] = src[i];
+}
+
+// Place one engine chunk on the timeline. Caller holds audio_m and has
+// checked rec->audio.
+static void iso_audio_place_locked(feeds_iso_recorder *rec, const int16_t *pcm, uint32_t frames,
+				   uint32_t sample_rate, uint32_t channels, uint64_t timestamp_ns)
+{
+	if (!rec->audio_logged_first) {
+		rec->audio_logged_first = true;
+		blog(LOG_INFO, "[feeds-iso] isolated audio arriving for '%s' (%u Hz, %u ch)",
+		     rec->audio_name.c_str(), sample_rate, channels);
+	}
+	rec->audio_received_ns += util_mul_div64(frames, 1000000000ULL, sample_rate);
+
+	// Continue the previous chunk, start a new anchor after a gap, or drop a
+	// chunk that is behind where we already are (never rewind).
+	const int64_t target = iso_audio_pos_of(rec, timestamp_ns);
+	const int64_t smooth = iso_audio_frames_of(rec, ISO_AUDIO_SMOOTH_NS);
+	bool contiguous = false;
+	if (rec->audio_next_pos >= 0) {
+		const int64_t diff = target - rec->audio_next_pos;
+		if (diff < -smooth) {
+			rec->audio_ahead_frames += (uint64_t)iso_audio_frames_of(
+				rec, util_mul_div64(frames, 1000000000ULL, sample_rate));
+			return;
+		}
+		contiguous = diff <= smooth;
+	}
+
+	// Format conversion only: s16 at the SDK's rate/channels -> float mono at
+	// the output rate. A fresh anchor gets a fresh resampler so no tail of the
+	// previous talk spurt is carried across the silence.
+	if (!contiguous || !rec->resampler || rec->rs_rate != sample_rate || rec->rs_channels != channels) {
+		audio_resampler_destroy(rec->resampler);
+		struct resample_info src = {};
+		src.samples_per_sec = sample_rate;
+		src.format = AUDIO_FORMAT_16BIT;
+		src.speakers = channels == 2 ? SPEAKERS_STEREO : SPEAKERS_MONO;
+		struct resample_info dst = {};
+		dst.samples_per_sec = rec->audio_rate;
+		dst.format = AUDIO_FORMAT_FLOAT_PLANAR;
+		dst.speakers = SPEAKERS_MONO;
+		rec->resampler = audio_resampler_create(&dst, &src);
+		rec->rs_rate = sample_rate;
+		rec->rs_channels = channels;
+		if (!rec->resampler) {
+			blog(LOG_WARNING, "[feeds-iso] could not create audio resampler (%u Hz, %u ch)",
+			     sample_rate, channels);
+			return;
+		}
+	}
+
+	uint8_t *out[MAX_AV_PLANES] = {};
+	uint32_t out_frames = 0;
+	uint64_t ts_offset = 0;
+	const uint8_t *in[MAX_AV_PLANES] = {reinterpret_cast<const uint8_t *>(pcm)};
+	if (!audio_resampler_resample(rec->resampler, out, &out_frames, &ts_offset, in, frames) || !out_frames)
+		return;
+
+	// The resampler delays its output by ts_offset; account for it on a fresh
+	// anchor, as libobs does for source audio.
+	const int64_t pos = contiguous ? rec->audio_next_pos
+				       : iso_audio_pos_of(rec, timestamp_ns > ts_offset ? timestamp_ns - ts_offset : 0);
+	iso_audio_write_locked(rec, reinterpret_cast<const float *>(out[0]), out_frames, pos);
+	rec->audio_next_pos = pos + out_frames;
+}
+
+// Open this recording's private audio_output. Called from start_output
+// (graphics thread, rec->lock held). Returns the audio handle, or null.
+static audio_t *iso_audio_open(feeds_iso_recorder *rec)
+{
+	struct obs_audio_info oai = {};
+	if (!obs_get_audio_info(&oai) || !oai.samples_per_sec)
+		return nullptr;
+
+	// Buffer: the smallest power of two covering ISO_AUDIO_BUFFER_NS.
+	size_t ring = 1;
+	const uint64_t need = util_mul_div64(ISO_AUDIO_BUFFER_NS, oai.samples_per_sec, 1000000000ULL);
+	while (ring < need)
+		ring <<= 1;
+
+	{
+		std::lock_guard<std::mutex> lk(rec->audio_m);
+		rec->audio_rate = oai.samples_per_sec;
+		// Origin a second in the past so no plausible stamp maps below zero.
+		rec->audio_base_ts = os_gettime_ns() - 1000000000ULL;
+		rec->audio_ring.assign(ring, 0.0f);
+		rec->audio_next_pos = -1;
+		rec->audio_emit_pos = -1;
+		rec->audio_logged_first = false;
+		rec->audio_received_ns = 0;
+		rec->audio_late_frames = 0;
+		rec->audio_ahead_frames = 0;
+	}
+
+	struct audio_output_info info = {};
+	info.name = rec->audio_name.c_str();
+	info.samples_per_sec = oai.samples_per_sec;
+	info.format = AUDIO_FORMAT_FLOAT_PLANAR;
+	info.speakers = SPEAKERS_MONO;
+	info.input_callback = iso_audio_input;
+	info.input_param = rec;
+
+	audio_t *audio = nullptr;
+	if (audio_output_open(&audio, &info) != AUDIO_OUTPUT_SUCCESS || !audio) {
+		std::lock_guard<std::mutex> lk(rec->audio_m);
+		rec->audio_ring.clear();
+		return nullptr;
+	}
+
+	std::lock_guard<std::mutex> lk(rec->audio_m);
+	rec->audio = audio;  // push_audio starts accepting chunks
+	return audio;
+}
+
+// Close the private audio_output, if open. Must run after the encoder bound to
+// it has been released. audio_output_close joins the audio thread, so once it
+// returns no callback can touch the buffer being freed below.
+static void iso_audio_close(feeds_iso_recorder *rec)
+{
+	audio_t *audio = nullptr;
+	{
+		std::lock_guard<std::mutex> lk(rec->audio_m);
+		audio = rec->audio;
+		rec->audio = nullptr;  // push_audio stops accepting chunks
+	}
+	if (!audio)
+		return;
+	audio_output_close(audio);
+
+	std::lock_guard<std::mutex> lk(rec->audio_m);
+	blog(LOG_INFO,
+	     "[feeds-iso] isolated audio closed for '%s': %llu ms received, %llu ms dropped late, "
+	     "%llu ms dropped ahead",
+	     rec->audio_name.c_str(), (unsigned long long)(rec->audio_received_ns / 1000000ULL),
+	     (unsigned long long)util_mul_div64(rec->audio_late_frames, 1000ULL, rec->audio_rate),
+	     (unsigned long long)util_mul_div64(rec->audio_ahead_frames, 1000ULL, rec->audio_rate));
+	audio_resampler_destroy(rec->resampler);
+	rec->resampler = nullptr;
+	rec->rs_rate = 0;
+	rec->rs_channels = 0;
+	rec->audio_ring.clear();
+	rec->audio_ring.shrink_to_fit();
+	rec->audio_next_pos = -1;
+	rec->audio_emit_pos = -1;
+}
+
+void feeds_iso_recorder_push_audio(feeds_iso_recorder *rec, const int16_t *pcm, uint32_t frames,
+				   uint32_t sample_rate, uint32_t channels, uint64_t timestamp_ns)
+{
+#if FEEDS_ISO_ISOLATED_AUDIO
+	if (!rec || !pcm || !frames || !sample_rate || (channels != 1 && channels != 2))
+		return;
+	std::lock_guard<std::mutex> lk(rec->audio_m);
+	if (!rec->audio)
+		return;  // not recording
+	iso_audio_place_locked(rec, pcm, frames, sample_rate, channels, timestamp_ns);
+#else
+	UNUSED_PARAMETER(rec);
+	UNUSED_PARAMETER(pcm);
+	UNUSED_PARAMETER(frames);
+	UNUSED_PARAMETER(sample_rate);
+	UNUSED_PARAMETER(channels);
+	UNUSED_PARAMETER(timestamp_ns);
+#endif
+}
+
 // Defined in the teardown section below; used by start_output's failure path.
 static void detach_view_source(feeds_iso_recorder *rec);
 
@@ -462,19 +771,34 @@ static void start_output(feeds_iso_recorder *rec)
 	}
 	obs_encoder_set_video(rec->venc, rec->video_output);
 
-	// Audio encoder — AAC bound to OBS's program audio mix. obs_get_audio()
-	// is libobs's global program audio handle (the same one feeding the main
-	// recording); mix index 0 = OBS recording track 1. Binding the encoder to
-	// it lets libobs's own audio plumbing route the full program mix into the
-	// ISO file, so it carries the same audio as the main recording. This
-	// handle is owned by libobs core and must NOT be closed by us (see
-	// destroy) — we no longer open a private per-source audio_output.
-	obs_data_t *aenc_settings = obs_data_create();
-	obs_data_set_int(aenc_settings, "bitrate", AUDIO_BITRATE_KBPS);
-	rec->aenc = obs_audio_encoder_create("ffmpeg_aac", aenc_name.c_str(), aenc_settings, 0, nullptr);
-	obs_data_release(aenc_settings);
-	if (rec->aenc)
-		obs_encoder_set_audio(rec->aenc, obs_get_audio());
+	// Audio encoder — AAC. On Windows it is bound to this recording's PRIVATE
+	// audio_output, which carries only this source's participant (see the
+	// file header); it is ours, and is closed after the encoder is released
+	// (finish_drain). If that pipeline can't open we record video only rather
+	// than fall back to the program mix, which would put every voice in every
+	// ISO file. On macOS (no isolated audio yet) the encoder binds to
+	// obs_get_audio(), libobs's program mix (mix 0 = OBS recording track 1),
+	// which libobs owns and we never close.
+	audio_t *audio = nullptr;
+#if FEEDS_ISO_ISOLATED_AUDIO
+	rec->audio_name = base;
+	audio = iso_audio_open(rec);
+	if (!audio)
+		blog(LOG_ERROR, "[feeds-iso] could not open the isolated audio pipeline for '%s'; "
+				"recording video only", base.c_str());
+#else
+	audio = obs_get_audio();
+#endif
+	if (audio) {
+		obs_data_t *aenc_settings = obs_data_create();
+		obs_data_set_int(aenc_settings, "bitrate", AUDIO_BITRATE_KBPS);
+		rec->aenc = obs_audio_encoder_create("ffmpeg_aac", aenc_name.c_str(), aenc_settings, 0, nullptr);
+		obs_data_release(aenc_settings);
+		if (rec->aenc)
+			obs_encoder_set_audio(rec->aenc, audio);
+		else
+			iso_audio_close(rec);  // nothing to feed; no-op on macOS
+	}
 
 	// Build the output and its settings (path).
 	std::string path = build_filepath(rec, dir.c_str(), ext);
@@ -488,6 +812,7 @@ static void start_output(feeds_iso_recorder *rec)
 		rec->venc = nullptr;
 		obs_encoder_release(rec->aenc);
 		rec->aenc = nullptr;
+		iso_audio_close(rec);  // after its encoder
 		return;
 	}
 
@@ -517,6 +842,7 @@ static void start_output(feeds_iso_recorder *rec)
 		rec->venc = nullptr;
 		obs_encoder_release(rec->aenc);
 		rec->aenc = nullptr;
+		iso_audio_close(rec);  // after its encoder
 	}
 }
 
@@ -556,8 +882,8 @@ static void detach_view_source(feeds_iso_recorder *rec)
 // Only one output drains at a time; tick blocks new starts and view
 // recreation while draining, so a draining output never has its mix freed
 // underneath it. The persistent view is torn down only at destroy, after the
-// final drain has been released. (Audio comes from OBS's shared program mix,
-// obs_get_audio(), which we never own and never free.)
+// final drain has been released. The private isolated-audio audio_output is
+// per recording: finish_drain closes it after the audio encoder is released.
 // ---------------------------------------------------------------------------
 
 // "stop" signal handler: marks the drain complete and wakes destroy's waiter.
@@ -617,6 +943,7 @@ static void finish_drain(feeds_iso_recorder *rec)
 		obs_encoder_release(rec->aenc);
 		rec->aenc = nullptr;
 	}
+	iso_audio_close(rec);  // the private audio_output, after its encoder
 	rec->draining = false;
 	rec->drain_forced = false;
 	rec->drain_done.store(false);
@@ -888,9 +1215,10 @@ void feeds_iso_recorder_destroy(feeds_iso_recorder *rec)
 	}
 
 	// Destruction is SYNCHRONOUS: the borrowed parent pointer is valid only
-	// until this destroy callback returns, and the audio thread (closed below)
-	// references it. So we drain + release everything inline, with a bounded
-	// wait, before returning. The parent stays valid throughout (we're inside
+	// until this destroy callback returns, and the recording pipeline must be
+	// gone before rec is freed (the isolated-audio thread reads rec). So we
+	// drain + release everything inline, with a bounded wait, before
+	// returning; finish_drain closes the audio_output. The parent stays valid throughout (we're inside
 	// the source's destroy callback) and the view holds it until detached.
 
 	// Begin a graceful drain of an active recording (no-op if already
@@ -918,10 +1246,11 @@ void feeds_iso_recorder_destroy(feeds_iso_recorder *rec)
 		finish_drain(rec);  // disconnect "stop", release output + encoders (Bug 3)
 	}
 
-	// Release the persistent render view. The recording's audio came from
-	// OBS's shared program mix (obs_get_audio()), which libobs core owns — we
-	// never opened a private audio_output, so there is nothing of ours to
-	// close here.
+	// Belt and braces: no recording audio pipeline may outlive rec. (finish_drain
+	// has normally closed it already; this is a no-op then.)
+	iso_audio_close(rec);
+
+	// Release the persistent render view.
 	if (rec->view) {
 		obs_view_set_source(rec->view, 0, nullptr);
 		obs_view_remove(rec->view);

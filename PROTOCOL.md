@@ -301,6 +301,8 @@ Engine has created a shared texture for this source.
  "format": "NV12"}
 ```
 
+Windows: alongside the frame region, the engine also creates the source's isolated-audio region (`common/shared-audio.h`, named `Local\FeedsAudio_<engine_pid>_<source_uuid>`). It carries only the audio of the participant the source currently shows (Zoom's per-participant one-way audio, never the meeting mix), as timestamped s16 PCM chunks, and follows the source when it is re-pointed to another participant. The plugin opens it together with the frame region and feeds it to the source's ISO recorder. No message announces it: it exists whenever the frame region does, and a missing region only means that source's ISO file records silent audio.
+
 #### `participant_source_unsubscribe` (P→E)
 Plugin no longer needs video for this source.
 

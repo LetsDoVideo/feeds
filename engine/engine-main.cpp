@@ -15,6 +15,7 @@
 #include "feeds-version.h"
 #include "engine-shared.h"
 #include "engine-speaker.h"
+#include "engine-audio.h"
 
 // Defined here, declared extern in engine-shared.h so engine-meeting.cpp
 // can post WM_FEEDS_SEND_CHAT to it from the pipe thread. Set inside
@@ -512,9 +513,10 @@ static LRESULT CALLBACK EngineWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         feeds_engine::QueueCameraOnReestablish((unsigned int)wp);
         return 0;
     }
-    if (msg == WM_FEEDS_AUDIO_PROBE) {
-        // TEMPORARY raw-audio probe (logging only). See engine-meeting.cpp.
-        feeds_engine::RunAudioProbeOnMainThread();
+    if (msg == WM_FEEDS_AUDIO_SUBSCRIBE) {
+        // Per-participant audio subscribe (SDK call, so on this thread). See
+        // engine-audio.cpp.
+        feeds_engine::IsolatedAudioSubscribeOnMainThread();
         return 0;
     }
     return DefWindowProc(hwnd, msg, wp, lp);

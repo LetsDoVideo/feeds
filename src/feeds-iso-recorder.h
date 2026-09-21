@@ -1,10 +1,11 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 #include <obs.h>
 
-// Per-source ISO recording for Feeds participant sources (Phase 1).
+// Per-source ISO recording for Feeds participant sources.
 //
 // When the user ticks "Enable ISO recording" in a participant source's
 // properties and starts OBS's main recording, that source records to its own
@@ -13,17 +14,32 @@
 // recording pauses. No filter appears in the UI — the recording machinery
 // lives directly inside the participant source via this module.
 //
+// Each file carries that participant's ISOLATED audio (their own voice only,
+// fed by feeds_iso_recorder_push_audio), never the OBS program mix, so
+// stacking ISO files in an edit doesn't multiply every voice. The full mix
+// stays in OBS's main recording.
+//
 // Architecture adopts Exeldro's Source Record patterns (obs_view +
 // audio_output + obs_output) used directly inside the source rather than as
 // an OBS filter, with the six known Source Record bugs fixed. Everything
 // except the enable checkbox is inherited from OBS's main recording config:
-// folder, format, video encoder + settings, audio encoder. See
+// folder, format, video encoder + settings. See
 // C:\Dev\iso-recording-investigation.md for the full rationale.
 //
 // Threading: the public functions below are called from the OBS UI/graphics
-// threads (source lifecycle + frontend events). The audio callback runs on
-// libobs's dedicated audio thread; the module guards its shared state
-// accordingly.
+// threads (source lifecycle + frontend events), except push_audio, which the
+// source's pump thread calls. The private audio output's callback runs on its
+// own libobs audio thread; the module guards the shared audio state with a
+// dedicated mutex.
+
+// Isolated per-participant audio is delivered by the Windows engine only.
+// Until the macOS engine delivers it too, macOS ISO files keep OBS's program
+// mix (the previous behavior) rather than going silent.
+#ifdef _WIN32
+#define FEEDS_ISO_ISOLATED_AUDIO 1
+#else
+#define FEEDS_ISO_ISOLATED_AUDIO 0
+#endif
 
 namespace feeds {
 
@@ -60,6 +76,18 @@ bool feeds_iso_recorder_is_enabled(const feeds_iso_recorder *rec);
 // Called from the participant source's video_tick. Lazily (re)creates the
 // private render view when the parent's dimensions become valid or change.
 void feeds_iso_recorder_tick(feeds_iso_recorder *rec, float seconds);
+
+// ---------------------------------------------------------------------------
+// Isolated participant audio — one chunk of the source's participant audio as
+// the engine delivered it: interleaved s16 PCM at the SDK's rate/channels,
+// stamped with the os_gettime_ns() time of its first sample. Placed on the
+// recording's timeline by that timestamp; anything not covered (silence,
+// muted participant, no audio at all) records as silence. A cheap no-op when
+// the source isn't recording. Called from one producer thread (the source's
+// pump thread). No-op when FEEDS_ISO_ISOLATED_AUDIO is 0.
+// ---------------------------------------------------------------------------
+void feeds_iso_recorder_push_audio(feeds_iso_recorder *rec, const int16_t *pcm, uint32_t frames,
+				   uint32_t sample_rate, uint32_t channels, uint64_t timestamp_ns);
 
 // ---------------------------------------------------------------------------
 // OBS frontend recording event hooks. These are invoked by the module's own

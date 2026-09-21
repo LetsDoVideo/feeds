@@ -120,6 +120,7 @@
 #undef emit
 
 #include "shared-frame.h"
+#include "shared-audio.h"
 #include "feeds-version.h"
 #include "feeds-json-lite.h"
 #include "feeds-http.h"
@@ -496,6 +497,11 @@ struct ZpSourceData {
     // torn down in zp_destroy. Records this source to its own MP4 alongside
     // OBS's main recording when the properties checkbox is enabled.
     feeds::feeds_iso_recorder* iso = nullptr;
+    // Guards the pump thread's use of `iso` (isolated-audio pushes) against
+    // zp_destroy, which destroys the recorder while the pump thread may still
+    // be running (the pump stops later, in CloseSharedMemory). zp_destroy
+    // detaches `iso` under this lock before destroying it.
+    std::mutex        isoMutex;
     // In-memory only; recomputed on every login_succeeded by
     // ReconcileSourcesToTier. Not persisted in scene-collection data
     // because the same scene can be tier-legal for one Feeds user and
@@ -516,6 +522,16 @@ struct ZpSourceData {
     std::atomic<bool> pumpShouldExit{false};
     HANDLE            pumpWakeEvent = nullptr;
     uint32_t          lastReadIndex = 0;
+
+    // Isolated participant audio region (shared-audio.h), opened and closed
+    // with the frame region above and drained by the same pump thread into
+    // `iso`. Windows only (FEEDS_ISO_ISOLATED_AUDIO); null otherwise, or when
+    // the engine didn't create one.
+    HANDLE                            audioMapping   = nullptr;
+    void*                             audioView      = nullptr;
+    feeds_shared::SharedAudioHeader*  audioHeader    = nullptr;
+    feeds_shared::AudioSlot*          audioSlots     = nullptr;
+    uint32_t                          audioReadIndex = 0;
 
     // Monotonic os_gettime_ns() of the last REAL frame (width>0) the pump output
     // for this source — the "receiving video now" signal the dock's live
@@ -1038,6 +1054,92 @@ static void RebindAllBoundSources(const char* reason) {
 }
 
 // ---------------------------------------------------------------------------
+// Isolated participant audio — the engine's per-source audio ring
+// (shared-audio.h), drained on the pump thread into the source's ISO recorder.
+// Every slot is consumed in order (a FIFO, unlike the newest-frame video
+// ring). Open/Close run under data->lifecycleMutex with the pump stopped,
+// alongside the frame region.
+// ---------------------------------------------------------------------------
+#if FEEDS_ISO_ISOLATED_AUDIO
+static void CloseAudioRegion(ZpSourceData* data) {
+    if (data->audioView)    { UnmapViewOfFile(data->audioView); data->audioView = nullptr; }
+    if (data->audioMapping) { CloseHandle(data->audioMapping); data->audioMapping = nullptr; }
+    data->audioHeader    = nullptr;
+    data->audioSlots     = nullptr;
+    data->audioReadIndex = 0;
+}
+
+// Non-fatal: without the region this source's ISO file records silence.
+static void OpenAudioRegion(ZpSourceData* data) {
+    CloseAudioRegion(data);
+    const std::string name = feeds_shared::MakeAudioRegionName(g_enginePid, data->uuid);
+    data->audioMapping = OpenFileMappingA(FILE_MAP_READ, FALSE, name.c_str());
+    if (!data->audioMapping) {
+        blog(LOG_WARNING, "[feeds] no isolated-audio region '%s' (err=%lu); "
+             "ISO audio for source=%s will be silent", name.c_str(),
+             GetLastError(), data->uuid.c_str());
+        return;
+    }
+    data->audioView = MapViewOfFile(data->audioMapping, FILE_MAP_READ, 0, 0,
+                                    feeds_shared::AUDIO_REGION_SIZE);
+    auto* header = (feeds_shared::SharedAudioHeader*)data->audioView;
+    if (!header || header->magic != feeds_shared::AUDIO_REGION_MAGIC ||
+        header->version != feeds_shared::AUDIO_REGION_VERSION) {
+        blog(LOG_WARNING, "[feeds] isolated-audio region '%s' unusable",
+             name.c_str());
+        CloseAudioRegion(data);
+        return;
+    }
+    data->audioHeader    = header;
+    data->audioSlots     = (feeds_shared::AudioSlot*)
+        ((uint8_t*)data->audioView + sizeof(feeds_shared::SharedAudioHeader));
+    data->audioReadIndex = header->write_index;  // start from "now"
+}
+
+// Pump thread. Copies each new slot out (then re-checks that the writer didn't
+// lap it mid-copy) and hands it to the ISO recorder, which ignores it unless
+// it is recording.
+static void DrainIsolatedAudio(ZpSourceData* data) {
+    feeds_shared::SharedAudioHeader* header = data->audioHeader;
+    if (!header) return;
+
+    const uint32_t kSlots = feeds_shared::AUDIO_RING_SLOTS;
+    uint32_t w = header->write_index;
+    MemoryBarrier();
+    uint32_t r = data->audioReadIndex;
+    if ((uint32_t)(w - r) > kSlots) {
+        // Lapped (pump stalled ~kSlots x 10 ms) or the engine re-created the
+        // region (index went backwards). Skip to the recent half of the ring;
+        // the recorder turns the hole into silence.
+        r = (w >= kSlots / 2) ? w - kSlots / 2 : 0;
+    }
+
+    feeds_shared::AudioSlot slot;  // ~4 KB scratch copy
+    for (; r != w; ++r) {
+        const feeds_shared::AudioSlot* src = &data->audioSlots[r % kSlots];
+        slot.user_id      = src->user_id;
+        slot.sample_rate  = src->sample_rate;
+        slot.channels     = src->channels;
+        slot.frames       = src->frames;
+        slot.timestamp_ns = src->timestamp_ns;
+        const uint32_t samples = slot.frames * slot.channels;
+        if (slot.channels == 0 || samples > feeds_shared::AUDIO_SLOT_MAX_SAMPLES)
+            continue;  // corrupt header: skip the slot
+        memcpy(slot.pcm, src->pcm, (size_t)samples * sizeof(int16_t));
+        MemoryBarrier();
+        if ((uint32_t)(header->write_index - r) >= kSlots)
+            continue;  // overwritten while we copied: torn, drop it
+
+        std::lock_guard<std::mutex> isoLock(data->isoMutex);
+        feeds::feeds_iso_recorder_push_audio(data->iso, slot.pcm, slot.frames,
+                                             slot.sample_rate, slot.channels,
+                                             slot.timestamp_ns);
+    }
+    data->audioReadIndex = r;
+}
+#endif
+
+// ---------------------------------------------------------------------------
 // Pump thread — reads frames from shared memory, feeds them to OBS.
 //
 // One instance runs per active Zoom Participant source with a live shared
@@ -1059,6 +1161,10 @@ static void PumpThreadFunc(ZpSourceData* data) {
         WaitForSingleObject(data->pumpWakeEvent, 8);
 
         if (data->pumpShouldExit) break;
+#if FEEDS_ISO_ISOLATED_AUDIO
+        // Audio first, every wake: it must never wait on video's early-outs.
+        DrainIsolatedAudio(data);
+#endif
         if (!data->header || !data->frameSlots) continue;
 
         uint32_t currentWrite = data->header->write_index;
@@ -1176,6 +1282,9 @@ static void OpenSharedMemory(ZpSourceData* data) {
         if (data->mapping) { CloseHandle(data->mapping); data->mapping = nullptr; }
         data->header = nullptr;
         data->frameSlots  = nullptr;
+#if FEEDS_ISO_ISOLATED_AUDIO
+        CloseAudioRegion(data);
+#endif
     }
 
     std::string name = feeds_shared::MakeFrameRegionName(g_enginePid, data->uuid);
@@ -1220,6 +1329,12 @@ static void OpenSharedMemory(ZpSourceData* data) {
     blog(LOG_INFO, "[feeds] opened shared memory '%s' for source=%s",
          name.c_str(), data->uuid.c_str());
 
+#if FEEDS_ISO_ISOLATED_AUDIO
+    // The engine creates this source's audio region together with its frame
+    // region, so it exists by the time source_texture_ready brings us here.
+    OpenAudioRegion(data);
+#endif
+
     StartPumpThread(data);
 }
 
@@ -1240,6 +1355,9 @@ static void CloseSharedMemory(ZpSourceData* data, bool clearTexture = true) {
     data->header = nullptr;
     data->frameSlots  = nullptr;
     data->lastReadIndex = 0;
+#if FEEDS_ISO_ISOLATED_AUDIO
+    CloseAudioRegion(data);
+#endif
 
     // Clear the OBS source's current frame. Without this, OBS keeps
     // displaying the last frame we delivered, producing a frozen image
@@ -2948,9 +3066,12 @@ public:
     QSize minimumSizeHint() const override {
         return QSize(0, QFontMetrics(font()).height());
     }
-    // Optional double-click affordance (source-box header rename). No signal/moc:
-    // the owner installs a plain callback, invoked from the event override below.
-    std::function<void()> onDoubleClick;
+    // Optional click affordance (source-box header rename): a single left click
+    // on the label (press and release both inside it) invokes it. No
+    // signal/moc: the owner installs a plain callback, invoked from the event
+    // overrides below. Only this label handles the click, so nothing else in
+    // the row changes behavior.
+    std::function<void()> onClick;
 protected:
     void resizeEvent(QResizeEvent* e) override {
         QLabel::resizeEvent(e);
@@ -2958,12 +3079,32 @@ protected:
         QFontMetrics fm(fontMetrics());
         QLabel::setText(fm.elidedText(m_full, Qt::ElideRight, contentsRect().width()));
     }
-    void mouseDoubleClickEvent(QMouseEvent* e) override {
-        if (onDoubleClick) onDoubleClick();
-        else QLabel::mouseDoubleClickEvent(e);
+    void mousePressEvent(QMouseEvent* e) override {
+        if (onClick && e->button() == Qt::LeftButton) {
+            m_pressed = true;
+            e->accept();
+            return;
+        }
+        QLabel::mousePressEvent(e);
+    }
+    void mouseReleaseEvent(QMouseEvent* e) override {
+        if (onClick && e->button() == Qt::LeftButton && m_pressed) {
+            m_pressed = false;
+            // Fire on release, not press, so a press dragged off the label
+            // cancels like a normal button. The callback swaps this label out
+            // of the layout, so nothing touches members after it.
+            if (rect().contains(e->pos())) {
+                auto f = onClick;
+                f();
+            }
+            return;
+        }
+        m_pressed = false;
+        QLabel::mouseReleaseEvent(e);
     }
 private:
     QString m_full;
+    bool    m_pressed = false;
 };
 
 // A QPushButton that truncates its label with a trailing ellipsis when the label
@@ -3080,7 +3221,7 @@ private:
     static constexpr int kArrowAndFramePx = 28;
 };
 
-// Inline rename editor for a source-box header. Double-clicking the header swaps
+// Inline rename editor for a source-box header. Clicking the header swaps
 // one of these in (FeedsParticipantDock::BeginRename); Enter or focus-out commits,
 // Escape cancels. No Q_OBJECT/signals — the two outcomes are delivered through
 // std::function callbacks fired exactly once. The m_done latch guards against
@@ -3475,7 +3616,7 @@ public:
             // Over-cap sources: grey name only, no assignment, no controls —
             // but still renamable. Grey is a tier-position status signal, not a
             // lock (the Source dock lets you rename a source in any state). An
-            // ElidingLabel with the same double-click handler as the framed-box
+            // ElidingLabel with the same click-to-rename handler as the framed-box
             // headers; BeginRename swaps it in place within this (m_root) layout.
             // Empty at exactly-cap — then only the prompt sits below the divider.
             for (const auto& r : rows) {
@@ -3483,7 +3624,7 @@ public:
                 ElidingLabel* lbl = new ElidingLabel(QString::fromStdString(r.name));
                 lbl->setStyleSheet("QLabel { color: #7a7d80; }");
                 const std::string uuid = r.uuid;
-                lbl->onDoubleClick = [this, uuid, lbl]() { BeginRename(uuid, lbl); };
+                lbl->onClick = [this, uuid, lbl]() { BeginRename(uuid, lbl); };
                 m_root->addWidget(lbl);
             }
 
@@ -3822,7 +3963,7 @@ private:
     // Small right-aligned per-row button: add THIS source to the current edit
     // scene as a Paste Reference (new scene-item on the same source). A separate
     // sibling from the header label, so it doesn't collide with the rename
-    // double-click. Shared by the live and non-live box header rows.
+    // click. Shared by the live and non-live box header rows.
     QPushButton* MakeAddToSceneButton(const std::string& uuid) {
         QPushButton* b = new QPushButton("+");
         b->setFixedSize(18, 18);
@@ -3864,7 +4005,7 @@ private:
 
     // Small icon button matched to the "+" above (18px slot), for the provisional
     // header-row cluster. Separate sibling from the header label, so it doesn't
-    // collide with the double-click rename. onClick is a plain functor.
+    // collide with the click-to-rename. onClick is a plain functor.
     static QPushButton* MakeIconButton(const QIcon& icon, const QString& tooltip,
                                        std::function<void()> onClick) {
         QPushButton* b = new QPushButton();
@@ -3951,7 +4092,7 @@ private:
     // non-live boxes: [ + add-to-scene | scenes-list | filters ]. Placement is
     // temporary — this crowds the row and the eliding name loses width on a narrow
     // dock (accepted for now; the row gets redesigned). Each button is a separate
-    // sibling from the header label, so none collides with the double-click rename.
+    // sibling from the header label, so none collides with the click-to-rename.
     void AppendHeaderButtons(QHBoxLayout* headerL, const std::string& uuid) {
         headerL->addWidget(MakeAddToSceneButton(uuid));
         headerL->addWidget(MakeIconButton(ScenesIcon(), "Included Scenes",
@@ -4481,7 +4622,7 @@ public:
     }
 private:
 
-    // --- Inline source-box rename (double-click the header) --------------------
+    // --- Inline source-box rename (click the header) ---------------------------
     //
     // BeginRename swaps the header ElidingLabel for a RenameLineEdit in the same
     // layout slot (so the live dot and mute mark don't move); Commit/Cancel swap
@@ -4658,11 +4799,11 @@ private:
         header->setStyleSheet(
             "QLabel#feedsSourceHeader { background: rgba(128,128,128,0.15);"
             " border-radius: 3px; padding: 3px 6px; font-weight: bold; }");
-        // Double-click to rename the underlying OBS source. A separate sibling from
+        // Click to rename the underlying OBS source. A separate sibling from
         // the clusters, so it can't interfere with the buttons/indicators.
         {
             const std::string uuid = r.uuid;
-            header->onDoubleClick = [this, uuid, header]() { BeginRename(uuid, header); };
+            header->onClick = [this, uuid, header]() { BeginRename(uuid, header); };
         }
 
         // Two-cluster header row, identical on live and non-live boxes:
@@ -7523,8 +7664,15 @@ static void zp_destroy(void* vdata) {
 
         // Tear down the ISO recorder while the source is still valid (it
         // borrows the source pointer). Synchronous, drain-aware, bounded.
-        feeds::feeds_iso_recorder_destroy(data->iso);
-        data->iso = nullptr;
+        // Detached under isoMutex first: the pump thread (stopped only below,
+        // in CloseSharedMemory) may be mid-push of isolated audio into it.
+        feeds::feeds_iso_recorder* iso = nullptr;
+        {
+            std::lock_guard<std::mutex> isoLock(data->isoMutex);
+            iso = data->iso;
+            data->iso = nullptr;
+        }
+        feeds::feeds_iso_recorder_destroy(iso);
 
         // clearTexture=false: source is being destroyed, don't touch it.
         // CloseSharedMemory takes data->lifecycleMutex internally, so any
