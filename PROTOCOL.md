@@ -253,6 +253,8 @@ Sent as a response to `get_participants`, and also unsolicited after `raw_livest
 
 `muted` seeds the dock's mute indicator so a row shows the right mark immediately; `participant_audio_status` keeps it live between roster changes.
 
+`persistent_id` is Zoom's persistent id for the person (`IUserInfo::GetPersistentId`), meant to survive a leave/rejoin where the runtime `id` changes. The ISO registry keys "same person" on it (one person = one ISO file). Additive: `""` from an older engine or the macOS engine, in which case the plugin falls back to an unambiguous exact name match.
+
 ```json
 {"type": "participant_list_changed",
  "my_user_id": 12345678,
@@ -309,6 +311,17 @@ Plugin no longer needs video for this source.
 ```json
 {"type": "participant_source_unsubscribe", "source_id": "obs_source_uuid"}
 ```
+
+#### `iso_participant_start` / `iso_participant_repoint` / `iso_participant_stop` (P→E)
+ISO recording follows people, not sources. For each person the plugin's ISO registry enrolls, it asks the engine for a RECORDING subscription keyed by an `iso_id` (`"iso-<uuid>"`) instead of a source uuid. It is otherwise an ordinary participant subscription: same readiness gate, same-user sequencing, resolution ladder, frame + isolated-audio regions named by the `iso_id`, and `source_texture_ready` / `source_texture_released` / `participant_source_subscribe_failed` reported with `source_id` = the `iso_id`. It never follows the active speaker and is independent of which sources show the person. `start` and `repoint` (after a leave/rejoin, with the person's new user id) both queue a fresh renderer; `stop` ends it.
+
+```json
+{"type": "iso_participant_start",   "iso_id": "iso-6f1c...", "participant_id": 16778240}
+{"type": "iso_participant_repoint", "iso_id": "iso-6f1c...", "participant_id": 16779264}
+{"type": "iso_participant_stop",    "iso_id": "iso-6f1c..."}
+```
+
+The macOS engine has no handlers for these yet; the macOS plugin sends `participant_source_recreate` / `participant_source_unsubscribe` with the `iso_id` as `source_id`, which that engine already treats as an opaque id.
 
 ### Shutdown
 

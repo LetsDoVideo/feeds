@@ -425,6 +425,9 @@ namespace feeds_engine {
     void HandleParticipantSourceSubscribe(const std::string&);
     void HandleParticipantSourceUnsubscribe(const std::string&);
     void HandleParticipantSourceRecreate(const std::string&);
+    void HandleIsoParticipantStart(const std::string&);
+    void HandleIsoParticipantRepoint(const std::string&);
+    void HandleIsoParticipantStop(const std::string&);
 }
 
 static void HandleShutdown(const std::string& json)
@@ -600,6 +603,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     RegisterHandler("participant_source_subscribe",   feeds_engine::HandleParticipantSourceSubscribe);
     RegisterHandler("participant_source_recreate",    feeds_engine::HandleParticipantSourceRecreate);
     RegisterHandler("participant_source_unsubscribe", feeds_engine::HandleParticipantSourceUnsubscribe);
+    RegisterHandler("iso_participant_start",          feeds_engine::HandleIsoParticipantStart);
+    RegisterHandler("iso_participant_repoint",        feeds_engine::HandleIsoParticipantRepoint);
+    RegisterHandler("iso_participant_stop",           feeds_engine::HandleIsoParticipantStop);
     RegisterHandler("shutdown",                       HandleShutdown);
 
     // Announce we're ready. Include our PID so the plugin can construct

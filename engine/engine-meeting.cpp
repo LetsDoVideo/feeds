@@ -269,6 +269,13 @@ static void SendParticipantList() {
             const zchar_t* avatarRaw = info->GetAvatarPath();
             std::string avatarPath = avatarRaw ? WideToUtf8(avatarRaw) : "";
 
+            // Zoom's persistent id for this person. Unlike the runtime user id
+            // it is meant to survive a leave/rejoin, so the plugin's ISO
+            // registry keys identity on it (one person = one file). May be
+            // empty; the plugin then falls back to an exact name match.
+            const zchar_t* persistentRaw = info->GetPersistentId();
+            std::string persistentId = persistentRaw ? WideToUtf8(persistentRaw) : "";
+
             if (!first) msg << ",";
             // Seed current mute state so a dock row shows the right mute mark
             // immediately (not blank until the next toggle). onUserAudioStatusChange
@@ -276,6 +283,7 @@ static void SendParticipantList() {
             msg << "{\"id\":" << uid
                 << ",\"name\":\"" << JsonEscape(name) << "\""
                 << ",\"avatar_path\":\"" << JsonEscape(avatarPath) << "\""
+                << ",\"persistent_id\":\"" << JsonEscape(persistentId) << "\""
                 << ",\"muted\":" << (info->IsAudioMuted() ? 1 : 0) << "}";
             first = false;
         }

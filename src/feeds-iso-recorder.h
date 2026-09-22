@@ -5,14 +5,15 @@
 
 #include <obs.h>
 
-// Per-source ISO recording for Feeds participant sources.
+// ISO recording of one OBS source to its own file alongside OBS's main
+// recording.
 //
-// When the user ticks "Enable ISO recording" in a participant source's
-// properties and starts OBS's main recording, that source records to its own
-// MP4 alongside the main recording, frame-aligned with every other enabled
-// ISO recording. It stops when OBS recording stops and pauses when OBS
-// recording pauses. No filter appears in the UI — the recording machinery
-// lives directly inside the participant source via this module.
+// Feeds records one ISO file per PERSON: the ISO registry in plugin-main.cpp
+// creates one recorder per enrolled participant, parented to a hidden private
+// source that carries only that participant's clean feed. A recorder starts
+// when it is enabled while OBS is recording (or when OBS recording starts),
+// stops when OBS recording stops or it is disabled/destroyed, and pauses when
+// OBS recording pauses. No filter appears in the UI.
 //
 // Each file carries that participant's ISOLATED audio (their own voice only,
 // fed by feeds_iso_recorder_push_audio), never the OBS program mix, so
@@ -21,9 +22,9 @@
 //
 // Architecture adopts Exeldro's Source Record patterns (obs_view +
 // audio_output + obs_output) used directly inside the source rather than as
-// an OBS filter, with the six known Source Record bugs fixed. Everything
-// except the enable checkbox is inherited from OBS's main recording config:
-// folder, format, video encoder + settings. See
+// an OBS filter, with the six known Source Record bugs fixed. The folder,
+// format, and video encoder + settings are inherited from OBS's main
+// recording config. See
 // C:\Dev\iso-recording-investigation.md for the full rationale.
 //
 // Threading: the public functions below are called from the OBS UI/graphics
@@ -45,27 +46,41 @@ namespace feeds {
 
 struct feeds_iso_recorder;
 
-// Resolves the human-readable name used in the ISO filename. Called exactly
-// once, at record start (so mid-recording renames don't rewrite the file).
-// Returns the chosen name; the recorder applies a final "Feeds ISO" fallback
-// when this is empty, plus filename sanitisation. May be null, in which case
-// the recorder uses obs_source_get_name(parent) only. Must not block, retry,
-// or throw — it runs inline at start time.
+// Resolves the ISO file's base name (everything but the extension). Called
+// exactly once per file, when that file starts (so later renames don't rewrite
+// it). The recorder uses it as-is apart from filename sanitisation, falls back
+// to "Feeds ISO" when it is empty, and adds " (2)", " (3)"... rather than
+// overwrite an existing file. May be null, in which case the recorder uses
+// obs_source_get_name(parent). Runs on the graphics thread with the recorder's
+// lock held: must not block, call back into the recorder, or throw.
 using feeds_iso_name_fn = std::string (*)(void *userdata);
 
+// Told the full path of each file right after it starts recording. Same
+// thread and restrictions as the name hook. May be null.
+using feeds_iso_started_fn = void (*)(void *userdata, const std::string &path);
+
 // ---------------------------------------------------------------------------
-// Lifecycle — called from the participant source create/destroy callbacks.
+// Lifecycle
 // ---------------------------------------------------------------------------
-// parent_source is borrowed (owned by the participant source); the recorder
-// never releases it. name_fn/userdata supply the filename (see above).
-feeds_iso_recorder *feeds_iso_recorder_create(obs_source_t *parent_source, feeds_iso_name_fn name_fn, void *userdata);
+// parent_source is borrowed; the recorder never releases it, but its render
+// view holds a reference to it while recording, so destroy the recorder BEFORE
+// releasing a parent you own. name_fn / started_fn / userdata: see above.
+feeds_iso_recorder *feeds_iso_recorder_create(obs_source_t *parent_source, feeds_iso_name_fn name_fn,
+					      feeds_iso_started_fn started_fn, void *userdata);
+
+// Record at a fixed width x height instead of following the parent's size.
+// The parent is drawn at its own size in the frame (black where it doesn't
+// cover, including while it has no picture at all), and a parent size change
+// never restarts the file. Call before recording starts. 0 x 0 restores
+// follow-the-parent.
+void feeds_iso_recorder_set_fixed_size(feeds_iso_recorder *rec, uint32_t width, uint32_t height);
 
 // Gracefully stops any active recording (drain-aware, bounded timeout) and
 // frees the recorder. Safe to call with null.
 void feeds_iso_recorder_destroy(feeds_iso_recorder *rec);
 
 // ---------------------------------------------------------------------------
-// Enable/disable from the checkbox in participant source properties.
+// Enable/disable.
 // ---------------------------------------------------------------------------
 // Honors the tier gate internally (records only when enabled && tier >= 1).
 // On a false->true transition it resets the stuck-state guard and, if OBS is

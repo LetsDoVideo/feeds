@@ -1537,6 +1537,71 @@ FollowRetargetResult RetargetFollowSources() {
 // participant_source_unsubscribe — plugin no longer needs frames for this
 // source. Tears down the renderer and closes the shared memory region.
 //   {"type":"participant_source_unsubscribe","source_id":"<uuid>"}
+// ---------------------------------------------------------------------------
+// ISO recording subscriptions — one per participant the plugin is recording
+// (the ISO registry in plugin-main.cpp), keyed by the plugin's iso_id rather
+// than an OBS source uuid. They are ordinary ParticipantSubscriptions: same
+// frame + isolated-audio regions (named by iso_id), same readiness gate, same
+// same-userId sequencing, ladder, blank sentinel and camera-on re-establish.
+// The differences are policy, enforced here: never follow-speaker, and they
+// live independently of which sources show the person.
+//
+//   iso_participant_start   {iso_id, participant_id}  begin recording feed
+//   iso_participant_repoint {iso_id, participant_id}  rejoin: FRESH renderer
+//                                                     for the new user id
+//   iso_participant_stop    {iso_id}                  end it
+//
+// Start and repoint both queue a fresh renderer through the gate (the proven
+// rejoin-recovery path: a kept renderer loses delivery on a drop/rejoin).
+// ---------------------------------------------------------------------------
+static void QueueIsoParticipant(const std::string& json, const char* what) {
+    std::string isoId  = JsonExtractString(json, "iso_id");
+    uint32_t    userId = JsonExtractUint(json, "participant_id");
+    if (isoId.empty() || userId <= ACTIVE_SPEAKER_SENTINEL) {
+        char msg[160];
+        sprintf_s(msg, "Video: ISO %s with missing iso_id or a non-person id (%u)",
+                  what, userId);
+        LogWarn(msg);
+        return;
+    }
+    char msg[256];
+    sprintf_s(msg, "Video: ISO %s iso='%s' userId=%u", what, isoId.c_str(), userId);
+    LogInfo(msg);
+
+    std::lock_guard<std::mutex> lock(g_subsMutex);
+    EnqueuePendingRenderLocked(isoId, userId, false, GetTopRungForCurrentTier());
+}
+
+void HandleIsoParticipantStart(const std::string& json)   { QueueIsoParticipant(json, "start"); }
+void HandleIsoParticipantRepoint(const std::string& json) { QueueIsoParticipant(json, "repoint"); }
+
+void HandleIsoParticipantStop(const std::string& json) {
+    std::string isoId = JsonExtractString(json, "iso_id");
+    if (isoId.empty()) return;
+
+    std::lock_guard<std::mutex> lock(g_subsMutex);
+    // Drop a still-queued create too, so a stop that beats the gate can't be
+    // followed by a renderer nobody reads.
+    for (size_t i = 0; i < g_pendingRenders.size();) {
+        if (g_pendingRenders[i].sourceId == isoId)
+            g_pendingRenders.erase(g_pendingRenders.begin() + i);
+        else
+            ++i;
+    }
+    auto it = g_subs.find(isoId);
+    if (it == g_subs.end()) return;
+    g_subs.erase(it);
+
+    char msg[256];
+    sprintf_s(msg, "Video: ISO stop iso='%s'", isoId.c_str());
+    LogInfo(msg);
+    char resp[256];
+    sprintf_s(resp,
+        "{\"type\":\"source_texture_released\",\"source_id\":\"%s\"}",
+        isoId.c_str());
+    SendToPlugin(resp);
+}
+
 void HandleParticipantSourceUnsubscribe(const std::string& json) {
     std::string sourceId = JsonExtractString(json, "source_id");
     if (sourceId.empty()) return;

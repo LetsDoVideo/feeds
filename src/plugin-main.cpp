@@ -28,6 +28,8 @@
 #include <atomic>
 #include <thread>
 #include <chrono>
+#include <memory>
+#include <condition_variable>
 #include <cstring>
 #include <cctype>
 #include <cstdio>
@@ -78,6 +80,9 @@
 #include <QScreen>
 #include <QSvgRenderer>
 #include <QFile>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QByteArray>
 #include <QCursor>
 #include <QPointer>
@@ -298,6 +303,10 @@ struct CachedParticipant {
     // chat message, so a nameplate for someone who hadn't chatted fell back
     // to the bundled logo.
     std::string  avatar_path;
+    // Zoom's persistent id (stable across leave/rejoin, unlike `id`). Empty
+    // from an older engine or when the SDK has none. The ISO registry keys
+    // "same person" on it.
+    std::string  persistent_id;
 };
 static std::vector<CachedParticipant> g_cachedParticipants;
 static std::mutex                     g_participantsMutex;
@@ -493,15 +502,21 @@ struct ZpSourceData {
     // always re-subscribes every bound source fresh regardless of leave-side
     // teardown ordering.
     unsigned int  subscribed_user_id = 0;
-    // Per-source ISO recorder (feeds-iso-recorder). Created in zp_create,
-    // torn down in zp_destroy. Records this source to its own MP4 alongside
-    // OBS's main recording when the properties checkbox is enabled.
+    // ISO recorder fed by this data's pump (isolated audio) and ticked by its
+    // source. Set ONLY on the hidden per-person ISO sources ("ISO recording by
+    // PARTICIPANT"); always null on user-facing participant sources, whose
+    // pump then drops the audio it drains.
     feeds::feeds_iso_recorder* iso = nullptr;
-    // Guards the pump thread's use of `iso` (isolated-audio pushes) against
-    // zp_destroy, which destroys the recorder while the pump thread may still
-    // be running (the pump stops later, in CloseSharedMemory). zp_destroy
-    // detaches `iso` under this lock before destroying it.
+    // Guards every use of `iso` (the pump thread's isolated-audio pushes, the
+    // graphics thread's recorder tick) against the teardown that destroys the
+    // recorder while those threads may still be running. Teardown detaches
+    // `iso` under this lock before destroying it.
     std::mutex        isoMutex;
+    // Optional, set before the pump starts and never changed while it runs:
+    // told when this source's picture goes live (first real frame) or dark
+    // (the engine's video-off sentinel). Called on the pump thread. Used by
+    // the ISO registry for the manifest's video-off spans.
+    std::function<void(bool live)> onVideoLive;
     // In-memory only; recomputed on every login_succeeded by
     // ReconcileSourcesToTier. Not persisted in scene-collection data
     // because the same scene can be tier-legal for one Feeds user and
@@ -770,6 +785,11 @@ static void RefreshAllSourceProperties() {
     PostParticipantDockRefresh();
 }
 
+// ISO registry entry points used above their definitions (see "ISO recording
+// by PARTICIPANT" further down).
+static void IsoNoteAssignment(unsigned int userId);
+static void IsoApplyEnabledState();
+
 // (Re)subscribe a participant source to its currently-bound participant, if it
 // is bound (current_user_id >= 1, which covers both a pinned participant and
 // the [Active Speaker] sentinel 1), we are in a meeting with raw-livestream
@@ -840,6 +860,9 @@ static bool SubscribeBoundSourceLocked(ZpSourceData* s) {
                       std::to_string(s->current_user_id) + "}";
     feeds::SendToEngine(msg);
     s->subscribed_user_id = s->current_user_id;
+    // A direct assignment enrolls that person for ISO (never the [Active
+    // Speaker] sentinel; IsoNoteAssignment ignores it).
+    IsoNoteAssignment(s->current_user_id);
     return true;
 }
 
@@ -1157,6 +1180,9 @@ static void PumpThreadFunc(ZpSourceData* data) {
     blog(LOG_INFO, "[feeds] pump thread started for source=%s",
          data->uuid.c_str());
 
+    // Picture state for onVideoLive: dark until the first real frame.
+    bool videoLive = false;
+
     while (!data->pumpShouldExit) {
         WaitForSingleObject(data->pumpWakeEvent, 8);
 
@@ -1188,6 +1214,10 @@ static void PumpThreadFunc(ZpSourceData* data) {
         if (width == 0 || height == 0) {
             obs_source_output_video(data->source, nullptr);
             data->lastReadIndex = currentWrite;
+            if (videoLive) {
+                videoLive = false;
+                if (data->onVideoLive) data->onVideoLive(false);
+            }
             continue;
         }
 
@@ -1229,6 +1259,10 @@ static void PumpThreadFunc(ZpSourceData* data) {
         // camera-off sentinel or a stall leaves it stale). Lock-free; the dock
         // poll reads it to drive the live indicator.
         data->lastRealFrameTick.store(os_gettime_ns(), std::memory_order_relaxed);
+        if (!videoLive) {
+            videoLive = true;
+            if (data->onVideoLive) data->onVideoLive(true);
+        }
 
         data->header->last_read_index = currentWrite;
         data->lastReadIndex = currentWrite;
@@ -5410,18 +5444,6 @@ static void SetupParticipantDock() {
     blog(LOG_INFO, "[feeds] participant dock registered");
 }
 
-// Push the global ISO-recording state to every active participant source's
-// recorder. The recorder itself also gates internally on tier >= 1, but
-// gating here keeps the menu state and observable behavior consistent.
-// MUST NOT be called while holding g_sourcesMutex (it acquires it here).
-static void ApplyIsoRecordingStateToAllSources() {
-    bool enabled = g_isoRecordingEnabled && g_currentTier >= 1;
-    std::lock_guard<std::mutex> lock(g_sourcesMutex);
-    for (ZpSourceData* s : g_allParticipantSources) {
-        if (s && s->iso)
-            feeds::feeds_iso_recorder_set_enabled(s->iso, enabled);
-    }
-}
 
 // Sync the menu item's enabled state and label to the current tier. Free /
 // logged-out shows greyed with the "paid feature" wording (matches the
@@ -7431,7 +7453,7 @@ void SetupPluginMenu() {
     QObject::connect(g_connectAction, &QAction::triggered, []() { OnConnectClick(); });
     QObject::connect(g_isoRecordingAction, &QAction::toggled, [](bool checked) {
         g_isoRecordingEnabled = checked;
-        ApplyIsoRecordingStateToAllSources();
+        IsoApplyEnabledState();
     });
     QObject::connect(aboutAction, &QAction::triggered, []() {
         ShowAboutDialog();
@@ -7504,32 +7526,6 @@ void ShowTierLimitDialog(const QString& title, const QString& html) {
 
             dlg->show();
         });
-}
-
-// Name hook for the ISO recorder — resolves the filename's "<participant
-// name>" once, at record start. Called from the recorder (graphics thread).
-// Fallback chain: selected participant's Zoom name -> OBS source name (the
-// recorder applies the final "Feeds ISO" guard if even that is empty). Never
-// blocks beyond a brief mutex, never throws.
-static std::string ResolveParticipantName(void* userdata) {
-    ZpSourceData* d = static_cast<ZpSourceData*>(userdata);
-    if (!d) return "";
-
-    // current_user_id 0 = no selection, 1 = [Active Speaker] sentinel — both
-    // lack a stable participant name, so fall through to the source name.
-    if (d->current_user_id > 1) {
-        std::lock_guard<std::mutex> lock(g_participantsMutex);
-        for (const auto& p : g_cachedParticipants) {
-            if (p.id == d->current_user_id) {
-                if (!p.name.empty() && p.name != "Unknown")
-                    return p.name;
-                break;
-            }
-        }
-    }
-
-    const char* sn = obs_source_get_name(d->source);
-    return sn ? std::string(sn) : std::string();
 }
 
 static void* zp_create(obs_data_t* settings, obs_source_t* source) {
@@ -7611,14 +7607,9 @@ static void* zp_create(obs_data_t* settings, obs_source_t* source) {
     // to the UI thread; the new source shows as unassigned until it's bound.
     PostParticipantDockRefresh();
 
-    // Per-source ISO recorder. The name hook reads this source's selected
-    // participant; the tier seed gates recording until the user is Basic+.
-    // Seed the enabled state from the global toggle so a source created
-    // while the menu toggle is already on starts in the right state.
-    data->iso = feeds::feeds_iso_recorder_create(source, ResolveParticipantName, data);
-    feeds::feeds_iso_recorder_set_tier(data->iso, g_currentTier);
-    feeds::feeds_iso_recorder_set_enabled(
-        data->iso, g_isoRecordingEnabled && g_currentTier >= 1);
+    // No ISO recorder here: ISO recording follows participants, not sources
+    // (see "ISO recording by PARTICIPANT"). Assigning this source to someone
+    // enrolls them there.
 
     return data;
   } catch (const std::exception& e) {
@@ -7662,17 +7653,8 @@ static void zp_destroy(void* vdata) {
         // OBS's destruction worker thread, so marshalling is mandatory here.
         PostParticipantDockRefresh();
 
-        // Tear down the ISO recorder while the source is still valid (it
-        // borrows the source pointer). Synchronous, drain-aware, bounded.
-        // Detached under isoMutex first: the pump thread (stopped only below,
-        // in CloseSharedMemory) may be mid-push of isolated audio into it.
-        feeds::feeds_iso_recorder* iso = nullptr;
-        {
-            std::lock_guard<std::mutex> isoLock(data->isoMutex);
-            iso = data->iso;
-            data->iso = nullptr;
-        }
-        feeds::feeds_iso_recorder_destroy(iso);
+        // (No ISO recorder to tear down: participant sources don't own one.
+        // Removing a source never ends anyone's ISO file.)
 
         // clearTexture=false: source is being destroyed, don't touch it.
         // CloseSharedMemory takes data->lifecycleMutex internally, so any
@@ -7695,10 +7677,9 @@ static void zp_update(void* vdata, obs_data_t* settings) {
     // terminates OBS. Swallow + log so the user sees a log message
     // instead of a crash.
     try {
-        // ISO recording enable state is driven by the global Feeds menu
-        // toggle, not per-source settings — applied via
-        // ApplyIsoRecordingStateToAllSources() when the toggle or tier
-        // changes, and seeded in zp_create for newly created sources.
+        // ISO recording follows participants, not sources: it is driven by
+        // the global Feeds menu toggle and the ISO registry
+        // (IsoApplyEnabledState), never by per-source settings.
 
         // Defensive: zp_properties replaces the dropdown with an upgrade
         // message for tier-disabled sources, so a normal user flow can't
@@ -7767,6 +7748,9 @@ static void zp_update(void* vdata, obs_data_t* settings) {
             // Record what we subscribed so the reconcile / privilege-granted
             // paths don't redundantly re-subscribe this same id.
             data->subscribed_user_id = selected_id;
+            // A manual pick of a specific person enrolls them for ISO
+            // ([Active Speaker], id 1, is ignored by IsoNoteAssignment).
+            IsoNoteAssignment(selected_id);
         }
     } catch (const std::exception& e) {
         blog(LOG_ERROR, "[feeds] zp_update exception: %s", e.what());
@@ -7775,18 +7759,680 @@ static void zp_update(void* vdata, obs_data_t* settings) {
     }
 }
 
-// Drives the ISO recorder's per-frame state machine (lazy view creation,
-// start/stop, pause). Exception-guarded like the other libobs C callbacks.
-static void zp_video_tick(void* vdata, float seconds) {
-    if (!vdata) return;
-    ZpSourceData* data = static_cast<ZpSourceData*>(vdata);
-    try {
-        feeds::feeds_iso_recorder_tick(data->iso, seconds);
-    } catch (const std::exception& e) {
-        blog(LOG_ERROR, "[feeds] zp_video_tick exception: %s", e.what());
-    } catch (...) {
-        blog(LOG_ERROR, "[feeds] zp_video_tick unknown exception");
+// ===========================================================================
+// ISO recording by PARTICIPANT
+//
+// One ISO file per PERSON, not per source. A participant is enrolled the first
+// time, during an OBS recording, that any Feeds source is directly assigned to
+// them ([Active Speaker] never enrolls anyone), and stays recorded until OBS
+// recording stops or the meeting ends, whether or not a source still shows
+// them. At most kIsoMaxPeople per meeting; enrollment never stops an existing
+// ISO.
+//
+// Each enrolled person gets:
+//   - an engine RECORDING subscription keyed by an iso_id (engine-video.cpp,
+//     iso_participant_start/_repoint/_stop): their clean feed + isolated
+//     audio, independent of any source;
+//   - a hidden private OBS source of type "feeds_iso_participant" that reads
+//     that subscription's frame and audio regions with the SAME ZpSourceData
+//     pump/shm code the participant sources use;
+//   - a feeds_iso_recorder parented to that private source (clean feed, no
+//     source filters), at the fixed tier-ceiling size.
+//
+// Identity: Zoom's persistent id, else (only when a person has none) an exact,
+// unambiguous display-name match. A leave/rejoin (new runtime user id) re-points
+// the SAME recording through the engine's fresh-renderer path, so one person
+// is one file.
+//
+// Files have no leading padding (OBS's muxer starts every file at its first
+// packet): each is named "<recording stamp> ISO <Name> +HH-MM-SS" with its
+// offset from the main recording's start, and a manifest written at stop maps
+// every file to its offset, names, absences and video-off spans.
+//
+// Threads: all registry decisions run on the UI thread. g_isoMutex guards the
+// person records, which the recorder hooks (graphics thread) and the pump's
+// video callback also touch; recorder and OBS calls are never made while
+// holding it. g_isoDataMutex guards only the iso_id -> ZpSourceData lookup the
+// IPC thread uses for shared memory open/close (the pump never takes it).
+// ===========================================================================
+
+static constexpr size_t kIsoMaxPeople = 15;
+// ISO frame size = the engine's frame-scaler target for tier >= 1 (engine-
+// video.cpp GetScalerTargetForCurrentTier); ISO requires tier >= 1.
+static constexpr uint32_t kIsoWidth  = 1920;
+static constexpr uint32_t kIsoHeight = 1080;
+static const char* const kIsoSourceTypeId = "feeds_iso_participant";
+
+struct IsoSpan {
+    uint64_t start_ns;
+    uint64_t end_ns;   // 0 = still open
+};
+struct IsoFile {
+    std::string path;
+    uint64_t    start_ns;
+    uint64_t    end_ns;   // 0 = still recording
+};
+struct IsoPerson {
+    std::string label;            // filename name (disambiguated), fixed at enrollment
+    std::string persistent_id;    // Zoom persistent id, may be empty
+    unsigned int user_id = 0;     // current Zoom runtime id
+    std::vector<unsigned int> user_ids;                        // every runtime id seen
+    std::vector<std::pair<uint64_t, std::string>> names;       // (ns, name), first = at enrollment
+    std::vector<IsoSpan> absent;     // left the meeting
+    std::vector<IsoSpan> video_off;  // no picture
+    std::vector<IsoFile> files;
+    bool present = true;
+    bool video_live = false;
+
+    // Live recording pipeline (UI thread only). Null when not recording.
+    obs_source_t*              src  = nullptr;   // owned ref to the private source
+    ZpSourceData*              data = nullptr;   // src's data, valid while src lives
+    feeds::feeds_iso_recorder* rec  = nullptr;
+    std::string                iso_id;           // == data->uuid
+    bool                       engine_started = false;
+};
+
+static std::mutex                               g_isoMutex;
+static std::vector<std::shared_ptr<IsoPerson>>  g_isoPeople;    // this meeting (UI thread)
+static std::vector<std::shared_ptr<IsoPerson>>  g_isoFinished;  // earlier meetings, this recording
+static std::vector<std::string>                 g_isoOverCap;   // names refused at the cap
+static bool        g_isoSessionActive  = false;   // between RECORDING_STARTED and _STOPPED
+static bool        g_isoCapNotified    = false;   // one notice per meeting
+static uint64_t    g_isoMainStartNs    = 0;       // main recording start (os_gettime_ns)
+static std::string g_isoMainStamp;                // "yyyy-MM-dd HH-mm-ss" at main start
+static std::vector<IsoSpan> g_isoPauses;          // main-recording pauses (g_isoMutex)
+
+static std::mutex                            g_isoDataMutex;
+static std::map<std::string, ZpSourceData*>  g_isoDataById;   // iso_id -> live ZpSourceData
+
+// Teardowns run on worker threads (a recorder's bounded drain must not block
+// the UI thread); shutdown waits for them.
+static std::mutex              g_isoTeardownMutex;
+static std::condition_variable g_isoTeardownCv;
+static int                     g_isoTeardownsInFlight = 0;
+
+static bool IsoEnabled() { return g_isoRecordingEnabled && g_currentTier >= 1; }
+
+// Where instant `ns` falls on the MAIN recording's timeline: time since it
+// started, minus time it spent paused (a paused OBS recording drops that time
+// from its file). Caller holds g_isoMutex.
+static uint64_t IsoMainOffsetNs(uint64_t ns) {
+    if (!g_isoMainStartNs || ns <= g_isoMainStartNs) return 0;
+    uint64_t paused = 0;
+    for (const auto& pz : g_isoPauses) {
+        const uint64_t a = pz.start_ns;
+        const uint64_t b = std::min(pz.end_ns ? pz.end_ns : ns, ns);
+        if (b > a) paused += b - a;
     }
+    const uint64_t elapsed = ns - g_isoMainStartNs;
+    return elapsed > paused ? elapsed - paused : 0;
+}
+
+static std::string IsoFormatOffset(uint64_t ns) {
+    const uint64_t s = ns / 1000000000ULL;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%02llu-%02llu-%02llu",
+             (unsigned long long)(s / 3600), (unsigned long long)((s / 60) % 60),
+             (unsigned long long)(s % 60));
+    return buf;
+}
+
+// --- Hidden ISO source ------------------------------------------------------
+// A private async-video source that is never in a scene or the source list.
+// It reuses ZpSourceData wholesale: OpenSharedMemory/CloseSharedMemory/the
+// pump (frames + isolated audio into data->iso) are the participant source's
+// own code, keyed by data->uuid = the iso_id.
+
+static void* iso_src_create(obs_data_t*, obs_source_t* source) {
+    auto* data = new ZpSourceData();
+    data->source = source;
+    const char* u = obs_source_get_uuid(source);
+    data->uuid = std::string("iso-") + (u ? u : "");
+    obs_source_set_async_unbuffered(source, true);
+    return data;
+}
+
+static void iso_src_destroy(void* vdata) {
+    auto* data = static_cast<ZpSourceData*>(vdata);
+    if (!data) return;
+    try {
+        // Normally already detached and destroyed by the registry (it must
+        // be: the recorder's view holds a ref to this source).
+        feeds::feeds_iso_recorder* iso = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(data->isoMutex);
+            iso = data->iso;
+            data->iso = nullptr;
+        }
+        feeds::feeds_iso_recorder_destroy(iso);
+        CloseSharedMemory(data, false);
+    } catch (...) {
+        blog(LOG_ERROR, "[feeds-iso] iso_src_destroy exception");
+    }
+    delete data;
+}
+
+static void iso_src_video_tick(void* vdata, float seconds) {
+    auto* data = static_cast<ZpSourceData*>(vdata);
+    if (!data) return;
+    try {
+        std::lock_guard<std::mutex> lk(data->isoMutex);
+        feeds::feeds_iso_recorder_tick(data->iso, seconds);
+    } catch (...) {
+        blog(LOG_ERROR, "[feeds-iso] iso_src_video_tick exception");
+    }
+}
+
+// --- Engine messages ----------------------------------------------------------
+// Windows: the engine's ISO messages. macOS: its engine has no ISO handlers
+// yet, but treats the iso_id like any source id, so the generic recreate /
+// unsubscribe messages give the same fresh-renderer behavior.
+static void IsoSendEngineStart(const IsoPerson& p, bool repoint) {
+#ifdef _WIN32
+    feeds::SendToEngine(std::string("{\"type\":\"") +
+        (repoint ? "iso_participant_repoint" : "iso_participant_start") +
+        "\",\"iso_id\":\"" + p.iso_id + "\",\"participant_id\":" +
+        std::to_string(p.user_id) + "}");
+#else
+    (void)repoint;
+    feeds::SendToEngine("{\"type\":\"participant_source_recreate\",\"source_id\":\"" +
+        p.iso_id + "\",\"participant_id\":" + std::to_string(p.user_id) + "}");
+#endif
+}
+
+static void IsoSendEngineStop(const std::string& isoId) {
+#ifdef _WIN32
+    feeds::SendToEngine("{\"type\":\"iso_participant_stop\",\"iso_id\":\"" + isoId + "\"}");
+#else
+    feeds::SendToEngine("{\"type\":\"participant_source_unsubscribe\",\"source_id\":\"" +
+                        isoId + "\"}");
+#endif
+}
+
+// --- Recorder hooks (graphics thread, recorder lock held) -------------------
+static std::string IsoNameFn(void* ud) {
+    auto* p = static_cast<IsoPerson*>(ud);
+    std::lock_guard<std::mutex> lk(g_isoMutex);
+    const uint64_t off = IsoMainOffsetNs(os_gettime_ns());
+    std::string name = g_isoMainStamp + " ISO " + p->label + " +" + IsoFormatOffset(off);
+    if (!p->files.empty())
+        name += " part " + std::to_string(p->files.size() + 1);
+    return name;
+}
+
+static void IsoStartedFn(void* ud, const std::string& path) {
+    auto* p = static_cast<IsoPerson*>(ud);
+    std::lock_guard<std::mutex> lk(g_isoMutex);
+    const uint64_t now = os_gettime_ns();
+    p->files.push_back({path, now, 0});
+    // A file that starts without a picture starts inside a video-off span.
+    const bool spanOpen = !p->video_off.empty() && p->video_off.back().end_ns == 0;
+    if (!p->video_live && !spanOpen)
+        p->video_off.push_back({now, 0});
+}
+
+// Pump thread (onVideoLive). Idempotent in both directions.
+static void IsoNoteVideo(IsoPerson* p, bool live) {
+    std::lock_guard<std::mutex> lk(g_isoMutex);
+    const uint64_t now = os_gettime_ns();
+    const bool spanOpen = !p->video_off.empty() && p->video_off.back().end_ns == 0;
+    if (live && spanOpen)
+        p->video_off.back().end_ns = now;
+    else if (!live && !spanOpen)
+        p->video_off.push_back({now, 0});
+    p->video_live = live;
+}
+
+// --- Pipeline start/stop (UI thread) ----------------------------------------
+static void IsoActivate(const std::shared_ptr<IsoPerson>& p) {
+    if (p->rec) return;
+
+    obs_source_t* src = obs_source_create_private(
+        kIsoSourceTypeId, ("Feeds ISO " + p->label).c_str(), nullptr);
+    auto* data = src ? static_cast<ZpSourceData*>(obs_obj_get_data(src)) : nullptr;
+    if (!data) {
+        blog(LOG_ERROR, "[feeds-iso] could not create the ISO source for '%s'",
+             p->label.c_str());
+        obs_source_release(src);
+        return;
+    }
+
+    std::weak_ptr<IsoPerson> weak = p;
+    data->onVideoLive = [weak](bool live) {
+        if (auto sp = weak.lock()) IsoNoteVideo(sp.get(), live);
+    };
+
+    feeds::feeds_iso_recorder* rec =
+        feeds::feeds_iso_recorder_create(src, IsoNameFn, IsoStartedFn, p.get());
+    feeds::feeds_iso_recorder_set_fixed_size(rec, kIsoWidth, kIsoHeight);
+    feeds::feeds_iso_recorder_set_tier(rec, g_currentTier);
+    {
+        std::lock_guard<std::mutex> lk(data->isoMutex);
+        data->iso = rec;
+    }
+
+    p->src  = src;
+    p->data = data;
+    p->rec  = rec;
+    p->iso_id = data->uuid;
+    {
+        std::lock_guard<std::mutex> lk(g_isoDataMutex);
+        g_isoDataById[p->iso_id] = data;
+    }
+
+    feeds::feeds_iso_recorder_set_enabled(rec, true);   // starts: OBS is recording
+    if (obs_frontend_recording_paused())
+        feeds::feeds_iso_recorder_on_obs_recording_paused(rec);
+
+    IsoSendEngineStart(*p, false);
+    p->engine_started = true;
+    blog(LOG_INFO, "[feeds-iso] recording participant '%s' (userId=%u iso=%s)",
+         p->label.c_str(), p->user_id, p->iso_id.c_str());
+}
+
+// Ends this person's current file. The recorder drain + source release run on
+// a worker thread so a slow drain never blocks the UI.
+static void IsoDeactivate(const std::shared_ptr<IsoPerson>& p, const char* reason) {
+    if (!p->rec) return;
+
+    feeds::feeds_iso_recorder* rec = p->rec;
+    obs_source_t*              src = p->src;
+    ZpSourceData*              data = p->data;
+    const std::string          isoId = p->iso_id;
+    p->rec  = nullptr;
+    p->src  = nullptr;
+    p->data = nullptr;
+    p->engine_started = false;
+
+    {
+        std::lock_guard<std::mutex> lk(g_isoDataMutex);
+        g_isoDataById.erase(isoId);
+    }
+    IsoSendEngineStop(isoId);
+    {
+        std::lock_guard<std::mutex> lk(g_isoMutex);
+        const uint64_t now = os_gettime_ns();
+        if (!p->files.empty() && p->files.back().end_ns == 0) p->files.back().end_ns = now;
+        if (!p->video_off.empty() && p->video_off.back().end_ns == 0) p->video_off.back().end_ns = now;
+        if (!p->absent.empty() && p->absent.back().end_ns == 0) p->absent.back().end_ns = now;
+    }
+    blog(LOG_INFO, "[feeds-iso] stopping ISO for '%s' (%s)", p->label.c_str(), reason);
+
+    {
+        std::lock_guard<std::mutex> lk(g_isoTeardownMutex);
+        g_isoTeardownsInFlight++;
+    }
+    std::shared_ptr<IsoPerson> keep = p;   // the recorder's hooks point at *p
+    std::thread([keep, rec, src, data]() {
+        (void)keep;   // held only to keep *p alive until the recorder is gone
+        // Detach first so the pump and tick stop using the recorder, then
+        // drain + free it, THEN drop our source ref (the recorder's view held
+        // one until now). The source's destroy closes the shared memory.
+        {
+            std::lock_guard<std::mutex> lk(data->isoMutex);
+            data->iso = nullptr;
+        }
+        feeds::feeds_iso_recorder_destroy(rec);
+        obs_source_release(src);
+        {
+            std::lock_guard<std::mutex> lk(g_isoTeardownMutex);
+            g_isoTeardownsInFlight--;
+        }
+        g_isoTeardownCv.notify_all();
+    }).detach();
+}
+
+// --- Roster helpers (UI thread) ---------------------------------------------
+static std::vector<CachedParticipant> IsoRosterSnapshot() {
+    std::lock_guard<std::mutex> lock(g_participantsMutex);
+    return g_cachedParticipants;
+}
+
+static std::string IsoLastName(const IsoPerson& p) {
+    return p.names.empty() ? p.label : p.names.back().second;
+}
+
+// A label no other person in this meeting already uses ("Name (2)" for two
+// different people with the same display name). Earlier meetings don't count:
+// the same person in a later meeting keeps their plain name, and the offset in
+// the filename already tells the files apart.
+static std::string IsoUniqueLabel(const std::string& name) {
+    auto taken = [](const std::string& l) {
+        for (const auto& q : g_isoPeople)
+            if (q->label == l) return true;
+        return false;
+    };
+    if (!taken(name)) return name;
+    for (int n = 2;; n++) {
+        std::string l = name + " (" + std::to_string(n) + ")";
+        if (!taken(l)) return l;
+    }
+}
+
+static std::shared_ptr<IsoPerson> IsoFindPerson(unsigned int userId, const std::string& pid) {
+    for (const auto& p : g_isoPeople) {
+        if (p->user_id == userId) return p;
+        if (!pid.empty() && p->persistent_id == pid) return p;
+    }
+    return nullptr;
+}
+
+static void IsoNotifyCap(const std::string& name) {
+    if (std::find(g_isoOverCap.begin(), g_isoOverCap.end(), name) != g_isoOverCap.end())
+        return;   // already reported (re-assigned)
+    blog(LOG_WARNING, "[feeds-iso] ISO limit reached (%zu people): '%s' is not being recorded",
+         kIsoMaxPeople, name.c_str());
+    g_isoOverCap.push_back(name);
+    if (g_isoCapNotified) return;
+    g_isoCapNotified = true;
+    QMessageBox* box = new QMessageBox(
+        QMessageBox::Information, QString::fromUtf8("Feeds - ISO Recording"),
+        QString::fromUtf8("ISO recording is limited to %1 people per meeting. %2 "
+                          "and anyone else newly assigned will not get an ISO "
+                          "file. Everyone already being recorded continues.")
+            .arg((int)kIsoMaxPeople).arg(QString::fromStdString(name)),
+        QMessageBox::Ok, static_cast<QWidget*>(obs_frontend_get_main_window()));
+    box->setAttribute(Qt::WA_DeleteOnClose);
+    box->setModal(false);
+    box->show();
+}
+
+// --- Enrollment (UI thread) --------------------------------------------------
+static void IsoEnroll(unsigned int userId) {
+    if (userId <= 1) return;   // 0 = none, 1 = [Active Speaker]: never enrolls
+    if (!g_isoSessionActive || !IsoEnabled() || !g_isInMeeting ||
+        !obs_frontend_recording_active())
+        return;
+
+    std::string name, pid;
+    for (const auto& c : IsoRosterSnapshot())
+        if (c.id == userId) { name = c.name; pid = c.persistent_id; break; }
+
+    if (auto existing = IsoFindPerson(userId, pid)) {
+        if (!existing->rec) IsoActivate(existing);   // e.g. ISO toggled back on
+        return;
+    }
+    if (g_isoPeople.size() >= kIsoMaxPeople) {
+        IsoNotifyCap(name.empty() ? "Participant " + std::to_string(userId) : name);
+        return;
+    }
+
+    auto p = std::make_shared<IsoPerson>();
+    if (name.empty() || name == "Unknown") name = "Participant " + std::to_string(userId);
+    {
+        std::lock_guard<std::mutex> lk(g_isoMutex);
+        p->label = IsoUniqueLabel(name);
+        p->persistent_id = pid;
+        p->user_id = userId;
+        p->user_ids.push_back(userId);
+        p->names.push_back({os_gettime_ns(), name});
+    }
+    g_isoPeople.push_back(p);
+    IsoActivate(p);
+}
+
+// Any thread: a source was just (re)subscribed to a specific participant.
+static void IsoNoteAssignment(unsigned int userId) {
+    if (userId <= 1) return;
+    QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
+                       [userId]() { IsoEnroll(userId); });
+}
+
+// Everyone currently directly assigned to a source (record start, re-enable).
+static void IsoEnrollCurrentlyAssigned() {
+    std::vector<unsigned int> ids;
+    {
+        std::lock_guard<std::mutex> lock(g_sourcesMutex);
+        for (ZpSourceData* s : g_allParticipantSources)
+            if (s && s->bound_this_session && s->subscribed_user_id > 1)
+                ids.push_back(s->subscribed_user_id);
+    }
+    for (unsigned int id : ids) IsoEnroll(id);
+}
+
+// --- Roster changes: presence, renames, rejoin (UI thread) -------------------
+static void IsoOnRosterChanged(const std::vector<unsigned int>& joinedIds) {
+    if (g_isoPeople.empty()) return;
+    const std::vector<CachedParticipant> roster = IsoRosterSnapshot();
+    const uint64_t now = os_gettime_ns();
+
+    auto claimed = [](unsigned int id, const IsoPerson* self) {
+        for (const auto& q : g_isoPeople)
+            if (q.get() != self && q->user_id == id) return true;
+        return false;
+    };
+
+    for (const auto& p : g_isoPeople) {
+        const CachedParticipant* match = nullptr;
+        bool sameId = false;
+        for (const auto& c : roster)
+            if (c.id == p->user_id) { match = &c; sameId = true; break; }
+        if (!match && !p->persistent_id.empty()) {
+            for (const auto& c : roster)
+                if (c.persistent_id == p->persistent_id && !claimed(c.id, p.get())) {
+                    match = &c;
+                    break;
+                }
+        }
+        if (!match && p->persistent_id.empty()) {
+            // Name fallback, only when unambiguous on both sides.
+            const std::string last = IsoLastName(*p);
+            int rosterHits = 0, peopleHits = 0;
+            const CachedParticipant* hit = nullptr;
+            for (const auto& c : roster)
+                if (c.name == last && !claimed(c.id, p.get())) { rosterHits++; hit = &c; }
+            for (const auto& q : g_isoPeople)
+                if (IsoLastName(*q) == last) peopleHits++;
+            if (rosterHits == 1 && peopleHits == 1) match = hit;
+        }
+
+        bool repoint = false;
+        {
+            std::lock_guard<std::mutex> lk(g_isoMutex);
+            if (!match) {
+                if (p->present) {
+                    p->present = false;
+                    p->absent.push_back({now, 0});
+                    blog(LOG_INFO, "[feeds-iso] '%s' left the meeting; ISO continues "
+                         "(black/silent) until they return", p->label.c_str());
+                }
+                continue;
+            }
+            const bool rejoinedSameId = sameId &&
+                std::find(joinedIds.begin(), joinedIds.end(), match->id) != joinedIds.end();
+            if (!p->present || !sameId || rejoinedSameId) {
+                if (!p->absent.empty() && p->absent.back().end_ns == 0)
+                    p->absent.back().end_ns = now;
+                p->present = true;
+                repoint = true;
+            }
+            if (match->id != p->user_id) {
+                p->user_id = match->id;
+                if (std::find(p->user_ids.begin(), p->user_ids.end(), match->id) == p->user_ids.end())
+                    p->user_ids.push_back(match->id);
+            }
+            if (p->persistent_id.empty() && !match->persistent_id.empty())
+                p->persistent_id = match->persistent_id;
+            if (!match->name.empty() && match->name != IsoLastName(*p))
+                p->names.push_back({now, match->name});
+        }
+        if (p->rec && (repoint || !p->engine_started)) {
+            blog(LOG_INFO, "[feeds-iso] '%s' is back (userId=%u); resuming the same ISO",
+                 p->label.c_str(), p->user_id);
+            IsoSendEngineStart(*p, p->engine_started);
+            p->engine_started = true;
+        }
+    }
+}
+
+// --- Manifest (UI thread, at recording stop) --------------------------------
+static double IsoMs(uint64_t ns) { return (double)(IsoMainOffsetNs(ns) / 1000000ULL); }
+
+static QJsonArray IsoSpansJson(const std::vector<IsoSpan>& spans, uint64_t from, uint64_t to) {
+    QJsonArray out;
+    for (const auto& s : spans) {
+        const uint64_t a = std::max(s.start_ns, from);
+        const uint64_t b = std::min(s.end_ns ? s.end_ns : to, to);
+        if (b <= a) continue;
+        QJsonArray pair;
+        pair.append(IsoMs(a));
+        pair.append(IsoMs(b));
+        out.append(pair);
+    }
+    return out;
+}
+
+static void IsoWriteManifest() {
+    std::vector<std::shared_ptr<IsoPerson>> all = g_isoFinished;
+    all.insert(all.end(), g_isoPeople.begin(), g_isoPeople.end());
+
+    std::lock_guard<std::mutex> lk(g_isoMutex);
+    std::string dir;
+    QJsonArray files;
+    const uint64_t now = os_gettime_ns();
+    for (const auto& p : all) {
+        for (const auto& f : p->files) {
+            if (dir.empty()) {
+                const size_t cut = f.path.find_last_of("/\\");
+                if (cut != std::string::npos) dir = f.path.substr(0, cut);
+            }
+            const uint64_t end = f.end_ns ? f.end_ns : now;
+            QJsonObject o;
+            o["person"] = QString::fromStdString(p->label);
+            const size_t cut = f.path.find_last_of("/\\");
+            o["file"] = QString::fromStdString(cut == std::string::npos ? f.path : f.path.substr(cut + 1));
+            o["path"] = QString::fromStdString(f.path);
+            o["start_offset_ms"] = IsoMs(f.start_ns);
+            o["end_offset_ms"]   = IsoMs(end);
+            o["persistent_id"] = QString::fromStdString(p->persistent_id);
+            QJsonArray ids;
+            for (unsigned int id : p->user_ids) ids.append((double)id);
+            o["zoom_user_ids"] = ids;
+            QJsonArray names;
+            for (const auto& n : p->names) {
+                QJsonObject no;
+                no["at_offset_ms"] = IsoMs(n.first);
+                no["name"] = QString::fromStdString(n.second);
+                names.append(no);
+            }
+            o["names"] = names;
+            o["absent_spans_ms"]    = IsoSpansJson(p->absent, f.start_ns, end);
+            o["video_off_spans_ms"] = IsoSpansJson(p->video_off, f.start_ns, end);
+            files.append(o);
+        }
+    }
+    if (dir.empty()) return;   // no ISO file this recording
+
+    QJsonObject root;
+    root["feeds_iso_manifest_version"] = 1;
+    root["recording_started"] = QString::fromStdString(g_isoMainStamp);
+    root["offsets_are_relative_to"] =
+        QStringLiteral("main OBS recording timeline (start, excluding paused time)");
+    root["files"] = files;
+    QJsonArray over;
+    for (const auto& n : g_isoOverCap) over.append(QString::fromStdString(n));
+    root["not_recorded_over_limit"] = over;
+
+    const std::string path = dir + "/" + g_isoMainStamp + " ISO manifest.json";
+    QFile out(QString::fromStdString(path));
+    if (out.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        out.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+        out.close();
+        blog(LOG_INFO, "[feeds-iso] wrote manifest %s", path.c_str());
+    } else {
+        blog(LOG_WARNING, "[feeds-iso] could not write manifest %s", path.c_str());
+    }
+}
+
+// --- Lifecycle entry points (UI thread) --------------------------------------
+static void IsoOnRecordingStarted() {
+    // Defensive: a previous session that never saw its STOPPED is ended here
+    // rather than orphaned.
+    for (const auto& p : g_isoPeople) IsoDeactivate(p, "new recording");
+    {
+        // Read by the recorder name hook on the graphics thread.
+        std::lock_guard<std::mutex> lk(g_isoMutex);
+        g_isoMainStartNs = os_gettime_ns();
+        g_isoPauses.clear();
+        g_isoMainStamp = QDateTime::currentDateTime()
+                             .toString(QStringLiteral("yyyy-MM-dd HH-mm-ss")).toStdString();
+    }
+    g_isoPeople.clear();
+    g_isoFinished.clear();
+    g_isoOverCap.clear();
+    g_isoCapNotified = false;
+    g_isoSessionActive = true;
+    if (IsoEnabled() && g_isInMeeting) IsoEnrollCurrentlyAssigned();
+}
+
+static void IsoOnRecordingStopped() {
+    if (!g_isoSessionActive) return;
+    for (const auto& p : g_isoPeople) IsoDeactivate(p, "recording stopped");
+    IsoWriteManifest();
+    g_isoSessionActive = false;
+    g_isoPeople.clear();
+    g_isoFinished.clear();
+    g_isoOverCap.clear();
+}
+
+// Main-recording pause/unpause (the recorders mirror it themselves; this only
+// keeps offsets on the main recording's timeline).
+static void IsoOnRecordingPaused(bool paused) {
+    if (!g_isoSessionActive) return;
+    std::lock_guard<std::mutex> lk(g_isoMutex);
+    const uint64_t now = os_gettime_ns();
+    const bool open = !g_isoPauses.empty() && g_isoPauses.back().end_ns == 0;
+    if (paused && !open)
+        g_isoPauses.push_back({now, 0});
+    else if (!paused && open)
+        g_isoPauses.back().end_ns = now;
+}
+
+// The meeting is over, so its files end. A later meeting in the same OBS
+// recording enrolls afresh (same stamp, larger offsets).
+static void IsoOnMeetingEnded() {
+    for (const auto& p : g_isoPeople) IsoDeactivate(p, "meeting ended");
+    g_isoFinished.insert(g_isoFinished.end(), g_isoPeople.begin(), g_isoPeople.end());
+    g_isoPeople.clear();
+    g_isoCapNotified = false;
+}
+
+// Menu toggle / tier / logout. Off ends every ISO file; on (while recording)
+// resumes this meeting's people and enrolls whoever is assigned now.
+static void IsoApplyEnabledState() {
+    for (const auto& p : g_isoPeople)
+        if (p->rec) feeds::feeds_iso_recorder_set_tier(p->rec, g_currentTier);
+    if (!IsoEnabled()) {
+        for (const auto& p : g_isoPeople) IsoDeactivate(p, "ISO recording turned off");
+        return;
+    }
+    if (!g_isoSessionActive || !g_isInMeeting || !obs_frontend_recording_active()) return;
+    for (const auto& p : g_isoPeople)
+        if (!p->rec && p->present) IsoActivate(p);
+    IsoEnrollCurrentlyAssigned();
+}
+
+// IPC thread: the engine opened / released an ISO subscription's regions.
+static bool IsoHandleTexture(const std::string& isoId, bool open) {
+    if (isoId.rfind("iso-", 0) != 0) return false;
+    std::lock_guard<std::mutex> lk(g_isoDataMutex);
+    auto it = g_isoDataById.find(isoId);
+    if (it != g_isoDataById.end()) {
+        if (open) OpenSharedMemory(it->second);
+        else      CloseSharedMemory(it->second);
+    }
+    return true;
+}
+
+// Module unload: end anything still recording and wait (bounded) for the
+// teardown workers, before the recorder module drains its own registry.
+static void IsoShutdown() {
+    if (g_isoSessionActive)
+        IsoOnRecordingStopped();   // ends every file and writes the manifest
+    for (const auto& p : g_isoPeople) IsoDeactivate(p, "shutdown");
+    std::unique_lock<std::mutex> lk(g_isoTeardownMutex);
+    g_isoTeardownCv.wait_for(lk, std::chrono::seconds(20),
+                             [] { return g_isoTeardownsInFlight == 0; });
 }
 
 // ---------------------------------------------------------------------------
@@ -8693,10 +9339,6 @@ static void ReconcileSourcesToTier() {
             }
             s->tier_disabled   = shouldDisable;
             s->source_position = idx;
-
-            // Forward the new tier to the ISO recorder; it stops any active
-            // recording if the tier drops below Basic.
-            feeds::feeds_iso_recorder_set_tier(s->iso, g_currentTier);
         }
     }
 
@@ -8742,7 +9384,7 @@ static void ReconcileSourcesToTier() {
     // greys the menu and stops any active recording (also enforced inside
     // the recorder via set_tier above, but we mirror it here for clarity).
     UpdateIsoMenuItemForTier();
-    ApplyIsoRecordingStateToAllSources();
+    IsoApplyEnabledState();
 
     RefreshAllSourceProperties();
 }
@@ -9020,7 +9662,7 @@ static void RegisterEngineHandlers() {
                 g_isoRecordingAction->setChecked(false);
             }
             UpdateIsoMenuItemForTier();
-            ApplyIsoRecordingStateToAllSources();
+            IsoApplyEnabledState();
 
             RefreshAllSourceProperties();
             // Clear any stale tier-disabled state from the prior login.
@@ -9088,7 +9730,7 @@ static void RegisterEngineHandlers() {
                 g_isoRecordingAction->setChecked(false);
             }
             UpdateIsoMenuItemForTier();
-            ApplyIsoRecordingStateToAllSources();
+            IsoApplyEnabledState();
 
             RefreshAllSourceProperties();
             // Clear stale tier-disabled state — same gap as
@@ -9303,6 +9945,8 @@ static void RegisterEngineHandlers() {
                 g_connectAction->setEnabled(true);
             RefreshAllSourceProperties();
             if (g_chatDock) g_chatDock->OnMeetingLeft();
+            // The meeting's ISO files end with it.
+            IsoOnMeetingEnded();
         });
     });
 
@@ -9402,6 +10046,7 @@ static void RegisterEngineHandlers() {
             // is exactly the "no profile picture" value, so the field is
             // additive in both directions.
             p.avatar_path = ExtractJsonString(obj, "avatar_path");
+            p.persistent_id = ExtractJsonString(obj, "persistent_id");  // "" if absent
             if (p.id != 0 && !p.name.empty()) {
                 newList.push_back(p);
                 mutedSnap[p.id] = ExtractJsonNumber(obj, "muted") != 0;
@@ -9474,6 +10119,8 @@ static void RegisterEngineHandlers() {
                 // name (both arrive as participant_list_changed).
                 ReconcileRememberedParticipants(joinedIds);
                 RefreshAllSourceProperties();
+                // ISO: presence, renames, and leave/rejoin of recorded people.
+                IsoOnRosterChanged(joinedIds);
             });
     });
 
@@ -9657,6 +10304,8 @@ static void RegisterEngineHandlers() {
         blog(LOG_INFO, "[feeds] source_texture_ready: source=%s",
              sourceId.c_str());
 
+        if (IsoHandleTexture(sourceId, true)) return;   // an ISO recording feed
+
         std::lock_guard<std::mutex> lock(g_sourcesMutex);
         ZpSourceData* s = FindSourceByUuid(sourceId);
         if (s) OpenSharedMemory(s);
@@ -9670,6 +10319,8 @@ static void RegisterEngineHandlers() {
         blog(LOG_INFO, "[feeds] source_texture_released: source=%s",
              sourceId.c_str());
 
+        if (IsoHandleTexture(sourceId, false)) return;   // an ISO recording feed
+
         std::lock_guard<std::mutex> lock(g_sourcesMutex);
         ZpSourceData* s = FindSourceByUuid(sourceId);
         if (s) CloseSharedMemory(s);
@@ -9679,6 +10330,18 @@ static void RegisterEngineHandlers() {
     [](const std::string& json) {
         std::string sourceId = ExtractJsonString(json, "source_id");
         if (sourceId.empty()) return;
+
+        // An ISO recording feed: its file keeps running (black) and the next
+        // roster change re-requests the feed if the person is present.
+        if (sourceId.rfind("iso-", 0) == 0) {
+            blog(LOG_WARNING, "[feeds-iso] engine could not establish ISO feed %s; "
+                 "will retry on the next roster change", sourceId.c_str());
+            QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), [sourceId]() {
+                for (const auto& p : g_isoPeople)
+                    if (p->iso_id == sourceId) p->engine_started = false;
+            });
+            return;
+        }
 
         // The engine's readiness-gated renderer creation gave up for this
         // source (retries exhausted, or a non-retryable error). Clear our
@@ -10466,9 +11129,8 @@ static bool IsLowerThirdShown(const std::string& ltUuid) {
 // `outBound` reports whether the source has a genuine binding at all, which is
 // what gates the card being on screen.
 //
-// Deliberately NOT ResolveParticipantName: that is the ISO recorder's filename
-// hook, and a filename must always resolve to something, so it falls back to
-// the OBS source name. A nameplate must never do that — "Participant 1" burned
+// Deliberately NOT the ISO filename naming: a filename must always resolve to
+// something, so it falls back to a placeholder. A nameplate must never do that — "Participant 1" burned
 // into a broadcast is always wrong — so this reports "no binding" instead and
 // the card stays down.
 //
@@ -10905,9 +11567,21 @@ bool obs_module_load(void) {
     zoom_participant_info.destroy        = zp_destroy;
     zoom_participant_info.get_properties = zp_properties;
     zoom_participant_info.update         = zp_update;
-    zoom_participant_info.video_tick     = zp_video_tick;
     zoom_participant_info.icon_type      = OBS_ICON_TYPE_CAMERA;
     obs_register_source(&zoom_participant_info);
+
+    // Hidden per-person ISO feed (see "ISO recording by PARTICIPANT"). Only
+    // ever created privately by the ISO registry; CAP_DISABLED keeps it out of
+    // the Add Source menu.
+    static struct obs_source_info iso_participant_info = {};
+    iso_participant_info.id           = kIsoSourceTypeId;
+    iso_participant_info.type         = OBS_SOURCE_TYPE_INPUT;
+    iso_participant_info.output_flags = OBS_SOURCE_ASYNC_VIDEO | OBS_SOURCE_CAP_DISABLED;
+    iso_participant_info.get_name     = [](void*) { return "Feeds ISO Participant"; };
+    iso_participant_info.create       = iso_src_create;
+    iso_participant_info.destroy      = iso_src_destroy;
+    iso_participant_info.video_tick   = iso_src_video_tick;
+    obs_register_source(&iso_participant_info);
 
     zoom_screenshare_info.id             = "zoom_screenshare_source";
     zoom_screenshare_info.type           = OBS_SOURCE_TYPE_INPUT;
@@ -10930,7 +11604,7 @@ bool obs_module_load(void) {
     feeds::RegisterLowerThirdSource();
 
     // ISO recorder: registers the single frontend-event callback that fans
-    // recording start/stop/pause out to every per-source recorder.
+    // recording start/stop/pause out to every per-person recorder.
     feeds::feeds_iso_recorder_module_load();
 
     // Eagerly load the fallback avatar so the popup source renders the
@@ -11030,6 +11704,21 @@ bool obs_module_load(void) {
         case OBS_FRONTEND_EVENT_STREAMING_STARTED:
             if (YtHasTarget() && IsStreamingToYouTube()) YtWakePoller();
             break;
+        // ISO registry: a recording session is the unit of enrollment, naming
+        // and the manifest. (Each recorder's own start/stop/pause mirroring is
+        // the recorder module's frontend callback.)
+        case OBS_FRONTEND_EVENT_RECORDING_STARTED:
+            IsoOnRecordingStarted();
+            break;
+        case OBS_FRONTEND_EVENT_RECORDING_STOPPED:
+            IsoOnRecordingStopped();
+            break;
+        case OBS_FRONTEND_EVENT_RECORDING_PAUSED:
+            IsoOnRecordingPaused(true);
+            break;
+        case OBS_FRONTEND_EVENT_RECORDING_UNPAUSED:
+            IsoOnRecordingPaused(false);
+            break;
         default:
             break;
         }
@@ -11060,8 +11749,10 @@ void obs_module_unload(void) {
     // blocked receive, joins).
     TwStopReaderThread();
 
-    // Remove the ISO recorder's frontend callback and drain any leftovers
-    // before the engine + Qt teardown below.
+    // End any per-person ISO still recording (and wait for those teardowns),
+    // THEN remove the ISO recorder's frontend callback and drain any
+    // leftovers, before the engine + Qt teardown below.
+    IsoShutdown();
     feeds::feeds_iso_recorder_module_unload();
 
     feeds::StopEngine();

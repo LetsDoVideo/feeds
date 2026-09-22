@@ -1,6 +1,6 @@
-// feeds-iso-recorder.cpp — per-source ISO recording for Feeds participant
-// sources (Phase 1). See feeds-iso-recorder.h and
-// C:\Dev\iso-recording-investigation.md for the full design rationale.
+// feeds-iso-recorder.cpp — records one OBS source to its own ISO file (Feeds
+// uses one per enrolled participant; see feeds-iso-recorder.h). See also
+// C:\Dev\iso-recording-investigation.md for the original design rationale.
 //
 // This adopts Exeldro's Source Record patterns (C:\Dev\obs-source-record\
 // source-record.c) — a private obs_view for video, a private audio_output
@@ -111,7 +111,13 @@ constexpr uint64_t ISO_AUDIO_BUFFER_NS  = 2000000000ULL;  // >= 2 s
 struct feeds_iso_recorder {
 	obs_source_t *parent = nullptr;  // borrowed; stable for the recorder's life
 	feeds_iso_name_fn name_fn = nullptr;
+	feeds_iso_started_fn started_fn = nullptr;
 	void *name_ud = nullptr;
+
+	// Fixed recording size (set_fixed_size); 0 x 0 = follow the parent's size.
+	// Written before recording starts, read by tick (both under lock).
+	uint32_t fixed_width = 0;
+	uint32_t fixed_height = 0;
 
 	// Guards the mutable state below against the UI thread (lifecycle +
 	// frontend events) racing the graphics thread (tick). The audio
@@ -141,7 +147,7 @@ struct feeds_iso_recorder {
 	std::mutex drain_m;                   // guards destroy's bounded drain wait
 	std::condition_variable drain_cv;
 
-	bool enabled = false;       // checkbox state
+	bool enabled = false;       // set by the owner (the ISO registry)
 	bool want_record = false;   // OBS main recording active and we should record
 	bool paused = false;        // desired pause state, mirrors main recording
 	std::atomic<bool> closing{false};  // teardown in progress (short-circuits tick)
@@ -416,25 +422,21 @@ static std::string resolve_and_sanitize_name(feeds_iso_recorder *rec)
 	return sanitize_filename(name);
 }
 
-// Build the full output path in `dir` with extension `ext`.
+// Build the full output path in `dir` with extension `ext`. The name hook
+// supplies the whole base name (the ISO registry puts the recording stamp and
+// offset in it), so nothing is appended except, if that file already exists,
+// " (2)", " (3)"... so an ISO never overwrites anything.
 static std::string build_filepath(feeds_iso_recorder *rec, const char *dir, const char *ext)
 {
-	std::string name = resolve_and_sanitize_name(rec);
-	// os_generate_formatted_filename already appends ".<ext>", so the result is
-	// "<name> 2026-05-27 14-03-09.<ext>" once we prepend the sanitized name.
-	char *ts = os_generate_formatted_filename(ext, true, "%CCYY-%MM-%DD %hh-%mm-%ss");
-	std::string filename;
-	if (ts) {
-		filename = name + " " + ts;
-		bfree(ts);
-	} else {
-		filename = name + " recording." + ext;
-	}
+	const std::string name = resolve_and_sanitize_name(rec);
+	std::string base = dir ? dir : "";
+	if (!base.empty() && base.back() != '/' && base.back() != '\\')
+		base += '/';
+	base += name;
 
-	std::string out = dir ? dir : "";
-	if (!out.empty() && out.back() != '/' && out.back() != '\\')
-		out += '/';
-	out += filename;
+	std::string out = base + "." + ext;
+	for (int n = 2; os_file_exists(out.c_str()) && n < 1000; n++)
+		out = base + " (" + std::to_string(n) + ")." + ext;
 	return out;
 }
 
@@ -833,6 +835,12 @@ static void start_output(feeds_iso_recorder *rec)
 		rec->output_active = true;
 		rec->paused = false;
 		blog(LOG_INFO, "[feeds-iso] recording started: %s", path.c_str());
+		if (rec->started_fn) {
+			try {
+				rec->started_fn(rec->name_ud, path);
+			} catch (...) {
+			}
+		}
 	} else {
 		blog(LOG_ERROR, "[feeds-iso] obs_output_start failed: %s", obs_output_get_last_error(rec->output));
 		detach_view_source(rec);
@@ -998,11 +1006,13 @@ void feeds_iso_recorder_tick(feeds_iso_recorder *rec, float seconds)
 
 	const bool should_record = rec->want_record && rec->enabled && rec->tier >= 1;
 
-	// Current parent dimensions, rounded up to even (H.264 requires even
-	// dimensions — Source Record:1339-1342).
-	uint32_t width = obs_source_get_width(rec->parent);
+	// Recording dimensions: the fixed size if one is set (the file never
+	// restarts on a parent size change, and records black until the parent has
+	// a picture), else the parent's current size. Rounded up to even (H.264
+	// requires even dimensions — Source Record:1339-1342).
+	uint32_t width = rec->fixed_width ? rec->fixed_width : obs_source_get_width(rec->parent);
 	width += (width & 1);
-	uint32_t height = obs_source_get_height(rec->parent);
+	uint32_t height = rec->fixed_height ? rec->fixed_height : obs_source_get_height(rec->parent);
 	height += (height & 1);
 
 	// Dimension change while recording: stop the current output. The next
@@ -1176,16 +1186,27 @@ static void frontend_event(enum obs_frontend_event event, void *)
 // ---------------------------------------------------------------------------
 // Create / destroy
 // ---------------------------------------------------------------------------
-feeds_iso_recorder *feeds_iso_recorder_create(obs_source_t *parent_source, feeds_iso_name_fn name_fn, void *userdata)
+feeds_iso_recorder *feeds_iso_recorder_create(obs_source_t *parent_source, feeds_iso_name_fn name_fn,
+					      feeds_iso_started_fn started_fn, void *userdata)
 {
 	auto *rec = new feeds_iso_recorder();
 	rec->parent = parent_source;
 	rec->name_fn = name_fn;
+	rec->started_fn = started_fn;
 	rec->name_ud = userdata;
 
 	std::lock_guard<std::mutex> lk(g_registry_mutex);
 	g_registry.push_back(rec);
 	return rec;
+}
+
+void feeds_iso_recorder_set_fixed_size(feeds_iso_recorder *rec, uint32_t width, uint32_t height)
+{
+	if (!rec)
+		return;
+	std::lock_guard<std::mutex> lk(rec->lock);
+	rec->fixed_width = width;
+	rec->fixed_height = height;
 }
 
 void feeds_iso_recorder_destroy(feeds_iso_recorder *rec)
