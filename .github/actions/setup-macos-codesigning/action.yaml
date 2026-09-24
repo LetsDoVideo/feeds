@@ -21,6 +21,15 @@ inputs:
     required: false
   notarizationPassword:
     description: Application password for notarization
+  notarizationKey:
+    description: App Store Connect API key (.p8) in base64 format, for notarization
+    required: false
+  notarizationKeyId:
+    description: App Store Connect API key ID, for notarization
+    required: false
+  notarizationIssuer:
+    description: App Store Connect API issuer ID, for notarization
+    required: false
   provisioningProfile:
     description: Provisioning profile in base64 format
     required: false
@@ -37,6 +46,12 @@ outputs:
   haveNotarizationUser:
     description: True if necessary notarization credentials were found
     value: ${{ steps.notarization.outputs.haveNotarizationUser || steps.codesign.outputs.haveNotarizationUser }}
+  haveNotarizationKey:
+    description: True if an App Store Connect API key for notarization was found
+    value: ${{ steps.notarization.outputs.haveNotarizationKey || steps.codesign.outputs.haveNotarizationKey }}
+  notarizationKeyPath:
+    description: Path to the decoded App Store Connect API key (.p8)
+    value: ${{ steps.notarization.outputs.notarizationKeyPath }}
   codesignIdent:
     description: Codesigning identity
     value: ${{ steps.codesign.outputs.codesignIdent }}
@@ -105,6 +120,7 @@ runs:
           print 'haveCodesignIdent=false' >> $GITHUB_OUTPUT
           print 'haveProvisioningProfile=false' >> $GITHUB_OUTPUT
           print 'haveNotarizationUser=false' >> $GITHUB_OUTPUT
+          print 'haveNotarizationKey=false' >> $GITHUB_OUTPUT
         }
 
     - name: Provisioning Profile 👤
@@ -148,6 +164,9 @@ runs:
       env:
           MACOS_NOTARIZATION_USERNAME: ${{ inputs.notarizationUser }}
           MACOS_NOTARIZATION_PASSWORD: ${{ inputs.notarizationPassword }}
+          MACOS_NOTARIZATION_KEY: ${{ inputs.notarizationKey }}
+          MACOS_NOTARIZATION_KEY_ID: ${{ inputs.notarizationKeyId }}
+          MACOS_NOTARIZATION_ISSUER: ${{ inputs.notarizationIssuer }}
       run: |
         : Notarization 🧑‍💼
         if (( ${+RUNNER_DEBUG} )) setopt XTRACE
@@ -156,4 +175,16 @@ runs:
           print 'haveNotarizationUser=true' >> $GITHUB_OUTPUT
         } else {
           print 'haveNotarizationUser=false' >> $GITHUB_OUTPUT
+        }
+
+        if [[ ${MACOS_NOTARIZATION_KEY} && ${MACOS_NOTARIZATION_KEY_ID} && ${MACOS_NOTARIZATION_ISSUER} ]] {
+          # notarytool reads the key from a file. RUNNER_TEMP is wiped after
+          # the job, and the file is only readable by the runner user.
+          local -r key_path="${RUNNER_TEMP}/AuthKey_${MACOS_NOTARIZATION_KEY_ID}.p8"
+          print -n "${MACOS_NOTARIZATION_KEY}" | base64 --decode --output="${key_path}"
+          chmod 600 "${key_path}"
+          print 'haveNotarizationKey=true' >> $GITHUB_OUTPUT
+          print "notarizationKeyPath=${key_path}" >> $GITHUB_OUTPUT
+        } else {
+          print 'haveNotarizationKey=false' >> $GITHUB_OUTPUT
         }

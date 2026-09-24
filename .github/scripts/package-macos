@@ -133,8 +133,25 @@ package() {
     }
 
     if (( codesign && notarize )) {
-      if ! [[ ${CODESIGN_IDENT} != '-' && ${CODESIGN_TEAM} && {CODESIGN_IDENT_USER} && ${CODESIGN_IDENT_PASS} ]] {
-        log_error "Notarization requires Apple ID and application password."
+      # Credentials: an App Store Connect API key (CODESIGN_NOTARY_KEY_PATH,
+      # _KEY_ID, _ISSUER) is preferred; an Apple ID with an app-specific
+      # password (CODESIGN_IDENT_USER, _PASS) is the fallback.
+      local -a notary_auth
+      if [[ ${CODESIGN_IDENT} != '-' && ${CODESIGN_NOTARY_KEY_PATH:-} && ${CODESIGN_NOTARY_KEY_ID:-} && ${CODESIGN_NOTARY_ISSUER:-} ]] {
+        if [[ ! -r ${CODESIGN_NOTARY_KEY_PATH} ]] {
+          log_error "Notarization API key not found at ${CODESIGN_NOTARY_KEY_PATH}."
+          return 2
+        }
+        notary_auth=(
+          --key "${CODESIGN_NOTARY_KEY_PATH}"
+          --key-id "${CODESIGN_NOTARY_KEY_ID}"
+          --issuer "${CODESIGN_NOTARY_ISSUER}"
+        )
+      } elif [[ ${CODESIGN_IDENT} != '-' && ${CODESIGN_TEAM} && ${CODESIGN_IDENT_USER:-} && ${CODESIGN_IDENT_PASS:-} ]] {
+        xcrun notarytool store-credentials "${product_name}-Codesign-Password" --apple-id "${CODESIGN_IDENT_USER}" --team-id "${CODESIGN_TEAM}" --password "${CODESIGN_IDENT_PASS}"
+        notary_auth=(--keychain-profile "${product_name}-Codesign-Password")
+      } else {
+        log_error "Notarization requires a Developer ID and either an App Store Connect API key or an Apple ID and application password."
         return 2
       }
 
@@ -143,8 +160,22 @@ package() {
         return 2
       }
 
-      xcrun notarytool store-credentials "${product_name}-Codesign-Password" --apple-id "${CODESIGN_IDENT_USER}" --team-id "${CODESIGN_TEAM}" --password "${CODESIGN_IDENT_PASS}"
-      xcrun notarytool submit ${project_root}/release/${output_name}.pkg --keychain-profile "${product_name}-Codesign-Password" --wait
+      # notarytool can exit 0 with a rejected submission, so the verdict is read
+      # from its JSON output. On anything but Accepted, Apple's log (which names
+      # each offending file) goes into the build log before failing.
+      local submit_result
+      submit_result="$(xcrun notarytool submit ${project_root}/release/${output_name}.pkg ${notary_auth} --wait --output-format json)" || true
+      print -r -- "${submit_result}"
+      local submission_id="$(print -r -- "${submit_result}" | jq -r '.id // empty' 2>/dev/null || true)"
+      local submission_status="$(print -r -- "${submit_result}" | jq -r '.status // empty' 2>/dev/null || true)"
+
+      if [[ ${submission_status} != Accepted ]] {
+        if [[ ${submission_id} ]] {
+          xcrun notarytool log "${submission_id}" ${notary_auth} || true
+        }
+        log_error "Notarization failed with status '${submission_status}' (submission ${submission_id:-unknown})."
+        return 2
+      }
 
       local -i _status=0
 

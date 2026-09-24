@@ -36,6 +36,18 @@ inputs:
     description: Apple ID password for notarization (macOS only)
     required: false
     default: ''
+  notaryKeyPath:
+    description: Path to App Store Connect API key (.p8) for notarization (macOS only)
+    required: false
+    default: ''
+  notaryKeyId:
+    description: App Store Connect API key ID for notarization (macOS only)
+    required: false
+    default: ''
+  notaryIssuer:
+    description: App Store Connect API issuer ID for notarization (macOS only)
+    required: false
+    default: ''
   package:
     description: Create Windows or macOS installation package
     required: false
@@ -57,6 +69,9 @@ runs:
         CODESIGN_TEAM: ${{ inputs.codesignTeam }}
         CODESIGN_IDENT_USER: ${{ inputs.codesignUser }}
         CODESIGN_IDENT_PASS: ${{ inputs.codesignPass }}
+        CODESIGN_NOTARY_KEY_PATH: ${{ inputs.notaryKeyPath }}
+        CODESIGN_NOTARY_KEY_ID: ${{ inputs.notaryKeyId }}
+        CODESIGN_NOTARY_ISSUER: ${{ inputs.notaryIssuer }}
       run: |
         : Run macOS Packaging
 

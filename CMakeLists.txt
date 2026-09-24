@@ -339,14 +339,29 @@ if(APPLE)
         # must keep the hardened runtime) will rely on, while dropping it here
         # means an ad-hoc CI build does not depend on entitlements being honored
         # for a signature with no team behind it at all.
+        #
+        # A real (Developer ID) identity gets what notarization requires on every
+        # signature: a secure timestamp and the hardened runtime. Ad-hoc keeps
+        # --timestamp=none, since there is no certificate for Apple's timestamp
+        # service to countersign.
         if(CODESIGN_IDENTITY STREQUAL "-")
             set_target_properties(
                 FeedsEngine
                 PROPERTIES XCODE_ATTRIBUTE_ENABLE_HARDENED_RUNTIME NO
             )
-            set(_feeds_engine_hardened_args "")
+            set(_feeds_sign_args "--timestamp=none")
+            set(_feeds_sign_nested_command "")
         else()
-            set(_feeds_engine_hardened_args "--options;runtime")
+            set(_feeds_sign_args "--timestamp;--options;runtime")
+            # The SDK payload copied into Contents/Frameworks arrives signed by
+            # Zoom. Notarization needs every Mach-O in it signed by us, and it
+            # has to happen before the app itself is signed over it.
+            set(_feeds_sign_nested_command
+                COMMAND /bin/zsh
+                        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/macos/sign-nested-code.zsh"
+                        "${CODESIGN_IDENTITY}"
+                        "$<TARGET_BUNDLE_DIR:FeedsEngine>/Contents/Frameworks"
+            )
         endif()
 
         target_include_directories(FeedsEngine PRIVATE
@@ -399,17 +414,17 @@ if(APPLE)
             # attached to the artifact that actually ships, rather than
             # depending on when Xcode chose to sign.
             #
-            # Zoom's own nested frameworks keep THEIR signatures: this signs the
-            # app, not its contents (no --deep), which is exactly the
-            # different-Team-ID arrangement the entitlement exists to permit. A
-            # notarized build will additionally have to re-sign every nested
-            # item with our Developer ID, deepest first; that belongs with the
-            # signing/notarization work, not here.
+            # Ad-hoc: Zoom's nested frameworks keep THEIR signatures and only the
+            # app is signed (no --deep), which is exactly the different-Team-ID
+            # arrangement the entitlement exists to permit. Developer ID: every
+            # nested item is first re-signed with ours, deepest first (see
+            # cmake/macos/sign-nested-code.zsh). The entitlement stays either
+            # way; it is what lets the hardened runtime load the SDK at all.
+            ${_feeds_sign_nested_command}
             COMMAND codesign --force --sign "${CODESIGN_IDENTITY}"
-                    ${_feeds_engine_hardened_args}
                     --entitlements
                     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/macos/FeedsEngine.entitlements"
-                    --timestamp=none
+                    ${_feeds_sign_args}
                     "$<TARGET_BUNDLE_DIR:FeedsEngine>"
             COMMENT "Copying the Zoom macOS SDK runtime into FeedsEngine.app and re-signing it"
             VERBATIM
@@ -428,7 +443,7 @@ if(APPLE)
             # engine was copied into it. Deliberately NO entitlements here — the
             # plugin loads no Zoom framework, and library validation must stay
             # on for the bundle OBS loads into its own process.
-            COMMAND codesign --force --sign "${CODESIGN_IDENTITY}" --timestamp=none
+            COMMAND codesign --force --sign "${CODESIGN_IDENTITY}" ${_feeds_sign_args}
                     "$<TARGET_BUNDLE_DIR:${CMAKE_PROJECT_NAME}>"
             COMMENT "Staging FeedsEngine.app inside the plugin bundle and re-signing it"
             VERBATIM

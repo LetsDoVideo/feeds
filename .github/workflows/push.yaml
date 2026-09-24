@@ -122,7 +122,10 @@ jobs:
   # macOS build: the plugin plus FeedsEngine.app (the Zoom Meeting SDK host),
   # built through the OBS plugin template's own macOS scripts
   # (.github/scripts/build-macos / package-macos, the macos-ci preset) into an
-  # installable, unsigned .pkg. Deliberately independent of the Windows job:
+  # installable .pkg, signed with our Developer ID and notarized (credentials
+  # are secrets of the "release" environment). A build that cannot sign or
+  # notarize fails rather than uploading a package Gatekeeper would block.
+  # Deliberately independent of the Windows job:
   # nothing needs it, so a macOS failure never blocks the Windows build or a
   # release, and releases still ship Windows assets only.
   #
@@ -166,6 +169,34 @@ jobs:
             "$(jq -r '. | {name, version} | join(" ")' buildspec.json)"
           print "pluginName=${product_name}" >> $GITHUB_OUTPUT
           print "pluginVersion=${product_version}" >> $GITHUB_OUTPUT
+      # Imports the Developer ID Application + Installer certificates (one .p12)
+      # into a temporary keychain and decodes the App Store Connect API key used
+      # by notarytool. Secrets come from the "release" environment this job runs
+      # in, not from repository secrets.
+      - name: Set Up Codesigning
+        id: codesign
+        uses: ./.github/actions/setup-macos-codesigning
+        with:
+          codesignIdentity: ${{ secrets.MACOS_SIGNING_IDENTITY_APP }}
+          installerIdentity: ${{ secrets.MACOS_SIGNING_IDENTITY_INSTALLER }}
+          codesignCertificate: ${{ secrets.MACOS_SIGNING_CERT_P12_BASE64 }}
+          certificatePassword: ${{ secrets.MACOS_SIGNING_CERT_PASSWORD }}
+          notarizationKey: ${{ secrets.MACOS_NOTARY_KEY_P8_BASE64 }}
+          notarizationKeyId: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          notarizationIssuer: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+      # The setup action treats missing credentials as "build unsigned". Here
+      # that would silently ship an artifact Gatekeeper blocks, so stop instead.
+      - name: Require Signing Credentials
+        run: |
+          if [[ '${{ steps.codesign.outputs.haveCodesignIdent }}' != true ]] {
+            print "::error::Developer ID signing credentials missing (MACOS_SIGNING_* secrets in the release environment)"
+            exit 1
+          }
+          if [[ '${{ steps.codesign.outputs.haveNotarizationKey }}' != true ]] {
+            print "::error::Notarization API key missing (MACOS_NOTARY_* secrets in the release environment)"
+            exit 1
+          }
+          print "Signing as team ${{ steps.codesign.outputs.codesignTeam }}"
       # The macOS Zoom Meeting SDK is licensed and ~600 MB, so it is kept as an
       # asset on a DRAFT release ("SDK assets — DO NOT PUBLISH"): invisible to
       # the public, downloadable by this workflow's own token. Never commit it
@@ -230,12 +261,73 @@ jobs:
         with:
           target: macos-arm64
           config: RelWithDebInfo
+          codesign: 'true'
+          codesignIdent: ${{ steps.codesign.outputs.codesignIdent }}
+          codesignTeam: ${{ steps.codesign.outputs.codesignTeam }}
       - name: Package Plugin
         uses: ./.github/actions/package-plugin
         with:
           target: macos-arm64
           config: RelWithDebInfo
           package: 'true'
+          codesign: 'true'
+          notarize: 'true'
+          codesignIdent: ${{ steps.codesign.outputs.codesignIdent }}
+          installerIdent: ${{ steps.codesign.outputs.installerIdent }}
+          codesignTeam: ${{ steps.codesign.outputs.codesignTeam }}
+          notaryKeyPath: ${{ steps.codesign.outputs.notarizationKeyPath }}
+          notaryKeyId: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          notaryIssuer: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+      # Independent check of what is about to be uploaded. package-macos already
+      # fails on a rejected notarization; this re-verifies the result from the
+      # outside (signatures, entitlements, Gatekeeper, stapled ticket), so a
+      # signing or notarization gap fails here instead of reaching a tester.
+      - name: Verify Signing and Notarization
+        run: |
+          local -r team='${{ steps.codesign.outputs.codesignTeam }}'
+          local -r name='${{ steps.setup.outputs.pluginName }}'
+          local -r pkg="release/${name}-${{ steps.setup.outputs.pluginVersion }}-macos-arm64.pkg"
+          local -r plugin="release/RelWithDebInfo/${name}.plugin"
+          local -r engine="${plugin}/Contents/MacOS/FeedsEngine.app"
+
+          fail() { print "::error::${1}"; exit 1 }
+
+          # Signed by our team, secure timestamp, hardened runtime.
+          check_signature() {
+            local info
+            info="$(codesign --display --verbose=2 "${1}" 2>&1)"
+            print -r -- "${info}"
+            [[ ${info} == *"TeamIdentifier=${team}"* ]] || fail "${1}: not signed by team ${team}"
+            [[ ${info} == *"Timestamp="* ]] || fail "${1}: no secure timestamp"
+            [[ ${info} == *"flags="*"(runtime)"* ]] || fail "${1}: hardened runtime not enabled"
+          }
+
+          print '::group::Plugin bundle'
+          codesign --verify --deep --strict --verbose=2 "${plugin}"
+          check_signature "${plugin}"
+          print '::endgroup::'
+
+          if [[ -d ${engine} ]] {
+            print '::group::FeedsEngine.app'
+            codesign --verify --deep --strict --verbose=2 "${engine}"
+            check_signature "${engine}"
+            # The engine must keep its library-validation exception under the
+            # hardened runtime, or it cannot load the Zoom SDK at all.
+            local ents
+            ents="$(codesign --display --entitlements - --xml "${engine}" 2>/dev/null)"
+            [[ ${ents} == *com.apple.security.cs.disable-library-validation* ]] \
+              || fail "FeedsEngine.app lost its disable-library-validation entitlement"
+            spctl --assess --type execute --verbose=4 "${engine}"
+            print '::endgroup::'
+          } else {
+            print "::warning::No FeedsEngine.app in the plugin (SDK asset missing?); verified the plugin only"
+          }
+
+          print '::group::Installer package'
+          pkgutil --check-signature "${pkg}"
+          spctl --assess --type install --verbose=4 "${pkg}"
+          xcrun stapler validate "${pkg}"
+          print '::endgroup::'
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
