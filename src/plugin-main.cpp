@@ -3426,6 +3426,31 @@ public:
         frameLayout->addWidget(m_header, 0);
         frameLayout->addWidget(scroll, 1);   // takes the stretch; header stays pinned above
 
+        // Free-trial offer pinned to the dock BOTTOM: added to the frame layout
+        // below the scroll area, so it sits on the bottom edge however many rows
+        // there are, never scrolls, and never moves as participants join/leave.
+        // Read-only text plus a link; clicking only opens the page (no state is
+        // kept). Deliberately small and grey: an offer, not a nag. Visibility is
+        // set in UpdateTrialFooter() on every Refresh().
+        m_trialFooter = new QLabel(
+            QString::fromUtf8(
+                "Want to try Streamer features free? Request a 2-week trial at "
+                "<a href=\"https://letsdovideo.com/feeds-freetrial\">"
+                "letsdovideo.com/feeds-freetrial</a>"),
+            dockFrame);
+        m_trialFooter->setTextFormat(Qt::RichText);
+        m_trialFooter->setTextInteractionFlags(Qt::TextBrowserInteraction);
+        m_trialFooter->setOpenExternalLinks(true);
+        m_trialFooter->setWordWrap(true);
+        m_trialFooter->setContentsMargins(8, 4, 8, 6);
+        m_trialFooter->setStyleSheet("QLabel { color: #7a7d80; }");
+        QFont trialFont = m_trialFooter->font();
+        if (trialFont.pointSizeF() > 2.0)
+            trialFont.setPointSizeF(trialFont.pointSizeF() - 1.0);
+        m_trialFooter->setFont(trialFont);
+        m_trialFooter->setVisible(false);
+        frameLayout->addWidget(m_trialFooter, 0);
+
         // Width is derived from the live theme/font in Refresh() (setMinimumWidth
         // on the dock root, propagating to the QDockWidget). Height floor as before.
         setMinimumHeight(300);
@@ -3461,6 +3486,7 @@ public:
         // even on the deferred-rename and empty-rows early returns below — so a
         // tier/login/share change always re-styles the header's source buttons.
         UpdateHeaderState();
+        UpdateTrialFooter();
 
         // An inline rename is in progress — don't tear the box (and the edit
         // field) out from under the user. Coalesce: remember a refresh is due and
@@ -3969,6 +3995,15 @@ private:
             QString("%1 is a %2-tier feature.<br><br>"
                     "<a href=\"https://letsdovideo.com/feeds-upgrade\">Click here "
                     "to upgrade your plan</a>").arg(feature, tierWord));
+    }
+
+    // Free-trial footer: logged-in Free or Basic only. Logged out, the tier reads
+    // 0 whatever the account is, so it stays hidden until login says otherwise.
+    // Called from Refresh(), which every tier/login/logout/expiry change already
+    // reaches through RefreshAllSourceProperties -> PostParticipantDockRefresh.
+    void UpdateTrialFooter() {
+        if (!m_trialFooter) return;
+        m_trialFooter->setVisible(g_isLoggedIn && g_currentTier < 2);
     }
 
     // Re-style the header source buttons from current tier + share state. Called
@@ -5248,6 +5283,10 @@ private:
     ElidingPushButton* m_hdrChatOverlay  = nullptr;
     ElidingPushButton* m_hdrChatPopup    = nullptr;
 
+    // Free-trial offer pinned below the scroll area (see the ctor). Shown or
+    // hidden by UpdateTrialFooter() on every Refresh().
+    QLabel*            m_trialFooter     = nullptr;
+
     // --- Per-button add-cooldowns (1s each) -----------------------------------
     // After a button performs an add, it greys and no-ops for 1s to absorb
     // accidental rapid re-clicks. Per-button, so adding different sources in quick
@@ -5453,7 +5492,7 @@ static void UpdateIsoMenuItemForTier() {
     bool paid = g_currentTier >= 1;
     g_isoRecordingAction->setEnabled(paid);
     g_isoRecordingAction->setText(paid
-        ? "ISO Recording (All Participants)"
+        ? "ISO Recording"
         : "ISO Recording is a Paid Feature");
 }
 
@@ -7359,7 +7398,7 @@ void SetupPluginMenu() {
     g_loginLogoutAction  = feedsMenu->addAction("Login to Zoom");
     g_connectAction      = feedsMenu->addAction("Connect to Zoom Meeting");
     feedsMenu->addSeparator();
-    g_isoRecordingAction = feedsMenu->addAction("ISO Recording (All Participants)");
+    g_isoRecordingAction = feedsMenu->addAction("ISO Recording");
     g_isoRecordingAction->setCheckable(true);
     g_isoRecordingAction->setChecked(g_isoRecordingEnabled);
     // Ticking this item arms ISO recording; it does not begin one. The
