@@ -1,0 +1,16 @@
+{
+  "display_name": "Feeds",
+  "id": "748c1ab8-04fb-403e-b407-f0747a7b3f70",
+  "version": "@FEEDS_MANIFEST_VERSION@",
+  "authors": ["Let's Do Video"],
+  "name": "feeds",
+  "description": "Bring individual Zoom participants into OBS as separate sources.",
+  "long_description": "Feeds connects OBS to your Zoom meeting and gives you each participant's video, screenshare and isolated audio as their own OBS sources, plus lower thirds, multi-platform chat and per-participant ISO recording.",
+  "urls": {
+    "repository": "https://github.com/LetsDoVideo/feeds",
+    "website": "https://letsdovideo.com/feeds",
+    "support": "https://letsdovideo.com/feeds"
+  },
+  "has_banner": false,
+  "has_icon": false
+}

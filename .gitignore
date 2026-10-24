@@ -25,6 +25,9 @@
 !/zoom-sdk/bin/
 !/zoom-sdk/bin/**
 
+# Generated at configure time from cmake/common/manifest.json.in
+/data/manifest.json
+
 # Exclude lock files
 *.lock.json
 

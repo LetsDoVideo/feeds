@@ -262,35 +262,111 @@ static bool WaitForEngineConnections()
     return true;
 }
 
-static bool LaunchEngineProcess()
+// Full path of the module containing this code (feeds.dll), or empty on
+// failure. The buffer grows until the name fits, so a long install path is
+// never silently truncated (GetModuleFileNameW truncates and returns the
+// buffer size when it is too small).
+static std::wstring GetPluginModulePath()
 {
     HMODULE hModule = NULL;
-    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       (LPCWSTR)&LaunchEngineProcess,
-                       &hModule);
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCWSTR)&GetPluginModulePath,
+                            &hModule)) {
+        return std::wstring();
+    }
 
-    wchar_t pluginPath[MAX_PATH];
-    GetModuleFileNameW(hModule, pluginPath, MAX_PATH);
+    std::wstring path(MAX_PATH, L'\0');
+    for (;;) {
+        DWORD len = GetModuleFileNameW(hModule, &path[0], (DWORD)path.size());
+        if (len == 0) return std::wstring();
+        if (len < path.size()) {
+            path.resize(len);
+            return path;
+        }
+        // Truncated. 32767 is the longest path Windows supports.
+        if (path.size() >= 32768) return std::wstring();
+        path.resize(path.size() * 2);
+    }
+}
 
-    wchar_t enginePath[MAX_PATH];
-    wcscpy_s(enginePath, pluginPath);
-    wchar_t* lastSlash = wcsrchr(enginePath, L'\\');
-    if (lastSlash) *lastSlash = L'\0';
-    lastSlash = wcsrchr(enginePath, L'\\');
-    if (lastSlash) *lastSlash = L'\0';
-    lastSlash = wcsrchr(enginePath, L'\\');
-    if (lastSlash) *lastSlash = L'\0';
-    wcscat_s(enginePath, L"\\bin\\64bit\\zoom-sdk\\FeedsEngine.exe");
+// Everything before the last backslash, or empty if there is none.
+static std::wstring ParentDir(const std::wstring& path)
+{
+    size_t pos = path.find_last_of(L'\\');
+    return (pos == std::wstring::npos) ? std::wstring() : path.substr(0, pos);
+}
 
-    blog(LOG_INFO, "[feeds] LaunchEngineProcess: launching %ls", enginePath);
+static bool IsExistingFile(const std::wstring& path)
+{
+    DWORD attrs = GetFileAttributesW(path.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static bool LaunchEngineProcess()
+{
+    std::wstring pluginPath = GetPluginModulePath();
+    if (pluginPath.empty()) {
+        blog(LOG_ERROR, "[feeds] LaunchEngineProcess: could not determine feeds.dll path: %lu",
+             GetLastError());
+        return false;
+    }
+    blog(LOG_INFO, "[feeds] LaunchEngineProcess: plugin at %ls", pluginPath.c_str());
+
+    // FeedsEngine.exe is looked up relative to feeds.dll's own folder (D), so
+    // the plugin finds its engine whichever layout it was installed in. The
+    // parent folders are taken by trimming path components rather than by
+    // appending "..", which a \\?\ path would not collapse. First match wins.
+    const std::wstring dllDir = ParentDir(pluginPath);
+    const std::wstring upTwo  = ParentDir(ParentDir(dllDir));
+    struct Candidate {
+        const wchar_t* label;
+        const std::wstring& base;
+        const wchar_t* tail;
+    };
+    const Candidate candidates[] = {
+        // Engine beside the DLL: OBS 33 layout (<plugins>\feeds\feeds.dll).
+        {L"D\\zoom-sdk",                     dllDir, L"\\zoom-sdk\\FeedsEngine.exe"},
+        // DLL in <plugins>\feeds\bin\64bit (OBS 33 legacy ProgramData layout),
+        // engine at the plugin folder's root.
+        {L"D\\..\\..\\zoom-sdk",             upTwo,  L"\\zoom-sdk\\FeedsEngine.exe"},
+        // Today's layout: DLL in <OBS>\obs-plugins\64bit, engine in
+        // <OBS>\bin\64bit\zoom-sdk.
+        {L"D\\..\\..\\bin\\64bit\\zoom-sdk", upTwo,  L"\\bin\\64bit\\zoom-sdk\\FeedsEngine.exe"},
+    };
+
+    std::wstring enginePath;
+    int index = 0;
+    for (const Candidate& c : candidates) {
+        ++index;
+        if (c.base.empty()) {
+            blog(LOG_INFO, "[feeds] LaunchEngineProcess: candidate %d (%ls): skipped, no such parent folder",
+                 index, c.label);
+            continue;
+        }
+        std::wstring path = c.base + c.tail;
+        bool found = IsExistingFile(path);
+        blog(LOG_INFO, "[feeds] LaunchEngineProcess: candidate %d (%ls): %ls: %s",
+             index, c.label, path.c_str(), found ? "found" : "not found");
+        if (found) {
+            enginePath = path;
+            break;
+        }
+    }
+
+    if (enginePath.empty()) {
+        blog(LOG_ERROR, "[feeds] LaunchEngineProcess: FeedsEngine.exe not found in any candidate location");
+        return false;
+    }
+
+    blog(LOG_INFO, "[feeds] LaunchEngineProcess: launching %ls", enginePath.c_str());
 
     STARTUPINFOW si = {};
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi = {};
 
     BOOL ok = CreateProcessW(
-        enginePath, NULL, NULL, NULL, FALSE,
+        enginePath.c_str(), NULL, NULL, NULL, FALSE,
         CREATE_SUSPENDED | CREATE_NO_WINDOW,
         NULL, NULL, &si, &pi);
 

@@ -76,6 +76,9 @@ Section "Feeds Plugin" SecMain
     SetOutPath "$INSTDIR\data\obs-plugins\feeds"
     File "${ROOT_DIR}\dist\data\obs-plugins\feeds\feeds-logo.png"
 
+    ; OBS plugin manifest -> data/obs-plugins/feeds/
+    File "${ROOT_DIR}\dist\data\obs-plugins\feeds\manifest.json"
+
     ; Connect-chooser icons -> data/obs-plugins/feeds/icons/
     SetOutPath "$INSTDIR\data\obs-plugins\feeds\icons"
     File "${ROOT_DIR}\dist\data\obs-plugins\feeds\icons\*.svg"
@@ -120,6 +123,7 @@ Section "Uninstall"
     Delete "$INSTDIR\data\obs-plugins\feeds\icons\*.svg"
     RMDir "$INSTDIR\data\obs-plugins\feeds\icons"
     Delete "$INSTDIR\data\obs-plugins\feeds\feeds-logo.png"
+    Delete "$INSTDIR\data\obs-plugins\feeds\manifest.json"
     RMDir "$INSTDIR\data\obs-plugins\feeds"
 
     ; Remove uninstaller

@@ -9437,6 +9437,13 @@ static void RegisterEngineHandlers() {
         g_enginePid = (uint32_t)ExtractJsonNumber(json, "pid");
         blog(LOG_INFO, "[feeds] engine_ready: version=%s, pid=%u",
              version.c_str(), g_enginePid);
+        // Plugin and engine ship from the same commit, so a mismatch means a
+        // stale binary on one side (e.g. a leftover engine from another
+        // install). Logged only; the session carries on.
+        if (version != feeds_shared::VERSION) {
+            blog(LOG_WARNING, "[feeds] engine_ready: engine version %s does not match plugin version %s",
+                 version.empty() ? "(none)" : version.c_str(), feeds_shared::VERSION);
+        }
     });
 
     // Engine log forwarding (Phase 1). The engine no longer writes its own

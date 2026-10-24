@@ -112,6 +112,22 @@ target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
     FEEDS_ZOOM_CLIENT_ID="${FEEDS_ZOOM_CLIENT_ID}"
 )
 
+# OBS plugin manifest (data/manifest.json), read by OBS from the plugin's data
+# folder. Its version comes from common/feeds-version.h, the same constant the
+# plugin and engine compile in, so it cannot drift. Generated into the SOURCE
+# data/ folder (and gitignored) because packaging copies data/ from the source
+# tree. Must run before set_target_properties_plugin, which collects data/
+# for the macOS bundle and the Windows rundir.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/common/feeds-version.h" _feeds_version_header)
+string(REGEX MATCH "const char\\* VERSION = \"([^\"]+)\"" _feeds_version_match "${_feeds_version_header}")
+if(NOT CMAKE_MATCH_1)
+    message(FATAL_ERROR "Could not read VERSION from common/feeds-version.h")
+endif()
+set(FEEDS_MANIFEST_VERSION "${CMAKE_MATCH_1}")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/common/feeds-version.h")
+configure_file(cmake/common/manifest.json.in "${CMAKE_CURRENT_SOURCE_DIR}/data/manifest.json" @ONLY)
+
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
 
 # macOS installs the .plugin bundle (and builds the .pkg) from
