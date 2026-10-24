@@ -35,6 +35,16 @@
 //   moment they become displayable — camera on, or a stale read corrected — the
 //   next evaluation cuts to them.
 //
+// SMOOTHING (feeds-speaker-smoothing.h, shared with the macOS engine)
+//   A displayable speaker does not go on screen straight away: the shared step
+//   applies the production wait/hold rules between "displayable now" and the
+//   committed target, and cuts immediately only for the first speaker or when
+//   the on-screen person left or turned their camera off. When a cut is due
+//   later, a one-shot timer (kSpeakerWaitTimerId) re-evaluates exactly then;
+//   the 1 s tick would be too coarse for the wait. The smoother's state is
+//   pump-thread only and is adopted only together with a committed evaluation,
+//   so a discarded (stale) evaluation can't record a cut that never happened.
+//
 // THREADS AND LOCKS
 //   g_speakerMutex guards the state block below and is held only for a copy or
 //   a commit: never across an SDK getter (the SDK can fire callbacks re-entrantly
@@ -73,6 +83,7 @@
 #include "meeting_service_components/meeting_participants_ctrl_interface.h"
 
 #include "engine-speaker.h"
+#include "feeds-speaker-smoothing.h"
 
 // Defined in engine-main.cpp
 extern void LogInfo(const char* msg);
@@ -98,6 +109,7 @@ static unsigned int g_rawSpeakerId      = kNoSpeaker;  // SDK input, unfiltered
 static uint64_t     g_rawGeneration     = 0;           // bumps on every input
 static ULONGLONG    g_rawTick           = 0;           // GetTickCount64 of last input
 static unsigned int g_resolvedSpeakerId = kNoSpeaker;  // derived on-screen target
+static unsigned int g_onScreenLeftId    = kNoSpeaker;  // on-screen person who left
 
 // --- Cross-thread flags ------------------------------------------------------
 static std::atomic<bool> g_speakerInMeeting{false};
@@ -109,6 +121,7 @@ static int          g_ticksSinceHeartbeat = 0;
 static unsigned int g_loggedRaw           = kNoSpeaker;
 static unsigned int g_loggedResolved      = kNoSpeaker;
 static const char*  g_loggedDecision      = "";
+static feeds_shared::SpeakerSmoother g_smoother;
 
 void RequestSpeakerEvaluation() {
     if (g_speakerEvalPosted.exchange(true)) return;   // one is already queued
@@ -129,6 +142,22 @@ void SpeakerOnActiveAudio(unsigned int rawUserId) {
     RequestSpeakerEvaluation();
 }
 
+void SpeakerOnUserLeft(unsigned int userId) {
+    {
+        std::lock_guard<std::mutex> lock(g_speakerMutex);
+        // The on-screen person leaving switches immediately (see SMOOTHING).
+        if (userId == g_resolvedSpeakerId) g_onScreenLeftId = userId;
+        // A departed raw speaker is no longer anyone to cut to. Same as the
+        // macOS engine, which clears its raw id on leave.
+        if (userId == g_rawSpeakerId) {
+            g_rawSpeakerId = kNoSpeaker;
+            ++g_rawGeneration;
+            g_rawTick = GetTickCount64();
+        }
+    }
+    RequestSpeakerEvaluation();
+}
+
 void SpeakerMeetingStarted() {
     g_speakerInMeeting.store(true);
     LogInfo("Speaker: meeting started — active-speaker evaluation and "
@@ -141,6 +170,7 @@ void SpeakerMeetingEnded() {
         std::lock_guard<std::mutex> lock(g_speakerMutex);
         g_rawSpeakerId      = kNoSpeaker;
         g_resolvedSpeakerId = kNoSpeaker;
+        g_onScreenLeftId    = kNoSpeaker;
         g_rawTick           = 0;
         ++g_rawGeneration;   // reject any evaluation already in flight
     }
@@ -154,30 +184,30 @@ unsigned int GetResolvedActiveSpeakerTarget() {
                                                : ACTIVE_SPEAKER_SENTINEL;
 }
 
-// Derive the on-screen target from the raw input and the currently committed
-// target. Called with NO lock held — it calls SDK getters.
-static unsigned int DeriveTarget(unsigned int raw, unsigned int held,
-                                 unsigned int me, const char*& decision) {
-    // The Feeds user is never a target: OBS is likely feeding them back into
-    // Zoom as a virtual camera, so subscribing would loop. This applies to the
-    // held target too — one accepted before our own id was known must not
-    // survive once it is.
-    if (me != 0 && held == me) held = kNoSpeaker;
-
-    if (raw == kNoSpeaker)       { decision = "no_speaker_yet"; return held; }
-    if (me != 0 && raw == me)    { decision = "hold_self";      return held; }
-
-    // Camera reported off -> not displayable right now; keep the current target.
-    // A missing user record is NOT treated as camera-off (same as before): the
-    // participants controller can lag a fresh join, and the next evaluation
-    // re-checks anyway.
+// Camera reported off. A missing user record is NOT treated as camera-off
+// (same as before): the participants controller can lag a fresh join, and the
+// next evaluation re-checks anyway. Called with NO lock held (SDK getter).
+static bool IsCameraReportedOff(unsigned int userId) {
     if (ZOOM_SDK_NAMESPACE::IMeetingService* ms = GetMeetingService()) {
         if (auto* pc = ms->GetMeetingParticipantsController()) {
-            if (auto* ui = pc->GetUserByUserID(raw)) {
-                if (!ui->IsVideoOn()) { decision = "hold_video_off"; return held; }
+            if (auto* ui = pc->GetUserByUserID(userId)) {
+                return !ui->IsVideoOn();
             }
         }
     }
+    return false;
+}
+
+// The raw speaker if they can go on screen right now, else kNoSpeaker (the
+// caller then keeps the current target). Called with NO lock held.
+static unsigned int DisplayableSpeaker(unsigned int raw, unsigned int me,
+                                       const char*& decision) {
+    if (raw == kNoSpeaker)       { decision = "no_speaker_yet"; return kNoSpeaker; }
+    // The Feeds user is never a target: OBS is likely feeding them back into
+    // Zoom as a virtual camera, so subscribing would loop.
+    if (me != 0 && raw == me)    { decision = "hold_self";      return kNoSpeaker; }
+    // Camera reported off -> not displayable right now.
+    if (IsCameraReportedOff(raw)) { decision = "hold_video_off"; return kNoSpeaker; }
 
     decision = "accept";
     return raw;
@@ -186,25 +216,47 @@ static unsigned int DeriveTarget(unsigned int raw, unsigned int held,
 static void EvaluateAndApply(bool heartbeat) {
     unsigned int raw     = kNoSpeaker;
     unsigned int held    = kNoSpeaker;
+    unsigned int leftId  = kNoSpeaker;
     uint64_t     gen     = 0;
     ULONGLONG    rawTick = 0;
     {
         std::lock_guard<std::mutex> lock(g_speakerMutex);
         raw     = g_rawSpeakerId;
         held    = g_resolvedSpeakerId;
+        leftId  = g_onScreenLeftId;
         gen     = g_rawGeneration;
         rawTick = g_rawTick;
     }
 
     const unsigned int me       = GetMySelfUserId();
     const char*        decision = "";
-    const unsigned int resolved = DeriveTarget(raw, held, me, decision);
+    const unsigned int displayable = DisplayableSpeaker(raw, me, decision);
+
+    // The Feeds user is never on screen either: a target accepted before our
+    // own id was known must not survive once it is.
+    unsigned int onScreen = held;
+    if (me != 0 && onScreen == me) onScreen = kNoSpeaker;
+
+    const char* immediate = nullptr;
+    if (onScreen != kNoSpeaker) {
+        if (onScreen == leftId)                 immediate = "on_screen_left";
+        else if (IsCameraReportedOff(onScreen)) immediate = "on_screen_camera_off";
+    }
+
+    // Stepped on a copy: adopted below only if this evaluation commits.
+    feeds_shared::SpeakerSmoother smoother = g_smoother;
+    const ULONGLONG nowMs = GetTickCount64();
+    const feeds_shared::SpeakerStepResult step = feeds_shared::SpeakerSmoothingStep(
+        smoother, displayable, onScreen, immediate, nowMs);
+    const unsigned int resolved = step.target;
+    if (displayable != kNoSpeaker && resolved != displayable) decision = "pending";
 
     bool committed = false;
     {
         std::lock_guard<std::mutex> lock(g_speakerMutex);
         if (g_rawGeneration == gen) {
             g_resolvedSpeakerId = resolved;
+            if (resolved != g_onScreenLeftId) g_onScreenLeftId = kNoSpeaker;
             committed = true;
         }
     }
@@ -218,6 +270,9 @@ static void EvaluateAndApply(bool heartbeat) {
         RequestSpeakerEvaluation();   // normally already queued by that input
         return;
     }
+
+    g_smoother = smoother;
+    if (!step.log.empty()) LogInfo(step.log.c_str());
 
     if (raw != g_loggedRaw || resolved != g_loggedResolved ||
         std::strcmp(decision, g_loggedDecision) != 0) {
@@ -237,6 +292,17 @@ static void EvaluateAndApply(bool heartbeat) {
     // thread): don't re-point or re-announce a target from the old meeting. The
     // evaluation it queued stops the tick.
     if (!g_speakerInMeeting.load()) return;
+
+    // A cut that is due later (wait or hold still running): re-evaluate exactly
+    // then. SetTimer on the same id replaces any earlier one.
+    if (g_anchorWnd) {
+        if (step.dueMs != 0) {
+            const ULONGLONG delay = step.dueMs > nowMs ? step.dueMs - nowMs : 1;
+            SetTimer(g_anchorWnd, kSpeakerWaitTimerId, (UINT)delay, nullptr);
+        } else {
+            KillTimer(g_anchorWnd, kSpeakerWaitTimerId);
+        }
+    }
 
     // Level-triggered apply. No g_speakerMutex held here (lock order).
     const FollowRetargetResult r = RetargetFollowSources();
@@ -276,6 +342,8 @@ static void StopSpeakerTick() {
         g_speakerTimerActive = false;
         LogInfo("Speaker: meeting ended — evaluation and heartbeat stopped");
     }
+    if (g_anchorWnd) KillTimer(g_anchorWnd, kSpeakerWaitTimerId);
+    g_smoother = feeds_shared::SpeakerSmoother();
     g_ticksSinceHeartbeat = 0;
     g_loggedRaw      = kNoSpeaker;
     g_loggedResolved = kNoSpeaker;
@@ -306,6 +374,16 @@ void SpeakerOnTimer() {
     const bool heartbeat = (++g_ticksSinceHeartbeat >= kHeartbeatEveryTicks);
     if (heartbeat) g_ticksSinceHeartbeat = 0;
     EvaluateAndApply(heartbeat);
+}
+
+void SpeakerOnWaitTimer() {
+    // One-shot: the evaluation re-arms it if a cut is still pending.
+    if (g_anchorWnd) KillTimer(g_anchorWnd, kSpeakerWaitTimerId);
+    if (!g_speakerInMeeting.load()) {
+        StopSpeakerTick();
+        return;
+    }
+    EvaluateAndApply(false);
 }
 
 } // namespace feeds_engine

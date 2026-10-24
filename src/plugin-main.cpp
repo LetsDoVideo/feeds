@@ -9329,6 +9329,12 @@ struct obs_source_info zoom_screenshare_info = {};
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("feeds", "en-US")
 
+// Plugin Manager label when no manifest.json is found (OBS 33 prefers the
+// manifest's display_name, then this, then the file name "feeds").
+const char *obs_module_name(void) {
+  return "Feeds";
+}
+
 // ---------------------------------------------------------------------------
 // Tier reconciliation
 // ---------------------------------------------------------------------------

@@ -81,6 +81,7 @@
 #include "feeds-json-lite.h"
 #include "feeds-mac-login.h"   // EngineSend / EngineLog / GetCurrentTier
 #include "feeds-mac-video.h"
+#include "feeds-speaker-smoothing.h"   // shared with the Windows engine
 #include "shared-frame.h"
 
 namespace {
@@ -723,11 +724,20 @@ uint64_t          g_lastHeartbeatMs = 0;
 // thrown away. Same model as engine-speaker.cpp, minus its generation guard:
 // there is no second thread to race here, because everything runs on the main
 // queue.
+//
+// Between "displayable now" and the resolved target sits the shared smoothing
+// step (feeds-speaker-smoothing.h): the production wait/hold rules, with an
+// immediate cut only for the first speaker or when the on-screen person left
+// or turned their camera off. A cut due later re-evaluates through a one-shot
+// dispatch_after (ArmSpeakerWait); the 5 s heartbeat is far too coarse.
 unsigned int g_rawSpeakerId      = 0;
 unsigned int g_resolvedSpeakerId = 0;
+unsigned int g_onScreenLeftId    = 0;   // on-screen person who just left
 unsigned int g_loggedRaw         = 0;
 unsigned int g_loggedResolved    = 0;
 const char*  g_loggedDecision    = "";
+feeds_shared::SpeakerSmoother g_smoother;
+uint64_t     g_speakerWaitSeq    = 0;   // newest ArmSpeakerWait wins
 
 // ── Screenshare ─────────────────────────────────────────────────────────────
 // One renderer for whatever share is currently viewable, not one per source:
@@ -1085,25 +1095,59 @@ void RetargetFollowSources(unsigned int target, int& outFollow, int& outMoved,
     }
 }
 
+// Re-evaluate once when a smoothed cut falls due (dueMs, 0 = nothing pending).
+// Each call supersedes the previous one: a block whose sequence number is no
+// longer the newest does nothing, so no cancel is needed.
+void ArmSpeakerWait(uint64_t dueMs, uint64_t nowMs)
+{
+    const uint64_t seq = ++g_speakerWaitSeq;
+    if (dueMs == 0) return;
+    const uint64_t delay = dueMs > nowMs ? dueMs - nowMs : 1;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)(delay * NSEC_PER_MSEC)),
+                   dispatch_get_main_queue(), ^{
+        if (seq != g_speakerWaitSeq) return;
+        EvaluateActiveSpeaker(false);
+    });
+}
+
 void EvaluateActiveSpeaker(bool heartbeat)
 {
     if (!g_inMeeting) return;
 
     const unsigned int me   = MyUserId();
     const unsigned int raw  = g_rawSpeakerId;
-    unsigned int       held = g_resolvedSpeakerId;
     const char*        decision = "";
 
     // The Feeds user is never a target: OBS is very likely feeding them back
     // into Zoom as a virtual camera, so subscribing would loop. That applies to
     // a held target accepted before our own id was known, too.
-    if (me != 0 && held == me) held = 0;
+    unsigned int onScreen = g_resolvedSpeakerId;
+    if (me != 0 && onScreen == me) onScreen = 0;
 
-    unsigned int resolved;
-    if (raw == 0)                   { decision = "no_speaker_yet"; resolved = held; }
-    else if (me != 0 && raw == me)  { decision = "hold_self";      resolved = held; }
-    else if (UserCameraOff(raw))    { decision = "hold_video_off"; resolved = held; }
-    else                            { decision = "accept";         resolved = raw;  }
+    unsigned int displayable = 0;
+    if (raw == 0)                   { decision = "no_speaker_yet"; }
+    else if (me != 0 && raw == me)  { decision = "hold_self";      }
+    else if (UserCameraOff(raw))    { decision = "hold_video_off"; }
+    else                            { decision = "accept"; displayable = raw; }
+
+    const char* immediate = nullptr;
+    if (onScreen != 0) {
+        if (onScreen == g_onScreenLeftId) immediate = "on_screen_left";
+        else if (UserCameraOff(onScreen)) immediate = "on_screen_camera_off";
+    }
+
+    const uint64_t nowMs = NowMs();
+    const feeds_shared::SpeakerStepResult step = feeds_shared::SpeakerSmoothingStep(
+        g_smoother, displayable, onScreen, immediate, nowMs);
+    unsigned int resolved = step.target;
+    // A departed on-screen person with no one to cut to leaves no target, as
+    // before smoothing: follow sources go back to waiting for a speaker.
+    if (g_onScreenLeftId != 0 && resolved == g_onScreenLeftId) resolved = 0;
+    g_onScreenLeftId = 0;
+    if (displayable != 0 && resolved != displayable) decision = "pending";
+    if (!step.log.empty()) LogInfo(step.log);
+    ArmSpeakerWait(step.dueMs, nowMs);
 
     const unsigned int previous = g_resolvedSpeakerId;
     g_resolvedSpeakerId = resolved;
@@ -1671,6 +1715,9 @@ void VideoMeetingStarted()
         g_rawRenderReady    = false;
         g_rawSpeakerId      = 0;
         g_resolvedSpeakerId = 0;
+        g_onScreenLeftId    = 0;
+        g_smoother          = feeds_shared::SpeakerSmoother();
+        ++g_speakerWaitSeq;   // drop any wait still pending
         g_lastHeartbeatMs   = NowMs();
         StartTick();
         LogInfo("Video: meeting started — renderer gate and active-speaker "
@@ -1695,6 +1742,9 @@ void VideoMeetingEnded()
         g_inflightByUser.clear();
         g_rawSpeakerId      = 0;
         g_resolvedSpeakerId = 0;
+        g_onScreenLeftId    = 0;
+        g_smoother          = feeds_shared::SpeakerSmoother();
+        ++g_speakerWaitSeq;   // drop any wait still pending
 
         ShareTeardown();
         g_sharerUserId = 0;
@@ -1759,7 +1809,9 @@ void VideoOnUserLeft(unsigned int userId)
                     std::to_string(userId));
 
         if (g_rawSpeakerId == userId) g_rawSpeakerId = 0;
-        if (g_resolvedSpeakerId == userId) g_resolvedSpeakerId = 0;
+        // The on-screen person leaving switches immediately; with no one to
+        // cut to, the evaluation clears the target as before.
+        if (g_resolvedSpeakerId == userId) g_onScreenLeftId = userId;
         EvaluateActiveSpeaker(false);
     });
 }

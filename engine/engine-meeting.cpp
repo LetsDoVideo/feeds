@@ -448,6 +448,9 @@ public:
         if (lstUserID) {
             for (int i = 0; i < lstUserID->GetCount(); ++i) {
                 BlankSubscriptionsForUser(lstUserID->GetItem(i));
+                // The on-screen speaker leaving switches [Active Speaker]
+                // sources immediately (engine-speaker.cpp).
+                SpeakerOnUserLeft(lstUserID->GetItem(i));
             }
         }
         SendParticipantList();
@@ -513,6 +516,10 @@ public:
         if (status == ZOOM_SDK_NAMESPACE::Video_ON && g_anchorWnd) {
             PostMessageW(g_anchorWnd, WM_FEEDS_CAMERA_ON, (WPARAM)userId, 0);
         }
+        // Camera state decides who is displayable, and the on-screen person
+        // turning their camera off switches immediately, so re-derive now
+        // rather than on the next 1 s tick. Any thread; coalesced.
+        RequestSpeakerEvaluation();
     }
 
     // Remaining IMeetingVideoCtrlEvent callbacks — required by the pure-virtual

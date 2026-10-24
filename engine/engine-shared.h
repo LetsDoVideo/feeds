@@ -62,6 +62,9 @@
 // poll) and 2 (camera-on debounce). EngineWndProc must route this id BEFORE
 // OnEngineTimer, whose fallthrough branch treats any other id as a renderer poll.
 static constexpr UINT_PTR kSpeakerTimerId = 3;
+// One-shot WM_TIMER id that re-evaluates the active speaker when a smoothed cut
+// (wait/hold) falls due. Routed before OnEngineTimer, like kSpeakerTimerId.
+static constexpr UINT_PTR kSpeakerWaitTimerId = 4;
 
 // Defined in engine-main.cpp. Set right after the anchor window is
 // created in WinMain. NULL before that (which the pipe handler

@@ -18,6 +18,11 @@ namespace feeds_engine {
 // SDK getters.
 void SpeakerOnActiveAudio(unsigned int rawUserId);
 
+// SDK callback thread (any thread). A participant left: if they are on screen,
+// the next evaluation switches immediately instead of waiting; if they are the
+// raw speaker, the raw input is cleared. Takes no g_subsMutex.
+void SpeakerOnUserLeft(unsigned int userId);
+
 // Any thread. Meeting lifecycle: Started arms the pump-thread re-evaluation and
 // heartbeat; Ended clears the state and stops them.
 void SpeakerMeetingStarted();
@@ -27,10 +32,11 @@ void SpeakerMeetingEnded();
 // burst of requests produces one evaluation.
 void RequestSpeakerEvaluation();
 
-// Pump thread only. EngineWndProc calls these on WM_FEEDS_SPEAKER_EVAL and on
-// the kSpeakerTimerId WM_TIMER respectively.
+// Pump thread only. EngineWndProc calls these on WM_FEEDS_SPEAKER_EVAL, on the
+// kSpeakerTimerId WM_TIMER and on the kSpeakerWaitTimerId WM_TIMER respectively.
 void SpeakerEvaluateOnMainThread();
 void SpeakerOnTimer();
+void SpeakerOnWaitTimer();
 
 // Any thread; safe to call while holding g_subsMutex. The on-screen target an
 // [Active Speaker] source should show right now, as last derived on the pump

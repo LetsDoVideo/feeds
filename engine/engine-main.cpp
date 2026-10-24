@@ -504,6 +504,10 @@ static LRESULT CALLBACK EngineWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             feeds_engine::SpeakerOnTimer();
             return 0;
         }
+        if ((UINT_PTR)wp == kSpeakerWaitTimerId) {
+            feeds_engine::SpeakerOnWaitTimer();
+            return 0;
+        }
         // The engine's video timers (renderer readiness/retry/gate poll and the
         // camera-on debounce); OnEngineTimer routes by timer id (wp).
         feeds_engine::OnEngineTimer((UINT_PTR)wp);
