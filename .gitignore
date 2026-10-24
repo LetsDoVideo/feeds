@@ -9,6 +9,7 @@
 !/common
 !/data
 !/engine
+!/installer
 !/src
 !/tests
 !.clang-format
