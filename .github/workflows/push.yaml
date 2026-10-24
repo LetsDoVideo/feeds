@@ -125,14 +125,14 @@ jobs:
   # installable .pkg, signed with our Developer ID and notarized (credentials
   # are secrets of the "release" environment). A build that cannot sign or
   # notarize fails rather than uploading a package Gatekeeper would block.
-  # Deliberately independent of the Windows job:
-  # nothing needs it, so a macOS failure never blocks the Windows build or a
-  # release, and releases still ship Windows assets only.
+  # Independent of the Windows job, but the release job needs both: a macOS
+  # failure never blocks the Windows build, but on a tag it does hold back the
+  # release, so a release never ships without its Mac installer.
   #
   # The engine needs the licensed macOS Zoom SDK, which is NOT in this repo (it
   # is ~600 MB and not ours to redistribute). It is fetched below from a DRAFT
-  # release asset; when that asset is absent the job still builds and packages
-  # the plugin, just without an engine.
+  # release asset; when that asset is absent a branch build still builds and
+  # packages the plugin, just without an engine, and a tag build fails.
   macos-build:
     name: Build Feeds (macOS)
     runs-on: macos-14
@@ -202,7 +202,8 @@ jobs:
       # the public, downloadable by this workflow's own token. Never commit it
       # and never publish that release.
       #
-      # A missing asset is NOT an error: the plugin still builds and loads, and
+      # On a branch build a missing asset is NOT an error (on a tag build it is,
+      # see below): the plugin still builds and loads, and
       # the CMake warning plus the engine-client log line say why Zoom features
       # are unavailable. That keeps macOS CI green before the SDK is uploaded.
       # NEVER fetch by tag or by a browser_download_url. A draft release has no
@@ -235,6 +236,13 @@ jobs:
           fi
 
           if [ -z "${asset_id}" ]; then
+              # A tag build feeds the release, so it must not ship a .pkg without
+              # the engine. Branch builds keep going without it.
+              if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+                  echo "::error::${asset_name} not found on any draft release; a tag build cannot ship the plugin WITHOUT the engine."
+                  printf '%s' "${releases}" | jq -r '.[] | select(.draft) | "draft release: name=\(.name // "(none)") assets=[\([.assets[].name] | join(", "))]"' || true
+                  exit 1
+              fi
               echo "::warning::${asset_name} not found on any draft release; building the plugin WITHOUT the engine."
               printf '%s' "${releases}" | jq -r '.[] | select(.draft) | "draft release: name=\(.name // "(none)") assets=[\([.assets[].name] | join(", "))]"' || true
               exit 0
@@ -337,14 +345,40 @@ jobs:
 
   release:
     name: Create Release
-    needs: build
+    needs: [build, macos-build]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
+      # The Mac .pkg is named from buildspec.json's version and the Windows files
+      # from the tag, so a tag that does not match buildspec.json would release
+      # mismatched files. Checked first, before anything creates or edits a
+      # release. Reads buildspec.json at the tagged commit through the API, so
+      # no checkout is needed.
+      - name: Verify Tag Matches buildspec.json
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="$(gh api -H "Accept: application/vnd.github.raw" \
+              "repos/${GITHUB_REPOSITORY}/contents/buildspec.json?ref=${GITHUB_SHA}" | jq -r '.version')"
+          if [ -z "${version}" ] || [ "${version}" = "null" ]; then
+              echo "::error::Could not read version from buildspec.json at ${GITHUB_SHA}"
+              exit 1
+          fi
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+              echo "::error::Tag ${GITHUB_REF_NAME} does not match buildspec.json version ${version} (expected tag v${version}). Not creating a release."
+              exit 1
+          fi
+          echo "Tag ${GITHUB_REF_NAME} matches buildspec.json version ${version}"
       - name: Download Artifacts
         uses: actions/download-artifact@v4
         with:
           name: Feeds-${{ github.ref_name }}
+      - name: Download macOS Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: Feeds-${{ github.ref_name }}-macos
       # Create the release as a DRAFT with the installer attached. A draft is
       # excluded from /releases/latest, which is what the in-app update check
       # polls — so users are never notified of a release before its installer is
@@ -357,6 +391,7 @@ jobs:
           files: |
             Feeds-*-windows-x64.zip
             Feeds-*-Setup.exe
+            feeds-*-macos-arm64.pkg
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # Flip the draft to published only AFTER the installer is attached above.
