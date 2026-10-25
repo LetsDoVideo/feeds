@@ -149,8 +149,10 @@ static constexpr float kLowerThirdShrinkMs = 400.0f;    // full -> compact
 // is ~0.53x (card 120 -> 64, avatar 96 -> 50, name 30 -> 17, title 24 -> 14) so
 // avatar, name and title keep their proportions to each other, and the padding
 // is tightened a little more than that so the tag reads as a tag, not a shrunk
-// card. Its width is not a constant: it fits its own content (avatar + the
-// wider of name pill and title), never wider than the full card.
+// card. Its width is FIXED (C_CARD_WIDTH, about a third of the full card's
+// 748px plate), never fitted to its content: a long title must not stretch the
+// tag back across the guest's face. Name and title elide inside it, exactly as
+// they do on the full card.
 //
 // Readability floor: one texture serves every scene item, and each item is
 // scaled by its participant's box (PlaceLowerThirdItem: 92% of the box width
@@ -158,6 +160,10 @@ static constexpr float kLowerThirdShrinkMs = 400.0f;    // full -> compact
 // (960px boxes, item scale ~1.15), gives a ~20px name and ~16px title, about
 // the smallest that stays legible on a 1080p stream. A full-screen
 // participant (scale ~2.3) gets a ~39px name, still half the full card.
+//
+// Width 250 leaves 172px of text (250 - 7 - 50 - 9 - 12): room for a typical
+// name in its pill and a title of about 25 characters before either elides.
+static constexpr int C_CARD_WIDTH         = 250;
 static constexpr int C_CARD_HEIGHT        = 64;
 static constexpr int C_CARD_CORNER_RADIUS = 3;
 static constexpr int C_SHADOW_OFFSET      = 3;
@@ -334,32 +340,12 @@ static void RenderLowerThirdToImage(FeedsLowerThirdData* d,
 
     // The plate. Its left edge and its bottom stay where the full card's are,
     // so the shrink closes in on the bottom-left corner of the box. The width
-    // runs from the full card's to the compact tag's content-fitted width.
+    // runs from the full card's to the compact tag's fixed width; the text
+    // below elides against whatever width the plate has at this k.
     const int fullCardW = cardWidth - CARD_LEFT_MARGIN - CARD_RIGHT_MARGIN;
-    int cardW = fullCardW;
-    if (k > 0.0f) {
-        // Compact width: avatar + the wider of the name pill and the title, at
-        // the compact metrics, plus a little slack so nothing elides on the
-        // way down from integer rounding of the interpolated fonts.
-        const int cInset = (int)(C_AVATAR_INSET   * scale);
-        const int cAv    = (int)(C_AVATAR_SIZE    * scale);
-        const int cGap   = (int)(C_TEXT_GAP       * scale);
-        const int cRight = (int)(C_TEXT_RIGHT_PAD * scale);
-        const int cPillH = (int)(C_PILL_H_PAD     * scale);
-        QFont cName;
-        cName.setBold(true);
-        cName.setPixelSize(std::max(1, (int)(C_NAME_FONT * scale)));
-        QFont cTitle;
-        cTitle.setPixelSize(std::max(1, (int)(C_TITLE_FONT * scale)));
-        const int nameW  = name.isEmpty() ? 0
-            : QFontMetrics(cName).horizontalAdvance(name) + 2 * cPillH;
-        const int titleW = title.isEmpty() ? 0
-            : QFontMetrics(cTitle).horizontalAdvance(title);
-        const int slack  = std::max(2, (int)(4 * scale));
-        const int compactW = std::min(fullCardW,
-            cInset + cAv + cGap + std::max(nameW, titleW) + cRight + slack);
-        cardW = (int)((float)fullCardW + (float)(compactW - fullCardW) * k);
-    }
+    const int compactW  = (int)(C_CARD_WIDTH * scale);
+    const int cardW =
+        (int)((float)fullCardW + (float)(compactW - fullCardW) * k);
     const QRect cardRect(
         CARD_LEFT_MARGIN,
         CARD_TOP_OFFSET + FULL_CARD_HEIGHT - CARD_HEIGHT,

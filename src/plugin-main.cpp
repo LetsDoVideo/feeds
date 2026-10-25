@@ -198,7 +198,7 @@ static QAction* g_chatDockMenuAction     = nullptr;
 // Global ISO recording toggle. When true (and tier >= 1), every participant
 // source's recorder is enabled — they all start writing when OBS main
 // recording starts. Driven by the Feeds menu item; replaces the old
-// per-source checkbox.
+// per-source checkbox. Remembered per OBS profile (LoadIsoRecordingSetting).
 static bool g_isoRecordingEnabled = false;
 
 // ---------------------------------------------------------------------------
@@ -5500,6 +5500,12 @@ static void UpdateIsoMenuItemForTier() {
     g_isoRecordingAction->setText(paid
         ? "ISO Recording"
         : "ISO Recording is a Paid Feature");
+    // The checkmark is the profile's saved choice, shown only where it can
+    // take effect. A locked item is never checked, but the choice itself is
+    // left alone so it comes back on upgrade. Blocked so this never reads as
+    // a user toggle (which would save).
+    QSignalBlocker blocker(g_isoRecordingAction);
+    g_isoRecordingAction->setChecked(paid && g_isoRecordingEnabled);
 }
 
 // Bold one Feeds menu item, or return it to the menu's normal weight. The
@@ -5705,6 +5711,33 @@ static void SaveTwitchChannelSetting(const std::string& channel) {
     if (!cfg) return;
     config_set_string(cfg, kFeedsConfigSection, kCfgTwitchChannel, channel.c_str());
     config_save(cfg);
+}
+
+// The one per-PROFILE preference: the Feeds menu's ISO Recording toggle. OBS
+// keeps recording settings per profile and this is a recording choice, so it
+// lives in the profile's own config (same section name). Absent = off. Tier
+// never writes it: below the ISO tier the saved value stays put and
+// IsoEnabled() keeps it from recording.
+static const char* kCfgIsoRecording = "IsoRecording";
+
+static bool LoadIsoRecordingSetting() {
+    config_t* cfg = obs_frontend_get_profile_config();
+    if (!cfg) return false;
+    return config_get_bool(cfg, kFeedsConfigSection, kCfgIsoRecording);
+}
+
+static void SaveIsoRecordingSetting(bool enabled) {
+    config_t* cfg = obs_frontend_get_profile_config();
+    if (!cfg) return;
+    config_set_bool(cfg, kFeedsConfigSection, kCfgIsoRecording, enabled);
+    config_save(cfg);
+}
+
+// Profile switch: adopt the new profile's saved choice. UI thread.
+static void RestoreIsoRecordingForProfile() {
+    g_isoRecordingEnabled = LoadIsoRecordingSetting();
+    UpdateIsoMenuItemForTier();
+    IsoApplyEnabledState();
 }
 
 // ---------------------------------------------------------------------------
@@ -7445,7 +7478,9 @@ void SetupPluginMenu() {
     feedsMenu->addSeparator();
     g_isoRecordingAction = feedsMenu->addAction("ISO Recording");
     g_isoRecordingAction->setCheckable(true);
-    g_isoRecordingAction->setChecked(g_isoRecordingEnabled);
+    // The startup profile's saved choice. The checkmark itself is set by
+    // UpdateIsoMenuItemForTier below, which hides it while locked.
+    g_isoRecordingEnabled = LoadIsoRecordingSetting();
     // Ticking this item arms ISO recording; it does not begin one. The
     // checkmark has been read as "recording now", so say when the files
     // actually start. Constant in every tier state, so it is set once here
@@ -7536,6 +7571,7 @@ void SetupPluginMenu() {
     QObject::connect(g_connectAction, &QAction::triggered, []() { OnConnectClick(); });
     QObject::connect(g_isoRecordingAction, &QAction::toggled, [](bool checked) {
         g_isoRecordingEnabled = checked;
+        SaveIsoRecordingSetting(checked);
         IsoApplyEnabledState();
     });
     QObject::connect(aboutAction, &QAction::triggered, []() {
@@ -9749,14 +9785,9 @@ static void RegisterEngineHandlers() {
             UpdateLoginLogoutMenuItem();
             if (g_connectAction) g_connectAction->setEnabled(false);
 
-            // Reset the global ISO toggle so the next login starts in a
-            // known state (the menu item also greys out via the tier
-            // update, but we clear the checked state to match).
-            g_isoRecordingEnabled = false;
-            if (g_isoRecordingAction) {
-                QSignalBlocker blocker(g_isoRecordingAction);
-                g_isoRecordingAction->setChecked(false);
-            }
+            // Tier is now 0: the menu locks (unchecked) and any ISO stops.
+            // The profile's saved ISO choice is left alone; it applies again
+            // once a paid account logs in.
             UpdateIsoMenuItemForTier();
             IsoApplyEnabledState();
 
@@ -9818,13 +9849,8 @@ static void RegisterEngineHandlers() {
             UpdateLoginLogoutMenuItem();
             if (g_connectAction) g_connectAction->setEnabled(false);
 
-            // Same reset as logout_complete: clear the global ISO toggle
-            // and refresh the menu so the user starts fresh on next login.
-            g_isoRecordingEnabled = false;
-            if (g_isoRecordingAction) {
-                QSignalBlocker blocker(g_isoRecordingAction);
-                g_isoRecordingAction->setChecked(false);
-            }
+            // Same as logout_complete: lock the menu and stop any ISO, but
+            // keep the profile's saved ISO choice.
             UpdateIsoMenuItemForTier();
             IsoApplyEnabledState();
 
@@ -11836,6 +11862,10 @@ bool obs_module_load(void) {
             break;
         case OBS_FRONTEND_EVENT_RECORDING_UNPAUSED:
             IsoOnRecordingPaused(false);
+            break;
+        // The ISO Recording toggle is remembered per profile.
+        case OBS_FRONTEND_EVENT_PROFILE_CHANGED:
+            RestoreIsoRecordingForProfile();
             break;
         default:
             break;
