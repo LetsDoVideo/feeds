@@ -189,6 +189,7 @@ static QMenu*   g_feedsMenu             = nullptr;
 static QAction* g_loginLogoutAction     = nullptr;
 static QAction* g_connectAction         = nullptr;
 static QAction* g_isoRecordingAction    = nullptr;
+static QAction* g_streamerBundleAction  = nullptr;
 // The Feeds menu's own dock toggles. Separate QActions from the ones OBS put
 // in its Docks menu, because the two menus show different captions for them
 // (see AddFeedsDockMenuItem).
@@ -365,6 +366,11 @@ void ShowTierLimitDialog(const QString& title, const QString& html);
 // Marshal a read-only participant-dock rebuild onto the Qt UI thread. Safe to
 // call from any thread (defined after the dock class + g_participantDock).
 static void PostParticipantDockRefresh();
+// Streamer Bundle (Streamer+): the welcome/download page, and the one-time
+// "seen" flag behind the dock's notice (defined with the other preferences).
+static const char* const kStreamerBundleUrl = "https://letsdovideo.com/feeds-streamer";
+static bool HasSeenStreamerBundle();
+static void OpenStreamerBundle();
 // Dock combo pick handler — commit a participant reassignment for the source
 // with the given UUID (defined after RecordParticipantBinding; UI thread only).
 static void OnDockParticipantPicked(const std::string& uuid, long long selectedId);
@@ -3432,18 +3438,23 @@ public:
         // Free-trial offer pinned to the dock BOTTOM: added to the frame layout
         // below the scroll area, so it sits on the bottom edge however many rows
         // there are, never scrolls, and never moves as participants join/leave.
-        // Read-only text plus a link; clicking only opens the page (no state is
-        // kept). Deliberately small and grey: an offer, not a nag. Visibility is
-        // set in UpdateTrialFooter() on every Refresh().
-        m_trialFooter = new QLabel(
-            QString::fromUtf8(
-                "Want to try Streamer features free? Request a 2-week trial at "
-                "<a href=\"https://letsdovideo.com/feeds-freetrial\">"
-                "letsdovideo.com/feeds-freetrial</a>"),
-            dockFrame);
+        // Read-only text plus a link. Deliberately small and grey: an offer, not
+        // a nag. For Streamer+ the same slot carries the one-time Streamer
+        // Bundle notice instead. Text and visibility are set in
+        // UpdateTrialFooter() on every Refresh().
+        m_trialFooter = new QLabel(dockFrame);
         m_trialFooter->setTextFormat(Qt::RichText);
         m_trialFooter->setTextInteractionFlags(Qt::TextBrowserInteraction);
-        m_trialFooter->setOpenExternalLinks(true);
+        // Links are opened here rather than by the label, so the bundle link
+        // can also record that the notice was seen. The trial link still only
+        // opens its page.
+        QObject::connect(m_trialFooter, &QLabel::linkActivated, this,
+                         [](const QString& link) {
+                             if (link == QLatin1String(kStreamerBundleUrl))
+                                 OpenStreamerBundle();
+                             else
+                                 QDesktopServices::openUrl(QUrl(link));
+                         });
         m_trialFooter->setWordWrap(true);
         m_trialFooter->setContentsMargins(8, 4, 8, 6);
         m_trialFooter->setStyleSheet("QLabel { color: #7a7d80; }");
@@ -4001,13 +4012,27 @@ private:
                     "to upgrade your plan</a>").arg(feature, tierWord));
     }
 
-    // Free-trial footer: logged-in Free or Basic only. Logged out, the tier reads
-    // 0 whatever the account is, so it stays hidden until login says otherwise.
+    // Tier-conditional footer. Logged-in Free or Basic: the free-trial offer.
+    // Streamer+: "Your Streamer Bundle is ready" until it has been clicked
+    // once (here or from the Feeds menu). Logged out, the tier reads 0
+    // whatever the account is, so it stays hidden until login says otherwise.
     // Called from Refresh(), which every tier/login/logout/expiry change already
     // reaches through RefreshAllSourceProperties -> PostParticipantDockRefresh.
     void UpdateTrialFooter() {
         if (!m_trialFooter) return;
-        m_trialFooter->setVisible(g_isLoggedIn && g_currentTier < 2);
+        QString text;
+        if (g_isLoggedIn && g_currentTier < 2) {
+            text = QString::fromUtf8(
+                "Want to try Streamer features free? Request a 2-week trial at "
+                "<a href=\"https://letsdovideo.com/feeds-freetrial\">"
+                "letsdovideo.com/feeds-freetrial</a>");
+        } else if (g_currentTier >= 2 && !HasSeenStreamerBundle()) {
+            text = QString("Your Streamer Bundle is ready. "
+                           "<a href=\"%1\">Get it here.</a>")
+                       .arg(QLatin1String(kStreamerBundleUrl));
+        }
+        if (m_trialFooter->text() != text) m_trialFooter->setText(text);
+        m_trialFooter->setVisible(!text.isEmpty());
     }
 
     // Re-style the header source buttons from current tier + share state. Called
@@ -5508,6 +5533,14 @@ static void UpdateIsoMenuItemForTier() {
     g_isoRecordingAction->setChecked(paid && g_isoRecordingEnabled);
 }
 
+// The Streamer Bundle item exists only for Streamer+ (tier >= 2, which already
+// covers manual grants: tier comes from the backend). Hidden, not greyed, below
+// that. Refreshed at the same points as the ISO item.
+static void UpdateStreamerBundleMenuItem() {
+    if (!g_streamerBundleAction) return;
+    g_streamerBundleAction->setVisible(g_currentTier >= 2);
+}
+
 // Bold one Feeds menu item, or return it to the menu's normal weight. The
 // font is seeded from the menu's own font so weight is the ONLY difference
 // from the item's neighbours: family and point size stay whatever the
@@ -5670,6 +5703,7 @@ static const char* kCfgYouTubeHandle         = "YouTubeChannelHandle";
 static const char* kCfgYouTubeVideoId        = "YouTubeVideoId";  // pinned stream (exclusive with handle)
 static const char* kCfgTwitchChannel         = "TwitchChannel";   // bare lowercase login
 static const char* kCfgFirstRunDockShown     = "FirstRunDockShown";  // set once, never cleared
+static const char* kCfgStreamerBundleSeen    = "StreamerBundleSeen"; // set once, never cleared
 
 static std::string LoadYouTubeHandleSetting() {
     config_t* cfg = obs_frontend_get_user_config();
@@ -5711,6 +5745,29 @@ static void SaveTwitchChannelSetting(const std::string& channel) {
     if (!cfg) return;
     config_set_string(cfg, kFeedsConfigSection, kCfgTwitchChannel, channel.c_str());
     config_save(cfg);
+}
+
+// Has the Streamer Bundle been opened once (dock notice or Feeds menu)? Global,
+// not per profile: it's about the user, not a profile. No config means the
+// click could never be recorded, so report it as seen rather than show a
+// notice that can't be dismissed (the menu item still reaches the page).
+static bool HasSeenStreamerBundle() {
+    config_t* cfg = obs_frontend_get_user_config();
+    if (!cfg) return true;
+    return config_get_bool(cfg, kFeedsConfigSection, kCfgStreamerBundleSeen);
+}
+
+// Open the Streamer Bundle page and retire the dock notice for good. Shared by
+// the dock link and the Feeds menu item. UI thread.
+static void OpenStreamerBundle() {
+    QDesktopServices::openUrl(QUrl(QString::fromLatin1(kStreamerBundleUrl)));
+    if (!HasSeenStreamerBundle()) {
+        if (config_t* cfg = obs_frontend_get_user_config()) {
+            config_set_bool(cfg, kFeedsConfigSection, kCfgStreamerBundleSeen, true);
+            config_save(cfg);
+        }
+        PostParticipantDockRefresh();
+    }
 }
 
 // The one per-PROFILE preference: the Feeds menu's ISO Recording toggle. OBS
@@ -7532,6 +7589,10 @@ void SetupPluginMenu() {
     // box, not the host application's, so opt out of the relocation and keep
     // it where it was added. No-op on Windows, where the role is never read.
     aboutAction->setMenuRole(QAction::NoRole);
+    // Streamer+ only; UpdateStreamerBundleMenuItem shows or hides it by tier.
+    // NoRole for the same reason as About: keep it in the Feeds menu on Mac.
+    g_streamerBundleAction = feedsMenu->addAction("Get Streamer Bundle");
+    g_streamerBundleAction->setMenuRole(QAction::NoRole);
 
     // Sync menu action states to the current plugin state. If the engine
     // has already finished authenticating (common on startup when a valid
@@ -7542,6 +7603,7 @@ void SetupPluginMenu() {
     g_connectAction->setEnabled(g_isLoggedIn && !g_isInMeeting);
     UpdateLoginLogoutMenuItem();
     UpdateIsoMenuItemForTier();
+    UpdateStreamerBundleMenuItem();
 
     // Everything in this menu whose appearance depends on state outside the
     // menu is recomputed the moment before it is drawn. That is one place
@@ -7550,6 +7612,7 @@ void SetupPluginMenu() {
     QObject::connect(feedsMenu, &QMenu::aboutToShow, feedsMenu, []() {
         UpdateFeedsMenuEmphasis();
         SyncFeedsDockMenuItems();
+        UpdateStreamerBundleMenuItem();
     });
 
     QObject::connect(g_loginLogoutAction, &QAction::triggered, []() {
@@ -7576,6 +7639,10 @@ void SetupPluginMenu() {
     });
     QObject::connect(aboutAction, &QAction::triggered, []() {
         ShowAboutDialog();
+    });
+    // Opening it from here also retires the dock's one-time notice.
+    QObject::connect(g_streamerBundleAction, &QAction::triggered, []() {
+        OpenStreamerBundle();
     });
 }
 
@@ -9509,6 +9576,7 @@ static void ReconcileSourcesToTier() {
     // greys the menu and stops any active recording (also enforced inside
     // the recorder via set_tier above, but we mirror it here for clarity).
     UpdateIsoMenuItemForTier();
+    UpdateStreamerBundleMenuItem();
     IsoApplyEnabledState();
 
     RefreshAllSourceProperties();
@@ -9789,6 +9857,7 @@ static void RegisterEngineHandlers() {
             // The profile's saved ISO choice is left alone; it applies again
             // once a paid account logs in.
             UpdateIsoMenuItemForTier();
+            UpdateStreamerBundleMenuItem();
             IsoApplyEnabledState();
 
             RefreshAllSourceProperties();
@@ -9852,6 +9921,7 @@ static void RegisterEngineHandlers() {
             // Same as logout_complete: lock the menu and stop any ISO, but
             // keep the profile's saved ISO choice.
             UpdateIsoMenuItemForTier();
+            UpdateStreamerBundleMenuItem();
             IsoApplyEnabledState();
 
             RefreshAllSourceProperties();
