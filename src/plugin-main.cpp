@@ -371,6 +371,13 @@ static void PostParticipantDockRefresh();
 static const char* const kStreamerBundleUrl = "https://letsdovideo.com/feeds-streamer";
 static bool HasSeenStreamerBundle();
 static void OpenStreamerBundle();
+// Dock lookup by registered id, and the cross-dock "Open ... Dock" plumbing
+// (defined with the dock helpers, after both dock classes). A dock counts as
+// CLOSED when its toggleViewAction is unchecked: a dock merely tabbed behind
+// another one is still open.
+static QDockWidget* FindFeedsDock(const char* id);
+static bool IsFeedsDockClosed(const char* id);
+static void ShowFeedsDock(const char* id);
 // Dock combo pick handler — commit a participant reassignment for the source
 // with the given UUID (defined after RecordParticipantBinding; UI thread only).
 static void OnDockParticipantPicked(const std::string& uuid, long long selectedId);
@@ -391,14 +398,14 @@ static void AddSourceReferenceToCurrentScene(const std::string& uuid);
 // the chat popup sits bottom-center at natural size.
 enum class RefAddPlacement { FitCenter, PopupDefault };
 
-// Header add-source actions (defined with the scene helpers, far below).
+// Dock add-source actions (defined with the scene helpers, far below).
 // CreateSourceOfTypeInCurrentScene mints a fresh source of the given type and
-// adds it (always-new, like "Create Participant Feed"); AddOrReferenceSourceInCurrentScene
+// adds it (always-new, like "Add Participant"); AddOrReferenceSourceInCurrentScene
 // references an existing source of that type if one exists, else creates one
-// (reference-or-create) — this is how the screenshare button never trips the
+// (reference-or-create) — this is how Add Screenshare never trips the
 // zs_create singleton block by trying to create a second instance.
-// openProperties: also open the new source's properties window (the Create
-// Participant Feed and Chat Overlay buttons only; see OpenNewSourceProperties).
+// openProperties: also open the new source's properties window (the Add
+// Participant and Chat Overlay buttons only; see OpenNewSourceProperties).
 static void CreateSourceOfTypeInCurrentScene(const char* typeId, const char* baseName,
                                              bool openProperties = false);
 static void AddOrReferenceSourceInCurrentScene(const char* typeId, const char* baseName,
@@ -2267,6 +2274,227 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// Shared dock widgets
+// ---------------------------------------------------------------------------
+// Pieces both docks use (Feeds Controls and Feeds Chat), defined once, above
+// both dock classes, so the two can never disagree and a fix in one is a fix
+// in both: the eliding add-source button and its styling, the tier upgrade
+// prompt, and the Login/Join block.
+
+// A QPushButton that truncates its label with a trailing ellipsis when the label
+// doesn't fit — the OBS dock-tab convention ("Chat O…") — rather than clipping the
+// glyphs hard, shrinking the font, or forcing the dock wider. Used for the docks'
+// side-by-side add buttons (Add Participant / Add Screenshare, Chat Overlay / Chat
+// Popup): the labels fit whole at or near the min dock width; a narrower dock
+// elides instead of overflowing. The un-elided label is kept for re-eliding on
+// resize; minimumSizeHint drops the natural-width floor so a shared row may shrink
+// a button below its text width and let it elide. No icon path: these buttons
+// carry no icons.
+class ElidingPushButton : public QPushButton {
+public:
+    explicit ElidingPushButton(const QString& text, QWidget* parent = nullptr)
+        : QPushButton(parent), m_full(text) {
+        QPushButton::setText(text);   // re-elided on first resizeEvent
+    }
+    QSize minimumSizeHint() const override {
+        // Keep the style's height; floor the width at about an ellipsis so a
+        // row of buttons can share a narrow dock without overflowing it.
+        QSize s = QPushButton::minimumSizeHint();
+        int floor = QFontMetrics(font()).horizontalAdvance(QStringLiteral("…")) + 12;
+        return QSize(qMin(s.width(), floor), s.height());
+    }
+protected:
+    void resizeEvent(QResizeEvent* e) override {
+        QPushButton::resizeEvent(e);
+        // Elide against the content rect (inside the style's frame + our reduced
+        // horizontal padding). The guarded setText avoids a resize feedback loop.
+        QStyleOptionButton opt;
+        initStyleOption(&opt);
+        QRect cr = style()->subElementRect(QStyle::SE_PushButtonContents, &opt, this);
+        QString shown = QFontMetrics(font()).elidedText(
+            m_full, Qt::ElideRight, qMax(0, cr.width()));
+        if (shown != text()) QPushButton::setText(shown);
+    }
+private:
+    QString m_full;
+};
+
+// Add cooldown shared by every dock add button: after an add, the button greys
+// and no-ops for this long to absorb accidental rapid re-clicks. Per button, so
+// adding different sources in quick succession stays fully allowed.
+static constexpr int kDockAddCooldownMs = 1000;
+
+// One add-source button (Add Screenshare, Chat Overlay, Chat Popup). Tooltip is
+// the constant "Add to Current Scene" in every state, locked or unlocked — the
+// tier explanation lives in the upgrade prompt a locked click opens, so it's set
+// once here and never changed. Per-state cursor, padding, and label color are
+// applied by StyleDockSourceButton on each refresh.
+static ElidingPushButton* MakeDockSourceButton(const QString& label) {
+    ElidingPushButton* b = new ElidingPushButton(label);
+    b->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    b->setToolTip("Add to Current Scene");
+    return b;
+}
+
+// Style one add-source button for its tier-lock and share state. Kept ENABLED even
+// when locked: a disabled Qt widget receives no hover events, so its tooltip
+// wouldn't show — and the button must still open the upgrade prompt on click.
+// Locked = greyed text (#7a7d80) + arrow cursor; the click handler short-circuits
+// the add on the tier check and instead opens the upgrade prompt
+// (ShowSourceUpgradePrompt), so it never performs the source action.
+//
+// Color precedence: tier-locked greying wins over the share-active green. Only
+// the Add Screenshare button ever passes sharing=true, and only when within tier,
+// so a locked button is never green. `cooling` is the transient add-cooldown
+// state: it greys the button while active and takes precedence over the sharing
+// green, but not over the tier-lock grey (a locked button never performs an add,
+// so it never cools). Because this recomputes colour from the live lock/share
+// state every call, the post-cooldown restyle restores the correct resting look.
+//
+// The stylesheet also sets a reduced horizontal padding (~half the themed
+// default) so the labels reclaim text room at/near the min dock width. Padding
+// lives in the same stylesheet as the color so a restyle never drops it.
+static void StyleDockSourceButton(QPushButton* b, bool locked, bool sharing,
+                                  bool cooling) {
+    if (!b) return;
+    QString color;
+    if (locked)       color = " color: #7a7d80;";   // greyed: tier-locked (wins)
+    else if (cooling) color = " color: #7a7d80;";   // greyed: on add-cooldown
+    else if (sharing) color = " color: #40c060;";   // green: someone is sharing
+    b->setCursor((locked || cooling) ? Qt::ArrowCursor : Qt::PointingHandCursor);
+    b->setStyleSheet(QString(
+        "QPushButton { padding-left: 4px; padding-right: 4px;%1 }").arg(color));
+}
+
+// Clicking a tier-locked add button opens the shared upgrade dialog
+// (ShowTierLimitDialog + the ShouldShowTierPopup throttle) — the same modal
+// used by the screenshare/chat create paths, with a clickable link to the
+// same upgrade URL as the dock cap chrome. `feature` is the source display
+// name; `tierWord` names the plan it needs (Basic / Streamer).
+static void ShowSourceUpgradePrompt(const QString& feature, const QString& tierWord) {
+    if (!ShouldShowTierPopup()) return;
+    // Explanation on one line, then the upgrade link on its own line below it as
+    // a clear call-to-action (the <br><br> break) rather than jammed mid-sentence.
+    ShowTierLimitDialog(
+        QString("Feeds: %1").arg(feature),
+        QString("%1 is a %2-tier feature.<br><br>"
+                "<a href=\"https://letsdovideo.com/feeds-upgrade\">Click here "
+                "to upgrade your plan</a>").arg(feature, tierWord));
+}
+
+// Style the Login/Join button as the dock's primary call to action.
+//
+// Whenever this button exists at all the user is either logged out or not
+// yet in a meeting, so it is what they came to the dock for; the rest of
+// the dock does nothing useful until it has been pressed. A themed default
+// button looks like every other button in OBS and does not say that, so
+// this one gets a filled accent instead: the same blue triad the Connect
+// dialog uses for its primary tiles, so "Feeds primary action" reads as one
+// colour across the plugin.
+//
+// The fill, text colour and border are all stated explicitly rather than
+// inherited, so the button looks the same under OBS's dark theme, its light
+// theme, and a user's custom theme, where an inherited button colour would
+// drift. Bold text and the pointing-hand cursor complete the affordance.
+//
+// Horizontal padding is deliberately tighter than the vertical: the label
+// is a whole sentence and this block sits OUTSIDE the docks' scrolling
+// content, so the button's width demand is a floor on the dock's own width.
+// Trading side padding for the extra width that bold costs keeps that floor
+// where it was.
+static void StylePrimaryCtaButton(QPushButton* b) {
+    if (!b) return;
+    QFont f = b->font();
+    f.setBold(true);
+    b->setFont(f);
+    b->setCursor(Qt::PointingHandCursor);
+    b->setStyleSheet(
+        "QPushButton {"
+        " background-color: #3a6fe0; color: #ffffff;"
+        " border: 1px solid #3a6fe0; border-radius: 4px;"
+        " padding: 8px 10px; }"
+        "QPushButton:hover {"
+        " background-color: #5285ea; border-color: #5285ea; }"
+        "QPushButton:pressed {"
+        " background-color: #2f5cc0; border-color: #2f5cc0; }");
+}
+
+// The Login/Join block at the top of BOTH docks: one class, one instance per
+// dock. Logged out it offers login; logged in but not in a meeting it offers
+// the connect flow; in a meeting it disappears entirely (zero height). No tier
+// lock: neither dock gates this, so a Free user sees and uses it.
+//
+// Sync() re-reads the login/meeting state itself rather than taking it as an
+// argument, so the two docks can't be handed different answers. Each dock calls
+// it from its own refresh, and both refreshes run off the same state changes.
+class FeedsConnectBlock : public QWidget {
+public:
+    explicit FeedsConnectBlock(QWidget* parent = nullptr) : QWidget(parent) {
+        m_layout = new QVBoxLayout(this);
+        m_layout->setContentsMargins(8, 8, 8, 6);
+        m_layout->setSpacing(0);
+        // Hidden until the owning dock's first Sync(), which runs once the block
+        // is in the dock's layout (showing a parentless widget would open it as
+        // a window of its own).
+        setVisible(false);
+    }
+
+    // UI thread. Rebuilds the button only when the state it names has changed.
+    void Sync() {
+        const int state = g_isInMeeting ? kInMeeting
+                        : (g_isLoggedIn ? kLoggedIn : kLoggedOut);
+        if (state == m_state) return;
+        m_state = state;
+        if (m_button) {
+            // Deferred: Sync can run from inside this button's own click.
+            m_button->hide();
+            m_button->deleteLater();
+            m_button = nullptr;
+        }
+        if (state == kInMeeting) { setVisible(false); return; }
+
+        // Labels are trimmed to the ACTION alone. The button only ever exists in
+        // the state it names, so a leading status clause ("Logged in.", "Not
+        // logged in to Zoom.") would restate what the button's own presence
+        // already says.
+        const bool loggedIn = (state == kLoggedIn);
+        m_button = new QPushButton(loggedIn ? "Click to Connect to Zoom Meeting"
+                                            : "Click to Login to Zoom",
+                                   this);
+        StylePrimaryCtaButton(m_button);
+        if (loggedIn)
+            QObject::connect(m_button, &QPushButton::clicked, []() { OnConnectClick(); });
+        else
+            QObject::connect(m_button, &QPushButton::clicked, []() { OnLoginClick(); });
+        m_layout->addWidget(m_button);
+        setVisible(true);
+    }
+
+private:
+    enum { kLoggedOut, kLoggedIn, kInMeeting };
+    QVBoxLayout* m_layout = nullptr;
+    QPushButton* m_button = nullptr;
+    int          m_state  = -1;
+};
+
+// The conditional "Open ... Dock" button each dock carries just below its
+// Login/Join block. A normal (secondary) themed button in its own padded slot;
+// the slot is what the owning dock shows or hides. `dockId` is the OTHER dock.
+// Top padding, so it keeps a gap from the dock edge when the Login/Join block
+// above it is gone (in a meeting).
+static QWidget* MakeOpenDockSlot(const QString& label, const char* dockId) {
+    QWidget* slot = new QWidget();
+    QVBoxLayout* l = new QVBoxLayout(slot);
+    l->setContentsMargins(8, 6, 8, 0);
+    l->setSpacing(0);
+    QPushButton* b = new QPushButton(label, slot);
+    QObject::connect(b, &QPushButton::clicked, [dockId]() { ShowFeedsDock(dockId); });
+    l->addWidget(b);
+    slot->setVisible(false);
+    return slot;
+}
+
+// ---------------------------------------------------------------------------
 // Zoom Chat dock. Phase 1: register a dock that displays placeholder content.
 // Commit 3 wires the chat_message IPC from the engine into this widget so it
 // reflects live meeting chat. Once handed to obs_frontend_add_dock_by_id,
@@ -2291,7 +2519,7 @@ public:
 
     explicit FeedsChatDock(QWidget* parent = nullptr) : QWidget(parent) {
         m_list = new QListWidget(this);
-        m_list->addItem(CurrentPlaceholderText());
+        SetPlaceholder(CurrentPlaceholderText());
 
         // Word wrap — without these three, long messages render on one
         // line with a horizontal scrollbar. setResizeMode(Adjust) makes
@@ -2354,8 +2582,8 @@ public:
         m_input->setPlaceholderText(QString::fromUtf8("Message Zoom chat…"));
         m_sendBtn = new QPushButton("Send", this);
 
-        // Disabled until we're in a meeting. OnMeetingJoined/OnMeetingLeft
-        // toggle these based on engine state.
+        // Disabled until we're in a meeting. UpdateChatHeaderState keeps them
+        // enabled exactly while in a meeting (and never while tier-locked).
         m_input->setEnabled(false);
         m_sendBtn->setEnabled(false);
 
@@ -2370,9 +2598,18 @@ public:
         inputRow->addWidget(m_input);
         inputRow->addWidget(m_sendBtn);
 
+        // Top to bottom: the shared Login/Join block (gone in a meeting), the
+        // conditional "Open Controls Dock" button, the chat source buttons, the
+        // Zoom / YouTube / Twitch rows, then the chat itself and the input row.
         QVBoxLayout* layout = new QVBoxLayout(this);
         layout->setContentsMargins(0, 0, 0, 0);
         layout->setSpacing(0);
+        m_connectBlock = new FeedsConnectBlock(this);
+        layout->addWidget(m_connectBlock);
+        m_openControlsSlot =
+            MakeOpenDockSlot("Open Controls Dock", "feeds_participant_dock");
+        layout->addWidget(m_openControlsSlot);
+        layout->addWidget(BuildChatSourceRow());
         m_chatHeader = BuildChatHeader();   // platform config/status, pinned on top
         layout->addWidget(m_chatHeader);
         layout->addWidget(m_list, 1);
@@ -2577,37 +2814,41 @@ public:
     }
 
     void OnMeetingJoined() {
-        // Free tier: the dock stays locked even after a meeting connects.
-        // Leave the upgrade-prompt placeholder in place and keep the input
-        // disabled. Without this guard a Free user gets a working send box
-        // and a "Connected" message on join.
-        if (m_tierDisabled) {
-            return;
-        }
-        SetPlaceholder("Connected");
-        m_input->setEnabled(true);
-        m_sendBtn->setEnabled(true);
-        UpdateChatHeaderState();   // Zoom row -> "In meeting (#N)"
+        // Nothing is printed into the chat area: the Zoom row and the Login/Join
+        // block carry the connection state. Free tier keeps its upgrade
+        // placeholder and a disabled input (UpdateChatHeaderState gates the
+        // input on the tier lock as well as the meeting).
+        UpdateChatHeaderState();   // Zoom row -> "Connected", input enabled
     }
     void OnMeetingLeft() {
-        SetPlaceholder(CurrentPlaceholderText());
-        m_input->setEnabled(false);
-        m_sendBtn->setEnabled(false);
-        UpdateChatHeaderState();   // Zoom row -> "Not connected"
+        UpdateChatHeaderState();   // Zoom row -> "Waiting", input disabled
         // Hide any active popup and drop the overlay history so stale
         // messages don't carry into the next meeting.
         feeds::ClearChatPopup();
         feeds::ClearChatOverlay();
     }
 
-    // Called from the IPC handlers when login state changes, so the
-    // placeholder reflects "click to login" vs "click to connect" as
-    // the user transitions between states without needing to leave a
-    // meeting first. No-op once chat history is showing.
+    // Called from the IPC handlers when login state changes: refreshes the
+    // Login/Join block, the Zoom row and the input, and the tier placeholder
+    // (the only text the dock still puts in the chat area). The placeholder
+    // part is a no-op once chat history is showing.
     void RefreshPlaceholder() {
         UpdateChatHeaderState();   // login/meeting state changed -> refresh Zoom row
         if (m_messagesStarted) return;
         SetPlaceholder(CurrentPlaceholderText());
+    }
+
+    // Re-sync everything above the chat area with current login / meeting /
+    // tier / dock state. Run from PostParticipantDockRefresh, so it rides the
+    // same state changes that refresh the Controls dock (both docks' Login/Join
+    // blocks update together), and from the dock toggle signals.
+    void RefreshDockState() { UpdateChatHeaderState(); }
+
+    // "Open Controls Dock": shown only while the Controls dock is closed (its
+    // toggle unchecked). No tier gate.
+    void UpdateOpenDockButton() {
+        if (m_openControlsSlot)
+            m_openControlsSlot->setVisible(IsFeedsDockClosed("feeds_participant_dock"));
     }
 
     // Toggle the dock between "normal" and "tier-locked" states.
@@ -2615,8 +2856,8 @@ public:
     // the locked state clears any accumulated chat history (so a Free
     // user picking up a shared OBS doesn't see a paid user's history)
     // and swaps the placeholder to the upgrade prompt. Exiting the
-    // locked state restores the normal placeholder; input stays
-    // disabled until OnMeetingJoined fires from a real connect.
+    // locked state clears it (a blank chat area); the input follows the
+    // meeting state from there (UpdateChatHeaderState).
     void SetTierDisabled(bool disabled) {
         if (m_tierDisabled == disabled) return;
         m_tierDisabled = disabled;
@@ -2690,31 +2931,105 @@ public:
     }
 
 private:
-    // Build the fixed platform header: a read-only Zoom status row and an
-    // editable YouTube row (glyph + field + status dot + word). Compact — a
-    // couple of chat lines tall. Row glyphs reuse DrawChatOriginGlyph (icon
-    // labels; no text labels needed). Twitch/TikTok rows are intentionally not
-    // built until those platforms ship.
+    // The chat source buttons, one row of two: Chat Overlay (always creates a
+    // new source, per-scene width/rows/count differ, and opens its properties)
+    // and Chat Popup (reference-or-create; no reason for duplicates). Both are
+    // Streamer+ (tier >= 2): a locked click opens the upgrade prompt instead.
+    // Restyled for tier/cooldown by UpdateChatHeaderState.
+    QWidget* BuildChatSourceRow() {
+        QWidget* row = new QWidget(this);
+        QHBoxLayout* l = new QHBoxLayout(row);
+        l->setContentsMargins(8, 6, 8, 0);
+        l->setSpacing(6);
+
+        m_chatOverlayBtn = MakeDockSourceButton("Chat Overlay");
+        QObject::connect(m_chatOverlayBtn, &QPushButton::clicked, this, [this]() {
+            if (g_currentTier < 2) {   // tier-locked (Streamer+): actionable upgrade prompt
+                ShowSourceUpgradePrompt("Feeds Chat Overlay", "Streamer");
+                return;
+            }
+            if (m_cdChatOverlay) return;   // on add-cooldown: absorb the rapid re-click
+            CreateSourceOfTypeInCurrentScene("feeds_chat_overlay", "Feeds Chat Overlay",
+                                             /*openProperties=*/true);
+            BeginSourceCooldown(&m_cdChatOverlay);
+        });
+
+        m_chatPopupBtn = MakeDockSourceButton("Chat Popup");
+        QObject::connect(m_chatPopupBtn, &QPushButton::clicked, this, [this]() {
+            if (g_currentTier < 2) {   // tier-locked (Streamer+): actionable upgrade prompt
+                ShowSourceUpgradePrompt("Feeds Chat Popup", "Streamer");
+                return;
+            }
+            if (m_cdChatPopup) return;   // on add-cooldown: absorb the rapid re-click
+            AddOrReferenceSourceInCurrentScene("feeds_chat_popup", "Feeds Chat Popup",
+                                               RefAddPlacement::PopupDefault);
+            BeginSourceCooldown(&m_cdChatPopup);
+        });
+
+        l->addWidget(m_chatOverlayBtn, 1);   // equal halves
+        l->addWidget(m_chatPopupBtn, 1);
+        return row;
+    }
+
+    // Begin a 1s add-cooldown on a chat source button: set its flag, grey it now,
+    // and schedule the flag-clear + restyle. `this` as the timer context, so it
+    // auto-cancels with the dock; the restyle recomputes the resting look.
+    void BeginSourceCooldown(bool* flag) {
+        *flag = true;
+        StyleChatSourceButtons();
+        QTimer::singleShot(kDockAddCooldownMs, this, [this, flag]() {
+            *flag = false;
+            StyleChatSourceButtons();
+        });
+    }
+
+    void StyleChatSourceButtons() {
+        const bool locked = g_currentTier < 2;   // overlay/popup: Streamer+
+        StyleDockSourceButton(m_chatOverlayBtn, locked, false, m_cdChatOverlay);
+        StyleDockSourceButton(m_chatPopupBtn,   locked, false, m_cdChatPopup);
+    }
+
+    // Build the fixed platform header: three rows of the same shape (glyph +
+    // field + status dot + word), Zoom first, then YouTube, then Twitch. Zoom's
+    // field is read-only status; YouTube's and Twitch's are editable targets.
+    // Compact — a couple of chat lines tall. Row glyphs reuse
+    // DrawChatOriginGlyph (icon labels; no text labels needed).
     QWidget* BuildChatHeader() {
         QWidget* header = new QWidget(this);
         QVBoxLayout* hv = new QVBoxLayout(header);
         hv->setContentsMargins(8, 6, 8, 6);
         hv->setSpacing(4);
 
-        // Zoom row — read-only status (connect flows stay in the list placeholder).
+        // Zoom row — same layout as YouTube/Twitch, but the field is read-only
+        // status: it shows the meeting state, and is not a join control. Joining
+        // happens only through the Login/Join block above.
+        //
+        // Read-only but deliberately NOT disabled, so its tooltip always shows
+        // and the meeting number can be selected and copied (right-click Copy).
+        // Greyed explicitly instead, in the dock's #7a7d80 "present, not in
+        // play" tone. No focus on click and an arrow pointer, and QLineEdit
+        // draws no text cursor when read-only, so nothing suggests typing.
         QHBoxLayout* zoomRow = new QHBoxLayout();
         zoomRow->setSpacing(6);
         QLabel* zoomGlyph = new QLabel(header);
         zoomGlyph->setPixmap(MakeChatOriginPixmap(kChatOriginZoom, kChatGlyphSize));
         zoomGlyph->setFixedSize(kChatGlyphSize, kChatGlyphSize);
         zoomGlyph->setToolTip("Zoom chat");
-        m_zoomStatus = new QLabel(header);
-        // Clickable (not restyled as a button) — routes to the shared
-        // click-to-connect flow, same as the message-list placeholder. Cursor is
-        // set per meeting-state in UpdateChatHeaderState.
-        m_zoomStatus->installEventFilter(this);
+        m_zoomField = new QLineEdit(header);
+        m_zoomField->setReadOnly(true);
+        m_zoomField->setFocusPolicy(Qt::NoFocus);
+        m_zoomField->setCursor(Qt::ArrowCursor);
+        m_zoomField->setStyleSheet("QLineEdit { color: #7a7d80; }");
+        m_zoomDot = new QLabel(header);
+        m_zoomDot->setFixedSize(10, 10);
+        m_zoomWord = new QLabel(header);
+        // Clickable only in the Upgrade state (same pattern as the YouTube and
+        // Twitch words), via m_zoomWordClickable.
+        m_zoomWord->installEventFilter(this);
         zoomRow->addWidget(zoomGlyph);
-        zoomRow->addWidget(m_zoomStatus, 1);
+        zoomRow->addWidget(m_zoomField, 1);
+        zoomRow->addWidget(m_zoomDot);
+        zoomRow->addWidget(m_zoomWord);
         hv->addLayout(zoomRow);
 
         // YouTube row — editable target + live status.
@@ -2766,40 +3081,29 @@ private:
         return header;
     }
 
-    // Refresh the Zoom status text + tier presentation. The header is ALWAYS
-    // visible (a visible "Waiting" row honestly says "configured, works once
+    // Refresh everything above the chat area plus the input from current state:
+    // Login/Join block, "Open Controls Dock", chat source buttons, the three
+    // platform rows, and tier presentation. The rows are ALWAYS visible (a
+    // visible "Waiting" row honestly says "configured, works once
     // connected/upgraded" — hiding it reintroduced the discoverability problem
     // this redesign solves, and tier-hiding didn't reliably track logout anyway).
     void UpdateChatHeaderState() {
         if (!m_chatHeader) return;
-        if (m_zoomStatus) {
-            // Label + click stay in lockstep with TriggerConnectFlow's precedence,
-            // so what the row says always matches what clicking it does:
-            //   tier-locked      -> "Upgrade Required" (click: upgrade URL) — the
-            //                       upgrade is the real blocker, so it wins over
-            //                       the login/connect labels.
-            //   in a meeting     -> "In Meeting (number)" (click: inert)
-            //   logged in        -> "Not Connected"       (click: connect)
-            //   logged out       -> "Not Logged In"       (click: login)
-            QString z;
-            bool actionable;
-            if (m_tierDisabled) {
-                z = "Upgrade Required"; actionable = true;
-            } else if (g_isInMeeting) {
-                z = g_currentMeetingNumber
-                        ? QString("In Meeting (%1)")
-                              .arg(FormatMeetingNumber(g_currentMeetingNumber))
-                        : QString("In Meeting");
-                actionable = false;
-            } else if (g_isLoggedIn) {
-                z = "Not Connected"; actionable = true;
-            } else {
-                z = "Not Logged In"; actionable = true;
-            }
-            m_zoomStatus->setText(z);
-            m_zoomStatus->setCursor(actionable ? Qt::PointingHandCursor
-                                               : Qt::ArrowCursor);
-        }
+
+        // Everything above the rows: the shared Login/Join block, the "Open
+        // Controls Dock" button (only while that dock is closed; no tier gate),
+        // and the chat source buttons' tier/cooldown look.
+        if (m_connectBlock) m_connectBlock->Sync();
+        UpdateOpenDockButton();
+        StyleChatSourceButtons();
+
+        RefreshZoomRow();
+
+        // The message input works exactly while in a meeting, and never while
+        // tier-locked (a Free user's dock stays locked even in a meeting).
+        const bool canSend = g_isInMeeting && !m_tierDisabled;
+        if (m_input)   m_input->setEnabled(canSend);
+        if (m_sendBtn) m_sendBtn->setEnabled(canSend);
         // Grey (but readable) the platform fields while tier-locked so the user sees
         // their configured target but understands it's inactive. Enable transitions
         // (upgrade -> reconcile -> SetTierDisabled) fire reliably; a disabled field
@@ -2885,6 +3189,43 @@ private:
         }
     }
 
+    // Zoom row: the meeting state in the same dot/word vocabulary as the
+    // YouTube and Twitch rows, and the field text saying what it is.
+    //   logged out        grey dot, "Off",       field "Not logged in"
+    //   tier-locked       amber,    "Upgrade",   field = meeting state (click:
+    //                     upgrade URL, like the other rows' Upgrade word)
+    //   logged in         amber,    "Waiting",   field "Not in a meeting"
+    //   in a meeting      green,    "Connected", field = meeting number
+    // The field's tooltip points at the Login/Join block whenever there is no
+    // meeting; in a meeting it has none.
+    void RefreshZoomRow() {
+        if (!m_zoomField) return;
+        QString field;
+        if (!g_isLoggedIn)
+            field = "Not logged in";
+        else if (!g_isInMeeting)
+            field = "Not in a meeting";
+        else if (g_currentMeetingNumber)
+            field = FormatMeetingNumber(g_currentMeetingNumber);
+        else
+            field = "In a meeting";   // number not known yet
+        if (m_zoomField->text() != field) m_zoomField->setText(field);
+        m_zoomField->setToolTip(g_isInMeeting
+            ? QString() : QString("Join a meeting using the button above"));
+
+        RowStatus s;
+        if (!g_isLoggedIn)
+            s = { "#7a7d80", "Off", QString(), false };
+        else if (m_tierDisabled)
+            s = { "#e0a020", "Upgrade",
+                  QString("Upgrade your plan to enable Feeds Chat"), true };
+        else if (g_isInMeeting)
+            s = { "#40c060", "Connected", QString(), false };
+        else
+            s = { "#e0a020", "Waiting", QString(), false };
+        ApplyRowStatus(m_zoomDot, m_zoomWord, m_zoomWordClickable, s);
+    }
+
     void RefreshYouTubeRowStatus() {
         ApplyRowStatus(m_ytDot, m_ytWord, m_ytWordClickable,
                        ResolveRowStatus(m_ytConn, "YouTube", m_ytLiveDetail));
@@ -2910,9 +3251,9 @@ private:
         }
     }
 
-    // Shared click-to-connect entry point: the message-list placeholder and the
-    // header's Zoom status label both route here. Tier-locked -> upgrade URL;
-    // already in a meeting -> inert; logged out -> login; logged in -> connect.
+    // Shared click entry point for the message-list placeholder and the rows'
+    // clickable status words. Tier-locked -> upgrade URL; already in a meeting ->
+    // inert; logged out -> login; logged in -> connect.
     void TriggerConnectFlow() {
         if (m_tierDisabled) {
             QDesktopServices::openUrl(QUrl("https://letsdovideo.com/feeds-upgrade"));
@@ -2923,11 +3264,10 @@ private:
         else               OnConnectClick();
     }
 
-    // Route a click on an (unstyled) status label to the shared connect flow. The
-    // Zoom row is always actionable; the YouTube/Twitch status words act only in
-    // their clickable states (Log In / Upgrade) — TriggerConnectFlow resolves to
-    // login when logged out and the upgrade URL when tier-locked, matching what
-    // ResolveRowStatus rendered.
+    // Route a click on an (unstyled) status word to the shared click flow. Each
+    // row's word acts only in its clickable states (Zoom: Upgrade; YouTube/Twitch:
+    // Log In / Upgrade) — TriggerConnectFlow resolves to login when logged out and
+    // the upgrade URL when tier-locked, matching what the row rendered.
     bool eventFilter(QObject* obj, QEvent* ev) override {
         // Preserve the user's reading position across the list's width-driven
         // word-wrap reflow (and keep the floating pill positioned). When this
@@ -2952,7 +3292,7 @@ private:
             return false;  // let the view handle the resize / relayout
         }
         if (ev->type() == QEvent::MouseButtonRelease &&
-            (obj == m_zoomStatus ||
+            ((obj == m_zoomWord && m_zoomWordClickable) ||
              (obj == m_ytWord && m_ytWordClickable) ||
              (obj == m_twWord && m_twWordClickable))) {
             TriggerConnectFlow();
@@ -2967,7 +3307,7 @@ private:
         // must not stomp on accumulated chat history.
         if (m_messagesStarted) return;
         m_list->clear();
-        m_list->addItem(text);
+        if (!text.isEmpty()) m_list->addItem(text);   // empty = a blank chat area
     }
 
     void OnMessageClicked(QListWidgetItem* item) {
@@ -3025,13 +3365,14 @@ private:
                                GetAvatarForSender(senderId, std::string()));
     }
 
+    // The chat area carries no connection status (the Login/Join block and the
+    // Zoom row do). The one remaining placeholder is the tier lock's upgrade
+    // prompt, which is about the plan, not the connection; otherwise blank.
     QString CurrentPlaceholderText() const {
         if (m_tierDisabled) {
             return "Feeds Chat is a paid feature. Click to upgrade your plan.";
         }
-        return g_isLoggedIn
-            ? "Logged in. Click to Connect to Zoom Meeting."
-            : "Not logged in to Zoom. Click to Login.";
+        return QString();
     }
 
     void SendCurrentMessage() {
@@ -3062,9 +3403,21 @@ private:
     QPushButton* m_newMsgPill       = nullptr;  // floating "↓ New messages"
     bool         m_messagesStarted  = false;
 
+    // Top chrome: the shared Login/Join block, the conditional "Open Controls
+    // Dock" slot, and the chat source buttons with their add-cooldown flags.
+    FeedsConnectBlock*  m_connectBlock     = nullptr;
+    QWidget*            m_openControlsSlot = nullptr;
+    ElidingPushButton*  m_chatOverlayBtn   = nullptr;
+    ElidingPushButton*  m_chatPopupBtn     = nullptr;
+    bool                m_cdChatOverlay    = false;
+    bool                m_cdChatPopup      = false;
+
     // Platform header widgets (see BuildChatHeader).
     QWidget*     m_chatHeader       = nullptr;
-    QLabel*      m_zoomStatus       = nullptr;
+    QLineEdit*   m_zoomField        = nullptr;
+    QLabel*      m_zoomDot          = nullptr;
+    QLabel*      m_zoomWord         = nullptr;
+    bool         m_zoomWordClickable = false;
     QLineEdit*   m_ytField          = nullptr;
     QLabel*      m_ytDot            = nullptr;
     QLabel*      m_ytWord           = nullptr;
@@ -3148,44 +3501,6 @@ protected:
 private:
     QString m_full;
     bool    m_pressed = false;
-};
-
-// A QPushButton that truncates its label with a trailing ellipsis when the label
-// doesn't fit — the OBS dock-tab convention ("Chat O…") — rather than clipping the
-// glyphs hard, shrinking the font, or forcing the dock wider. Used for the header's
-// three equal-thirds add-source buttons: with their reduced horizontal padding (see
-// StyleHeaderButton) the short labels ("Screenshare", "Chat Overlay", "Chat Popup")
-// fit whole at or near the min dock width; a narrower dock elides instead of
-// overflowing. The un-elided label is kept for re-eliding on resize; minimumSizeHint
-// drops the natural-width floor so the equal-thirds layout may shrink a button below
-// its text width and let it elide. No icon path: the header buttons carry no icons.
-class ElidingPushButton : public QPushButton {
-public:
-    explicit ElidingPushButton(const QString& text, QWidget* parent = nullptr)
-        : QPushButton(parent), m_full(text) {
-        QPushButton::setText(text);   // re-elided on first resizeEvent
-    }
-    QSize minimumSizeHint() const override {
-        // Keep the style's height; floor the width at about an ellipsis so three
-        // buttons can share a narrow dock without overflowing it.
-        QSize s = QPushButton::minimumSizeHint();
-        int floor = QFontMetrics(font()).horizontalAdvance(QStringLiteral("…")) + 12;
-        return QSize(qMin(s.width(), floor), s.height());
-    }
-protected:
-    void resizeEvent(QResizeEvent* e) override {
-        QPushButton::resizeEvent(e);
-        // Elide against the content rect (inside the style's frame + our reduced
-        // horizontal padding). The guarded setText avoids a resize feedback loop.
-        QStyleOptionButton opt;
-        initStyleOption(&opt);
-        QRect cr = style()->subElementRect(QStyle::SE_PushButtonContents, &opt, this);
-        QString shown = QFontMetrics(font()).elidedText(
-            m_full, Qt::ElideRight, qMax(0, cr.width()));
-        if (shown != text()) QPushButton::setText(shown);
-    }
-private:
-    QString m_full;
 };
 
 // A QComboBox whose CLOSED value elides with a trailing ellipsis instead of
@@ -3422,15 +3737,10 @@ public:
 
         // Fixed header chrome pinned to the dock TOP — added to the OUTER layout
         // ABOVE the scroll area, so it never scrolls with the source list and never
-        // moves as participants join/leave. It carries the state-driven Connect/
-        // Login button (top slot, rebuilt each Refresh) and, beneath it, the three
-        // always-present add-source buttons. The three source buttons are static,
-        // roster-independent actions, so they belong here as a fixed header rather
-        // than mixed into the moving participant content (or competing with OBS's
-        // own dock tab strip, which sits directly below a bottom-pinned bar). Their
-        // per-button state (tier lock + screenshare live dot) is updated in place by
-        // UpdateHeaderState() on every Refresh(), riding the existing tier/login/
-        // meeting/share refresh path with no separate mechanism.
+        // moves as participants join/leave. It carries the shared Login/Join block
+        // (gone in a meeting) and the conditional "Open Chat Dock" button, both
+        // updated in place by UpdateHeaderState() on every Refresh(), riding the
+        // existing tier/login/meeting refresh path with no separate mechanism.
         m_header = BuildHeaderBar();
         frameLayout->addWidget(m_header, 0);
         frameLayout->addWidget(scroll, 1);   // takes the stretch; header stays pinned above
@@ -3498,7 +3808,8 @@ public:
         // Header chrome first: it's persistent (outer layout, not m_root) and
         // independent of the inline-rename editor, so update it unconditionally —
         // even on the deferred-rename and empty-rows early returns below — so a
-        // tier/login/share change always re-styles the header's source buttons.
+        // tier/login/meeting change always reaches the Login/Join block and the
+        // "Open Chat Dock" button.
         UpdateHeaderState();
         UpdateTrialFooter();
 
@@ -3615,39 +3926,21 @@ public:
 
         ClearContent();
 
-        // Top slot — three states, mirroring the properties dialog's single
-        // state-driven top slot:
-        //   not in a meeting            -> connect/login button (in the FIXED header)
-        //   in a meeting, granted, alone-> greyed "Waiting for participants..."
-        //   live (other participant)    -> neither
-        // The pre-grant window (in a meeting, not granted) shows neither.
-        //
-        // The connect/login button lives in the fixed header (above the three
-        // source buttons), NOT in this scrolling content, so it never scrolls under
-        // the roster; when it's gone (connected), the source buttons become the
-        // dock's top row. Rebuilt here from the freshly gathered login/meeting
-        // state. The "Waiting for participants..." line stays in the scrolling
-        // content — it's roster feedback that belongs above the rows, and keeping it
-        // out of the header means the source buttons don't shift when it comes/goes.
-        RebuildHeaderTopSlot(loggedIn, inMeeting);
-
-        if (inMeeting && granted && othersPresent == 0) {
-            // Connected but alone — one greyed waiting line at the top (not per
-            // row). Same string and #7a7d80 styling as the properties dialog.
-            QLabel* waiting = new QLabel("Waiting for participants...");
-            waiting->setStyleSheet("QLabel { color: #7a7d80; }");
-            waiting->setWordWrap(true);
-            m_root->addWidget(waiting);
-        }
+        // The Login/Join block lives in the fixed header (UpdateHeaderState, run
+        // at the top of every Refresh), not in this scrolling content, so it never
+        // scrolls under the roster. Connected-but-alone shows no dock-level line:
+        // each row's own "Waiting for participants..." already says it.
 
         if (rows.empty()) {
             QLabel* empty = new QLabel(
                 "No Feeds Participant sources yet.\n"
-                "Click “Create Participant Feed” below to create one.");
+                "Click “Add Participant” below to create one.");
             empty->setWordWrap(true);
             empty->setStyleSheet("QLabel { color: #7a7d80; }");
             m_root->addWidget(empty);
-            AppendCreateButton();
+            // No rows means nothing to be over the cap with: Add Participant is
+            // always offered here, as the create button always was.
+            AppendAddRow(true);
             m_root->addStretch(1);
             return;
         }
@@ -3730,178 +4023,66 @@ public:
             }
         }
 
-        // Hide the create button at/over the tier cap so it doesn't compete with
+        // Hide Add Participant at/over the tier cap so it doesn't compete with
         // the upgrade prompt (a deliberate divergence from the Source dock, which
         // still creates above cap). Same count-vs-cap test the greying/divider
         // uses, so "at cap" means the same thing everywhere; logged out / tier
         // unknown keeps atOrOverCap false, so the button still shows there. It
         // returns automatically once a delete drops back under cap (rebuilt here).
-        if (!atOrOverCap)
-            AppendCreateButton();
+        // Add Screenshare stays either way: the participant cap isn't its limit.
+        AppendAddRow(!atOrOverCap);
         m_root->addStretch(1);
     }
 
+    // "Open Chat Dock": shown only for Basic or higher (the Chat dock's own tier
+    // gate) AND while the Chat dock is closed (its toggle unchecked). Run from
+    // UpdateHeaderState and from the dock toggle signals.
+    void UpdateOpenDockButton() {
+        if (m_openChatSlot)
+            m_openChatSlot->setVisible(g_currentTier >= 1 &&
+                                       IsFeedsDockClosed("feeds_chat_dock"));
+    }
+
 private:
-    // Full-width "create a Feeds participant source" button, pinned at the bottom
-    // (the top slot is state-driven). Never disabled by the tier cap — it always
-    // creates; an over-cap result is greyed by the identical existing logic. The
-    // create + scene-add + placement + dock-row all ride the existing signal paths.
-    // "Create Participant Feed" (no "+") names what it uniquely does — brings a new
-    // feed into existence — vs. the header buttons that place/reference a source.
-    void AppendCreateButton() {
-        QPushButton* addBtn = new QPushButton("Create Participant Feed");
-        m_createBtn = addBtn;   // current instance (rebuilt each Refresh) for the cooldown restyle
-        // Creating a feed triggers a dock rebuild (zp_create -> refresh), which
-        // replaces this button — so the cooldown state lives on the dock, not the
-        // widget: re-grey the fresh button here whenever a cooldown is still in
-        // flight across that rebuild.
-        StyleCreateButton(addBtn, m_cdCreateFeed);
-        QObject::connect(addBtn, &QPushButton::clicked, [this]() {
-            if (m_cdCreateFeed) return;   // on add-cooldown: absorb the rapid re-click
-            CreateParticipantSourceInCurrentScene();
-            m_cdCreateFeed = true;
-            if (m_createBtn) StyleCreateButton(m_createBtn, true);
-            QTimer::singleShot(kAddCooldownMs, this, [this]() {
-                m_cdCreateFeed = false;
-                if (m_createBtn) StyleCreateButton(m_createBtn, false);
-            });
-        });
-        m_root->addWidget(addBtn);
-    }
-
-    // Create-button resting style is the theme default (no stylesheet); on the add-
-    // cooldown it greys to the same #7a7d80 as the tier-locked buttons, then reverts.
-    // Colour only — the cursor is left at the button default in both states, so the
-    // resting appearance is unchanged from before the cooldown existed.
-    static void StyleCreateButton(QPushButton* b, bool cooling) {
-        if (!b) return;
-        b->setStyleSheet(cooling ? "QPushButton { color: #7a7d80; }" : QString());
-    }
-
-    // --- Fixed header bar: add-source buttons for the other three source types ---
-    // A toolbar-style bar pinned to the dock TOP (built once, in the outer layout),
-    // completing "all four Feeds source types addable from the dock". Three
-    // equal-width buttons; each honors its type's multiplicity rule:
-    //   Screenshare  — reference-or-create (hard singleton; zs_create refuses a 2nd)
-    //   Chat Overlay — ALWAYS create new (per-scene width/rows/count differ)
-    //   Chat Popup   — reference-or-create (no reason for duplicates)
-    // Tier gates match the source types themselves: screenshare Basic+ (tier >= 1),
-    // chat overlay/popup Streamer+ (tier >= 2). g_currentTier is the same value the
-    // cap chrome reads, so the header re-locks in the same refresh path.
-
-    // One equal-thirds header button. Tooltip is the constant "Add to Current
-    // Scene" in every state, locked or unlocked — the tier explanation lives in the
-    // upgrade prompt a locked click opens, so it's set once here and never changed.
-    // Eliding (ElidingPushButton) truncates the label with an ellipsis if a narrow
-    // dock can't fit it whole, matching OBS's dock-tab convention. Per-state cursor,
-    // padding, and label color are applied by StyleHeaderButton on each Refresh.
-    static ElidingPushButton* MakeHeaderButton(const QString& label) {
-        ElidingPushButton* b = new ElidingPushButton(label);
-        b->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-        b->setToolTip("Add to Current Scene");
-        return b;
-    }
-
-    // Rebuild the fixed header's top slot: the Connect/Login button when not in a
-    // meeting, empty (and collapsed to zero height) once connected — at which point
-    // the three source buttons below become the dock's top row. Split on login
-    // state only; no tier lock (this dock isn't tier-gated, so a Free user sees and
-    // uses it). Same labels/actions as the properties dialog's buttons. Called from
-    // Refresh() with the freshly gathered login/meeting state.
-    void RebuildHeaderTopSlot(bool loggedIn, bool inMeeting) {
-        if (!m_headerTopLayout) return;
-        QLayoutItem* item;
-        while ((item = m_headerTopLayout->takeAt(0)) != nullptr) {
-            if (QWidget* w = item->widget()) { w->hide(); w->deleteLater(); }
-            delete item;
-        }
-        if (inMeeting) { m_headerTopSlot->setVisible(false); return; }
-
-        // Labels are trimmed to the ACTION alone. The button only ever exists in
-        // the state it names, so the leading status clause ("Logged in.", "Not
-        // logged in to Zoom.") restated what the button's own presence already
-        // says — and the connect label was long enough that it overran the slot
-        // at the dock's minimum width and painted clipped at both ends.
-        QPushButton* btn = new QPushButton(
-            loggedIn ? "Click to Connect to Zoom Meeting"
-                     : "Click to Login to Zoom");
-        StylePrimaryCtaButton(btn);
-        if (loggedIn)
-            QObject::connect(btn, &QPushButton::clicked, []() { OnConnectClick(); });
-        else
-            QObject::connect(btn, &QPushButton::clicked, []() { OnLoginClick(); });
-        m_headerTopLayout->addWidget(btn);
-        m_headerTopSlot->setVisible(true);
-    }
-
-    // Style the header top slot's button as the dock's primary call to action.
-    //
-    // Whenever this button exists at all the user is either logged out or not
-    // yet in a meeting, so it is what they came to the dock for; the rest of
-    // the dock does nothing useful until it has been pressed. A themed default
-    // button looks like every other button in OBS and does not say that, so
-    // this one gets a filled accent instead: the same blue triad the Connect
-    // dialog uses for its primary tiles, so "Feeds primary action" reads as one
-    // colour across the plugin.
-    //
-    // The fill, text colour and border are all stated explicitly rather than
-    // inherited, so the button looks the same under OBS's dark theme, its light
-    // theme, and a user's custom theme, where an inherited button colour would
-    // drift. Bold text and the pointing-hand cursor complete the affordance.
-    //
-    // Horizontal padding is deliberately tighter than the vertical: the label
-    // is a whole sentence and this slot sits OUTSIDE the dock's scroll area, so
-    // the button's width demand is a floor on the dock's own width. Trading
-    // side padding for the extra width that bold costs keeps that floor where
-    // it was.
-    static void StylePrimaryCtaButton(QPushButton* b) {
-        if (!b) return;
-        QFont f = b->font();
-        f.setBold(true);
-        b->setFont(f);
-        b->setCursor(Qt::PointingHandCursor);
-        b->setStyleSheet(
-            "QPushButton {"
-            " background-color: #3a6fe0; color: #ffffff;"
-            " border: 1px solid #3a6fe0; border-radius: 4px;"
-            " padding: 8px 10px; }"
-            "QPushButton:hover {"
-            " background-color: #5285ea; border-color: #5285ea; }"
-            "QPushButton:pressed {"
-            " background-color: #2f5cc0; border-color: #2f5cc0; }");
-    }
-
-    QWidget* BuildHeaderBar() {
-        QWidget* header = new QWidget();
-        QVBoxLayout* hv = new QVBoxLayout(header);
-        hv->setContentsMargins(0, 0, 0, 0);
-        hv->setSpacing(0);
-
-        // Top slot: the state-driven Connect/Login button, rebuilt each Refresh by
-        // RebuildHeaderTopSlot. Hidden (zero height) whenever it has no button — i.e.
-        // once connected — so the three source buttons sit flush at the dock top.
-        // Its own margins pad the button, matching the old in-content top slot.
-        m_headerTopSlot = new QWidget();
-        m_headerTopLayout = new QVBoxLayout(m_headerTopSlot);
-        m_headerTopLayout->setContentsMargins(8, 8, 8, 6);
-        m_headerTopLayout->setSpacing(0);
-        m_headerTopSlot->setVisible(false);
-        hv->addWidget(m_headerTopSlot);
-
-        QFrame* bar = new QFrame();
-        bar->setObjectName("feedsHeaderBar");
-        // Toolbar chrome: a bottom divider + faint fill so it reads as fixed header
-        // chrome, distinct from the scrolling participant rows below.
-        bar->setStyleSheet(
-            "QFrame#feedsHeaderBar { border-bottom: 1px solid rgba(128,128,128,0.35);"
-            " background: rgba(128,128,128,0.06); }");
-
-        QHBoxLayout* l = new QHBoxLayout(bar);
-        l->setContentsMargins(8, 6, 8, 6);
+    // The bottom row, rebuilt each Refresh below the participant rows:
+    // Add Participant | Add Screenshare, equal halves.
+    //   Add Participant — always creates a new participant source. Never disabled
+    //     by the tier cap — an over-cap result is greyed by the identical existing
+    //     logic — but omitted at/over the cap (includeParticipant false) so it
+    //     doesn't compete with the upgrade prompt; Add Screenshare then has the row
+    //     to itself. The create + scene-add + placement + dock-row all ride the
+    //     existing signal paths.
+    //   Add Screenshare — reference-or-create (hard singleton; zs_create refuses a
+    //     2nd). Basic+ (tier >= 1): a locked click opens the upgrade prompt.
+    // Both buttons are rebuilt with the row, so their cooldown state lives on the
+    // dock, not the widgets: a fresh button is re-greyed here whenever a cooldown
+    // is still in flight across a rebuild.
+    void AppendAddRow(bool includeParticipant) {
+        QWidget* row = new QWidget();
+        QHBoxLayout* l = new QHBoxLayout(row);
+        l->setContentsMargins(0, 0, 0, 0);
         l->setSpacing(6);
 
-        m_hdrScreenshare = MakeHeaderButton("Screenshare");
-        QObject::connect(m_hdrScreenshare, &QPushButton::clicked, [this]() {
+        if (includeParticipant) {
+            ElidingPushButton* addBtn = new ElidingPushButton("Add Participant");
+            addBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+            m_createBtn = addBtn;   // current instance (rebuilt each Refresh) for the cooldown restyle
+            StyleCreateButton(addBtn, m_cdCreateFeed);
+            QObject::connect(addBtn, &QPushButton::clicked, [this]() {
+                if (m_cdCreateFeed) return;   // on add-cooldown: absorb the rapid re-click
+                CreateParticipantSourceInCurrentScene();
+                m_cdCreateFeed = true;
+                if (m_createBtn) StyleCreateButton(m_createBtn, true);
+                QTimer::singleShot(kAddCooldownMs, this, [this]() {
+                    m_cdCreateFeed = false;
+                    if (m_createBtn) StyleCreateButton(m_createBtn, false);
+                });
+            });
+            l->addWidget(addBtn, 1);
+        }
+
+        m_addScreenshareBtn = MakeDockSourceButton("Add Screenshare");
+        QObject::connect(m_addScreenshareBtn, &QPushButton::clicked, [this]() {
             if (g_currentTier < 1) {   // tier-locked (Basic+): actionable upgrade prompt
                 ShowSourceUpgradePrompt("Feeds Screenshare", "Basic");
                 return;   // locked: no add to cool down (upgrade-prompt throttle handles it)
@@ -3909,107 +4090,53 @@ private:
             if (m_cdScreenshare) return;   // on add-cooldown: absorb the rapid re-click
             AddOrReferenceSourceInCurrentScene("zoom_screenshare_source", "Feeds Screenshare",
                                                RefAddPlacement::FitCenter);
-            BeginHeaderCooldown(&m_cdScreenshare);
+            m_cdScreenshare = true;
+            StyleScreenshareButton();
+            QTimer::singleShot(kAddCooldownMs, this, [this]() {
+                m_cdScreenshare = false;
+                StyleScreenshareButton();
+            });
         });
+        StyleScreenshareButton();
+        l->addWidget(m_addScreenshareBtn, 1);
 
-        m_hdrChatOverlay = MakeHeaderButton("Chat Overlay");
-        QObject::connect(m_hdrChatOverlay, &QPushButton::clicked, [this]() {
-            if (g_currentTier < 2) {   // tier-locked (Streamer+): actionable upgrade prompt
-                ShowSourceUpgradePrompt("Feeds Chat Overlay", "Streamer");
-                return;
-            }
-            if (m_cdChatOverlay) return;   // on add-cooldown: absorb the rapid re-click
-            CreateSourceOfTypeInCurrentScene("feeds_chat_overlay", "Feeds Chat Overlay",
-                                             /*openProperties=*/true);
-            BeginHeaderCooldown(&m_cdChatOverlay);
-        });
-
-        m_hdrChatPopup = MakeHeaderButton("Chat Popup");
-        QObject::connect(m_hdrChatPopup, &QPushButton::clicked, [this]() {
-            if (g_currentTier < 2) {   // tier-locked (Streamer+): actionable upgrade prompt
-                ShowSourceUpgradePrompt("Feeds Chat Popup", "Streamer");
-                return;
-            }
-            if (m_cdChatPopup) return;   // on add-cooldown: absorb the rapid re-click
-            AddOrReferenceSourceInCurrentScene("feeds_chat_popup", "Feeds Chat Popup",
-                                               RefAddPlacement::PopupDefault);
-            BeginHeaderCooldown(&m_cdChatPopup);
-        });
-
-        l->addWidget(m_hdrScreenshare, 1);   // equal thirds
-        l->addWidget(m_hdrChatOverlay, 1);
-        l->addWidget(m_hdrChatPopup, 1);
-
-        hv->addWidget(bar);
-        return header;
+        m_root->addWidget(row);
     }
 
-    // Style one header button for its tier-lock and share state. Kept ENABLED even
-    // when locked: a disabled Qt widget receives no hover events, so its tooltip
-    // wouldn't show — and the button must still open the upgrade prompt on click.
-    // Locked = greyed text (#7a7d80) + arrow cursor; the click lambda short-circuits
-    // the add on the tier check and instead opens the upgrade prompt
-    // (ShowSourceUpgradePrompt), so it never performs the source action. The tooltip
-    // ("Add to Current Scene") is constant in both states — set once at creation — so
-    // this doesn't touch it.
-    //
-    // Color precedence: tier-locked greying wins over the share-active green. Only
-    // the Screenshare button ever passes sharing=true, and only when within tier, so
-    // a locked button is never green (nor sharing). The green (#40c060, the tone the
-    // old status dot used) is clearly distinct from the locked grey.
-    //
-    // The stylesheet also sets a reduced horizontal padding (~half the themed
-    // default) so the labels reclaim text room and fit at/near the min dock width;
-    // it's the per-button *minimum* — the Expanding buttons still grow the padding by
-    // centering when the dock is widened. Matches the padding-stylesheet pattern the
-    // row buttons already use. Padding lives in the same stylesheet as the color so a
-    // restyle never drops it.
-    // `cooling` is the transient add-cooldown state (see BeginHeaderCooldown): it
-    // greys the button while active and takes visual precedence over the sharing
-    // green, but not over the tier-lock grey (a locked button never performs an add,
-    // so it never cools). Because this recomputes colour from the live lock/share
-    // state every call, the post-cooldown restyle restores the correct resting look
-    // — normal, still-green if sharing, etc. — rather than clobbering it.
-    static void StyleHeaderButton(QPushButton* b, bool locked, bool sharing, bool cooling) {
+    // Add Participant's resting style is the theme default (no stylesheet); on the
+    // add-cooldown it greys to the same #7a7d80 as the tier-locked buttons, then
+    // reverts. Colour only — the cursor is left at the button default in both
+    // states, so the resting appearance is unchanged from before the cooldown
+    // existed.
+    static void StyleCreateButton(QPushButton* b, bool cooling) {
         if (!b) return;
-        QString color;
-        if (locked)       color = " color: #7a7d80;";   // greyed: tier-locked (wins)
-        else if (cooling) color = " color: #7a7d80;";   // greyed: on add-cooldown
-        else if (sharing) color = " color: #40c060;";   // green: someone is sharing
-        b->setCursor((locked || cooling) ? Qt::ArrowCursor : Qt::PointingHandCursor);
-        b->setStyleSheet(QString(
-            "QPushButton { padding-left: 4px; padding-right: 4px;%1 }").arg(color));
+        b->setStyleSheet(cooling ? "QPushButton { color: #7a7d80; }" : QString());
     }
 
-    // Begin a 1s add-cooldown on a header button: set its flag, grey it now via the
-    // shared style pass, and schedule the flag-clear + restyle. The single-shot uses
-    // the dock (`this`) as context so it auto-cancels if the dock is destroyed; the
-    // flag is a dock member (pointer captured by value), so the reference stays valid
-    // for the timer's lifetime. Restyle goes through UpdateHeaderState so the resting
-    // style is recomputed, never blindly reset.
-    void BeginHeaderCooldown(bool* flag) {
-        *flag = true;
-        UpdateHeaderState();
-        QTimer::singleShot(kAddCooldownMs, this, [this, flag]() {
-            *flag = false;
-            UpdateHeaderState();
-        });
+    // Add Screenshare's look from current tier, share and cooldown state. The label
+    // turns green while someone in the meeting is sharing and the button is within
+    // tier (never on a tier-locked button — greying wins). Same signal the old
+    // status dot used (g_activeSharerUserId); its share_status_changed handler
+    // already marshals a dock refresh, so no new mechanism.
+    void StyleScreenshareButton() {
+        const bool locked  = g_currentTier < 1;   // screenshare: Basic+
+        const bool sharing = !locked && g_activeSharerUserId != 0;
+        StyleDockSourceButton(m_addScreenshareBtn, locked, sharing, m_cdScreenshare);
     }
 
-    // Clicking a tier-locked header button opens the shared upgrade dialog
-    // (ShowTierLimitDialog + the ShouldShowTierPopup throttle) — the same modal
-    // used by the screenshare/chat create paths, with a clickable link to the
-    // same upgrade URL as the dock cap chrome. `feature` is the source display
-    // name; `tierWord` names the plan it needs (Basic / Streamer).
-    static void ShowSourceUpgradePrompt(const QString& feature, const QString& tierWord) {
-        if (!ShouldShowTierPopup()) return;
-        // Explanation on one line, then the upgrade link on its own line below it as
-        // a clear call-to-action (the <br><br> break) rather than jammed mid-sentence.
-        ShowTierLimitDialog(
-            QString("Feeds: %1").arg(feature),
-            QString("%1 is a %2-tier feature.<br><br>"
-                    "<a href=\"https://letsdovideo.com/feeds-upgrade\">Click here "
-                    "to upgrade your plan</a>").arg(feature, tierWord));
+    // The fixed header: the shared Login/Join block, then the conditional "Open
+    // Chat Dock" button. Each collapses to zero height when hidden, so in a
+    // meeting with the Chat dock open the participant rows sit at the dock top.
+    QWidget* BuildHeaderBar() {
+        QWidget* header = new QWidget();
+        QVBoxLayout* hv = new QVBoxLayout(header);
+        hv->setContentsMargins(0, 0, 0, 0);
+        hv->setSpacing(0);
+        m_connectBlock = new FeedsConnectBlock(header);
+        hv->addWidget(m_connectBlock);
+        m_openChatSlot = MakeOpenDockSlot("Open Chat Dock", "feeds_chat_dock");
+        hv->addWidget(m_openChatSlot);
+        return header;
     }
 
     // Tier-conditional footer. Logged-in Free or Basic: the free-trial offer.
@@ -4035,27 +4162,18 @@ private:
         m_trialFooter->setVisible(!text.isEmpty());
     }
 
-    // Re-style the header source buttons from current tier + share state. Called
-    // from Refresh(), so tier/login/meeting/share changes (which all already route
-    // through RefreshAllSourceProperties -> PostParticipantDockRefresh) update them
-    // with no separate mechanism. The buttons are always visible (like "Create
-    // Participant Feed"); gating is per-button greying, for discoverability/upgrade.
+    // Re-sync the fixed header and the in-place button looks from current state:
+    // the shared Login/Join block, the "Open Chat Dock" button, and Add
+    // Screenshare's tier/share look (restyled in place, so a share change reaches
+    // it even while a rename defers the rebuild). Called from Refresh(), so
+    // tier/login/meeting/share changes (which all already route through
+    // RefreshAllSourceProperties -> PostParticipantDockRefresh) update them with
+    // no separate mechanism.
     void UpdateHeaderState() {
         if (!m_header) return;
-
-        const bool ssLocked   = g_currentTier < 1;   // screenshare: Basic+
-        const bool chatLocked = g_currentTier < 2;   // overlay/popup: Streamer+
-
-        // Screenshare label turns green while someone in the meeting is sharing and
-        // the button is within tier (never on a tier-locked button — greying wins).
-        // Same signal the old status dot used (g_activeSharerUserId); its
-        // share_status_changed handler already marshals a dock refresh here, so no
-        // new mechanism.
-        const bool sharing = !ssLocked && g_activeSharerUserId != 0;
-
-        StyleHeaderButton(m_hdrScreenshare, ssLocked,   sharing, m_cdScreenshare);
-        StyleHeaderButton(m_hdrChatOverlay, chatLocked, false,   m_cdChatOverlay);
-        StyleHeaderButton(m_hdrChatPopup,   chatLocked, false,   m_cdChatPopup);
+        if (m_connectBlock) m_connectBlock->Sync();
+        UpdateOpenDockButton();
+        StyleScreenshareButton();
     }
 
     // Small right-aligned per-row button: add THIS source to the current edit
@@ -5205,7 +5323,7 @@ private:
         return row;
     }
 
-    // Lower-third button styling, matching the header buttons' conventions:
+    // Lower-third button styling, matching the add-source buttons' conventions:
     // kept ENABLED when tier-locked (a disabled Qt widget gets no hover events,
     // so its tooltip wouldn't show, and the button must still open the upgrade
     // prompt), greyed to #7a7d80 when locked or cooling, with the arrow cursor
@@ -5285,10 +5403,12 @@ private:
         // Same for the lower-third buttons — borrowed, and m_cdLowerThird (the
         // enforcement) likewise survives the rebuild.
         m_ltButtons.clear();
-        // The create button is about to be deleted; drop the pointer so a pending
-        // cooldown timer can't touch a freed widget if the rebuild omits it (e.g.
-        // hidden at/over the tier cap). AppendCreateButton re-sets it when present.
+        // The bottom-row buttons are about to be deleted; drop the pointers so a
+        // pending cooldown timer can't touch a freed widget if the rebuild omits
+        // one (e.g. Add Participant hidden at/over the tier cap). AppendAddRow
+        // re-sets them when present.
         m_createBtn = nullptr;
+        m_addScreenshareBtn = nullptr;
         QLayoutItem* item;
         while ((item = m_root->takeAt(0)) != nullptr) {
             if (QWidget* w = item->widget()) {
@@ -5303,16 +5423,11 @@ private:
     int          m_minWidth = 0;     // last-applied theme-derived dock min width
     QTimer*      m_liveTimer = nullptr;  // live-indicator poll (parented to dock)
 
-    // Fixed header bar (outer layout, pinned to the dock top — does not scroll).
-    // Built once in the ctor; UpdateHeaderState() re-styles the source buttons in
-    // place, and RebuildHeaderTopSlot() rebuilds the Connect/Login top slot each
-    // Refresh. m_headerTopSlot is hidden (collapsed) whenever it holds no button.
+    // Fixed header (outer layout, pinned to the dock top — does not scroll).
+    // Built once in the ctor; UpdateHeaderState() syncs both parts each Refresh.
     QWidget*           m_header          = nullptr;
-    QWidget*           m_headerTopSlot   = nullptr;  // state-driven Connect/Login slot
-    QVBoxLayout*       m_headerTopLayout = nullptr;  // top-slot layout (cleared each Refresh)
-    ElidingPushButton* m_hdrScreenshare  = nullptr;
-    ElidingPushButton* m_hdrChatOverlay  = nullptr;
-    ElidingPushButton* m_hdrChatPopup    = nullptr;
+    FeedsConnectBlock* m_connectBlock    = nullptr;  // shared Login/Join block
+    QWidget*           m_openChatSlot    = nullptr;  // conditional "Open Chat Dock"
 
     // Free-trial offer pinned below the scroll area (see the ctor). Shown or
     // hidden by UpdateTrialFooter() on every Refresh().
@@ -5327,12 +5442,11 @@ private:
     // clobbering a button's resting state (tier-lock grey / screenshare green /
     // normal). Timers are QTimer::singleShot with the dock as context, so they
     // clean up with the dock.
-    static constexpr int kAddCooldownMs = 1000;
-    bool m_cdScreenshare = false;   // header: Screenshare
-    bool m_cdChatOverlay = false;   // header: Chat Overlay
-    bool m_cdChatPopup   = false;   // header: Chat Popup
-    bool m_cdCreateFeed  = false;   // "Create Participant Feed" (rebuilt each Refresh)
-    QPushButton* m_createBtn = nullptr;            // current Create-Feed button instance
+    static constexpr int kAddCooldownMs = kDockAddCooldownMs;
+    bool m_cdScreenshare = false;   // "Add Screenshare" (rebuilt each Refresh)
+    bool m_cdCreateFeed  = false;   // "Add Participant" (rebuilt each Refresh)
+    QPushButton* m_createBtn = nullptr;            // current Add Participant instance
+    QPushButton* m_addScreenshareBtn = nullptr;    // current Add Screenshare instance
     std::set<std::string> m_cdRows;                // row uuids currently cooling
     std::map<std::string, QPointer<QPushButton>> m_rowAddButtons;  // uuid -> current "+"
 
@@ -5384,6 +5498,9 @@ static void PostParticipantDockRefresh() {
         // routes through here, so there is no separate mechanism to maintain.
         RefreshAllLowerThirdContent();
         if (g_participantDock) g_participantDock->Refresh();
+        // The Chat dock's Login/Join block, Zoom row and buttons follow the same
+        // state, so both docks update on the same signal and can't disagree.
+        if (g_chatDock) g_chatDock->RefreshDockState();
     });
 }
 
@@ -5811,23 +5928,62 @@ static QDockWidget* FindFeedsDock(const char* id) {
     return mainWindow->findChild<QDockWidget*>(QString::fromUtf8(id));
 }
 
-// Show the Controls dock and bring it to the front: raise() selects its tab if
-// it is tabbed with other docks, activateWindow() fronts it if floating. UI
-// thread.
-static void ShowControlsDock() {
-    QDockWidget* dock = FindFeedsDock("feeds_participant_dock");
+// Is this Feeds dock closed? Closed means its toggleViewAction is unchecked (the
+// state OBS's Docks menu shows), NOT that the widget is invisible: a dock tabbed
+// behind another dock in the same area is hidden from view but still open. An
+// unregistered dock (not found) reads as not closed, so nothing offers to open
+// it. UI thread.
+static bool IsFeedsDockClosed(const char* id) {
+    QDockWidget* dock = FindFeedsDock(id);
+    return dock && !dock->toggleViewAction()->isChecked();
+}
+
+// Show a Feeds dock and bring it to the front: raise() selects its tab if it is
+// tabbed with other docks, activateWindow() fronts it if floating. UI thread.
+static void ShowFeedsDock(const char* id) {
+    QDockWidget* dock = FindFeedsDock(id);
     if (!dock) return;
     dock->show();
     dock->raise();
     if (dock->isFloating()) dock->activateWindow();
 }
 
+static void ShowControlsDock() {
+    ShowFeedsDock("feeds_participant_dock");
+}
+
+// Re-evaluate both docks' "Open ... Dock" buttons. Wired to each dock's toggle
+// (see ConnectFeedsDockToggles); tier changes reach them through the docks' own
+// refreshes. UI thread.
+static void RefreshCrossDockButtons() {
+    if (g_participantDock) g_participantDock->UpdateOpenDockButton();
+    if (g_chatDock)        g_chatDock->UpdateOpenDockButton();
+}
+
+// Follow both docks' open/closed state live: any toggle of either dock (its X,
+// the Docks menu, the Feeds menu, an "Open ... Dock" button) re-evaluates both
+// buttons. Run once at FINISHED_LOADING, when both QDockWidget wrappers exist
+// and OBS has restored the saved layout; the initial refresh covers that
+// restored state. QAction::toggled fires on every checked-state change, which
+// QDockWidget drives from explicit show/hide only, so switching tabs does not
+// fire it.
+static void ConnectFeedsDockToggles() {
+    for (const char* id : { "feeds_participant_dock", "feeds_chat_dock" }) {
+        QDockWidget* dock = FindFeedsDock(id);
+        if (!dock) continue;
+        QObject::connect(dock->toggleViewAction(), &QAction::toggled, dock,
+                         [](bool) { RefreshCrossDockButtons(); });
+    }
+    RefreshCrossDockButtons();
+}
+
 // Footer for the Feeds Participant properties: where ongoing control lives,
 // and a button that brings up the Controls dock, included only while the dock
-// is not on screen (closed, or tabbed behind another dock). Decided when the
-// properties are built. get_properties can also run off the UI thread (e.g.
-// obs-websocket), where the dock must not be touched; the button is included
-// there, and its click hops to the UI thread.
+// is closed (same rule as the docks' "Open ... Dock" buttons: a dock tabbed
+// behind another one counts as open). Decided when the properties are built.
+// get_properties can also run off the UI thread (e.g. obs-websocket), where the
+// dock must not be touched; the button is included there, and its click hops
+// to the UI thread.
 static void AppendControlsDockFooter(obs_properties_t* props) {
     obs_properties_add_text(props, "dock_info",
         "After closing this window, manage this source from the Feeds "
@@ -5835,8 +5991,7 @@ static void AppendControlsDockFooter(obs_properties_t* props) {
         OBS_TEXT_INFO);
 
     if (obs_in_task_thread(OBS_TASK_UI)) {
-        QDockWidget* dock = FindFeedsDock("feeds_participant_dock");
-        if (!dock || dock->isVisible()) return;
+        if (!IsFeedsDockClosed("feeds_participant_dock")) return;
     }
     obs_properties_add_button(props, "show_dock_btn", "Show Feeds Controls Dock",
         [](obs_properties_t*, obs_property_t*, void*) -> bool {
@@ -9727,9 +9882,9 @@ static void RegisterEngineHandlers() {
                 g_authInProgress = false;
                 UpdateLoginLogoutMenuItem();
                 g_pendingMeetingJoin = false;
-                // Make the dock say what's true. CurrentPlaceholderText reads
-                // g_isLoggedIn (false on every path that reaches here) and
-                // renders "Not logged in to Zoom. Click to Login." — the whole
+                // Make the dock say what's true. g_isLoggedIn is false on every
+                // path that reaches here, so the Chat dock's Login/Join block
+                // offers login and its Zoom row reads "Not logged in" — the whole
                 // point of failing closed is that the user is shown the one
                 // action that recovers them.
                 if (g_chatDock) g_chatDock->RefreshPlaceholder();
@@ -10733,7 +10888,7 @@ static void OpenNewSourceProperties(const std::string& uuid) {
 // sources) and the source_create signal (OnSourceCreated's deferred, per-type
 // placement, which finds the scene-item we add here). No resolvable scene -> safe
 // no-op (don't leak an orphan source). This is the always-new path — used by
-// "Create Participant Feed" and the header's Chat Overlay button, which also pass
+// "Add Participant" and the Chat dock's Chat Overlay button, which also pass
 // openProperties. UI thread.
 static void CreateSourceOfTypeInCurrentScene(const char* typeId, const char* baseName,
                                              bool openProperties) {
@@ -10773,7 +10928,7 @@ static void CreateParticipantSourceInCurrentScene() {
 // Find the first live (non-removed) source of the given type, returning an owned
 // ref (caller releases) or null. Skips OnSourceCreated "husks" (removed flag set)
 // and any source mid-destroy (obs_source_get_ref returns null). Used by the
-// reference-or-create header buttons to decide reference vs. create. UI thread.
+// reference-or-create dock buttons to decide reference vs. create. UI thread.
 static obs_source_t* FindFirstSourceOfType(const char* typeId) {
     struct Ctx { const char* id; obs_source_t* found; } ctx{ typeId, nullptr };
     obs_enum_sources([](void* p, obs_source_t* s) -> bool {
@@ -11901,6 +12056,9 @@ bool obs_module_load(void) {
             // the resulting visibility, and after OBSInit's restoreState so a
             // saved layout is not overwritten. No-op except on a fresh install.
             MaybeOpenControlsDockOnFirstRun();
+            // After the first-run reveal, so the docks' "Open ... Dock" buttons
+            // start from the final startup state, then follow every toggle.
+            ConnectFeedsDockToggles();
             QTimer::singleShot(5000,
                 (QObject*)obs_frontend_get_main_window(),
                 []() { CheckForUpdateAsync(); });
