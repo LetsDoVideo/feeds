@@ -391,7 +391,10 @@ enum class RefAddPlacement { FitCenter, PopupDefault };
 // references an existing source of that type if one exists, else creates one
 // (reference-or-create) — this is how the screenshare button never trips the
 // zs_create singleton block by trying to create a second instance.
-static void CreateSourceOfTypeInCurrentScene(const char* typeId, const char* baseName);
+// openProperties: also open the new source's properties window (the Create
+// Participant Feed and Chat Overlay buttons only; see OpenNewSourceProperties).
+static void CreateSourceOfTypeInCurrentScene(const char* typeId, const char* baseName,
+                                             bool openProperties = false);
 static void AddOrReferenceSourceInCurrentScene(const char* typeId, const char* baseName,
                                                RefAddPlacement placement);
 // Per-source dock header actions (defined with the scene helpers, far below).
@@ -3905,7 +3908,8 @@ private:
                 return;
             }
             if (m_cdChatOverlay) return;   // on add-cooldown: absorb the rapid re-click
-            CreateSourceOfTypeInCurrentScene("feeds_chat_overlay", "Feeds Chat Overlay");
+            CreateSourceOfTypeInCurrentScene("feeds_chat_overlay", "Feeds Chat Overlay",
+                                             /*openProperties=*/true);
             BeginHeaderCooldown(&m_cdChatOverlay);
         });
 
@@ -5713,6 +5717,47 @@ static QDockWidget* FindFeedsDock(const char* id) {
     QMainWindow* mainWindow = (QMainWindow*)obs_frontend_get_main_window();
     if (!mainWindow) return nullptr;
     return mainWindow->findChild<QDockWidget*>(QString::fromUtf8(id));
+}
+
+// Show the Controls dock and bring it to the front: raise() selects its tab if
+// it is tabbed with other docks, activateWindow() fronts it if floating. UI
+// thread.
+static void ShowControlsDock() {
+    QDockWidget* dock = FindFeedsDock("feeds_participant_dock");
+    if (!dock) return;
+    dock->show();
+    dock->raise();
+    if (dock->isFloating()) dock->activateWindow();
+}
+
+// Footer for the properties of the two source types that open on creation
+// (Feeds Participant, Feeds Chat Overlay): where ongoing control lives, and a
+// button that brings up the Controls dock, included only while the dock is not
+// on screen (closed, or tabbed behind another dock). Decided when the
+// properties are built. get_properties can also run off the UI thread (e.g.
+// obs-websocket), where the dock must not be touched; the button is included
+// there, and its click hops to the UI thread. Also called from
+// feeds-chat-overlay-source.cpp.
+void AppendControlsDockFooter(obs_properties_t* props) {
+    obs_properties_add_text(props, "dock_info",
+        "After closing this window, manage this source from the Feeds "
+        "Controls Dock.",
+        OBS_TEXT_INFO);
+
+    if (obs_in_task_thread(OBS_TASK_UI)) {
+        QDockWidget* dock = FindFeedsDock("feeds_participant_dock");
+        if (!dock || dock->isVisible()) return;
+    }
+    obs_properties_add_button(props, "show_dock_btn", "Show Feeds Controls Dock",
+        [](obs_properties_t*, obs_property_t*, void*) -> bool {
+            if (!obs_in_task_thread(OBS_TASK_UI)) {
+                QTimer::singleShot(0, qApp, []() { ShowControlsDock(); });
+                return false;
+            }
+            ShowControlsDock();
+            // Rebuild the list: the dock is now visible, so the button drops out.
+            return true;
+        });
 }
 
 // Add one dock toggle to the Feeds menu, under a caption of our own.
@@ -8717,6 +8762,7 @@ static obs_properties_t* zp_properties(void* data) {
                     return true;
                 });
         }
+        AppendControlsDockFooter(props);
         return props;
     }
 
@@ -8827,6 +8873,7 @@ static obs_properties_t* zp_properties(void* data) {
         "back to Zoom.",
         OBS_TEXT_INFO);
 
+    AppendControlsDockFooter(props);
     return props;
   } catch (const std::exception& e) {
     blog(LOG_ERROR, "[feeds] zp_properties exception: %s", e.what());
@@ -10572,14 +10619,31 @@ static obs_source_t* ResolveCurrentEditScene() {
     return s;
 }
 
+// Open OBS's properties window for a source the dock just created, as OBS's own
+// Add Source flow does for a new source. Deferred one event-loop turn so OBS has
+// finished handling the new scene item before the window opens. Looked up by
+// uuid, not held by pointer: a source removed in that turn opens nothing. Never
+// pass null to obs_frontend_open_source_properties: OBS then opens the
+// properties of whatever scene item is selected. UI thread.
+static void OpenNewSourceProperties(const std::string& uuid) {
+    QTimer::singleShot(0, qApp, [uuid]() {
+        obs_source_t* src = obs_get_source_by_uuid(uuid.c_str());
+        if (!src) return;
+        if (!obs_source_removed(src)) obs_frontend_open_source_properties(src);
+        obs_source_release(src);
+    });
+}
+
 // Action A: create a new Feeds source of `typeId` and add it to the current edit
 // scene, exactly as the OBS add-source flow does — obs_source_create fires the
 // type's create callback (dock row via PostParticipantDockRefresh for participant
 // sources) and the source_create signal (OnSourceCreated's deferred, per-type
 // placement, which finds the scene-item we add here). No resolvable scene -> safe
 // no-op (don't leak an orphan source). This is the always-new path — used by
-// "Create Participant Feed" and the header's Chat Overlay button. UI thread.
-static void CreateSourceOfTypeInCurrentScene(const char* typeId, const char* baseName) {
+// "Create Participant Feed" and the header's Chat Overlay button, which also pass
+// openProperties. UI thread.
+static void CreateSourceOfTypeInCurrentScene(const char* typeId, const char* baseName,
+                                             bool openProperties) {
     obs_source_t* sceneSrc = ResolveCurrentEditScene();
     if (!sceneSrc) return;
     obs_scene_t* scene = obs_scene_from_source(sceneSrc);   // borrowed
@@ -10598,14 +10662,19 @@ static void CreateSourceOfTypeInCurrentScene(const char* typeId, const char* bas
     obs_source_t* source = obs_source_create(typeId, name.c_str(), nullptr, nullptr);
     if (source) {
         // Add promptly so the ~100ms-deferred placement thread finds a scene-item.
-        obs_scene_add(scene, source);   // scene-item takes its own ref
+        obs_sceneitem_t* item = obs_scene_add(scene, source);   // takes its own ref
+        if (item && openProperties) {
+            if (const char* uuid = obs_source_get_uuid(source))
+                OpenNewSourceProperties(uuid);
+        }
         obs_source_release(source);     // release our create ref
     }
     obs_source_release(sceneSrc);
 }
 
 static void CreateParticipantSourceInCurrentScene() {
-    CreateSourceOfTypeInCurrentScene("zoom_participant_source", "Feeds Participant");
+    CreateSourceOfTypeInCurrentScene("zoom_participant_source", "Feeds Participant",
+                                     /*openProperties=*/true);
 }
 
 // Find the first live (non-removed) source of the given type, returning an owned

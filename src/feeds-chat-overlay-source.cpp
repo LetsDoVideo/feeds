@@ -56,6 +56,10 @@ extern std::map<std::string, QImage>    g_twAvatarCacheByUser;
 // dormant source — so the login/popup-helper externs are no longer needed.)
 extern int  g_currentTier;
 
+// Properties footer shared with the Feeds Participant source (plugin-main.cpp):
+// "manage from the Controls Dock" line + Show Feeds Controls Dock button.
+void AppendControlsDockFooter(obs_properties_t* props);
+
 // Tier threshold for the overlay. Streamer (2) and Broadcaster (3) get
 // it; Free (0) and Basic (1) don't.
 static constexpr int OVERLAY_MIN_TIER = 2;
@@ -526,6 +530,7 @@ static obs_properties_t* fcr_get_properties(void* data) {
                     QUrl("https://letsdovideo.com/feeds-upgrade"));
                 return true;
             });
+        AppendControlsDockFooter(props);
         return props;
     }
 
@@ -542,6 +547,7 @@ static obs_properties_t* fcr_get_properties(void* data) {
     obs_properties_add_bool(props, S_SHOW_ZOOM,    "Show Zoom Chat");
     obs_properties_add_bool(props, S_SHOW_YOUTUBE, "Show YouTube Chat");
     obs_properties_add_bool(props, S_SHOW_TWITCH,  "Show Twitch Chat");
+    AppendControlsDockFooter(props);
     return props;
 }
 
