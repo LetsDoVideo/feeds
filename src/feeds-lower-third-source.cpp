@@ -23,6 +23,15 @@
 // the LEFT (the traditional lower-third entrance) rather than up from below,
 // which also keeps it visually distinct from a chat popup on the same stream.
 // Same ease-out cubic and same 0.5s duration.
+//
+// Intro then compact: every Show starts with the full card, and after
+// kLowerThirdIntroMs (if still heading on screen) the card shrinks over
+// kLowerThirdShrinkMs to a compact name tag in the bottom-left corner of its
+// own box. The shrink is drawn INSIDE the source (the image keeps its full
+// size and the plate repaints smaller each frame), so the scene items placed
+// on Show are never touched again: every scene, transition and Studio Mode
+// view of the source shows the same plate at the same moment. Per source
+// opt-out: the "compact_after_intro" setting (default on).
 
 #include "feeds-lower-third-source.h"
 #include "feeds-card-render.h"
@@ -76,6 +85,11 @@ static constexpr int LOWER_THIRD_MIN_TIER = 1;
 static constexpr const char* kLtParticipantUuidKey = "participant_uuid";
 static constexpr const char* kLtShownKey           = "shown";
 static constexpr const char* kLtTitleKey           = "title";
+//   compact_after_intro — shrink to the compact name tag after the intro.
+//                      Default true, which also applies to lower thirds in
+//                      collections saved before the setting existed (libobs
+//                      falls back to the default for a missing key).
+static constexpr const char* kLtCompactKey         = "compact_after_intro";
 
 // The participant-side key holding the one true title string. Mirrored in
 // plugin-main.cpp (kLowerThirdTitleKey) — both sides read and write this
@@ -124,6 +138,41 @@ static constexpr int L_PILL_CORNER_RADIUS = 6;
 static constexpr int L_NAME_FONT          = 30;
 static constexpr int L_TITLE_FONT         = 24;
 static constexpr int L_TITLE_TOP_GAP      = 8;    // below the pill
+
+// Intro, then the shrink to the compact name tag. Both timed from the source's
+// own video tick, like the slide.
+static constexpr float kLowerThirdIntroMs  = 8000.0f;   // full card after Show
+static constexpr float kLowerThirdShrinkMs = 400.0f;    // full -> compact
+
+// Compact name tag, same scale-1.0 reference as the L_ literals (full card 768
+// wide on a 1080p canvas). The same plate, about half size: everything vertical
+// is ~0.53x (card 120 -> 64, avatar 96 -> 50, name 30 -> 17, title 24 -> 14) so
+// avatar, name and title keep their proportions to each other, and the padding
+// is tightened a little more than that so the tag reads as a tag, not a shrunk
+// card. Its width is not a constant: it fits its own content (avatar + the
+// wider of name pill and title), never wider than the full card.
+//
+// Readability floor: one texture serves every scene item, and each item is
+// scaled by its participant's box (PlaceLowerThirdItem: 92% of the box width
+// over the 768px card). The smallest common layout, a 2x2 grid at 1080p
+// (960px boxes, item scale ~1.15), gives a ~20px name and ~16px title, about
+// the smallest that stays legible on a 1080p stream. A full-screen
+// participant (scale ~2.3) gets a ~39px name, still half the full card.
+static constexpr int C_CARD_HEIGHT        = 64;
+static constexpr int C_CARD_CORNER_RADIUS = 3;
+static constexpr int C_SHADOW_OFFSET      = 3;
+static constexpr int C_AVATAR_INSET       = 7;
+static constexpr int C_AVATAR_SIZE        = 50;
+static constexpr int C_AVATAR_BORDER      = 2;
+static constexpr int C_TEXT_GAP           = 9;
+static constexpr int C_TEXT_RIGHT_PAD     = 12;
+static constexpr int C_PILL_TOP           = 7;
+static constexpr int C_PILL_H_PAD         = 6;
+static constexpr int C_PILL_V_PAD         = 3;
+static constexpr int C_PILL_CORNER_RADIUS = 4;
+static constexpr int C_NAME_FONT          = 17;
+static constexpr int C_TITLE_FONT         = 14;
+static constexpr int C_TITLE_TOP_GAP      = 3;
 
 // 40% of the active OBS canvas width, queried per content change so the card
 // is the same proportion of the screen at any canvas resolution. Falls back to
@@ -201,6 +250,14 @@ struct FeedsLowerThirdData {
     float         anim_elapsed = 0.0f;
     float         anim_from    = 1.0f;
     float         anim_to      = 1.0f;
+
+    // Intro then compact (see the file header). shrink_u is linear progress,
+    // 0 = full card, 1 = compact tag, moved toward shrink_target by the video
+    // tick; the render eases it. All reset to full once the card is Hidden.
+    bool          compact_enabled = true;
+    float         intro_elapsed   = 0.0f;   // seconds since this Show began
+    float         shrink_u        = 0.0f;
+    float         shrink_target   = 0.0f;
 };
 
 // Instance registry. UpdateLowerThirdContent / ReconcileLowerThirdSources walk
@@ -216,38 +273,53 @@ std::mutex                          g_ltStateMutex;
 // Paint the card into d->rendered_image. name/title/avatar are passed in as a
 // snapshot so the caller can take them under the state mutex and release it
 // before the slow paint.
+//
+// k is the eased shrink: 0 = the full card, 1 = the compact name tag, and
+// anything between is the shrink in flight. Every metric interpolates between
+// its L_ and C_ literal; at k = 0 each one is exactly the L_ value, so a card
+// that never shrinks (compact off, or still in its intro) paints exactly what
+// it always has. The image itself is always the full card's size: the plate
+// shrinks toward the bottom-left corner of it.
 // ---------------------------------------------------------------------------
 static void RenderLowerThirdToImage(FeedsLowerThirdData* d,
                                     const QString& name,
                                     const QString& title,
-                                    const QImage&  avatar) {
+                                    const QImage&  avatar,
+                                    float          k) {
     const int   cardWidth = (int)GetCardWidth();
     const float scale     = (float)cardWidth / kReferenceCardWidth;
+
+    // Interpolated pixel size of one layout literal.
+    auto px = [scale, k](int full, int compact) {
+        return (int)(((float)full + (float)(compact - full) * k) * scale);
+    };
 
     const int CARD_LEFT_MARGIN   = (int)(L_CARD_LEFT_MARGIN   * scale);
     const int CARD_RIGHT_MARGIN  = (int)(L_CARD_RIGHT_MARGIN  * scale);
     const int CARD_TOP_OFFSET    = (int)(L_CARD_TOP_OFFSET    * scale);
-    const int CARD_HEIGHT        = (int)(L_CARD_HEIGHT        * scale);
     const int BOTTOM_MARGIN      = (int)(L_BOTTOM_MARGIN      * scale);
-    const int CARD_CORNER_RADIUS = (int)(L_CARD_CORNER_RADIUS * scale);
-    const int SHADOW_OFFSET      = (int)(L_SHADOW_OFFSET      * scale);
-    const int AVATAR_INSET       = (int)(L_AVATAR_INSET       * scale);
-    const int AVATAR_SIZE        = (int)(L_AVATAR_SIZE        * scale);
-    const int AVATAR_BORDER      = std::max(1, (int)(L_AVATAR_BORDER * scale));
-    const int TEXT_GAP           = (int)(L_TEXT_GAP           * scale);
-    const int TEXT_RIGHT_PAD     = (int)(L_TEXT_RIGHT_PAD     * scale);
-    const int PILL_TOP           = (int)(L_PILL_TOP           * scale);
-    const int PILL_H_PAD         = (int)(L_PILL_H_PAD         * scale);
-    const int PILL_V_PAD         = (int)(L_PILL_V_PAD         * scale);
-    const int PILL_CORNER_RADIUS = (int)(L_PILL_CORNER_RADIUS * scale);
-    const int NAME_FONT          = (int)(L_NAME_FONT          * scale);
-    const int TITLE_FONT         = (int)(L_TITLE_FONT         * scale);
-    const int TITLE_TOP_GAP      = (int)(L_TITLE_TOP_GAP      * scale);
+    const int FULL_CARD_HEIGHT   = (int)(L_CARD_HEIGHT        * scale);
+    const int CARD_HEIGHT        = px(L_CARD_HEIGHT,        C_CARD_HEIGHT);
+    const int CARD_CORNER_RADIUS = px(L_CARD_CORNER_RADIUS, C_CARD_CORNER_RADIUS);
+    const int SHADOW_OFFSET      = px(L_SHADOW_OFFSET,      C_SHADOW_OFFSET);
+    const int AVATAR_INSET       = px(L_AVATAR_INSET,       C_AVATAR_INSET);
+    const int AVATAR_SIZE        = px(L_AVATAR_SIZE,        C_AVATAR_SIZE);
+    const int AVATAR_BORDER      = std::max(1, px(L_AVATAR_BORDER, C_AVATAR_BORDER));
+    const int TEXT_GAP           = px(L_TEXT_GAP,           C_TEXT_GAP);
+    const int TEXT_RIGHT_PAD     = px(L_TEXT_RIGHT_PAD,     C_TEXT_RIGHT_PAD);
+    const int PILL_TOP           = px(L_PILL_TOP,           C_PILL_TOP);
+    const int PILL_H_PAD         = px(L_PILL_H_PAD,         C_PILL_H_PAD);
+    const int PILL_V_PAD         = px(L_PILL_V_PAD,         C_PILL_V_PAD);
+    const int PILL_CORNER_RADIUS = px(L_PILL_CORNER_RADIUS, C_PILL_CORNER_RADIUS);
+    const int NAME_FONT          = std::max(1, px(L_NAME_FONT,  C_NAME_FONT));
+    const int TITLE_FONT         = std::max(1, px(L_TITLE_FONT, C_TITLE_FONT));
+    const int TITLE_TOP_GAP      = px(L_TITLE_TOP_GAP,      C_TITLE_TOP_GAP);
 
     // Fixed height — see the layout note above. Written before the QImage is
     // sized so OBS's next get_width/get_height query sees the current canvas.
+    // Always the FULL card's footprint, whatever k is.
     d->width  = (uint32_t)cardWidth;
-    d->height = (uint32_t)(CARD_TOP_OFFSET + CARD_HEIGHT + BOTTOM_MARGIN);
+    d->height = (uint32_t)(CARD_TOP_OFFSET + FULL_CARD_HEIGHT + BOTTOM_MARGIN);
 
     if (d->rendered_image.size() != QSize((int)d->width, (int)d->height) ||
         d->rendered_image.format() != QImage::Format_RGBA8888) {
@@ -260,10 +332,38 @@ static void RenderLowerThirdToImage(FeedsLowerThirdData* d,
     p.setRenderHint(QPainter::Antialiasing, true);
     p.setRenderHint(QPainter::SmoothPixmapTransform, true);
 
+    // The plate. Its left edge and its bottom stay where the full card's are,
+    // so the shrink closes in on the bottom-left corner of the box. The width
+    // runs from the full card's to the compact tag's content-fitted width.
+    const int fullCardW = cardWidth - CARD_LEFT_MARGIN - CARD_RIGHT_MARGIN;
+    int cardW = fullCardW;
+    if (k > 0.0f) {
+        // Compact width: avatar + the wider of the name pill and the title, at
+        // the compact metrics, plus a little slack so nothing elides on the
+        // way down from integer rounding of the interpolated fonts.
+        const int cInset = (int)(C_AVATAR_INSET   * scale);
+        const int cAv    = (int)(C_AVATAR_SIZE    * scale);
+        const int cGap   = (int)(C_TEXT_GAP       * scale);
+        const int cRight = (int)(C_TEXT_RIGHT_PAD * scale);
+        const int cPillH = (int)(C_PILL_H_PAD     * scale);
+        QFont cName;
+        cName.setBold(true);
+        cName.setPixelSize(std::max(1, (int)(C_NAME_FONT * scale)));
+        QFont cTitle;
+        cTitle.setPixelSize(std::max(1, (int)(C_TITLE_FONT * scale)));
+        const int nameW  = name.isEmpty() ? 0
+            : QFontMetrics(cName).horizontalAdvance(name) + 2 * cPillH;
+        const int titleW = title.isEmpty() ? 0
+            : QFontMetrics(cTitle).horizontalAdvance(title);
+        const int slack  = std::max(2, (int)(4 * scale));
+        const int compactW = std::min(fullCardW,
+            cInset + cAv + cGap + std::max(nameW, titleW) + cRight + slack);
+        cardW = (int)((float)fullCardW + (float)(compactW - fullCardW) * k);
+    }
     const QRect cardRect(
         CARD_LEFT_MARGIN,
-        CARD_TOP_OFFSET,
-        cardWidth - CARD_LEFT_MARGIN - CARD_RIGHT_MARGIN,
+        CARD_TOP_OFFSET + FULL_CARD_HEIGHT - CARD_HEIGHT,
+        cardW,
         CARD_HEIGHT);
 
     feeds::card::DrawCardBody(p, cardRect, CARD_CORNER_RADIUS, SHADOW_OFFSET);
@@ -337,8 +437,9 @@ static void RenderLowerThirdToImage(FeedsLowerThirdData* d,
 static void RegenerateTexture(FeedsLowerThirdData* d,
                               const QString& name,
                               const QString& title,
-                              const QImage&  avatar) {
-    RenderLowerThirdToImage(d, name, title, avatar);
+                              const QImage&  avatar,
+                              float          shrink) {
+    RenderLowerThirdToImage(d, name, title, avatar, shrink);
     feeds::card::UploadImageToTexture(d->rendered_image, d->width, d->height,
                                       d->texture);
     d->texture_dirty = false;
@@ -371,6 +472,11 @@ static void StartSlide_locked(FeedsLowerThirdData* d, bool show) {
     d->anim_elapsed = 0.0f;
     d->anim_from    = cur;
     d->anim_to      = show ? 0.0f : 1.0f;
+    // Every Show is a new intro, whichever path started it (dock, a binding
+    // returning, a settings update). From fully hidden the plate is already
+    // back to full; reversing a slide-out that had shrunk grows it back to full
+    // over the shrink duration instead of jumping (see lt_video_tick).
+    if (show) d->intro_elapsed = 0.0f;
 }
 
 // Reconcile the animation with the two inputs that decide whether the card
@@ -441,6 +547,7 @@ static void lt_get_defaults(obs_data_t* settings) {
     obs_data_set_default_string(settings, kLtParticipantUuidKey, "");
     obs_data_set_default_string(settings, kLtTitleKey, "");
     obs_data_set_default_bool(settings, kLtShownKey, false);
+    obs_data_set_default_bool(settings, kLtCompactKey, true);
 }
 
 static void* lt_create(obs_data_t* settings, obs_source_t* source) {
@@ -463,6 +570,7 @@ static void* lt_create(obs_data_t* settings, obs_source_t* source) {
         const char* pu = obs_data_get_string(settings, kLtParticipantUuidKey);
         if (pu) d->participant_uuid = pu;
         d->shown = obs_data_get_bool(settings, kLtShownKey);
+        d->compact_enabled = obs_data_get_bool(settings, kLtCompactKey);
         // Restored HIDDEN regardless of the stored `shown` flag. A saved scene
         // collection is loaded long before any meeting exists, so no source can
         // be bound yet, and a nameplate with no bound participant must display
@@ -540,6 +648,7 @@ static void lt_update(void* data, obs_data_t* settings) {
 
     const char* pu    = obs_data_get_string(settings, kLtParticipantUuidKey);
     const bool  shown = obs_data_get_bool(settings, kLtShownKey);
+    const bool  compact = obs_data_get_bool(settings, kLtCompactKey);
     const char* mirror = obs_data_get_string(settings, kLtTitleKey);
 
     // Resolve the title BEFORE taking the state lock (ResolveDisplayTitle
@@ -575,6 +684,10 @@ static void lt_update(void* data, obs_data_t* settings) {
     // fighting over the animation.
     d->shown = shown;
     ApplyEffectiveVisibility_locked(d);
+
+    // Picked up by the next video tick: on while past the intro shrinks the
+    // card, off while shrunk grows it back, both animated.
+    d->compact_enabled = compact;
 }
 
 // libobs calls this once the ENTIRE scene collection has been created —
@@ -666,6 +779,10 @@ static obs_properties_t* lt_get_properties(void* data) {
             return false;   // value persists; no property layout change
         }, data);
 
+    // Per-source escape hatch for the intro-then-compact behaviour. Bound to
+    // this source's own settings, so OBS applies it through lt_update.
+    obs_properties_add_bool(props, kLtCompactKey, "Shrink to compact after intro");
+
     if (!d || d->participant_uuid.empty()) {
         obs_properties_add_text(props, "orphan_msg",
             "This lower third is not linked to a participant source. "
@@ -684,6 +801,47 @@ static obs_properties_t* lt_get_properties(void* data) {
     return props;
 }
 
+// Intro timer and shrink, after the slide has been stepped. Caller must hold
+// g_ltStateMutex.
+//   - Heading on screen: the intro counts; once it has run (and compact is on)
+//     the target is the compact tag, otherwise the full card. Turning compact
+//     off while shrunk therefore grows the card back, animated.
+//   - Heading off screen: the target freezes where the plate is, so a Hide
+//     during the shrink slides the plate out at its current size.
+//   - Hidden: everything resets to full, ready for the next Show's intro.
+// No Qt timer anywhere: all of it lives in this per-frame tick, so a Hide can
+// never leave a timer behind to fire later.
+static void StepIntroAndShrink_locked(FeedsLowerThirdData* d, float seconds) {
+    if (d->anim == LtAnimState::Hidden) {
+        if (d->shrink_u != 0.0f) d->texture_dirty = true;
+        d->intro_elapsed = 0.0f;
+        d->shrink_u      = 0.0f;
+        d->shrink_target = 0.0f;
+        return;
+    }
+
+    const bool heading =
+        (d->anim == LtAnimState::Shown || d->anim == LtAnimState::AnimatingIn);
+    if (heading) {
+        bool introDone = d->intro_elapsed * 1000.0f >= kLowerThirdIntroMs;
+        if (!introDone) {
+            d->intro_elapsed += seconds;
+            introDone = d->intro_elapsed * 1000.0f >= kLowerThirdIntroMs;
+        }
+        d->shrink_target = (d->compact_enabled && introDone) ? 1.0f : 0.0f;
+    } else {
+        d->shrink_target = d->shrink_u;
+    }
+
+    if (d->shrink_u == d->shrink_target) return;
+    const float step = seconds * 1000.0f / kLowerThirdShrinkMs;
+    if (d->shrink_u < d->shrink_target)
+        d->shrink_u = std::min(d->shrink_target, d->shrink_u + step);
+    else
+        d->shrink_u = std::max(d->shrink_target, d->shrink_u - step);
+    d->texture_dirty = true;   // the plate repaints at its new size
+}
+
 // Advance this instance's own animation. Unlike the popup — whose single
 // global clock forces a "am I the first instance" gate — every lower third
 // animates independently, so each one just steps its own counter.
@@ -692,18 +850,18 @@ static void lt_video_tick(void* data, float seconds) {
     if (!d) return;
 
     std::lock_guard<std::mutex> lock(g_ltStateMutex);
-    if (d->anim != LtAnimState::AnimatingIn &&
-        d->anim != LtAnimState::AnimatingOut) {
-        return;
+    if (d->anim == LtAnimState::AnimatingIn ||
+        d->anim == LtAnimState::AnimatingOut) {
+        d->anim_elapsed += seconds;
+        if (d->anim_elapsed >= feeds::card::kSlideDurationSeconds) {
+            d->anim = (d->anim == LtAnimState::AnimatingIn) ? LtAnimState::Shown
+                                                            : LtAnimState::Hidden;
+            d->anim_elapsed = 0.0f;
+            d->anim_from    = (d->anim == LtAnimState::Shown) ? 0.0f : 1.0f;
+            d->anim_to      = d->anim_from;
+        }
     }
-    d->anim_elapsed += seconds;
-    if (d->anim_elapsed < feeds::card::kSlideDurationSeconds) return;
-
-    d->anim = (d->anim == LtAnimState::AnimatingIn) ? LtAnimState::Shown
-                                                    : LtAnimState::Hidden;
-    d->anim_elapsed = 0.0f;
-    d->anim_from    = (d->anim == LtAnimState::Shown) ? 0.0f : 1.0f;
-    d->anim_to      = d->anim_from;
+    StepIntroAndShrink_locked(d, seconds);
 }
 
 static void lt_video_render(void* data, gs_effect_t* /*effect*/) {
@@ -723,6 +881,7 @@ static void lt_video_render(void* data, gs_effect_t* /*effect*/) {
     QString title;
     QImage  avatar;
     float   fraction;
+    float   shrink;
     {
         std::lock_guard<std::mutex> lock(g_ltStateMutex);
 
@@ -744,10 +903,13 @@ static void lt_video_render(void* data, gs_effect_t* /*effect*/) {
         avatar   = d->avatar;
         if (dirty) d->texture_dirty = false;
         fraction = ComputeFraction_locked(d);
+        // Eased like the slide. Exactly 0 while the card is full.
+        shrink   = d->shrink_u > 0.0f ? feeds::card::EaseOutCubic(d->shrink_u)
+                                      : 0.0f;
     }
 
     if (dirty || !d->texture) {
-        RegenerateTexture(d, name, title, avatar);
+        RegenerateTexture(d, name, title, avatar, shrink);
     }
     if (!d->texture) return;
 

@@ -5139,8 +5139,10 @@ private:
         btn->setToolTip(
             !exists     ? "Create a nameplate for this participant"
             : r.ltShown ? "Hide the nameplate (the source is kept)"
-                        : "Show the nameplate, repositioned over the "
-                          "participant's current video");
+                        // <qt> makes Qt treat it as rich text, which wraps.
+                        : "<qt>Shows a full lower third, then shrinks to a "
+                          "compact name tag. To keep it full size, turn this "
+                          "off in the lower third's Properties.</qt>");
         StyleLowerThirdButton(btn, locked, m_cdLowerThird.count(uuid) != 0);
         m_ltButtons[uuid] = btn;
 
@@ -5730,15 +5732,13 @@ static void ShowControlsDock() {
     if (dock->isFloating()) dock->activateWindow();
 }
 
-// Footer for the properties of the two source types that open on creation
-// (Feeds Participant, Feeds Chat Overlay): where ongoing control lives, and a
-// button that brings up the Controls dock, included only while the dock is not
-// on screen (closed, or tabbed behind another dock). Decided when the
+// Footer for the Feeds Participant properties: where ongoing control lives,
+// and a button that brings up the Controls dock, included only while the dock
+// is not on screen (closed, or tabbed behind another dock). Decided when the
 // properties are built. get_properties can also run off the UI thread (e.g.
 // obs-websocket), where the dock must not be touched; the button is included
-// there, and its click hops to the UI thread. Also called from
-// feeds-chat-overlay-source.cpp.
-void AppendControlsDockFooter(obs_properties_t* props) {
+// there, and its click hops to the UI thread.
+static void AppendControlsDockFooter(obs_properties_t* props) {
     obs_properties_add_text(props, "dock_info",
         "After closing this window, manage this source from the Feeds "
         "Controls Dock.",
@@ -7451,8 +7451,7 @@ void SetupPluginMenu() {
     // actually start. Constant in every tier state, so it is set once here
     // and never touched by UpdateIsoMenuItemForTier.
     g_isoRecordingAction->setToolTip(
-        "When enabled, ISO recordings start automatically when you start "
-        "your OBS recording.");
+        "ISO recording starts with your OBS recording.");
 
     // YouTube live chat is configured from the Feeds Chat dock header now (no
     // menu items). Load the persisted target into the poller globals here
@@ -8841,9 +8840,7 @@ static obs_properties_t* zp_properties(void* data) {
         obs_property_t* ltTitle = obs_properties_add_text(
             props, kLowerThirdTitleKey, "Lower Third Title", OBS_TEXT_DEFAULT);
         obs_property_set_long_description(ltTitle,
-            "Shown under the participant's name on their lower third. Create "
-            "and show the lower third from this participant's row in the Feeds "
-            "Controls dock.");
+            "Appears under their name on the lower third.");
         // Below Basic the field is shown but disabled, matching how the dock
         // greys its lower-third controls rather than hiding them — the feature
         // stays discoverable, and the upgrade path lives in the dock's prompt.
