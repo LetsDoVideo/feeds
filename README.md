@@ -168,7 +168,7 @@ If you see a "couldn't reach the login server" or "couldn't reach the licensing 
 
 ## Known Limitations
 
-- **Windows only** in this release (macOS coming in a future version)
+- Runs on **Windows** and **macOS (Apple Silicon)**
 - The meeting host must click **Allow** when prompted with the livestream request. Without host approval the plugin cannot access video feeds
 - **YouTube and Twitch chat are receive-only.** You can send to Zoom chat from Feeds, but not to YouTube or Twitch
 
