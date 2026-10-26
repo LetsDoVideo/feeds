@@ -2494,6 +2494,24 @@ static QWidget* MakeOpenDockSlot(const QString& label, const char* dockId) {
     return slot;
 }
 
+// A thin full-width section divider for a dock's top-to-bottom layout: a 1px
+// line in the tone the old Controls Dock header bar used for its bottom
+// border. padTop/padBottom are the breathing room either side, chosen against
+// the margins of the rows it sits between so neither sits on the line.
+static QWidget* MakeDockDivider(int padTop, int padBottom) {
+    QWidget* slot = new QWidget();
+    QVBoxLayout* l = new QVBoxLayout(slot);
+    l->setContentsMargins(0, padTop, 0, padBottom);
+    l->setSpacing(0);
+    QFrame* line = new QFrame(slot);
+    line->setObjectName("feedsDockDivider");
+    line->setFixedHeight(1);
+    line->setStyleSheet(
+        "QFrame#feedsDockDivider { background: rgba(128,128,128,0.35); border: none; }");
+    l->addWidget(line);
+    return slot;
+}
+
 // ---------------------------------------------------------------------------
 // Zoom Chat dock. Phase 1: register a dock that displays placeholder content.
 // Commit 3 wires the chat_message IPC from the engine into this widget so it
@@ -2601,6 +2619,11 @@ public:
         // Top to bottom: the shared Login/Join block (gone in a meeting), the
         // conditional "Open Controls Dock" button, the chat source buttons, the
         // Zoom / YouTube / Twitch rows, then the chat itself and the input row.
+        // Two dividers split that into actions | platform status | chat. The
+        // first sits under the source row, which is always shown, so it holds
+        // its place in and out of a meeting. Padding: the source row has no
+        // bottom margin and the header 6px top and bottom, so 8+2 and 2+8 put
+        // about 8px either side of each line.
         QVBoxLayout* layout = new QVBoxLayout(this);
         layout->setContentsMargins(0, 0, 0, 0);
         layout->setSpacing(0);
@@ -2610,8 +2633,10 @@ public:
             MakeOpenDockSlot("Open Controls Dock", "feeds_participant_dock");
         layout->addWidget(m_openControlsSlot);
         layout->addWidget(BuildChatSourceRow());
+        layout->addWidget(MakeDockDivider(8, 2));
         m_chatHeader = BuildChatHeader();   // platform config/status, pinned on top
         layout->addWidget(m_chatHeader);
+        layout->addWidget(MakeDockDivider(2, 8));
         layout->addWidget(m_list, 1);
         layout->addLayout(inputRow);
 

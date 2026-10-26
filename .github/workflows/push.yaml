@@ -379,11 +379,11 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: Feeds-${{ github.ref_name }}-macos
-      # Create the release as a DRAFT with the installer attached. A draft is
-      # excluded from /releases/latest, which is what the in-app update check
-      # polls — so users are never notified of a release before its installer is
-      # downloadable. softprops creates the release (as draft) and uploads the
-      # assets to it; nothing is published yet.
+      # Create the release as a DRAFT with every asset attached, and leave it a
+      # draft: it is published by hand, from the GitHub releases page, after the
+      # assets have been downloaded and checked. A draft is excluded from
+      # /releases/latest, which is what the in-app update check polls (Windows
+      # and Mac), so users are not notified until that manual publish.
       - name: Create Draft Release
         uses: softprops/action-gh-release@v1
         with:
@@ -394,10 +394,3 @@ jobs:
             feeds-*-macos-arm64.pkg
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # Flip the draft to published only AFTER the installer is attached above.
-      # This is the moment /releases/latest starts returning it — so it never
-      # surfaces a published release whose download doesn't exist yet.
-      - name: Publish Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release edit "${{ github.ref_name }}" --repo "${{ github.repository }}" --draft=false
