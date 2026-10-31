@@ -42,9 +42,17 @@
 
 // Tier state from plugin-main.cpp. Popup is gated at Streamer (>= 2),
 // enforced by ReconcileChatPopupSources via the tier_disabled flag.
-// (The create callback no longer gates on login/tier — it always creates a
-// dormant source — so the login/popup-helper externs are no longer needed.)
+// (The create callback no longer refuses on login/tier — it always creates a
+// dormant source — but a source created while logged in still starts locked if
+// the tier calls for it, since ReconcileChatPopupSources only runs at login.)
+extern bool g_isLoggedIn;
 extern int  g_currentTier;
+
+// Chat Dock's highlight and "on screen" pill, in plugin-main.cpp. Queues a re-read
+// of feeds::GetChatPopupMessage / GetChatPopupOnScreen on the UI thread, so it is
+// safe from any thread and with any lock held. Called after everything that can
+// change either answer.
+extern void PostChatPopupDockRefresh();
 
 // Tier threshold for the popup. Streamer (2) and Broadcaster (3) get it;
 // Free (0) and Basic (1) don't.
@@ -176,6 +184,11 @@ unsigned int   g_popupPendingSenderId = 0;
 QString        g_popupPendingSenderName;
 QString        g_popupPendingContent;
 QImage         g_popupPendingAvatar;
+
+// For the state changes with several return paths.
+struct ScopedPopupDockRefresh {
+    ~ScopedPopupDockRefresh() { PostChatPopupDockRefresh(); }
+};
 
 static void RenderPopupToImage(FeedsChatPopupData* d,
                                const QString& senderName,
@@ -368,6 +381,29 @@ static float ComputeCurrentFraction_locked() {
     return 0.0f;
 }
 
+// The message the popup is on or heading to, if any: the queued one during a
+// swap, nothing once a hide has started. Caller must hold g_popupStateMutex.
+static bool PopupMessage_locked(unsigned int& senderId, QString& senderName,
+                                QString& content) {
+    switch (g_popupAnimState) {
+    case PopupAnimState::Hidden:
+        return false;
+    case PopupAnimState::AnimatingOut:
+        if (!g_popupPending) return false;
+        senderId   = g_popupPendingSenderId;
+        senderName = g_popupPendingSenderName;
+        content    = g_popupPendingContent;
+        return true;
+    case PopupAnimState::AnimatingIn:
+    case PopupAnimState::Shown:
+        senderId   = g_popupSenderId;
+        senderName = g_popupSenderName;
+        content    = g_popupContent;
+        return true;
+    }
+    return false;
+}
+
 // Advance the global animation by `seconds`. Called once per frame from
 // the first popup instance's video_tick (see fcp_video_tick — gating
 // stops the elapsed counter from advancing N times per frame when there
@@ -426,7 +462,10 @@ static void AdvanceAnimation(float seconds) {
         }
         needsRefresh = true;
     }
-    if (needsRefresh) UpdateAllInstances();
+    if (needsRefresh) {
+        UpdateAllInstances();
+        PostChatPopupDockRefresh();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -453,6 +492,11 @@ static void* fcp_create(obs_data_t* /*settings*/, obs_source_t* source) {
 
     FeedsChatPopupData* d = new FeedsChatPopupData();
     d->source = source;
+
+    // Login reconciles only the instances that exist then, so one created later
+    // (scene collection switch, OBS Sources "+") has to pick up the tier here.
+    // Logged out the tier is unknown, not Free: stay unlocked until login decides.
+    if (g_isLoggedIn) d->tier_disabled = (g_currentTier < POPUP_MIN_TIER);
 
     // Allocate the slide-clip texrender up front. gs_texrender_create
     // requires the graphics context; create is called from the Qt main
@@ -485,6 +529,7 @@ static void fcp_destroy(void* data) {
             std::remove(g_instances.begin(), g_instances.end(), d),
             g_instances.end());
     }
+    PostChatPopupDockRefresh();
 
     // gs_texture_destroy / gs_texrender_destroy need the graphics context —
     // destroy is not guaranteed to be on the graphics thread. Wrap both
@@ -561,6 +606,11 @@ static void fcp_video_tick(void* data, float seconds) {
     AdvanceAnimation(seconds);
 }
 
+// On/off program decides whether the current message is really on screen.
+static void fcp_active_changed(void* /*data*/) {
+    PostChatPopupDockRefresh();
+}
+
 static void fcp_video_render(void* data, gs_effect_t* /*effect*/) {
     FeedsChatPopupData* d = static_cast<FeedsChatPopupData*>(data);
     if (!d) return;
@@ -629,6 +679,8 @@ void RegisterChatPopupSource() {
     feeds_chat_popup_info.get_properties = fcp_get_properties;
     feeds_chat_popup_info.video_render   = fcp_video_render;
     feeds_chat_popup_info.video_tick     = fcp_video_tick;
+    feeds_chat_popup_info.activate       = fcp_active_changed;
+    feeds_chat_popup_info.deactivate     = fcp_active_changed;
     feeds_chat_popup_info.icon_type      = OBS_ICON_TYPE_TEXT;
     obs_register_source(&feeds_chat_popup_info);
 }
@@ -746,9 +798,11 @@ void ToggleChatPopup(unsigned int senderId,
     // AdvanceAnimation will fan out when AnimatingOut completes and
     // either promotes pending or flips visible to false.
     if (needsRefresh) UpdateAllInstances();
+    PostChatPopupDockRefresh();
 }
 
 void ClearChatPopup() {
+    ScopedPopupDockRefresh dockRefresh;
     std::lock_guard<std::mutex> lock(g_popupStateMutex);
 
     // ClearChatPopup always drops any queued message — the dock is
@@ -787,6 +841,7 @@ void ClearChatPopup() {
 // this message. Same transitions as ClearChatPopup, gated on identity.
 void ClearChatPopupIfMatches(unsigned int senderId, const std::string& content) {
     QString qc = QString::fromStdString(content);
+    ScopedPopupDockRefresh dockRefresh;
     std::lock_guard<std::mutex> lock(g_popupStateMutex);
 
     if (g_popupPending &&
@@ -825,8 +880,38 @@ void ClearChatPopupIfMatches(unsigned int senderId, const std::string& content) 
     }
 }
 
+bool GetChatPopupOnScreen(QString* senderName) {
+    // instances-outer / state-inner, the order used everywhere else.
+    std::lock_guard<std::mutex> instancesLock(g_instancesMutex);
+    const bool anyLive = std::any_of(
+        g_instances.begin(), g_instances.end(), [](FeedsChatPopupData* d) {
+            return d && !d->tier_disabled && obs_source_active(d->source);
+        });
+    if (!anyLive) return false;
+
+    std::lock_guard<std::mutex> stateLock(g_popupStateMutex);
+    unsigned int id = 0;
+    QString      name;
+    QString      content;
+    if (!PopupMessage_locked(id, name, content)) return false;
+    if (senderName) *senderName = name;
+    return true;
+}
+
+bool GetChatPopupMessage(unsigned int* senderId, QString* content) {
+    std::lock_guard<std::mutex> lock(g_popupStateMutex);
+    unsigned int id = 0;
+    QString      name;
+    QString      text;
+    if (!PopupMessage_locked(id, name, text)) return false;
+    if (senderId) *senderId = id;
+    if (content)  *content  = text;
+    return true;
+}
+
 void ReconcileChatPopupSources() {
     const bool shouldDisable = (g_currentTier < POPUP_MIN_TIER);
+    ScopedPopupDockRefresh dockRefresh;
     std::lock_guard<std::mutex> lock(g_instancesMutex);
     for (FeedsChatPopupData* d : g_instances) {
         if (!d) continue;

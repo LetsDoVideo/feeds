@@ -2382,6 +2382,13 @@ static void ShowSourceUpgradePrompt(const QString& feature, const QString& tierW
                 "to upgrade your plan</a>").arg(feature, tierWord));
 }
 
+// The lower third's tier gate, shared by the dock's button and the source's
+// Show/Hide hotkeys so they can't drift apart. Only the response differs: the
+// button prompts, a hotkey does nothing.
+static bool PassLowerThirdTierGate() {
+    return g_currentTier >= kLowerThirdMinTier;
+}
+
 // Style the Login/Join button as the dock's primary call to action.
 //
 // Whenever this button exists at all the user is either logged out or not
@@ -2535,6 +2542,19 @@ public:
     // per-platform). Oldest rows trim as new ones arrive.
     static constexpr int kMaxChatRows = 500;
 
+    // Shared look of the dock's floating pills. Subtle grey chrome: rgba greys +
+    // thin border, as in the participant header bar.
+    static constexpr const char* kChatPillStyle =
+        "QPushButton {"
+        " background: rgba(40,40,40,0.92);"
+        " color: #d6d8da;"
+        " border: 1px solid rgba(128,128,128,0.35);"
+        " border-radius: 10px;"
+        " padding: 3px 12px; }"
+        "QPushButton:hover { background: rgba(64,64,64,0.95); }";
+    static constexpr int kPillMarginPx = 8;    // gap to the chat area's edges
+    static constexpr int kPillChromePx = 26;   // horizontal padding + border
+
     explicit FeedsChatDock(QWidget* parent = nullptr) : QWidget(parent) {
         m_list = new QListWidget(this);
         SetPlaceholder(CurrentPlaceholderText());
@@ -2563,27 +2583,30 @@ public:
         m_list->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
 
         // Floating "new messages" pill — parented to the viewport so it hovers
-        // over the bottom of the list without taking part in the layout. Styled
-        // to match the dock's subtle grey chrome (rgba greys + thin border, as
-        // in the participant header bar). Hidden until a message arrives while
-        // the user is scrolled up.
+        // over the bottom of the list without taking part in the layout. Hidden
+        // until a message arrives while the user is scrolled up.
         m_newMsgPill = new QPushButton(
             QString::fromUtf8("\xE2\x86\x93 New messages"), m_list->viewport());
         m_newMsgPill->setCursor(Qt::PointingHandCursor);
         m_newMsgPill->setFocusPolicy(Qt::NoFocus);
-        m_newMsgPill->setStyleSheet(
-            "QPushButton {"
-            " background: rgba(40,40,40,0.92);"
-            " color: #d6d8da;"
-            " border: 1px solid rgba(128,128,128,0.35);"
-            " border-radius: 10px;"
-            " padding: 3px 12px; }"
-            "QPushButton:hover { background: rgba(64,64,64,0.95); }");
+        m_newMsgPill->setStyleSheet(kChatPillStyle);
         m_newMsgPill->hide();
         QObject::connect(m_newMsgPill, &QPushButton::clicked, this, [this]() {
             m_list->scrollToBottom();
             HideNewMessagesPill();
         });
+
+        // Floating "on screen" pill, top of the chat area, so it can't meet the
+        // "new messages" pill at the bottom. Parented to the list rather than
+        // its viewport: QWidget::scroll moves a viewport's children along with
+        // the content, and this pill stays up while chat keeps scrolling.
+        m_popupPill = new QPushButton(m_list);
+        m_popupPill->setCursor(Qt::PointingHandCursor);
+        m_popupPill->setFocusPolicy(Qt::NoFocus);
+        m_popupPill->setStyleSheet(kChatPillStyle);
+        m_popupPill->hide();
+        QObject::connect(m_popupPill, &QPushButton::clicked, this,
+                         []() { feeds::ClearChatPopup(); });
 
         // Reposition the pill on viewport resize and preserve the reading
         // position across the width-driven word-wrap reflow (see eventFilter).
@@ -2679,6 +2702,82 @@ public:
         m_newMsgPill->move(x < 0 ? 0 : x, y < 0 ? 0 : y);
     }
 
+    // Make the highlighted row match the popup's message. Without this the
+    // highlight is only Qt's click selection, which outlives any hide and leaves
+    // a row that looks like "click to hide" but shows the popup again. A selected
+    // row that already matches is left alone, so of two identical rows the one
+    // clicked keeps the highlight. setSelected, not setCurrentItem: changing the
+    // current item scrolls the list to it.
+    void SyncHighlightToPopup() {
+        unsigned int senderId = 0;
+        QString      content;
+        if (!feeds::GetChatPopupMessage(&senderId, &content)) {
+            m_list->clearSelection();
+            return;
+        }
+        const auto matches = [&](const QListWidgetItem* it) {
+            return it->data(kRoleChatOrigin).isValid() &&   // skips placeholders
+                   it->data(RoleSenderId).toUInt() == senderId &&
+                   it->data(RoleContent).toString() == content;
+        };
+        const QList<QListWidgetItem*> selected = m_list->selectedItems();
+        for (const QListWidgetItem* it : selected) {
+            if (matches(it)) return;
+        }
+        m_list->clearSelection();
+        for (int i = m_list->count() - 1; i >= 0; --i) {   // newest first
+            QListWidgetItem* it = m_list->item(i);
+            if (it && matches(it)) {
+                it->setSelected(true);
+                return;
+            }
+        }
+    }
+
+    // Bring the highlight and the "on screen" pill in line with the popup. The
+    // popup source is the one place that decides, so every way of showing or
+    // hiding a popup lands here through PostChatPopupDockRefresh.
+    void RefreshPopupState() {
+        SyncHighlightToPopup();
+        if (!m_popupPill) return;
+        QString sender;
+        if (!feeds::GetChatPopupOnScreen(&sender)) {
+            m_popupPill->hide();
+            return;
+        }
+        m_popupPillSender = sender;
+        PositionPopupPill();
+        m_popupPill->show();
+        m_popupPill->raise();
+    }
+
+    // Fit the text to the current width and centre the pill at the top of the
+    // chat area. Viewport geometry is in the list's coordinates, the pill's parent.
+    void PositionPopupPill() {
+        if (!m_popupPill) return;
+        const QRect vp = m_list->viewport()->geometry();
+        const int maxW = std::max(0, vp.width() - 2 * kPillMarginPx);
+        m_popupPill->setMaximumWidth(maxW);
+        m_popupPill->ensurePolished();
+
+        // Only the name shrinks, so the action stays readable. On a dock too
+        // narrow to leave room for a name, drop the action instead.
+        const QFontMetrics fm(m_popupPill->font());
+        const QString prefix = "On screen: ";
+        const QString suffix = ", click to hide";
+        const int textW = maxW - kPillChromePx;
+        const int nameW = textW - fm.horizontalAdvance(prefix + suffix);
+        QString text = (nameW >= 6 * fm.averageCharWidth())
+            ? prefix + fm.elidedText(m_popupPillSender, Qt::ElideRight, nameW) + suffix
+            : fm.elidedText(prefix + m_popupPillSender, Qt::ElideRight, textW);
+        // A button reads '&' as a mnemonic marker; sender names are arbitrary.
+        m_popupPill->setText(text.replace(QLatin1Char('&'), QStringLiteral("&&")));
+
+        m_popupPill->adjustSize();
+        m_popupPill->move(vp.x() + (vp.width() - m_popupPill->width()) / 2,
+                          vp.y() + kPillMarginPx);
+    }
+
     // Enforce the retained-row cap by trimming the oldest rows. When the user
     // is scrolled up, subtract the removed rows' height from the scroll value
     // so the messages they're reading don't shift under them. When at the
@@ -2704,7 +2803,10 @@ public:
     void AppendChatItem(QListWidgetItem* item) {
         const bool atBottom = IsAtBottom();
         m_list->addItem(item);
+        const bool trimming = m_list->count() > kMaxChatRows;
         TrimToCap(atBottom);
+        // Removing the current row makes Qt select its neighbour.
+        if (trimming) SyncHighlightToPopup();
         if (atBottom) {
             m_list->scrollToBottom();
             HideNewMessagesPill();
@@ -3312,8 +3414,10 @@ private:
                                          QAbstractItemView::PositionAtTop);
                 }
                 PositionNewMessagesPill();
+                PositionPopupPill();
             });
             PositionNewMessagesPill();
+            PositionPopupPill();
             return false;  // let the view handle the resize / relayout
         }
         if (ev->type() == QEvent::MouseButtonRelease &&
@@ -3426,6 +3530,8 @@ private:
     QLineEdit*   m_input            = nullptr;
     QPushButton* m_sendBtn          = nullptr;
     QPushButton* m_newMsgPill       = nullptr;  // floating "↓ New messages"
+    QPushButton* m_popupPill        = nullptr;  // floating "On screen: ..."
+    QString      m_popupPillSender;             // full name, re-elided on resize
     bool         m_messagesStarted  = false;
 
     // Top chrome: the shared Login/Join block, the conditional "Open Controls
@@ -3468,6 +3574,16 @@ private:
 // lifetime once it's been handed to obs_frontend_add_dock_by_id; we hold
 // this only so the chat_message IPC handler can route messages to it.
 static FeedsChatDock* g_chatDock = nullptr;
+
+// Non-static so feeds-chat-popup-source.cpp can call it. Popup state changes on
+// the UI thread (dock, hotkey), the graphics thread (slide-out finishing, a popup
+// source going on or off program) and OBS's destruction worker, so always marshal.
+void PostChatPopupDockRefresh() {
+    if (!g_chatDock) return;
+    QTimer::singleShot(0, g_chatDock, []() {
+        if (g_chatDock) g_chatDock->RefreshPopupState();
+    });
+}
 
 // Single-line label that elides its (full) text to the current width with a
 // trailing ellipsis and carries the full text as a tooltip. Used for source-box
@@ -5317,7 +5433,7 @@ private:
         const bool shown = r.ltShown;
         QObject::connect(btn, &QPushButton::clicked, this,
             [this, uuid, exists, shown]() {
-                if (g_currentTier < kLowerThirdMinTier) {
+                if (!PassLowerThirdTierGate()) {
                     // Tier-locked: actionable upgrade prompt instead of the
                     // action, exactly like the header source buttons.
                     ShowSourceUpgradePrompt("Feeds Lower Third", "Basic");
@@ -11786,6 +11902,18 @@ static void SetLowerThirdTitleFor(const std::string& participantUuid,
 
 namespace feeds {
 
+// The lower third's Show/Hide hotkeys. Runs what the dock's button runs, silently
+// when tier-locked. Deferred because OBS holds its hotkey lock around the callback,
+// and a Show adds scene items and takes source locks that shouldn't nest inside it.
+void RequestLowerThirdShown(const std::string& participantUuid, bool shown) {
+    QObject* mainWindow = static_cast<QObject*>(obs_frontend_get_main_window());
+    if (!mainWindow) return;
+    QTimer::singleShot(0, mainWindow, [participantUuid, shown]() {
+        if (PassLowerThirdTierGate())
+            SetLowerThirdShownFor(participantUuid, shown);
+    });
+}
+
 // Surface 3's callback into plugin-main. The lower third's properties panel is
 // the one edit surface that can't bind to the canonical value (an OBS property
 // only ever binds to its OWN source's settings), so it writes the new title
@@ -11949,6 +12077,34 @@ static void OnSourceActivationChanged(void* /*data*/, calldata_t* /*cd*/) {
     PostParticipantDockOnAirRefresh();
 }
 
+// "Feeds: Hide Chat Popup" hotkey. ClearChatPopup rather than ToggleChatPopup: it
+// runs the same slide-out as clicking the highlighted message, but a second press
+// during that slide-out can't queue the message back in, and it also drops a
+// queued message. No-op with nothing showing, and with the popup locked there is
+// nothing on stream for it to hide.
+static const char* kHideChatPopupHotkeyName = "FeedsHideChatPopup";
+static obs_hotkey_id g_hideChatPopupHotkey  = OBS_INVALID_HOTKEY_ID;
+
+static void OnHideChatPopupHotkey(void* /*data*/, obs_hotkey_id /*id*/,
+                                  obs_hotkey_t* /*hotkey*/, bool pressed) {
+    if (pressed) feeds::ClearChatPopup();
+}
+
+// OBS Settings writes every frontend hotkey's bindings to the profile config, but
+// only loads back its own. So there is nothing to save here, just this load: at
+// startup, and on a profile switch, since bindings are per profile like every
+// other OBS hotkey. A profile with no entry clears the binding, as OBS's own do.
+static void LoadHideChatPopupHotkey() {
+    config_t* cfg = obs_frontend_get_profile_config();
+    if (!cfg) return;
+    const char* json = config_get_string(cfg, "Hotkeys", kHideChatPopupHotkeyName);
+    obs_data_t* data = json ? obs_data_create_from_json(json) : nullptr;
+    obs_data_array_t* bindings = data ? obs_data_get_array(data, "bindings") : nullptr;
+    obs_hotkey_load(g_hideChatPopupHotkey, bindings);
+    obs_data_array_release(bindings);
+    obs_data_release(data);
+}
+
 // ---------------------------------------------------------------------------
 // Module load/unload
 // ---------------------------------------------------------------------------
@@ -11996,6 +12152,10 @@ bool obs_module_load(void) {
     feeds::RegisterChatPopupSource();
     feeds::RegisterChatOverlaySource();
     feeds::RegisterLowerThirdSource();
+
+    g_hideChatPopupHotkey = obs_hotkey_register_frontend(
+        kHideChatPopupHotkeyName, "Feeds: Hide Chat Popup",
+        OnHideChatPopupHotkey, nullptr);
 
     // ISO recorder: registers the single frontend-event callback that fans
     // recording start/stop/pause out to every per-person recorder.
@@ -12076,6 +12236,7 @@ bool obs_module_load(void) {
         case OBS_FRONTEND_EVENT_FINISHED_LOADING:
             g_sceneCollectionLoading.store(false);   // startup load done
             g_sceneCollectionReloading.store(false);
+            LoadHideChatPopupHotkey();
             SetupPluginMenu();
             // After SetupPluginMenu so the Feeds menu's dock toggle picks up
             // the resulting visibility, and after OBSInit's restoreState so a
@@ -12119,6 +12280,7 @@ bool obs_module_load(void) {
         // The ISO Recording toggle is remembered per profile.
         case OBS_FRONTEND_EVENT_PROFILE_CHANGED:
             RestoreIsoRecordingForProfile();
+            LoadHideChatPopupHotkey();
             break;
         default:
             break;
@@ -12141,6 +12303,8 @@ void obs_module_unload(void) {
         signal_handler_disconnect(sh, "source_deactivate", OnSourceActivationChanged, nullptr);
     }
     if (g_updateCheckThread.joinable()) g_updateCheckThread.join();
+
+    obs_hotkey_unregister(g_hideChatPopupHotkey);
 
     // Stop the YouTube chat poller (signals exit, wakes it, joins). Worst case it
     // waits out one in-flight HTTP request (bounded by the WinHTTP timeouts).

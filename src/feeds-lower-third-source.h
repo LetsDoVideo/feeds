@@ -76,4 +76,10 @@ void ReconcileLowerThirdSources();
 // signature.
 void NotifyLowerThirdTitleChanged(const std::string& participantUuid);
 
+// Implemented by plugin-main, called by the lower third's Show/Hide hotkeys. Goes
+// through the same tier gate and show/hide path as the dock's button, queued onto
+// the UI thread; tier-locked it does nothing, with no upgrade prompt. Declared
+// here for the same reason.
+void RequestLowerThirdShown(const std::string& participantUuid, bool shown);
+
 }  // namespace feeds

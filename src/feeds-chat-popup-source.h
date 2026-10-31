@@ -3,6 +3,7 @@
 #include <string>
 
 #include <QImage>
+#include <QString>
 
 // Public interface for the feeds_chat_popup OBS source. Registration is
 // called once from obs_module_load. ToggleChatPopup / ClearChatPopup are
@@ -35,6 +36,21 @@ void ClearChatPopup();
 // message (matched by sender_id + content) — used to pull a moderator-deleted
 // YouTube message off the popup. No-op otherwise.
 void ClearChatPopupIfMatches(unsigned int senderId, const std::string& content);
+
+// True while a viewer can actually see a popup: a message is up (or queued to
+// replace the one sliding out) AND at least one unlocked popup source is live on
+// program. The message state alone can't answer this, since it is set by any dock
+// click, including with no popup source in the program scene or on a locked tier.
+// A popup already sliding out with nothing queued counts as hidden. senderName
+// receives whose message it is.
+bool GetChatPopupOnScreen(QString* senderName);
+
+// The message the popup is currently on, whether or not anyone can see it: unlike
+// GetChatPopupOnScreen this stays true for a message armed with no popup source on
+// program. False once a hide has started, unless a queued message is replacing it.
+// The dock's row highlight follows this. Matched the way ToggleChatPopup matches,
+// by sender_id + content.
+bool GetChatPopupMessage(unsigned int* senderId, QString* content);
 
 // Re-evaluate every popup source instance's tier_disabled flag against
 // the current g_currentTier (popup is a Streamer-tier feature, gated at

@@ -59,7 +59,10 @@
 // Tier state from plugin-main.cpp. The lower third is gated at Basic (>= 1),
 // enforced by ReconcileLowerThirdSources via the tier_disabled flag. Unlike
 // the chat popup/overlay (Streamer, >= 2), this is Basic's marquee feature.
-extern int g_currentTier;
+// A source created while logged in still starts locked if the tier calls for it,
+// since ReconcileLowerThirdSources only runs at login.
+extern bool g_isLoggedIn;
+extern int  g_currentTier;
 
 // Tier threshold for the lower third. Basic (1), Streamer (2) and
 // Broadcaster (3) get it; Free (0) does not.
@@ -264,6 +267,9 @@ struct FeedsLowerThirdData {
     float         intro_elapsed   = 0.0f;   // seconds since this Show began
     float         shrink_u        = 0.0f;
     float         shrink_target   = 0.0f;
+
+    // Show/Hide hotkeys, one pair per source so each lists under its own name.
+    obs_hotkey_pair_id hotkey_pair = OBS_INVALID_HOTKEY_PAIR_ID;
 };
 
 // Instance registry. UpdateLowerThirdContent / ReconcileLowerThirdSources walk
@@ -536,6 +542,42 @@ static void lt_get_defaults(obs_data_t* settings) {
     obs_data_set_default_bool(settings, kLtCompactKey, true);
 }
 
+// Show/Hide hotkeys. Show or Hide is a Feeds action because the eye icon can't
+// replay the intro, so these go through the dock's path rather than scene-item
+// visibility. Pair contract: return whether the press did anything. With one key
+// bound to both, the first callback declines when the card is already in that
+// state and the other one runs, which makes a single key a toggle. Reads the same
+// settings flag the dock's button reads, so the two can't disagree.
+static bool LtHotkeySetShown(void* data, bool pressed, bool show) {
+    FeedsLowerThirdData* d = static_cast<FeedsLowerThirdData*>(data);
+    if (!d || !pressed) return false;
+
+    bool shown = false;
+    if (obs_data_t* s = obs_source_get_settings(d->source)) {
+        shown = obs_data_get_bool(s, kLtShownKey);
+        obs_data_release(s);
+    }
+    if (shown == show) return false;
+
+    std::string participantUuid;
+    {
+        std::lock_guard<std::mutex> lock(g_ltStateMutex);
+        participantUuid = d->participant_uuid;
+    }
+    feeds::RequestLowerThirdShown(participantUuid, show);
+    return true;
+}
+
+static bool lt_hotkey_show(void* data, obs_hotkey_pair_id, obs_hotkey_t*,
+                           bool pressed) {
+    return LtHotkeySetShown(data, pressed, true);
+}
+
+static bool lt_hotkey_hide(void* data, obs_hotkey_pair_id, obs_hotkey_t*,
+                           bool pressed) {
+    return LtHotkeySetShown(data, pressed, false);
+}
+
 static void* lt_create(obs_data_t* settings, obs_source_t* source) {
     // Always create, never return nullptr on a policy block. Returning nullptr
     // from a create callback makes OBS keep an invalid husk that the next
@@ -545,6 +587,11 @@ static void* lt_create(obs_data_t* settings, obs_source_t* source) {
     // its properties panel explains why.
     FeedsLowerThirdData* d = new FeedsLowerThirdData();
     d->source = source;
+
+    // Login reconciles only the instances that exist then, so one created later
+    // (scene collection switch, the dock's Create) has to pick up the tier here.
+    // Logged out the tier is unknown, not Free: stay unlocked until login decides.
+    if (g_isLoggedIn) d->tier_disabled = (g_currentTier < LOWER_THIRD_MIN_TIER);
 
     // Report correct dimensions immediately: the placement code reads
     // obs_source_get_width/height to compute the scene-item scale, and it runs
@@ -587,12 +634,27 @@ static void* lt_create(obs_data_t* settings, obs_source_t* source) {
         g_ltInstances.push_back(d);
     }
 
+    // Bindings persist with the source in the scene collection: libobs saves them
+    // under the source's "hotkeys" key and hands them back to this registration
+    // on load, matched by these names, so the names must never change. Private
+    // sources get no hotkeys (the id stays invalid).
+    d->hotkey_pair = obs_hotkey_pair_register_source(
+        source,
+        "FeedsLowerThird.Show", "Show lower third",
+        "FeedsLowerThird.Hide", "Hide lower third",
+        lt_hotkey_show, lt_hotkey_hide, d, d);
+
     return d;
 }
 
 static void lt_destroy(void* data) {
     FeedsLowerThirdData* d = static_cast<FeedsLowerThirdData*>(data);
     if (!d) return;
+
+    // Before d goes away: libobs only releases a source's hotkeys after destroy
+    // returns, and the callbacks run on the UI thread, not this one. Takes the
+    // hotkey lock the callbacks run under, so none can still be in flight.
+    obs_hotkey_pair_unregister(d->hotkey_pair);
 
     {
         std::lock_guard<std::mutex> lock(g_ltInstancesMutex);

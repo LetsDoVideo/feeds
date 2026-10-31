@@ -52,8 +52,10 @@ extern std::map<std::string, QImage>    g_twAvatarCacheByUser;
 
 // Tier state from plugin-main.cpp. Overlay is gated at Streamer (>= 2),
 // enforced by ReconcileChatOverlaySources via the tier_disabled flag.
-// (The create callback no longer gates on login/tier — it always creates a
-// dormant source — so the login/popup-helper externs are no longer needed.)
+// (The create callback no longer refuses on login/tier — it always creates a
+// dormant source — but a source created while logged in still starts locked if
+// the tier calls for it, since ReconcileChatOverlaySources only runs at login.)
+extern bool g_isLoggedIn;
 extern int  g_currentTier;
 
 // Tier threshold for the overlay. Streamer (2) and Broadcaster (3) get
@@ -83,6 +85,9 @@ static constexpr const char* S_VISIBLE_MESSAGES = "visible_messages";
 static constexpr const char* S_SHOW_ZOOM        = "show_zoom";
 static constexpr const char* S_SHOW_YOUTUBE     = "show_youtube";
 static constexpr const char* S_SHOW_TWITCH      = "show_twitch";
+// Default off, so overlays saved before this key existed behave as they always
+// have.
+static constexpr const char* S_CLEAR_WHEN_SHOWN = "clear_when_shown";
 
 // Width range and step. WIDTH_DEFAULT_PX is the property-system default
 // (35% of 1920 ≈ 672 px) — a baseline for sources loaded from saves
@@ -122,6 +127,7 @@ struct OverlayMessage {
     QString      sender_name;
     QString      content;
     qint64       timestamp   = 0;
+    uint64_t     seq         = 0;   // arrival order (see g_overlayNextSeq)
 };
 
 // Bounded ring of recent chat messages — single source of truth for every
@@ -134,6 +140,11 @@ static constexpr size_t       HISTORY_CAP = 50;
 
 std::mutex                    g_overlayHistoryMutex;
 std::vector<OverlayMessage>   g_overlayHistory;
+// Stamped onto each message at append, guarded by g_overlayHistoryMutex. The
+// history is shared by every overlay, so "Clear when shown" can't drop rows from
+// it: each instance instead remembers the first seq it may draw. Never reset, so
+// those per-instance marks stay valid across ClearChatOverlay.
+uint64_t                      g_overlayNextSeq = 1;
 
 // ---------------------------------------------------------------------------
 // Per-instance state. Same layout as the popup's data struct minus the
@@ -165,6 +176,12 @@ struct FeedsChatOverlayData {
     bool            show_zoom         = true;
     bool            show_youtube      = true;
     bool            show_twitch       = true;
+    // "Clear when shown": fcr_activate raises first_visible_seq past everything
+    // already in the history, and RenderOverlayToImage skips anything older.
+    // Written and read on the graphics thread (activate runs from the source's
+    // tick); clear_when_shown is written by fcr_update under the instances mutex.
+    bool            clear_when_shown  = false;
+    uint64_t        first_visible_seq = 0;
     uint32_t        height            = (uint32_t)(
                                             VISIBLE_DEFAULT * AVATAR_SIZE +
                                             (VISIBLE_DEFAULT - 1) * ROW_SPACING +
@@ -227,6 +244,7 @@ static void RenderOverlayToImage(FeedsChatOverlayData* d,
     std::vector<const OverlayMessage*> filtered;
     filtered.reserve(messages.size());
     for (const OverlayMessage& m : messages) {
+        if (m.seq < d->first_visible_seq) continue;  // cleared on this overlay
         bool keep = false;
         switch (m.origin) {
         case feeds::ChatMsgOrigin::Zoom:    keep = d->show_zoom;    break;
@@ -405,6 +423,7 @@ static void fcr_get_defaults(obs_data_t* settings) {
     obs_data_set_default_bool(settings, S_SHOW_ZOOM,    true);
     obs_data_set_default_bool(settings, S_SHOW_YOUTUBE, true);
     obs_data_set_default_bool(settings, S_SHOW_TWITCH,  true);
+    obs_data_set_default_bool(settings, S_CLEAR_WHEN_SHOWN, false);
 }
 
 // Pull the configured dimensions out of settings, clamp to ranges,
@@ -421,6 +440,7 @@ static void fcr_update(void* data, obs_data_t* settings) {
     bool sz = obs_data_get_bool(settings, S_SHOW_ZOOM);
     bool sy = obs_data_get_bool(settings, S_SHOW_YOUTUBE);
     bool st = obs_data_get_bool(settings, S_SHOW_TWITCH);
+    bool cs = obs_data_get_bool(settings, S_CLEAR_WHEN_SHOWN);
     if (w < WIDTH_MIN_PX) w = WIDTH_MIN_PX;
     if (w > WIDTH_MAX_PX) w = WIDTH_MAX_PX;
     if (v < VISIBLE_MIN)  v = VISIBLE_MIN;
@@ -434,6 +454,30 @@ static void fcr_update(void* data, obs_data_t* settings) {
     if (d->show_youtube != sy) { d->show_youtube = sy; changed = true; }
     if (d->show_twitch  != st) { d->show_twitch  = st; changed = true; }
     if (changed) d->texture_dirty = true;
+    // Takes effect at the next activation, so no repaint needed.
+    d->clear_when_shown = cs;
+}
+
+// Went live on program. Activate rather than show: show also fires for Studio
+// Mode preview, multiview, projectors and the Properties window's own preview,
+// none of which should wipe the overlay. Refcounted across every scene holding
+// this source, so moving between two scenes that both contain it doesn't fire.
+// Runs on the graphics thread from the source's tick, ahead of that frame's
+// render, so the dirty bit normally lands on the same frame.
+static void fcr_activate(void* data) {
+    FeedsChatOverlayData* d = static_cast<FeedsChatOverlayData*>(data);
+    if (!d) return;
+
+    uint64_t nextSeq;
+    {
+        std::lock_guard<std::mutex> lock(g_overlayHistoryMutex);
+        nextSeq = g_overlayNextSeq;
+    }
+
+    std::lock_guard<std::mutex> lock(g_overlayInstancesMutex);
+    if (!d->clear_when_shown) return;
+    d->first_visible_seq = nextSeq;
+    d->texture_dirty     = true;
 }
 
 static void* fcr_create(obs_data_t* settings, obs_source_t* source) {
@@ -448,6 +492,11 @@ static void* fcr_create(obs_data_t* settings, obs_source_t* source) {
 
     FeedsChatOverlayData* d = new FeedsChatOverlayData();
     d->source = source;
+
+    // Login reconciles only the instances that exist then, so one created later
+    // (scene collection switch, OBS Sources "+") has to pick up the tier here.
+    // Logged out the tier is unknown, not Free: stay unlocked until login decides.
+    if (g_isLoggedIn) d->tier_disabled = (g_currentTier < OVERLAY_MIN_TIER);
 
     obs_enter_graphics();
     d->texrender = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
@@ -542,6 +591,10 @@ static obs_properties_t* fcr_get_properties(void* data) {
     obs_properties_add_bool(props, S_SHOW_ZOOM,    "Show Zoom Chat");
     obs_properties_add_bool(props, S_SHOW_YOUTUBE, "Show YouTube Chat");
     obs_properties_add_bool(props, S_SHOW_TWITCH,  "Show Twitch Chat");
+    obs_property_t* clearProp =
+        obs_properties_add_bool(props, S_CLEAR_WHEN_SHOWN, "Clear when shown");
+    obs_property_set_long_description(clearProp,
+        "Start empty each time this overlay goes live, so only new messages appear.");
     return props;
 }
 
@@ -660,6 +713,7 @@ void RegisterChatOverlaySource() {
     feeds_chat_overlay_info.get_properties = fcr_get_properties;
     feeds_chat_overlay_info.get_defaults   = fcr_get_defaults;
     feeds_chat_overlay_info.update         = fcr_update;
+    feeds_chat_overlay_info.activate       = fcr_activate;
     feeds_chat_overlay_info.video_render   = fcr_video_render;
     feeds_chat_overlay_info.icon_type      = OBS_ICON_TYPE_TEXT;
     obs_register_source(&feeds_chat_overlay_info);
@@ -680,6 +734,7 @@ void AppendChatMessageToOverlay(ChatMsgOrigin      origin,
         msg.sender_name = QString::fromStdString(senderName);
         msg.content     = QString::fromStdString(content);
         msg.timestamp   = timestamp;
+        msg.seq         = g_overlayNextSeq++;
         g_overlayHistory.push_back(std::move(msg));
 
         // Trim oldest. erase-from-begin on a vector is O(N), but with
