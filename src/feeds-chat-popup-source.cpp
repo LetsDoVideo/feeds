@@ -48,10 +48,10 @@
 extern bool g_isLoggedIn;
 extern int  g_currentTier;
 
-// Chat Dock's highlight and "on screen" pill, in plugin-main.cpp. Queues a re-read
-// of feeds::GetChatPopupMessage / GetChatPopupOnScreen on the UI thread, so it is
-// safe from any thread and with any lock held. Called after everything that can
-// change either answer.
+// Chat Dock's highlight and "Hide Chat Popup" button, in plugin-main.cpp. Queues a
+// re-read of feeds::GetChatPopupMessage / GetChatPopupOnScreen on the UI thread, so
+// it is safe from any thread and with any lock held. Called after everything that
+// can change either answer.
 extern void PostChatPopupDockRefresh();
 
 // Tier threshold for the popup. Streamer (2) and Broadcaster (3) get it;
@@ -880,7 +880,7 @@ void ClearChatPopupIfMatches(unsigned int senderId, const std::string& content) 
     }
 }
 
-bool GetChatPopupOnScreen(QString* senderName) {
+bool GetChatPopupOnScreen() {
     // instances-outer / state-inner, the order used everywhere else.
     std::lock_guard<std::mutex> instancesLock(g_instancesMutex);
     const bool anyLive = std::any_of(
@@ -893,9 +893,7 @@ bool GetChatPopupOnScreen(QString* senderName) {
     unsigned int id = 0;
     QString      name;
     QString      content;
-    if (!PopupMessage_locked(id, name, content)) return false;
-    if (senderName) *senderName = name;
-    return true;
+    return PopupMessage_locked(id, name, content);
 }
 
 bool GetChatPopupMessage(unsigned int* senderId, QString* content) {

@@ -2542,7 +2542,7 @@ public:
     // per-platform). Oldest rows trim as new ones arrive.
     static constexpr int kMaxChatRows = 500;
 
-    // Shared look of the dock's floating pills. Subtle grey chrome: rgba greys +
+    // The "new messages" pill's look. Subtle grey chrome: rgba greys +
     // thin border, as in the participant header bar.
     static constexpr const char* kChatPillStyle =
         "QPushButton {"
@@ -2552,8 +2552,6 @@ public:
         " border-radius: 10px;"
         " padding: 3px 12px; }"
         "QPushButton:hover { background: rgba(64,64,64,0.95); }";
-    static constexpr int kPillMarginPx = 8;    // gap to the chat area's edges
-    static constexpr int kPillChromePx = 26;   // horizontal padding + border
 
     explicit FeedsChatDock(QWidget* parent = nullptr) : QWidget(parent) {
         m_list = new QListWidget(this);
@@ -2596,20 +2594,8 @@ public:
             HideNewMessagesPill();
         });
 
-        // Floating "on screen" pill, top of the chat area, so it can't meet the
-        // "new messages" pill at the bottom. Parented to the list rather than
-        // its viewport: QWidget::scroll moves a viewport's children along with
-        // the content, and this pill stays up while chat keeps scrolling.
-        m_popupPill = new QPushButton(m_list);
-        m_popupPill->setCursor(Qt::PointingHandCursor);
-        m_popupPill->setFocusPolicy(Qt::NoFocus);
-        m_popupPill->setStyleSheet(kChatPillStyle);
-        m_popupPill->hide();
-        QObject::connect(m_popupPill, &QPushButton::clicked, this,
-                         []() { feeds::ClearChatPopup(); });
-
         // Reposition the pill on viewport resize and preserve the reading
-        // position across the width-driven word-wrap reflow (see eventFilter).
+        // position across the resize (see eventFilter).
         m_list->viewport()->installEventFilter(this);
 
         // Dismiss the pill the moment the view is back at the bottom — whether
@@ -2641,7 +2627,8 @@ public:
 
         // Top to bottom: the shared Login/Join block (gone in a meeting), the
         // conditional "Open Controls Dock" button, the chat source buttons, the
-        // Zoom / YouTube / Twitch rows, then the chat itself and the input row.
+        // Zoom / YouTube / Twitch rows, the "Hide Chat Popup" row (only while a
+        // popup is on screen), then the chat itself and the input row.
         // Two dividers split that into actions | platform status | chat. The
         // first sits under the source row, which is always shown, so it holds
         // its place in and out of a meeting. Padding: the source row has no
@@ -2660,6 +2647,7 @@ public:
         m_chatHeader = BuildChatHeader();   // platform config/status, pinned on top
         layout->addWidget(m_chatHeader);
         layout->addWidget(MakeDockDivider(2, 8));
+        layout->addWidget(BuildHidePopupRow());
         layout->addWidget(m_list, 1);
         layout->addLayout(inputRow);
 
@@ -2734,48 +2722,14 @@ public:
         }
     }
 
-    // Bring the highlight and the "on screen" pill in line with the popup. The
-    // popup source is the one place that decides, so every way of showing or
-    // hiding a popup lands here through PostChatPopupDockRefresh.
+    // Bring the highlight and the "Hide Chat Popup" button in line with the popup.
+    // The popup source is the one place that decides, so every way of showing or
+    // hiding a popup lands here through PostChatPopupDockRefresh. The list changes
+    // height with the button; the viewport Resize handling in eventFilter keeps
+    // the reading position across that.
     void RefreshPopupState() {
         SyncHighlightToPopup();
-        if (!m_popupPill) return;
-        QString sender;
-        if (!feeds::GetChatPopupOnScreen(&sender)) {
-            m_popupPill->hide();
-            return;
-        }
-        m_popupPillSender = sender;
-        PositionPopupPill();
-        m_popupPill->show();
-        m_popupPill->raise();
-    }
-
-    // Fit the text to the current width and centre the pill at the top of the
-    // chat area. Viewport geometry is in the list's coordinates, the pill's parent.
-    void PositionPopupPill() {
-        if (!m_popupPill) return;
-        const QRect vp = m_list->viewport()->geometry();
-        const int maxW = std::max(0, vp.width() - 2 * kPillMarginPx);
-        m_popupPill->setMaximumWidth(maxW);
-        m_popupPill->ensurePolished();
-
-        // Only the name shrinks, so the action stays readable. On a dock too
-        // narrow to leave room for a name, drop the action instead.
-        const QFontMetrics fm(m_popupPill->font());
-        const QString prefix = "On screen: ";
-        const QString suffix = ", click to hide";
-        const int textW = maxW - kPillChromePx;
-        const int nameW = textW - fm.horizontalAdvance(prefix + suffix);
-        QString text = (nameW >= 6 * fm.averageCharWidth())
-            ? prefix + fm.elidedText(m_popupPillSender, Qt::ElideRight, nameW) + suffix
-            : fm.elidedText(prefix + m_popupPillSender, Qt::ElideRight, textW);
-        // A button reads '&' as a mnemonic marker; sender names are arbitrary.
-        m_popupPill->setText(text.replace(QLatin1Char('&'), QStringLiteral("&&")));
-
-        m_popupPill->adjustSize();
-        m_popupPill->move(vp.x() + (vp.width() - m_popupPill->width()) / 2,
-                          vp.y() + kPillMarginPx);
+        m_hidePopupRow->setVisible(feeds::GetChatPopupOnScreen());
     }
 
     // Enforce the retained-row cap by trimming the oldest rows. When the user
@@ -3116,6 +3070,28 @@ private:
         StyleDockSourceButton(m_chatPopupBtn,   locked, false, m_cdChatPopup);
     }
 
+    // The "Hide Chat Popup" row, a full-width button styled like the source buttons
+    // above. It lives in the layout, so hiding the row gives its space back to the
+    // chat list. Never locked (a locked popup never shows it) and no cooldown, so
+    // one styling is enough. No keyboard focus: a click shouldn't take focus from
+    // the chat input, and the button is about to hide.
+    QWidget* BuildHidePopupRow() {
+        m_hidePopupRow = new QWidget(this);
+        QHBoxLayout* l = new QHBoxLayout(m_hidePopupRow);
+        l->setContentsMargins(8, 0, 8, 8);
+
+        ElidingPushButton* btn = MakeDockSourceButton("Hide Chat Popup");
+        btn->setToolTip(QString());
+        btn->setFocusPolicy(Qt::NoFocus);
+        StyleDockSourceButton(btn, false, false, false);
+        QObject::connect(btn, &QPushButton::clicked, this,
+                         []() { feeds::ClearChatPopup(); });
+
+        l->addWidget(btn);
+        m_hidePopupRow->hide();
+        return m_hidePopupRow;
+    }
+
     // Build the fixed platform header: three rows of the same shape (glyph +
     // field + status dot + word), Zoom first, then YouTube, then Twitch. Zoom's
     // field is read-only status; YouTube's and Twitch's are editable targets.
@@ -3396,15 +3372,20 @@ private:
     // Log In / Upgrade) — TriggerConnectFlow resolves to login when logged out and
     // the upgrade URL when tier-locked, matching what the row rendered.
     bool eventFilter(QObject* obj, QEvent* ev) override {
-        // Preserve the user's reading position across the list's width-driven
-        // word-wrap reflow (and keep the floating pill positioned). When this
-        // Resize arrives the view hasn't relaid out yet, so we can read the
-        // current at-bottom state / top row now and restore it after the
-        // relayout via a queued call (scrollTo* flushes the pending layout).
+        // Preserve the user's reading position across a resize of the list (and
+        // keep the floating pill positioned). When this Resize arrives the view
+        // hasn't relaid out yet, so we can read the current at-bottom state / top
+        // row now and restore it after the relayout via a queued call (scrollTo*
+        // flushes the pending layout). At the bottom it re-pins for any resize. A
+        // height-only change (the dock growing, the "Hide Chat Popup" row coming
+        // and going) keeps row heights, so the scroll value stays good by itself;
+        // only a width change reflows word wrap and needs the top row put back.
         if (ev->type() == QEvent::Resize && m_list && obj == m_list->viewport()) {
+            const QResizeEvent* re = static_cast<QResizeEvent*>(ev);
+            const bool reflowed = re->size().width() != re->oldSize().width();
             const bool atBottom = IsAtBottom();
-            const QModelIndex topIdx =
-                atBottom ? QModelIndex() : m_list->indexAt(QPoint(2, 2));
+            const QModelIndex topIdx = (reflowed && !atBottom)
+                ? m_list->indexAt(QPoint(2, 2)) : QModelIndex();
             const int topRow = topIdx.isValid() ? topIdx.row() : -1;
             QTimer::singleShot(0, this, [this, atBottom, topRow]() {
                 if (atBottom) {
@@ -3414,10 +3395,8 @@ private:
                                          QAbstractItemView::PositionAtTop);
                 }
                 PositionNewMessagesPill();
-                PositionPopupPill();
             });
             PositionNewMessagesPill();
-            PositionPopupPill();
             return false;  // let the view handle the resize / relayout
         }
         if (ev->type() == QEvent::MouseButtonRelease &&
@@ -3530,8 +3509,7 @@ private:
     QLineEdit*   m_input            = nullptr;
     QPushButton* m_sendBtn          = nullptr;
     QPushButton* m_newMsgPill       = nullptr;  // floating "↓ New messages"
-    QPushButton* m_popupPill        = nullptr;  // floating "On screen: ..."
-    QString      m_popupPillSender;             // full name, re-elided on resize
+    QWidget*     m_hidePopupRow     = nullptr;  // "Hide Chat Popup" button's row
     bool         m_messagesStarted  = false;
 
     // Top chrome: the shared Login/Join block, the conditional "Open Controls

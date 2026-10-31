@@ -41,9 +41,8 @@ void ClearChatPopupIfMatches(unsigned int senderId, const std::string& content);
 // replace the one sliding out) AND at least one unlocked popup source is live on
 // program. The message state alone can't answer this, since it is set by any dock
 // click, including with no popup source in the program scene or on a locked tier.
-// A popup already sliding out with nothing queued counts as hidden. senderName
-// receives whose message it is.
-bool GetChatPopupOnScreen(QString* senderName);
+// A popup already sliding out with nothing queued counts as hidden.
+bool GetChatPopupOnScreen();
 
 // The message the popup is currently on, whether or not anyone can see it: unlike
 // GetChatPopupOnScreen this stays true for a message armed with no popup source on
