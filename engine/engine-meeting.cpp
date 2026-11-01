@@ -31,6 +31,7 @@
 #include "engine-shared.h"
 #include "engine-speaker.h"
 #include "engine-audio.h"
+#include "feeds-public-chat-ids.h"
 
 // Defined elsewhere in the engine
 extern void LogToFile(const char* msg);  // forwards at DEBUG
@@ -553,8 +554,11 @@ static ZoomVideoListener g_videoListener;
 // are filtered out here at the engine boundary and never reach the plugin.
 // This is structural: the plugin literally cannot leak private chat
 // because it never receives it. Filtering at the source is the correct
-// security posture for this feature.
+// security posture for this feature. Deletes and edits of public messages
+// follow the same rule: chat_message_deleted, chat_message_edited.
 // ---------------------------------------------------------------------------
+static feeds::PublicChatIds g_publicChatIds;
+
 class ZoomChatListener : public ZOOM_SDK_NAMESPACE::IMeetingChatCtrlEvent {
 public:
     virtual void onChatMsgNotification(
@@ -598,6 +602,14 @@ public:
         std::string avatarPath =
             avatarPathRaw ? WideToUtf8(avatarPathRaw) : "";
 
+        // Asked of the SDK here rather than left to the plugin's roster: a
+        // message can be typed in the dock before the first roster arrives.
+        ZOOM_SDK_NAMESPACE::IUserInfo* mySelf =
+            pc ? pc->GetMySelfUser() : nullptr;
+        const bool isSelf = mySelf && mySelf->GetUserID() == senderId;
+
+        g_publicChatIds.Add(messageId);
+
         std::ostringstream out;
         out << "{\"type\":\"chat_message\","
             << "\"message_id\":\"" << JsonEscape(messageId) << "\","
@@ -605,7 +617,8 @@ public:
             << "\"sender_name\":\"" << JsonEscape(senderName) << "\","
             << "\"content\":\"" << JsonEscape(content) << "\","
             << "\"avatar_path\":\"" << JsonEscape(avatarPath) << "\","
-            << "\"timestamp\":" << (long long)timestamp << "}";
+            << "\"timestamp\":" << (long long)timestamp << ","
+            << "\"is_self\":" << (isSelf ? 1 : 0) << "}";
         SendToPlugin(out.str());
 
         // Debug-visibility log only — the full content lives in the IPC.
@@ -632,6 +645,12 @@ public:
         sprintf_s(buf, "Chat: onChatMsgDeleteNotification id=%s deleteBy=%d",
                   id.c_str(), (int)deleteBy);
         LogToFile(buf);
+
+        // The callback doesn't say whether the message was public. Only an id
+        // this listener forwarded as public goes on.
+        if (!g_publicChatIds.Contains(id)) return;
+        SendToPlugin("{\"type\":\"chat_message_deleted\",\"message_id\":\"" +
+                     JsonEscape(id) + "\"}");
     }
 
     virtual void onChatMessageEditNotification(
@@ -641,6 +660,12 @@ public:
         sprintf_s(buf, "Chat: onChatMessageEditNotification id=%s",
                   id.c_str());
         LogToFile(buf);
+
+        // Same privacy filter as a new message.
+        if (!chatMsg || !chatMsg->IsChatToAll()) return;
+        SendToPlugin("{\"type\":\"chat_message_edited\",\"message_id\":\"" +
+                     JsonEscape(id) + "\",\"content\":\"" +
+                     JsonEscape(WideToUtf8(chatMsg->GetContent())) + "\"}");
     }
 
     virtual void onShareMeetingChatStatusChanged(bool) override {}

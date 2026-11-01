@@ -128,6 +128,7 @@ struct OverlayMessage {
     QString      content;
     qint64       timestamp   = 0;
     uint64_t     seq         = 0;   // arrival order (see g_overlayNextSeq)
+    std::string  zoom_message_id;   // SDK id, for delete/edit ("" for YouTube/Twitch)
 };
 
 // Bounded ring of recent chat messages — single source of truth for every
@@ -724,7 +725,8 @@ void AppendChatMessageToOverlay(ChatMsgOrigin      origin,
                                 const std::string& channelId,
                                 const std::string& senderName,
                                 const std::string& content,
-                                qint64             timestamp) {
+                                qint64             timestamp,
+                                const std::string& zoomMessageId) {
     {
         std::lock_guard<std::mutex> lock(g_overlayHistoryMutex);
         OverlayMessage msg;
@@ -735,6 +737,7 @@ void AppendChatMessageToOverlay(ChatMsgOrigin      origin,
         msg.content     = QString::fromStdString(content);
         msg.timestamp   = timestamp;
         msg.seq         = g_overlayNextSeq++;
+        msg.zoom_message_id = zoomMessageId;
         g_overlayHistory.push_back(std::move(msg));
 
         // Trim oldest. erase-from-begin on a vector is O(N), but with
@@ -744,6 +747,37 @@ void AppendChatMessageToOverlay(ChatMsgOrigin      origin,
         if (g_overlayHistory.size() > HISTORY_CAP) {
             g_overlayHistory.erase(g_overlayHistory.begin());
         }
+    }
+    MarkAllOverlayInstancesDirty();
+}
+
+void RemoveZoomMessageFromOverlay(const std::string& zoomMessageId) {
+    if (zoomMessageId.empty()) return;
+    {
+        std::lock_guard<std::mutex> lock(g_overlayHistoryMutex);
+        const auto it = std::find_if(
+            g_overlayHistory.begin(), g_overlayHistory.end(),
+            [&](const OverlayMessage& m) {
+                return m.zoom_message_id == zoomMessageId;
+            });
+        if (it == g_overlayHistory.end()) return;
+        g_overlayHistory.erase(it);
+    }
+    MarkAllOverlayInstancesDirty();
+}
+
+void EditZoomMessageInOverlay(const std::string& zoomMessageId,
+                              const std::string& content) {
+    if (zoomMessageId.empty()) return;
+    {
+        std::lock_guard<std::mutex> lock(g_overlayHistoryMutex);
+        const auto it = std::find_if(
+            g_overlayHistory.begin(), g_overlayHistory.end(),
+            [&](const OverlayMessage& m) {
+                return m.zoom_message_id == zoomMessageId;
+            });
+        if (it == g_overlayHistory.end()) return;
+        it->content = QString::fromStdString(content);
     }
     MarkAllOverlayInstancesDirty();
 }

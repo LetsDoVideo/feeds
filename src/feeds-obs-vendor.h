@@ -8,12 +8,13 @@
 //
 // PERMANENT PUBLIC CONTRACT. Customer automation is keyed on these strings, so
 // they are never renamed once shipped: the vendor name "feeds", the events
-// speaker_changed, meeting_joined, meeting_left and participant_1_speaking
-// through participant_8_speaking, the request get_state, and the field names
-// name, participant_id, slots, in_meeting, speaker, participants, share_active
-// and locked. The slot numbers themselves (feeds_slot, plugin-main.cpp) are part
-// of the same contract. New fields may be added. See feeds-obs-vendor.cpp for the
-// wire format.
+// speaker_changed, meeting_joined, meeting_left, participant_1_speaking through
+// participant_8_speaking, chat_message, share_started, share_stopped,
+// participant_joined, participant_left, participant_muted and participant_unmuted,
+// the request get_state, and the field names name, participant_id, slots, message,
+// is_self, in_meeting, speaker, participants, share_active and locked. The slot
+// numbers themselves (feeds_slot, plugin-main.cpp) are part of the same contract.
+// New fields may be added. See feeds-obs-vendor.cpp for the wire format.
 //
 // Optional by design: with obs-websocket missing or disabled, every function
 // here is a no-op and Feeds behaves exactly as it does without this file.
@@ -60,6 +61,14 @@ bool VendorAvailable();
 void VendorEmitSpeakerChanged(const VendorPerson& speaker);
 void VendorEmitMeetingJoined();
 void VendorEmitMeetingLeft();
+void VendorEmitChatMessage(const VendorPerson& sender, const std::string& message,
+                           bool is_self);
+void VendorEmitShareStarted(const VendorPerson& sharer);
+void VendorEmitShareStopped(const VendorPerson& sharer);
+void VendorEmitParticipantJoined(const VendorPerson& person);
+void VendorEmitParticipantLeft(const VendorPerson& person);
+// Sends participant_muted, or participant_unmuted when muted is false.
+void VendorEmitParticipantMuted(const VendorPerson& person, bool muted);
 
 // The get_state snapshot. Defined in plugin-main.cpp. Called on an obs-websocket
 // thread pool thread, so it must be safe from any thread and must never wait on

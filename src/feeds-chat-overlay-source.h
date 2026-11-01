@@ -32,12 +32,21 @@ void RegisterChatOverlaySource();
 //
 // The overlay keeps the most recent ~50 messages; only the last few are
 // typically visible. Cap is internal — caller doesn't need to trim.
+//
+// zoomMessageId is the SDK message id, for the two calls below. Zoom only.
 void AppendChatMessageToOverlay(ChatMsgOrigin      origin,
                                 unsigned int       senderId,
                                 const std::string& channelId,
                                 const std::string& senderName,
                                 const std::string& content,
-                                qint64             timestamp);
+                                qint64             timestamp,
+                                const std::string& zoomMessageId = std::string());
+
+// A Zoom message was deleted, or edited. Same threading as the append, and a
+// no-op for an id the history doesn't hold.
+void RemoveZoomMessageFromOverlay(const std::string& zoomMessageId);
+void EditZoomMessageInOverlay(const std::string& zoomMessageId,
+                              const std::string& content);
 
 // Drop all messages from the overlay history. Called on meeting-left
 // so stale messages don't carry into the next meeting.

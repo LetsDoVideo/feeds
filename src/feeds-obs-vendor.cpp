@@ -19,6 +19,13 @@
 //   participant_N_speaking    same data, N = 1 to 8, one per slot in slots
 //   meeting_joined            {}
 //   meeting_left              {}
+//   chat_message              name, participant_id, slots, message, is_self
+//   share_started             name, participant_id, slots
+//   share_stopped             name, participant_id, slots
+//   participant_joined        name, participant_id, slots
+//   participant_left          name, participant_id, slots
+//   participant_muted         name, participant_id, slots
+//   participant_unmuted       name, participant_id, slots
 //
 //   get_state                 locked: {"locked":true} and nothing else
 //                             otherwise: in_meeting, speaker (as speaker_changed),
@@ -53,6 +60,14 @@ void WritePerson(obs_data_t* data, const VendorPerson& person) {
 void EmitEmpty(const char* type) {
     if (!g_vendor) return;
     obs_data_t* data = obs_data_create();
+    obs_websocket_vendor_emit_event(g_vendor, type, data);
+    obs_data_release(data);
+}
+
+void EmitPerson(const char* type, const VendorPerson& person) {
+    if (!g_vendor) return;
+    obs_data_t* data = obs_data_create();
+    WritePerson(data, person);
     obs_websocket_vendor_emit_event(g_vendor, type, data);
     obs_data_release(data);
 }
@@ -143,6 +158,37 @@ void VendorEmitMeetingJoined() {
 
 void VendorEmitMeetingLeft() {
     EmitEmpty("meeting_left");
+}
+
+void VendorEmitChatMessage(const VendorPerson& sender, const std::string& message,
+                           bool is_self) {
+    if (!g_vendor) return;
+    obs_data_t* data = obs_data_create();
+    WritePerson(data, sender);
+    obs_data_set_string(data, "message", message.c_str());
+    obs_data_set_bool(data, "is_self", is_self);
+    obs_websocket_vendor_emit_event(g_vendor, "chat_message", data);
+    obs_data_release(data);
+}
+
+void VendorEmitShareStarted(const VendorPerson& sharer) {
+    EmitPerson("share_started", sharer);
+}
+
+void VendorEmitShareStopped(const VendorPerson& sharer) {
+    EmitPerson("share_stopped", sharer);
+}
+
+void VendorEmitParticipantJoined(const VendorPerson& person) {
+    EmitPerson("participant_joined", person);
+}
+
+void VendorEmitParticipantLeft(const VendorPerson& person) {
+    EmitPerson("participant_left", person);
+}
+
+void VendorEmitParticipantMuted(const VendorPerson& person, bool muted) {
+    EmitPerson(muted ? "participant_muted" : "participant_unmuted", person);
 }
 
 }  // namespace feeds

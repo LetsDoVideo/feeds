@@ -28,6 +28,8 @@
 #include <atomic>
 #include <thread>
 #include <chrono>
+#include <ctime>
+#include <deque>
 #include <memory>
 #include <condition_variable>
 #include <cstring>
@@ -456,6 +458,21 @@ static void        RefreshAllLowerThirdContent();
 static void VendorOnMeetingJoined();
 static void VendorOnMeetingLeft(bool wasInMeeting);
 static void VendorOnActiveSpeaker(unsigned int userId);
+static void VendorOnChatMessage(unsigned int senderId, const std::string& name,
+                                const std::string& message,
+                                const std::string& messageId, qint64 timestamp,
+                                bool isSelf);
+static void VendorOnSharer(unsigned int userId);
+static void VendorOnAudioStatus(unsigned int userId, bool muted);
+// One line of participant_list_changed, for the roster diff.
+struct VendorRosterEntry {
+    unsigned int id;
+    std::string  name;
+    bool         muted;
+};
+static std::vector<unsigned int> VendorOnRosterLeaves(
+    const std::vector<VendorRosterEntry>& roster, unsigned int myUserId);
+static void VendorOnRosterJoins(const std::vector<unsigned int>& joined);
 
 // ---------------------------------------------------------------------------
 // Per-source data
@@ -2069,7 +2086,7 @@ static void ShowSessionPickerDialog(const std::string& json) {
 // because ChatMessageDelegate — defined below, before the dock — reads the role.
 // Placeholder rows carry no origin (role absent) and get no glyph/indent.
 static constexpr int kRoleChatOrigin  = Qt::UserRole + 10;  // int: kChatOrigin*
-static constexpr int kRoleChatMsgId   = Qt::UserRole + 11;  // platform message id (deletion): YT id / Twitch id tag
+static constexpr int kRoleChatMsgId   = Qt::UserRole + 11;  // platform message id (deletion): Zoom SDK id / YT id / Twitch id tag
 static constexpr int kRoleChatChannel = Qt::UserRole + 12;  // by-author id: YT channel id / Twitch user-id
 static constexpr int kRoleChatAvatar  = Qt::UserRole + 13;  // avatar URL (YouTube only; Twitch has none)
 enum ChatOrigin { kChatOriginZoom = 1, kChatOriginYouTube = 2, kChatOriginTwitch = 3 };
@@ -2798,7 +2815,8 @@ public:
     void AppendMessage(unsigned int   senderId,
                        const QString& senderName,
                        const QString& content,
-                       qint64         timestamp) {
+                       qint64         timestamp,
+                       const QString& messageId) {
         // timestamp is kept in the signature so the engine's value
         // flows through unchanged — future surfaces (tooltip, an
         // opt-in "show timestamps" preference, the overlay source)
@@ -2825,7 +2843,40 @@ public:
         item->setData(RoleSenderName, senderName);
         item->setData(RoleContent,    content);
         item->setData(kRoleChatOrigin, kChatOriginZoom);   // blue Zoom glyph
+        item->setData(kRoleChatMsgId,  messageId);
         AppendChatItem(item);
+    }
+
+    // A Zoom message was deleted. The popup is the caller's: it can hold a
+    // message whose row has already trimmed away.
+    void RemoveZoomMessageById(const QString& msgId) {
+        if (msgId.isEmpty()) return;
+        for (int i = m_list->count() - 1; i >= 0; --i) {
+            QListWidgetItem* it = m_list->item(i);
+            if (!it || it->data(kRoleChatOrigin).toInt() != kChatOriginZoom) continue;
+            if (it->data(kRoleChatMsgId).toString() != msgId) continue;
+            delete m_list->takeItem(i);
+            return;
+        }
+    }
+
+    // A Zoom message was edited: new text on its row, in place. The view keeps
+    // the old row height until it lays out again, and edited text can wrap to a
+    // different number of lines.
+    void EditZoomMessageById(const QString& msgId, const QString& content) {
+        if (msgId.isEmpty()) return;
+        for (int i = m_list->count() - 1; i >= 0; --i) {
+            QListWidgetItem* it = m_list->item(i);
+            if (!it || it->data(kRoleChatOrigin).toInt() != kChatOriginZoom) continue;
+            if (it->data(kRoleChatMsgId).toString() != msgId) continue;
+            const bool atBottom = IsAtBottom();
+            it->setText(QString("%1: %2").arg(it->data(RoleSenderName).toString(),
+                                              content));
+            it->setData(RoleContent, content);
+            m_list->doItemsLayout();
+            if (atBottom) m_list->scrollToBottom();
+            return;
+        }
     }
 
     // Inject a YouTube live-chat message into the dock. Phase 1 is dock-only:
@@ -3492,7 +3543,8 @@ private:
         feeds::ToggleChatPopup(senderId,
                                sender.toStdString(),
                                content.toStdString(),
-                               GetAvatarForSender(senderId, std::string()));
+                               GetAvatarForSender(senderId, std::string()),
+                               item->data(kRoleChatMsgId).toString().toStdString());
     }
 
     // The chat area carries no connection status (the Login/Join block and the
@@ -10675,6 +10727,12 @@ static void RegisterEngineHandlers() {
             }
         }
 
+        std::vector<VendorRosterEntry> vendorRoster;
+        vendorRoster.reserve(newList.size());
+        for (const auto& p : newList) {
+            vendorRoster.push_back({p.id, p.name, mutedSnap[p.id]});
+        }
+
         // Seed the avatar cache from the roster, so a lower third (or a chat
         // popup) can show a real avatar for someone who hasn't chatted. Only
         // for participants that actually carry a path: GetAvatarForSender
@@ -10723,12 +10781,18 @@ static void RegisterEngineHandlers() {
              (size_t)g_cachedParticipants.size());
 
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
-            [joinedIds, mutedSnap = std::move(mutedSnap)]() {
+            [joinedIds, myUserId, mutedSnap = std::move(mutedSnap),
+             vendorRoster = std::move(vendorRoster)]() {
                 // Re-seed the UI-thread-owned mute map from this roster's fresh
                 // muted fields (wholesale: drops departed users, reflects current
                 // state) BEFORE the refresh so the dock rebuild seeds correct
                 // mute marks. participant_audio_status keeps it live in between.
                 g_muteByUserId = mutedSnap;
+                // Leaves go first, before reconcile can move a binding: they
+                // report the slots as they were. Joins go last, so they report
+                // the slots reconcile just rebound.
+                const std::vector<unsigned int> vendorJoined =
+                    VendorOnRosterLeaves(vendorRoster, myUserId);
                 // Auto-rebind participant-pinned sources to their remembered
                 // name, then refresh properties. joinedIds drives the in-
                 // reconcile rejoin re-establishment: a source already bound to
@@ -10743,6 +10807,7 @@ static void RegisterEngineHandlers() {
                 RefreshAllSourceProperties();
                 // ISO: presence, renames, and leave/rejoin of recorded people.
                 IsoOnRosterChanged(joinedIds);
+                VendorOnRosterJoins(vendorJoined);
             });
     });
 
@@ -10752,9 +10817,9 @@ static void RegisterEngineHandlers() {
         // UI mutation to the Qt main thread via QTimer::singleShot —
         // same pattern the participant_list_changed handler above uses.
         // Engine already filtered to public ("to everyone") messages,
-        // so we just render whatever arrives. message_id is parsed for
-        // logging only in Phase 1; future phases may use it for edit/
-        // delete propagation or dedup.
+        // so we just render whatever arrives. message_id travels with
+        // the message so chat_message_deleted and chat_message_edited
+        // can find it again.
 
         // Tier gating at the IPC entry point. Sinks (dock, popup,
         // overlay) gate themselves too, but cutting traffic here saves
@@ -10766,13 +10831,14 @@ static void RegisterEngineHandlers() {
         //   Tier 2+ (Streamer+): full processing
         if (g_currentTier < 1) return;
 
-        std::string messageId  = ExtractJsonString(json, "message_id");
+        std::string messageId  = ExtractJsonStringEscaped(json, "message_id");
         unsigned int senderId  =
             (unsigned int)ExtractJsonNumber(json, "sender_id");
         std::string senderName = ExtractJsonStringEscaped(json, "sender_name");
         std::string content    = ExtractJsonStringEscaped(json, "content");
         std::string avatarPath = ExtractJsonStringEscaped(json, "avatar_path");
         qint64      timestamp  = (qint64)ExtractJsonNumber(json, "timestamp");
+        const bool  isSelf     = ExtractJsonNumber(json, "is_self") != 0;
 
         blog(LOG_INFO, "[feeds] chat_message id=%s", messageId.c_str());
 
@@ -10788,17 +10854,58 @@ static void RegisterEngineHandlers() {
         if (g_currentTier >= 2) {
             feeds::AppendChatMessageToOverlay(
                 feeds::ChatMsgOrigin::Zoom, senderId, std::string(),
-                senderName, content, timestamp);
+                senderName, content, timestamp, messageId);
         }
 
         QString qSender  = QString::fromStdString(senderName);
         QString qContent = QString::fromStdString(content);
+        QString qId      = QString::fromStdString(messageId);
 
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
-            [senderId, qSender, qContent, timestamp]() {
+            [senderId, senderName, content, messageId, qSender, qContent, qId,
+             timestamp, isSelf]() {
                 if (g_chatDock)
                     g_chatDock->AppendMessage(senderId, qSender, qContent,
-                                              timestamp);
+                                              timestamp, qId);
+                VendorOnChatMessage(senderId, senderName, content, messageId,
+                                    timestamp, isSelf);
+            });
+    });
+
+    // A public Zoom message was deleted. Gated like chat_message. The overlay
+    // goes here on the reader thread, where its append runs; the dock and the
+    // popup on the UI thread, behind any queued append of the same message.
+    feeds::RegisterMessageHandler("chat_message_deleted",
+    [](const std::string& json) {
+        if (g_currentTier < 1) return;
+        std::string messageId = ExtractJsonStringEscaped(json, "message_id");
+        blog(LOG_INFO, "[feeds] chat_message_deleted id=%s", messageId.c_str());
+        feeds::RemoveZoomMessageFromOverlay(messageId);
+        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
+            [messageId]() {
+                if (g_chatDock)
+                    g_chatDock->RemoveZoomMessageById(
+                        QString::fromStdString(messageId));
+                feeds::ClearChatPopupForZoomMessage(messageId);
+            });
+    });
+
+    // A public Zoom message was edited. Same threading as the delete. The popup
+    // follows the dock, so its refresh matches the highlight on the new text.
+    feeds::RegisterMessageHandler("chat_message_edited",
+    [](const std::string& json) {
+        if (g_currentTier < 1) return;
+        std::string messageId = ExtractJsonStringEscaped(json, "message_id");
+        std::string content   = ExtractJsonStringEscaped(json, "content");
+        blog(LOG_INFO, "[feeds] chat_message_edited id=%s", messageId.c_str());
+        feeds::EditZoomMessageInOverlay(messageId, content);
+        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
+            [messageId, content]() {
+                if (g_chatDock)
+                    g_chatDock->EditZoomMessageById(
+                        QString::fromStdString(messageId),
+                        QString::fromStdString(content));
+                feeds::EditChatPopupZoomMessage(messageId, content);
             });
     });
 
@@ -10862,15 +10969,19 @@ static void RegisterEngineHandlers() {
     // UI-thread-owned mute map, then recompute mute marks in place — no Refresh(),
     // no box rebuild. A pid==1 row picks this up when userId is the active
     // speaker; direct rows update by pid. Runs on the pipe-reader thread here.
+    // Marshalled on the main window, not the dock: the vendor events run with
+    // the dock closed too.
     feeds::RegisterMessageHandler("participant_audio_status",
     [](const std::string& json) {
         unsigned int userId = (unsigned int)ExtractJsonNumber(json, "participant_id");
-        if (userId == 0 || !g_participantDock) return;
+        if (userId == 0) return;
         bool muted = ExtractJsonNumber(json, "muted") != 0;
-        QTimer::singleShot(0, g_participantDock, [userId, muted]() {
-            g_muteByUserId[userId] = muted;
-            if (g_participantDock) g_participantDock->RecomputeMuteMarks();
-        });
+        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
+            [userId, muted]() {
+                g_muteByUserId[userId] = muted;
+                if (g_participantDock) g_participantDock->RecomputeMuteMarks();
+                VendorOnAudioStatus(userId, muted);
+            });
     });
 
     // Per-user connection quality from the engine's onUserNetworkStatusChanged.
@@ -10908,9 +11019,11 @@ static void RegisterEngineHandlers() {
             CloseSharedMemoryForAllScreenshareSources();
         }
 
-        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
-            RefreshAllSourceProperties();
-        });
+        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
+            [newSharer]() {
+                RefreshAllSourceProperties();
+                VendorOnSharer(newSharer);
+            });
     });
 
     feeds::RegisterMessageHandler("token_refreshed", [](const std::string&) {
@@ -11893,6 +12006,44 @@ static constexpr int kVendorMinTier = 1;
 // one only moves when a client was actually told.
 static unsigned int g_vendorSpeakerId = 0;   // UI thread
 
+// How long after Feeds joins the roster is still arriving. The SDK can deliver
+// the people already in a meeting in several batches, so a late one must not read
+// as a crowd of joins. Someone who really joins inside this window is silent, and
+// get_state still lists them.
+static constexpr uint64_t kVendorRosterSettleMs = 5000;
+// How long after a person appears their audio state is still settling. A
+// participant connecting to audio reports it a moment after they join, which is
+// their initial state, not a person pressing mute.
+static constexpr uint64_t kVendorMuteSettleMs = 5000;
+// More than the dock can hold, and only ever a guard against redelivery.
+static constexpr size_t kVendorChatIdCap = 1000;
+
+// A person in the meeting, as the vendor last saw them. The Feeds account is
+// never in here. Kept apart from g_cachedParticipants, which is already the new
+// roster by the time the UI thread can diff it, and from g_muteByUserId, which
+// each roster overwrites: a status arriving just behind the roster that already
+// carries it would read as no change, and the event would be lost.
+struct VendorMember {
+    std::string name;
+    bool        muted = false;
+    uint64_t    mute_settled_at_ms = 0;
+};
+
+// All UI thread. All of it tracks while locked, so an unlock mid-meeting doesn't
+// replay the difference; only the emits are gated.
+static std::map<unsigned int, VendorMember> g_vendorMembers;
+static unsigned int        g_vendorMyUserId         = 0;   // 0 until the first roster
+static uint64_t            g_vendorRosterSettledAtMs = 0;
+static unsigned int        g_vendorSharerId         = 0;
+static std::string         g_vendorSharerName;
+static time_t              g_vendorJoinedAt         = 0;
+static std::set<std::string>    g_vendorChatIds;
+static std::deque<std::string>  g_vendorChatIdOrder;
+
+static uint64_t VendorNowMs() {
+    return os_gettime_ns() / 1000000;
+}
+
 static bool VendorUnlocked() {
     return g_isLoggedIn && g_currentTier >= kVendorMinTier;
 }
@@ -11943,6 +12094,7 @@ static feeds::VendorPerson MakeVendorPerson(unsigned int id, std::string name,
 }
 
 static void VendorOnMeetingJoined() {
+    g_vendorJoinedAt = time(nullptr);
     if (VendorUnlocked()) feeds::VendorEmitMeetingJoined();
 }
 
@@ -11950,6 +12102,14 @@ static void VendorOnMeetingJoined() {
 // which the engine sends when it was already out.
 static void VendorOnMeetingLeft(bool wasInMeeting) {
     g_vendorSpeakerId = 0;
+    g_vendorMembers.clear();
+    g_vendorMyUserId = 0;
+    g_vendorRosterSettledAtMs = 0;
+    g_vendorSharerId = 0;
+    g_vendorSharerName.clear();
+    g_vendorJoinedAt = 0;
+    g_vendorChatIds.clear();
+    g_vendorChatIdOrder.clear();
     if (wasInMeeting && VendorUnlocked()) feeds::VendorEmitMeetingLeft();
 }
 
@@ -11961,6 +12121,138 @@ static void VendorOnActiveSpeaker(unsigned int userId) {
     feeds::VendorEmitSpeakerChanged(
         MakeVendorPerson(userId, LowerThirdNameForUser(userId),
                          SnapshotVendorSlots()));
+}
+
+// Two guards against replay. The timestamp covers history the SDK hands over on
+// join: it compares the sender's clock with this PC's, so a clock running ahead
+// silences only messages in the first moments after joining, which is the safe
+// way round. The id set covers the SDK delivering a message again, as a
+// reconnect can, with a timestamp from after the join. A timestamp of 0 means the
+// SDK gave none and is not evidence of age.
+static void VendorOnChatMessage(unsigned int senderId, const std::string& name,
+                                const std::string& message,
+                                const std::string& messageId, qint64 timestamp,
+                                bool isSelf) {
+    if (!feeds::VendorAvailable() || !g_isInMeeting) return;
+    if (timestamp > 0 && timestamp < (qint64)g_vendorJoinedAt) {
+        blog(LOG_INFO, "[feeds] vendor: chat_message id=%s treated as history "
+             "(timestamp %lld, joined %lld)", messageId.c_str(),
+             (long long)timestamp, (long long)g_vendorJoinedAt);
+        return;
+    }
+    if (!messageId.empty()) {
+        if (!g_vendorChatIds.insert(messageId).second) return;
+        g_vendorChatIdOrder.push_back(messageId);
+        if (g_vendorChatIdOrder.size() > kVendorChatIdCap) {
+            g_vendorChatIds.erase(g_vendorChatIdOrder.front());
+            g_vendorChatIdOrder.pop_front();
+        }
+    }
+    if (!VendorUnlocked()) return;
+    feeds::VendorEmitChatMessage(
+        MakeVendorPerson(senderId, name, SnapshotVendorSlots()), message, isSelf);
+}
+
+// One id at a time: the engine reports a switch of sharer as the new id directly,
+// with no 0 in between, and a change of share source as the same id.
+static void VendorOnSharer(unsigned int userId) {
+    if (!feeds::VendorAvailable() || userId == g_vendorSharerId) return;
+    const unsigned int previousId   = g_vendorSharerId;
+    const std::string  previousName = g_vendorSharerName;
+    g_vendorSharerId   = userId;
+    g_vendorSharerName = LowerThirdNameForUser(userId);
+
+    if (!VendorUnlocked() || !g_isInMeeting) return;
+    const std::vector<VendorSlotRow> rows = SnapshotVendorSlots();
+    // The name as it was at the start: a sharer who left the meeting has left the
+    // roster too.
+    if (previousId != 0 && previousId != g_vendorMyUserId) {
+        feeds::VendorEmitShareStopped(
+            MakeVendorPerson(previousId, previousName, rows));
+    }
+    if (userId != 0 && userId != g_vendorMyUserId) {
+        feeds::VendorEmitShareStarted(
+            MakeVendorPerson(userId, g_vendorSharerName, rows));
+    }
+}
+
+// Changes only, for people the roster has delivered. The roster seeds the state,
+// so a status for anyone else, or one inside the settle window, fires nothing.
+static void VendorOnAudioStatus(unsigned int userId, bool muted) {
+    if (!feeds::VendorAvailable()) return;
+    const auto it = g_vendorMembers.find(userId);
+    if (it == g_vendorMembers.end() || it->second.muted == muted) return;
+    it->second.muted = muted;
+    if (VendorNowMs() < it->second.mute_settled_at_ms) return;
+    if (!VendorUnlocked() || !g_isInMeeting) return;
+    feeds::VendorEmitParticipantMuted(
+        MakeVendorPerson(userId, it->second.name, SnapshotVendorSlots()), muted);
+}
+
+// Diff a new roster against the last one, send participant_left for whoever went,
+// and return who arrived for VendorOnRosterJoins. See the call site for the split.
+//
+// A new Feeds user id means the ids themselves were reissued, by a reconnect or a
+// move between rooms, so nobody has really come or gone: that roster, like the
+// first of a meeting, is a baseline. myUserId 0 is a roster the SDK couldn't build
+// and says nothing about who is here.
+static std::vector<unsigned int> VendorOnRosterLeaves(
+    const std::vector<VendorRosterEntry>& roster, unsigned int myUserId) {
+    std::vector<unsigned int> joined;
+    if (!feeds::VendorAvailable() || !g_isInMeeting || myUserId == 0) return joined;
+
+    const uint64_t now = VendorNowMs();
+    if (myUserId != g_vendorMyUserId) {
+        g_vendorMyUserId = myUserId;
+        g_vendorMembers.clear();
+        g_vendorRosterSettledAtMs = now + kVendorRosterSettleMs;
+    }
+    const bool announce = now >= g_vendorRosterSettledAtMs;
+
+    std::set<unsigned int> present;
+    for (const VendorRosterEntry& entry : roster) {
+        if (entry.id == myUserId) continue;
+        present.insert(entry.id);
+        const std::string name = (entry.name == "Unknown") ? std::string() : entry.name;
+        const auto it = g_vendorMembers.find(entry.id);
+        if (it != g_vendorMembers.end()) {
+            it->second.name = name;   // a rename, or nothing
+            continue;
+        }
+        VendorMember member;
+        member.name               = name;
+        member.muted              = entry.muted;
+        member.mute_settled_at_ms = now + kVendorMuteSettleMs;
+        g_vendorMembers.emplace(entry.id, std::move(member));
+        if (announce) joined.push_back(entry.id);
+    }
+
+    const bool notify = announce && VendorUnlocked();
+    std::vector<VendorSlotRow> rows;
+    if (notify) rows = SnapshotVendorSlots();
+    for (auto it = g_vendorMembers.begin(); it != g_vendorMembers.end();) {
+        if (present.count(it->first) != 0) {
+            ++it;
+            continue;
+        }
+        if (notify) {
+            feeds::VendorEmitParticipantLeft(
+                MakeVendorPerson(it->first, it->second.name, rows));
+        }
+        it = g_vendorMembers.erase(it);
+    }
+    return joined;
+}
+
+static void VendorOnRosterJoins(const std::vector<unsigned int>& joined) {
+    if (joined.empty() || !VendorUnlocked() || !g_isInMeeting) return;
+    const std::vector<VendorSlotRow> rows = SnapshotVendorSlots();
+    for (unsigned int id : joined) {
+        const auto it = g_vendorMembers.find(id);
+        if (it == g_vendorMembers.end()) continue;
+        feeds::VendorEmitParticipantJoined(
+            MakeVendorPerson(id, it->second.name, rows));
+    }
 }
 
 namespace feeds {

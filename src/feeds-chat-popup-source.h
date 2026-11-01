@@ -23,10 +23,14 @@ void RegisterChatPopupSource();
 // messages from the channel-id-keyed YT cache. A null QImage renders the
 // neutral placeholder circle. YouTube messages pass senderId 0 (no Zoom id) —
 // origin gating lives in the caller, not here.
+//
+// zoomMessageId is the SDK message id of a Zoom message, kept for the two calls
+// below. The toggle still matches by sender and content.
 void ToggleChatPopup(unsigned int senderId,
                      const std::string& senderName,
                      const std::string& content,
-                     const QImage& avatar);
+                     const QImage& avatar,
+                     const std::string& zoomMessageId = std::string());
 
 // Hide any active popup and clear the stored message. Called on
 // meeting-left so stale state doesn't carry into the next meeting.
@@ -36,6 +40,16 @@ void ClearChatPopup();
 // message (matched by sender_id + content) — used to pull a moderator-deleted
 // YouTube message off the popup. No-op otherwise.
 void ClearChatPopupIfMatches(unsigned int senderId, const std::string& content);
+
+// A Zoom message was deleted: hide the popup if it is on (or has queued) this
+// message. By id, so a second message with the same text is left alone. No-op
+// otherwise.
+void ClearChatPopupForZoomMessage(const std::string& zoomMessageId);
+
+// A Zoom message was edited: put the new text on the popup if it is on (or has
+// queued) this message, in place, with no slide. No-op otherwise.
+void EditChatPopupZoomMessage(const std::string& zoomMessageId,
+                              const std::string& content);
 
 // True while a viewer can actually see a popup: a message is up (or queued to
 // replace the one sliding out) AND at least one unlocked popup source is live on

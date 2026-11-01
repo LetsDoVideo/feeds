@@ -271,6 +271,38 @@ The on-screen target for [Active Speaker] sources. `participant_id` is the engin
 {"type": "active_speaker_changed", "participant_id": 12345679}
 ```
 
+#### `participant_audio_status` (E→P)
+One participant's mute state changed. `muted` is 1 for the muted statuses and 0 for the unmuted ones; a status of "no audio connected" is not sent. Same message from the Windows and macOS engines. `participant_list_changed` seeds the state; this keeps it live between rosters. It drives the dock's mute marks and the `participant_muted` / `participant_unmuted` vendor events.
+
+```json
+{"type": "participant_audio_status", "participant_id": 12345679, "muted": 1}
+```
+
+### Chat
+
+Public Zoom in-meeting chat only. Each engine drops anything else at its own boundary, so the plugin never receives a private message, or anything about one.
+
+#### `chat_message` (E→P)
+A new public message. `message_id` is the SDK's id, which `chat_message_deleted` and `chat_message_edited` refer back to. `avatar_path` is as in `participant_list_changed`. `timestamp` is the SDK's, in seconds. `is_self` is 1 when the Feeds account sent it (typed in the Chat Dock; Zoom echoes it back as a normal message) and 0 otherwise. Additive: an older engine omits `is_self` and the plugin reads 0.
+
+```json
+{"type": "chat_message", "message_id": "a1b2c3", "sender_id": 12345679, "sender_name": "Alice", "content": "Hello", "avatar_path": "", "timestamp": 1793548800, "is_self": 0}
+```
+
+#### `chat_message_deleted` (E→P)
+A public message was deleted, by the host or by its sender. The plugin removes it from the dock and every Chat Overlay, and hides the Chat Popup if that message is on it. The SDK's delete callback carries only an id, so the engine sends this only for an id it already forwarded as `chat_message`.
+
+```json
+{"type": "chat_message_deleted", "message_id": "a1b2c3"}
+```
+
+#### `chat_message_edited` (E→P)
+A public message was edited. `content` is the new text. The plugin updates it everywhere the message is shown, including an on-screen Chat Popup. A `message_id` the plugin no longer holds is ignored.
+
+```json
+{"type": "chat_message_edited", "message_id": "a1b2c3", "content": "Hello everyone"}
+```
+
 ### Screenshare
 
 #### `share_status_changed` (E→P)

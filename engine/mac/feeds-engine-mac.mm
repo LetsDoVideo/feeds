@@ -77,6 +77,7 @@
 #include "feeds-json-lite.h"
 #include "feeds-mac-login.h"
 #include "feeds-mac-video.h"
+#include "feeds-public-chat-ids.h"
 #include "feeds-version.h"
 
 // ---------------------------------------------------------------------------
@@ -407,9 +408,15 @@ static bool EnsureSdkUpThen(std::function<void()> action)
 //
 // ZoomSDKMeetingChatControllerDelegate declares no @optional section, so every
 // method is @required; the file-transfer ones are deliberate empty stubs.
+//
+// Deletes and edits of public messages follow the same rule. The edit callback
+// is on this delegate; the delete callback is on the action delegate, and is
+// filtered through g_publicChatIds because it carries only an id.
 // ---------------------------------------------------------------------------
 @interface FeedsChatDelegate : NSObject <ZoomSDKMeetingChatControllerDelegate>
 @end
+
+static feeds::PublicChatIds g_publicChatIds;
 
 @implementation FeedsActionDelegate
 
@@ -461,8 +468,51 @@ static bool EnsureSdkUpThen(std::function<void()> action)
     }
 }
 
+// ── audio ────────────────────────────────────────────────────────────────────
+// Per-user mute change, in the same message and with the same reading of the
+// status as the Windows engine: muted is the Muted family, unmuted the UnMuted
+// family. ZoomSDKAudioStatus_None is "no audio connected yet" and is skipped so
+// it can't seed a false state.
+- (void)onUserAudioStatusChange:(NSArray*)userAudioStatusArray
+{
+    for (id entry in userAudioStatusArray) {
+        if (![entry isKindOfClass:[ZoomSDKUserAudioStatus class]]) continue;
+        ZoomSDKUserAudioStatus* status = (ZoomSDKUserAudioStatus*)entry;
+        bool muted;
+        switch ([status getStatus]) {
+        case ZoomSDKAudioStatus_Muted:
+        case ZoomSDKAudioStatus_MutedByHost:
+        case ZoomSDKAudioStatus_MutedAllByHost:
+            muted = true;
+            break;
+        case ZoomSDKAudioStatus_UnMuted:
+        case ZoomSDKAudioStatus_UnMutedByHost:
+        case ZoomSDKAudioStatus_UnMutedAllByHost:
+            muted = false;
+            break;
+        default:
+            continue;
+        }
+        SendToPlugin("{\"type\":\"participant_audio_status\",\"participant_id\":" +
+                     std::to_string([status getUserID]) +
+                     ",\"muted\":" + (muted ? "1" : "0") + "}");
+    }
+}
+
+// ── chat, the delete half (see FeedsChatDelegate) ────────────────────────────
+- (void)onChatMsgDeleteNotification:(NSString*)msgID
+                  messageDeleteType:(ZoomSDKChatMessageDeleteType)deleteBy
+{
+    const std::string messageId =
+        (msgID && msgID.UTF8String) ? std::string(msgID.UTF8String) : std::string();
+    LogDebug("Chat: delete notification id=" + messageId +
+             " deleteBy=" + std::to_string((int)deleteBy));
+    if (!g_publicChatIds.Contains(messageId)) return;
+    SendToPlugin("{\"type\":\"chat_message_deleted\",\"message_id\":\"" +
+                 feeds::JsonEscape(messageId) + "\"}");
+}
+
 // ── @required, and nothing this engine acts on ───────────────────────────────
-- (void)onUserAudioStatusChange:(NSArray*)userAudioStatusArray {}
 - (void)onVirtualNameTagStatusChanged:(BOOL)bOn userID:(unsigned int)userID {}
 - (void)onVirtualNameTagRosterInfoUpdated:(unsigned int)userID {}
 - (void)onHostChange:(unsigned int)userID {}
@@ -485,8 +535,6 @@ static bool EnsureSdkUpThen(std::function<void()> action)
 - (void)onFollowHostVideoOrderChanged:(BOOL)follow {}
 - (void)onAllHandsLowered {}
 - (void)onUserVideoQualityChanged:(ZoomSDKVideoQuality)quality userID:(unsigned int)userID {}
-- (void)onChatMsgDeleteNotification:(NSString*)msgID
-                  messageDeleteType:(ZoomSDKChatMessageDeleteType)deleteBy {}
 - (void)onChatStatusChangedNotification:(ZoomSDKChatStatus*)chatStatus {}
 - (void)onShareMeetingChatStatusChanged:(BOOL)isStart {}
 - (void)onSuspendParticipantsActivities {}
@@ -552,11 +600,16 @@ static bool EnsureSdkUpThen(std::function<void()> action)
         // Same arrangement the roster uses. Empty when the sender has no
         // picture, and the plugin falls back to the bundled Feeds logo.
         NSString* avatar = nil;
+        bool      isSelf = false;
         ZoomSDKMeetingActionController* action =
             g_meetingService ? [g_meetingService getMeetingActionController] : nil;
         if (action) {
             ZoomSDKUserInfo* info = [action getUserByUserID:senderId];
             if (info) avatar = [info getAvatarPath];
+            // Asked of the SDK here rather than left to the plugin's roster: a
+            // message can be typed in the dock before the first roster arrives.
+            ZoomSDKUserInfo* mySelf = [action getMyself];
+            isSelf = mySelf && [mySelf getUserID] == senderId;
         }
 
         auto utf8 = [](NSString* s) -> std::string {
@@ -566,6 +619,8 @@ static bool EnsureSdkUpThen(std::function<void()> action)
         const std::string contentStr = utf8(content);
         const std::string nameStr    = utf8(senderName);
 
+        g_publicChatIds.Add(utf8(messageId));
+
         SendToPlugin(
             std::string("{\"type\":\"chat_message\",\"message_id\":\"") +
             feeds::JsonEscape(utf8(messageId)) +
@@ -573,7 +628,8 @@ static bool EnsureSdkUpThen(std::function<void()> action)
             ",\"sender_name\":\"" + feeds::JsonEscape(nameStr) +
             "\",\"content\":\"" + feeds::JsonEscape(contentStr) +
             "\",\"avatar_path\":\"" + feeds::JsonEscape(utf8(avatar)) +
-            "\",\"timestamp\":" + std::to_string((long long)timestamp) + "}");
+            "\",\"timestamp\":" + std::to_string((long long)timestamp) +
+            ",\"is_self\":" + (isSelf ? "1" : "0") + "}");
 
         // Visibility only; the message itself already went over the IPC. The
         // preview is truncated so one long paste cannot flood the log.
@@ -586,10 +642,22 @@ static bool EnsureSdkUpThen(std::function<void()> action)
 
 - (void)onChatMessageEditNotification:(ZoomSDKChatInfo*)chatInfo
 {
-    // Not surfaced. The plugin's chat model has no edit path on either
-    // platform, and an edited message arriving as a new one would duplicate it
-    // on every overlay. Windows logs and drops this too.
-    (void)chatInfo;
+    if (!chatInfo) return;
+
+    // Same privacy filter as a new message.
+    if ([chatInfo getChatMessageType] != ZoomSDKChatMessageType_To_All) return;
+
+    @autoreleasepool {
+        NSString* messageId = [chatInfo getMessageID];
+        NSString* content   = [chatInfo getMsgContent];
+        auto utf8 = [](NSString* s) -> std::string {
+            return (s && s.UTF8String) ? std::string(s.UTF8String) : std::string();
+        };
+        LogDebug("Chat: edit notification id=" + utf8(messageId));
+        SendToPlugin("{\"type\":\"chat_message_edited\",\"message_id\":\"" +
+                     feeds::JsonEscape(utf8(messageId)) + "\",\"content\":\"" +
+                     feeds::JsonEscape(utf8(content)) + "\"}");
+    }
 }
 
 // File transfer is not a Feeds feature on either platform. Required by the

@@ -155,6 +155,7 @@ unsigned int   g_popupSenderId     = 0;
 QString        g_popupSenderName;
 QString        g_popupContent;
 QImage         g_popupAvatar;      // resolved avatar for the current message
+std::string    g_popupZoomMessageId;   // SDK id; "" for YouTube/Twitch
 
 // ---------------------------------------------------------------------------
 // Slide-animation state. Global so every popup instance animates in lockstep,
@@ -184,6 +185,7 @@ unsigned int   g_popupPendingSenderId = 0;
 QString        g_popupPendingSenderName;
 QString        g_popupPendingContent;
 QImage         g_popupPendingAvatar;
+std::string    g_popupPendingZoomMessageId;
 
 // For the state changes with several return paths.
 struct ScopedPopupDockRefresh {
@@ -439,12 +441,14 @@ static void AdvanceAnimation(float seconds) {
             g_popupSenderName        = g_popupPendingSenderName;
             g_popupContent           = g_popupPendingContent;
             g_popupAvatar            = g_popupPendingAvatar;
+            g_popupZoomMessageId     = g_popupPendingZoomMessageId;
             g_popupVisible           = true;
             g_popupPending           = false;
             g_popupPendingSenderId   = 0;
             g_popupPendingSenderName.clear();
             g_popupPendingContent.clear();
             g_popupPendingAvatar     = QImage();
+            g_popupPendingZoomMessageId.clear();
             g_popupAnimState         = PopupAnimState::AnimatingIn;
             g_popupAnimElapsed       = 0.0f;
             g_popupAnimFrom          = 1.0f;
@@ -455,6 +459,7 @@ static void AdvanceAnimation(float seconds) {
             g_popupSenderName.clear();
             g_popupContent.clear();
             g_popupAvatar      = QImage();
+            g_popupZoomMessageId.clear();
             g_popupAnimState   = PopupAnimState::Hidden;
             g_popupAnimElapsed = 0.0f;
             g_popupAnimFrom    = 1.0f;
@@ -703,7 +708,8 @@ void RegisterChatPopupSource() {
 void ToggleChatPopup(unsigned int senderId,
                      const std::string& senderName,
                      const std::string& content,
-                     const QImage& avatar) {
+                     const QImage& avatar,
+                     const std::string& zoomMessageId) {
     bool needsRefresh = false;
     {
         std::lock_guard<std::mutex> lock(g_popupStateMutex);
@@ -725,6 +731,7 @@ void ToggleChatPopup(unsigned int senderId,
             g_popupSenderName   = qName;
             g_popupContent      = qContent;
             g_popupAvatar       = avatar;
+            g_popupZoomMessageId = zoomMessageId;
             g_popupAnimState    = PopupAnimState::AnimatingIn;
             g_popupAnimElapsed  = 0.0f;
             g_popupAnimFrom     = 1.0f;
@@ -750,6 +757,7 @@ void ToggleChatPopup(unsigned int senderId,
                 g_popupPendingSenderName = qName;
                 g_popupPendingContent    = qContent;
                 g_popupPendingAvatar     = avatar;
+                g_popupPendingZoomMessageId = zoomMessageId;
             }
             break;
 
@@ -772,6 +780,7 @@ void ToggleChatPopup(unsigned int senderId,
                 g_popupPendingSenderName = qName;
                 g_popupPendingContent    = qContent;
                 g_popupPendingAvatar     = avatar;
+                g_popupPendingZoomMessageId = zoomMessageId;
             }
             break;
         }
@@ -788,6 +797,7 @@ void ToggleChatPopup(unsigned int senderId,
                 g_popupPendingSenderName = qName;
                 g_popupPendingContent    = qContent;
                 g_popupPendingAvatar     = avatar;
+                g_popupPendingZoomMessageId = zoomMessageId;
             }
             break;
         }
@@ -835,6 +845,69 @@ void ClearChatPopup() {
     }
 }
 
+// Slide the current message out, keeping any queued one. Caller must hold
+// g_popupStateMutex.
+static void SlideOutCurrent_locked() {
+    switch (g_popupAnimState) {
+    case PopupAnimState::Hidden:
+    case PopupAnimState::AnimatingOut:
+        return;
+    case PopupAnimState::Shown:
+        g_popupAnimState   = PopupAnimState::AnimatingOut;
+        g_popupAnimElapsed = 0.0f;
+        g_popupAnimFrom    = 0.0f;
+        g_popupAnimTo      = 1.0f;
+        return;
+    case PopupAnimState::AnimatingIn: {
+        float cur          = ComputeCurrentFraction_locked();
+        g_popupAnimState   = PopupAnimState::AnimatingOut;
+        g_popupAnimElapsed = 0.0f;
+        g_popupAnimFrom    = cur;
+        g_popupAnimTo      = 1.0f;
+        return;
+    }
+    }
+}
+
+void ClearChatPopupForZoomMessage(const std::string& zoomMessageId) {
+    if (zoomMessageId.empty()) return;
+    ScopedPopupDockRefresh dockRefresh;
+    std::lock_guard<std::mutex> lock(g_popupStateMutex);
+
+    if (g_popupPending && g_popupPendingZoomMessageId == zoomMessageId) {
+        g_popupPending = false;
+        g_popupPendingSenderId = 0;
+        g_popupPendingSenderName.clear();
+        g_popupPendingContent.clear();
+        g_popupPendingAvatar = QImage();
+        g_popupPendingZoomMessageId.clear();
+    }
+
+    if (g_popupVisible && g_popupZoomMessageId == zoomMessageId) {
+        SlideOutCurrent_locked();
+    }
+}
+
+void EditChatPopupZoomMessage(const std::string& zoomMessageId,
+                              const std::string& content) {
+    if (zoomMessageId.empty()) return;
+    const QString qContent = QString::fromStdString(content);
+    bool currentChanged = false;
+    {
+        std::lock_guard<std::mutex> lock(g_popupStateMutex);
+        if (g_popupPending && g_popupPendingZoomMessageId == zoomMessageId) {
+            g_popupPendingContent = qContent;
+        }
+        if (g_popupVisible && g_popupZoomMessageId == zoomMessageId) {
+            g_popupContent = qContent;
+            currentChanged = true;
+        }
+    }
+    // Instances re-render from the global state on their next frame.
+    if (currentChanged) UpdateAllInstances();
+    PostChatPopupDockRefresh();
+}
+
 // Pull a specific message off the popup (moderator deletion). Clears a matching
 // queued message, and slides the current one out if it's the match — leaving any
 // different pending message to slide in next. No-op if the popup isn't showing
@@ -857,27 +930,7 @@ void ClearChatPopupIfMatches(unsigned int senderId, const std::string& content) 
     const bool currentMatches = g_popupVisible &&
                                 g_popupSenderId == senderId &&
                                 g_popupContent  == qc;
-    if (!currentMatches) return;
-
-    switch (g_popupAnimState) {
-    case PopupAnimState::Hidden:
-    case PopupAnimState::AnimatingOut:
-        return;
-    case PopupAnimState::Shown:
-        g_popupAnimState   = PopupAnimState::AnimatingOut;
-        g_popupAnimElapsed = 0.0f;
-        g_popupAnimFrom    = 0.0f;
-        g_popupAnimTo      = 1.0f;
-        return;
-    case PopupAnimState::AnimatingIn: {
-        float cur          = ComputeCurrentFraction_locked();
-        g_popupAnimState   = PopupAnimState::AnimatingOut;
-        g_popupAnimElapsed = 0.0f;
-        g_popupAnimFrom    = cur;
-        g_popupAnimTo      = 1.0f;
-        return;
-    }
-    }
+    if (currentMatches) SlideOutCurrent_locked();
 }
 
 bool GetChatPopupOnScreen() {
