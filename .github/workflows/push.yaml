@@ -135,7 +135,7 @@ jobs:
   # packages the plugin, just without an engine, and a tag build fails.
   macos-build:
     name: Build Feeds (macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     environment: release
     env:
       FEEDS_ZOOM_CLIENT_ID: ${{ secrets.FEEDS_ZOOM_CLIENT_ID }}
@@ -152,8 +152,9 @@ jobs:
         id: setup
         run: |
           # OBS 31's plugin CMake requires Xcode 16 and the macOS 15 SDK
-          # (cmake/macos/compilerconfig.cmake). The macos-14 image ships Xcode 16
-          # alongside an older default, so select the newest Xcode 16 present.
+          # (cmake/macos/compilerconfig.cmake). The macos-15 image also ships newer
+          # Xcode releases, so don't rely on its default: select the newest Xcode 16
+          # present.
           local -a xcodes=(/Applications/Xcode_16*.app(N))
           if (( ! ${#xcodes} )) {
             print "::error::No Xcode 16 found on this runner"
