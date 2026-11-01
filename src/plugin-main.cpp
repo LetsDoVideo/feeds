@@ -107,6 +107,7 @@
 #include "feeds-chat-overlay-source.h"
 #include "feeds-lower-third-source.h"
 #include "feeds-iso-recorder.h"
+#include "feeds-obs-vendor.h"
 
 // matrix4 by value, for reading a scene-item's box transform when placing a
 // lower third over its participant (obs.h only forward-declares it).
@@ -229,7 +230,8 @@ bool g_loginAttemptCompleted      = false;
 // "Logging in..." / "Logging out..." disabled states so a double-click
 // during the in-progress window can't double-fire the request.
 static bool g_authInProgress      = false;
-static bool g_isInMeeting         = false;
+// Atomic for the get_state vendor request, which reads it off the UI thread.
+static std::atomic<bool> g_isInMeeting{false};
 static bool g_rawLiveStreamGranted = false;
 static bool g_pendingMeetingJoin   = false;
 
@@ -282,17 +284,19 @@ static std::atomic<bool> g_pendingInstantMeeting{false};
 static std::atomic<bool> g_eventsListPending{false};
 static std::atomic<bool> g_eventsSessionsPending{false};
 
-static unsigned int       g_activeSharerUserId   = 0;
+// Atomic for the get_state vendor request, which reads it off the UI thread.
+static std::atomic<unsigned int> g_activeSharerUserId{0};
 static unsigned int       g_cachedMyUserId       = 0;
 // UI-thread-owned: written only in marshalled lambdas (the active_speaker_changed
-// handler and the meeting-end/left resets), read on the UI thread. NOT an
+// handler and the meeting-end/left resets), read on the UI thread and, hence the
+// atomic, by the get_state vendor request. NOT an
 // independent copy of the active speaker: it mirrors the engine's RESOLVED
 // target (engine-speaker.cpp) — the person an [Active Speaker] source is
 // actually showing, after the engine's Feeds-user / camera-off filtering — so
 // the dock's Active-Speaker row (participant_id sentinel 1) and an
 // Active-Speaker lower third always name the face on screen. The engine re-sends
 // it every 5 s, so it cannot stay stale. 0 = no one on screen yet -> no mark.
-static unsigned int       g_activeSpeakerUserId  = 0;
+static std::atomic<unsigned int> g_activeSpeakerUserId{0};
 
 struct CachedParticipant {
     unsigned int id;
@@ -351,6 +355,14 @@ static std::atomic<bool> g_sceneCollectionLoading{true};
 // g_sceneCollectionLoading: a rename fires no CHANGING, so that flag misses
 // rename reloads, and widening it would also change the 9th-source block.
 static std::atomic<bool> g_sceneCollectionReloading{false};
+
+// True from SCRIPTING_SHUTDOWN, the last frontend event before OBS starts
+// clearing scene data on exit. Never cleared.
+static std::atomic<bool> g_obsExiting{false};
+
+// Re-run the tier cap on the UI thread, coalesced, from any thread. Defined after
+// ReconcileSourcesToTier.
+static void PostTierReconcile();
 
 void OnLoginClick();
 void OnLogoutClick();
@@ -438,6 +450,12 @@ static void        SetLowerThirdTitleFor(const std::string& participantUuid,
 // name, title, avatar — and push it into the matching lower-third instances.
 static void        RefreshLowerThirdContentFor(const std::string& participantUuid);
 static void        RefreshAllLowerThirdContent();
+
+// obs-websocket vendor events (defined after the lower-third resolvers, which
+// they share). UI thread; each one applies the tier gate itself.
+static void VendorOnMeetingJoined();
+static void VendorOnMeetingLeft(bool wasInMeeting);
+static void VendorOnActiveSpeaker(unsigned int userId);
 
 // ---------------------------------------------------------------------------
 // Per-source data
@@ -543,6 +561,10 @@ struct ZpSourceData {
     // collection (vector order = creation order). Set by
     // ReconcileSourcesToTier. 0 means "not yet computed."
     int           source_position = 0;
+    // Stable 1-8 slot, the runtime copy of kSlotKey in the source's private
+    // settings. 0 = none: not assigned yet, a private copy, or past the 8th.
+    // Written and read under g_sourcesMutex. See AssignSourceSlots.
+    int           slot = 0;
 
     HANDLE mapping = nullptr;
     void*  view    = nullptr;
@@ -3985,6 +4007,7 @@ public:
                     obs_data_release(st);
                 }
                 r.disabled = s->tier_disabled;
+                r.slot     = s->slot;
                 // Runtime-only, never persisted — read here under the same lock
                 // as the settings above so the picker sees the pid and the flag
                 // that backs it as one consistent pair.
@@ -3998,6 +4021,14 @@ public:
             }
         }
         // --- Both mutexes released. From here on, Qt only. ---
+
+        // Slot order, so the numbers always read 1, 2, 3. Stable, so anything with
+        // no slot stays in creation order, after the rest.
+        std::stable_sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) {
+            const int aKey = a.slot > 0 ? a.slot : kMaxParticipantSourcesEver + 1;
+            const int bKey = b.slot > 0 ? b.slot : kMaxParticipantSourcesEver + 1;
+            return aKey < bKey;
+        });
 
         // Resolve each row's lower third now that no Feeds mutex is held.
         // GetLowerThirdUuidFor validates the stored pointer, so a lower third
@@ -4081,8 +4112,8 @@ public:
             if (r.pid > 0 && BoundUserId(r.pid) != 0)  livePidCount[r.pid]++;
         }
 
-        // Enabled (tier-active) sources on top, in vector = creation order,
-        // each a self-contained framed box. Logged out, no row is treated as
+        // Enabled (tier-active) sources on top, in slot order, each a
+        // self-contained framed box. Logged out, no row is treated as
         // disabled, so all render here. A live source is an interactive box
         // (header + functional combo); a non-live one is the same box, frame
         // dimmed and combo-less (header + "Waiting for participants…") so its
@@ -4103,7 +4134,7 @@ public:
             // but still renamable. Grey is a tier-position status signal, not a
             // lock (the Source dock lets you rename a source in any state). An
             // ElidingLabel with the same click-to-rename handler as the framed-box
-            // headers; BeginRename swaps it in place within this (m_root) layout.
+            // headers; BeginRename swaps it in place within this row's layout.
             // Empty at exactly-cap — then only the prompt sits below the divider.
             for (const auto& r : rows) {
                 if (!(loggedIn && r.disabled)) continue;
@@ -4111,7 +4142,13 @@ public:
                 lbl->setStyleSheet("QLabel { color: #7a7d80; }");
                 const std::string uuid = r.uuid;
                 lbl->onClick = [this, uuid, lbl]() { BeginRename(uuid, lbl); };
-                m_root->addWidget(lbl);
+                QWidget*     nameRow = new QWidget();
+                QHBoxLayout* nameL   = new QHBoxLayout(nameRow);
+                nameL->setContentsMargins(0, 0, 0, 0);
+                nameL->setSpacing(8);
+                if (QLabel* slot = MakeSlotLabel(r.slot)) nameL->addWidget(slot);
+                nameL->addWidget(lbl, 1);
+                m_root->addWidget(nameRow);
             }
 
             // One shared, group-level prompt pinned at the bottom. At the product
@@ -4506,6 +4543,7 @@ private:
                                  // combo -> source by this (name can change/collide)
         std::string name;        // OBS source name (copied — pointer not owned)
         long long   pid = 0;     // participant_id setting
+        int         slot = 0;    // stable slot, 0 = none
         // s->bound_this_session: does a CONFIRMED live binding back that pid?
         // The setting persists into the scene collection while the runtime
         // binding does not, so after a restart (or any reconcile that refused
@@ -5098,6 +5136,17 @@ private:
     // header fill use semi-transparent neutral greys so one rule reads on both
     // dark and light themes; the non-live frame is dimmed (lower alpha) so a
     // greyed source doesn't read as more prominent than an active one.
+    // The slot number shown before a source's name, or null with no slot. Same
+    // grey as the dock's other secondary text. Its own label, not part of the name:
+    // the name label is the click-to-rename target.
+    static QLabel* MakeSlotLabel(int slot) {
+        if (slot <= 0) return nullptr;
+        QLabel* label = new QLabel(QString::number(slot));
+        label->setStyleSheet("QLabel { color: #7a7d80; }");
+        label->setToolTip(QString("Slot %1").arg(slot));
+        return label;
+    }
+
     QWidget* MakeSourceBox(const Row& r, bool live, unsigned int myId,
                            const std::map<unsigned int, std::string>& roster,
                            const std::map<long long, int>& pidCount,
@@ -5172,6 +5221,7 @@ private:
         leftL->addWidget(warn);
         headerL->addWidget(left);
 
+        if (QLabel* slot = MakeSlotLabel(r.slot)) headerL->addWidget(slot);
         headerL->addWidget(header, 1);          // middle: name takes the stretch
         AppendHeaderButtons(headerL, r.uuid);   // right: + add-to-scene | scenes | filters
         boxL->addWidget(headerRow);
@@ -8113,6 +8163,11 @@ static void zp_destroy(void* vdata) {
         // OBS's destruction worker thread, so marshalling is mandatory here.
         PostParticipantDockRefresh();
 
+        // Everything behind this source moved up one, so an over-cap source may
+        // now be within the cap. Not for a Studio Mode private copy: those come
+        // and go with every transition and were never a user's source.
+        if (!obs_obj_is_private(data->source)) PostTierReconcile();
+
         // (No ISO recorder to tear down: participant sources don't own one.
         // Removing a source never ends anyone's ISO file.)
 
@@ -9760,7 +9815,8 @@ const char *obs_module_name(void) {
 // Tier reconciliation
 // ---------------------------------------------------------------------------
 // Walks both source vectors and applies tier rules. Called on every
-// login_succeeded after g_currentTier is updated.
+// login_succeeded after g_currentTier is updated, and through PostTierReconcile
+// after a source is deleted or a scene collection loads.
 //
 // The common scenario isn't an actual downgrade — it's a Broadcaster
 // who built an OBS scene with N participant sources and a screenshare
@@ -9854,6 +9910,95 @@ static void ReconcileSourcesToTier() {
     IsoApplyEnabledState();
 
     RefreshAllSourceProperties();
+}
+
+static std::atomic<bool> g_tierReconcilePending{false};
+
+// For the changes login doesn't see: a deleted source and a loaded collection.
+// Queued, so the flags are read when it runs, and a burst of deletes is one pass.
+// During a collection clear or OBS exit the sources are going away, and the
+// collection load that follows runs this anyway, so it stands down. Logged out it
+// stands down too: the tier isn't known, it reads as a cap of 1, and login runs
+// the real pass.
+static void PostTierReconcile() {
+    if (g_obsExiting.load()) return;
+    QObject* mainWindow = static_cast<QObject*>(obs_frontend_get_main_window());
+    if (!mainWindow || g_tierReconcilePending.exchange(true)) return;
+    QTimer::singleShot(0, mainWindow, []() {
+        g_tierReconcilePending = false;
+        if (g_obsExiting.load() || g_sceneCollectionLoading.load() ||
+            g_sceneCollectionReloading.load() || !g_isLoggedIn)
+            return;
+        ReconcileSourcesToTier();
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Slot numbers
+//
+// A permanent public contract: the Streamer.bot events and prebuilt actions are
+// numbered by slot. A source takes the lowest free slot from 1 to 8 and keeps it
+// for life. Deleting a source frees its slot and moves nobody else.
+//
+// Private settings, not normal settings: the Properties dialog's Defaults button
+// clears normal settings, which would silently lose the slot. That choice has two
+// consequences, and both are why this is one pass over every source rather than a
+// step in zp_create. They load after zp_create has run, and Paste Duplicate copies
+// them, after source_create has fired. So this runs once the dust has settled, and
+// resolves any duplicate: the first holder in vector order keeps the number, which
+// is the original, as a copy or an undone delete always sits later.
+//
+// Claiming every valid number before filling any gap is what stops a source with
+// no slot taking a number a later source owns. On a collection from before slots
+// nothing has a number, so they fill 1, 2, 3 in vector order, today's dock order.
+// ---------------------------------------------------------------------------
+static constexpr const char* kSlotKey = "feeds_slot";
+
+// UI thread. Runs after a load and after a source is created outside one.
+static void AssignSourceSlots() {
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(g_sourcesMutex);
+        bool taken[kMaxParticipantSourcesEver + 1] = {};
+        std::vector<ZpSourceData*> unslotted;
+
+        for (ZpSourceData* s : g_allParticipantSources) {
+            if (!s || !s->source) continue;
+            // A deleted source can outlive its removal briefly. It gives its slot
+            // up now, so an immediate delete and re-add gets the same number.
+            if (obs_obj_is_private(s->source) || obs_source_removed(s->source)) {
+                if (s->slot != 0) changed = true;
+                s->slot = 0;
+                continue;
+            }
+            obs_data_t* ps = obs_source_get_private_settings(s->source);
+            const long long saved = ps ? obs_data_get_int(ps, kSlotKey) : 0;
+            obs_data_release(ps);
+            if (saved >= 1 && saved <= kMaxParticipantSourcesEver && !taken[saved]) {
+                taken[saved] = true;
+                if (s->slot != (int)saved) changed = true;
+                s->slot = (int)saved;
+            } else {
+                unslotted.push_back(s);
+            }
+        }
+
+        int next = 1;
+        for (ZpSourceData* s : unslotted) {
+            while (next <= kMaxParticipantSourcesEver && taken[next]) ++next;
+            // Past the 8th (a legacy collection) there's no slot left: 0 clears any
+            // copied number, so it can't claim one on a later pass.
+            const int slot = (next <= kMaxParticipantSourcesEver) ? next : 0;
+            if (slot != 0) taken[slot] = true;
+            if (obs_data_t* ps = obs_source_get_private_settings(s->source)) {
+                obs_data_set_int(ps, kSlotKey, slot);
+                obs_data_release(ps);
+            }
+            if (s->slot != slot) changed = true;
+            s->slot = slot;
+        }
+    }
+    if (changed) PostParticipantDockRefresh();
 }
 
 // ---------------------------------------------------------------------------
@@ -10105,6 +10250,10 @@ static void RegisterEngineHandlers() {
         CloseSharedMemoryForAllScreenshareSources();
 
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
+            // Before the tier clears below. The engine does not wait for the
+            // meeting to end before sending logout_complete, so a meeting_left
+            // arriving later would find the events already locked.
+            VendorOnMeetingLeft(g_isInMeeting);
             g_isLoggedIn           = false;
             g_isInMeeting          = false;
             g_rawLiveStreamGranted = false;
@@ -10171,6 +10320,8 @@ static void RegisterEngineHandlers() {
         }
         CloseSharedMemoryForAllScreenshareSources();
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
+            // Same as logout_complete: this is the last moment events can fire.
+            VendorOnMeetingLeft(g_isInMeeting);
             g_isLoggedIn = false;
             g_isInMeeting = false;
             g_rawLiveStreamGranted = false;
@@ -10235,10 +10386,12 @@ static void RegisterEngineHandlers() {
 
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
             [wasInstant, meetingNum, joinUrl, password]() {
+                const bool alreadyInMeeting = g_isInMeeting;
                 g_isInMeeting = true;
                 if (g_connectAction) g_connectAction->setEnabled(false);
                 RefreshAllSourceProperties();
                 if (g_chatDock) g_chatDock->OnMeetingJoined();
+                if (!alreadyInMeeting) VendorOnMeetingJoined();
 
                 if (!wasInstant || meetingNum == 0) return;
 
@@ -10394,6 +10547,7 @@ static void RegisterEngineHandlers() {
         CloseSharedMemoryForAllScreenshareSources();
 
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(), []() {
+            const bool wasInMeeting = g_isInMeeting;
             g_isInMeeting          = false;
             g_rawLiveStreamGranted = false;
             g_rawPrivilegeState    = RawPrivilegeState::NotRequested;
@@ -10413,6 +10567,8 @@ static void RegisterEngineHandlers() {
             if (g_chatDock) g_chatDock->OnMeetingLeft();
             // The meeting's ISO files end with it.
             IsoOnMeetingEnded();
+            // Last, so a client reacting with get_state sees the meeting gone.
+            VendorOnMeetingLeft(wasInMeeting);
         });
     });
 
@@ -10687,7 +10843,7 @@ static void RegisterEngineHandlers() {
                 // log only an actual change.
                 if (userId != g_activeSpeakerUserId) {
                     blog(LOG_INFO, "[feeds] active speaker (resolved, on screen): "
-                         "%u -> %u", g_activeSpeakerUserId, userId);
+                         "%u -> %u", g_activeSpeakerUserId.load(), userId);
                 }
                 g_activeSpeakerUserId = userId;
                 if (g_participantDock) g_participantDock->RecomputeMuteMarks();
@@ -10697,6 +10853,7 @@ static void RegisterEngineHandlers() {
                 // dirty when the resolved content actually changed, so every
                 // non-Active-Speaker card ignores this.
                 RefreshAllLowerThirdContent();
+                VendorOnActiveSpeaker(userId);
             });
     });
 
@@ -11715,6 +11872,143 @@ static void RefreshAllLowerThirdContent() {
     }, nullptr);
 }
 
+// ---------------------------------------------------------------------------
+// obs-websocket vendor state. feeds-obs-vendor.cpp owns the transport; this is
+// what the events and get_state say, built here because this file owns the
+// roster and the sources.
+//
+// Threads: the events run on the UI thread, get_state on an obs-websocket thread
+// pool thread. get_state must never wait on the UI thread: obs-websocket's
+// shutdown waits for that pool, which would stall OBS's exit behind it, and a
+// busy UI would stall the reply. So everything here copies state out under the
+// existing locks, one at a time (see RecordParticipantBinding on not nesting
+// them), and the payload is built and sent with neither held.
+// ---------------------------------------------------------------------------
+
+// All paid tiers. Read on every use, so a tier change applies immediately.
+static constexpr int kVendorMinTier = 1;
+
+// The speaker last announced. Separate from g_activeSpeakerUserId, which the
+// engine's 5 s heartbeat rewrites and which moves while events are locked: this
+// one only moves when a client was actually told.
+static unsigned int g_vendorSpeakerId = 0;   // UI thread
+
+static bool VendorUnlocked() {
+    return g_isLoggedIn && g_currentTier >= kVendorMinTier;
+}
+
+// A slotted source pinned to a person, copied out of the registry.
+struct VendorSlotRow {
+    int          slot;
+    unsigned int boundId;
+};
+
+// Ascending by slot. Pinned only: an [Active Speaker] source (id 1) is a role and
+// fires nothing. bound_this_session is the gate for the reason
+// ResolveLowerThirdUserId gives: a saved id can match a stranger. A tier-disabled
+// source shows nobody.
+//
+// g_sourcesMutex keeps each ZpSourceData alive for the walk and guards slot. On
+// the get_state thread the three other plain fields are read while the UI and
+// graphics threads can write them unlocked (RecordParticipantBinding, zp_update).
+// They are word-sized and only reported, so the worst case is one reply that is a
+// tick stale, the same trade zp_update already makes reading tier_disabled.
+static std::vector<VendorSlotRow> SnapshotVendorSlots() {
+    std::vector<VendorSlotRow> rows;
+    {
+        std::lock_guard<std::mutex> lock(g_sourcesMutex);
+        rows.reserve(g_allParticipantSources.size());
+        for (ZpSourceData* s : g_allParticipantSources) {
+            if (!s || s->slot == 0 || s->tier_disabled) continue;
+            if (!s->bound_this_session || s->current_user_id <= 1) continue;
+            rows.push_back({s->slot, s->current_user_id});
+        }
+    }
+    std::sort(rows.begin(), rows.end(),
+              [](const VendorSlotRow& a, const VendorSlotRow& b) {
+                  return a.slot < b.slot;
+              });
+    return rows;
+}
+
+static feeds::VendorPerson MakeVendorPerson(unsigned int id, std::string name,
+                                            const std::vector<VendorSlotRow>& rows) {
+    feeds::VendorPerson person;
+    person.participant_id = id;
+    person.name           = std::move(name);
+    for (const VendorSlotRow& row : rows) {
+        if (row.boundId == id) person.slot_list.push_back(row.slot);
+    }
+    return person;
+}
+
+static void VendorOnMeetingJoined() {
+    if (VendorUnlocked()) feeds::VendorEmitMeetingJoined();
+}
+
+// wasInMeeting: a meeting ended here rather than a stray or repeated meeting_left,
+// which the engine sends when it was already out.
+static void VendorOnMeetingLeft(bool wasInMeeting) {
+    g_vendorSpeakerId = 0;
+    if (wasInMeeting && VendorUnlocked()) feeds::VendorEmitMeetingLeft();
+}
+
+// Fires for every engine message, heartbeats included; only a changed id goes out.
+static void VendorOnActiveSpeaker(unsigned int userId) {
+    if (!feeds::VendorAvailable() || !VendorUnlocked() || !g_isInMeeting) return;
+    if (userId == g_vendorSpeakerId) return;
+    g_vendorSpeakerId = userId;
+    feeds::VendorEmitSpeakerChanged(
+        MakeVendorPerson(userId, LowerThirdNameForUser(userId),
+                         SnapshotVendorSlots()));
+}
+
+namespace feeds {
+
+// Any thread, any time. See the note above the section.
+VendorState VendorGetState() {
+    VendorState state;
+    if (!VendorUnlocked()) {
+        state.locked = true;
+        return state;
+    }
+
+    state.in_meeting = g_isInMeeting;
+    if (!state.in_meeting) return state;   // not yet joined, or just left
+
+    state.share_active = g_activeSharerUserId != 0;
+
+    struct RosterEntry {
+        unsigned int id;
+        std::string  name;
+    };
+    std::vector<RosterEntry> roster;
+    {
+        std::lock_guard<std::mutex> lock(g_participantsMutex);
+        roster.reserve(g_cachedParticipants.size());
+        for (const auto& p : g_cachedParticipants) {
+            // The Feeds account is not a guest: no source can show it and it is
+            // never the speaker, as in the dock's participant picker.
+            if (p.id == g_cachedMyUserId) continue;
+            roster.push_back({p.id, (p.name == "Unknown") ? std::string() : p.name});
+        }
+    }
+
+    const unsigned int speakerId = g_activeSpeakerUserId;
+    const std::vector<VendorSlotRow> rows = SnapshotVendorSlots();
+
+    state.speaker =
+        MakeVendorPerson(speakerId, LowerThirdNameForUser(speakerId), rows);
+    state.participants.reserve(roster.size());
+    for (RosterEntry& entry : roster) {
+        state.participants.push_back(
+            MakeVendorPerson(entry.id, std::move(entry.name), rows));
+    }
+    return state;
+}
+
+}  // namespace feeds
+
 // Create this participant's nameplate: one source, plus a scene-item in every
 // scene the participant is currently in, each placed over that scene's copy.
 // Created HIDDEN, so the operator can type the title before anything goes on
@@ -11979,6 +12273,15 @@ static void OnSourceCreated(void* /*data*/, calldata_t* cd) {
         }
     }
 
+    // A new source outside a load takes its slot. Queued, because Paste Duplicate
+    // and undo only set the private settings after this signal returns. A load
+    // assigns every slot once it's finished.
+    if (isParticipant && !g_sceneCollectionLoading.load() &&
+        !g_sceneCollectionReloading.load()) {
+        QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
+                           []() { AssignSourceSlots(); });
+    }
+
     // Initial placement is for a source the user just ADDED. A participant or
     // screenshare source restored by a collection load (startup, switch,
     // rename) already carries the user's saved geometry, so don't start the
@@ -12197,6 +12500,8 @@ bool obs_module_load(void) {
         case OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED:
             g_sceneCollectionLoading.store(false);
             g_sceneCollectionReloading.store(false);
+            AssignSourceSlots();
+            PostTierReconcile();
             // A switch or rename (both end here) re-created every Feeds source
             // unbound, and mid-meeting nothing else re-binds them. Run the same
             // binding sweep a grant runs. Deferred one turn so OBS finishes
@@ -12214,6 +12519,8 @@ bool obs_module_load(void) {
         case OBS_FRONTEND_EVENT_FINISHED_LOADING:
             g_sceneCollectionLoading.store(false);   // startup load done
             g_sceneCollectionReloading.store(false);
+            AssignSourceSlots();
+            PostTierReconcile();
             LoadHideChatPopupHotkey();
             SetupPluginMenu();
             // After SetupPluginMenu so the Feeds menu's dock toggle picks up
@@ -12260,12 +12567,23 @@ bool obs_module_load(void) {
             RestoreIsoRecordingForProfile();
             LoadHideChatPopupHotkey();
             break;
+        // Fires before OBS starts clearing scene data on exit, which EXIT doesn't.
+        case OBS_FRONTEND_EVENT_SCRIPTING_SHUTDOWN:
+            g_obsExiting.store(true);
+            break;
+        case OBS_FRONTEND_EVENT_EXIT:
+            feeds::VendorShutdown();
+            break;
         default:
             break;
         }
     }, nullptr);
 
     return true;
+}
+
+void obs_module_post_load(void) {
+    feeds::VendorRegister();
 }
 
 void obs_module_unload(void) {

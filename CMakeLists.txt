@@ -79,6 +79,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     src/feeds-chat-overlay-source.cpp
     src/feeds-lower-third-source.cpp
     src/feeds-iso-recorder.cpp
+    src/feeds-obs-vendor.cpp
 )
 
 # The engine client: same four entry points either way, different transport.
@@ -106,6 +107,7 @@ endif()
 
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/common"
+    "${CMAKE_CURRENT_SOURCE_DIR}/lib"
 )
 
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE

@@ -10,6 +10,7 @@
 !/data
 !/engine
 !/installer
+!/lib
 !/src
 !/tests
 !.clang-format
