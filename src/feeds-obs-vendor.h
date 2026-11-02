@@ -11,8 +11,9 @@
 // speaker_changed, meeting_joined, meeting_left, participant_1_speaking through
 // participant_8_speaking, chat_message, share_started, share_stopped,
 // participant_joined, participant_left, participant_muted and participant_unmuted,
-// the request get_state, and the field names name, participant_id, slots, message,
-// is_self, in_meeting, speaker, participants, share_active and locked. The slot
+// the requests get_state, clear_chat_overlay and hide_chat_popup, and the field
+// names name, participant_id, slots, message, is_self, in_meeting, speaker,
+// participants, share_active, locked and ok. The slot
 // numbers themselves (feeds_slot, plugin-main.cpp) are part of the same contract.
 // New fields may be added. See feeds-obs-vendor.cpp for the wire format.
 //
@@ -44,7 +45,7 @@ struct VendorState {
     bool                      share_active = false;
 };
 
-// Register the vendor and its request. From obs_module_post_load only: that is
+// Register the vendor and its requests. From obs_module_post_load only: that is
 // the first point obs-websocket is guaranteed to have loaded.
 void VendorRegister();
 
@@ -74,5 +75,12 @@ void VendorEmitParticipantMuted(const VendorPerson& person, bool muted);
 // thread pool thread, so it must be safe from any thread and must never wait on
 // the UI thread.
 VendorState VendorGetState();
+
+// clear_chat_overlay and hide_chat_popup. Defined in plugin-main.cpp. Called on
+// an obs-websocket thread pool thread: each checks the tier and queues the action
+// to the UI thread without waiting. False, and nothing queued, when the Chat
+// Overlay / Chat Popup is locked (logged out, or below Streamer).
+bool VendorClearChatOverlay();
+bool VendorHideChatPopup();
 
 }  // namespace feeds

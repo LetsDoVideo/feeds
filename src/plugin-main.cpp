@@ -12255,7 +12255,48 @@ static void VendorOnRosterJoins(const std::vector<unsigned int>& joined) {
     }
 }
 
+// The Chat Overlay and Chat Popup are Streamer and up (OVERLAY_MIN_TIER and
+// POPUP_MIN_TIER in their source files). Logged out counts as locked here: the
+// tier is unknown and there is no meeting chat to act on. Any thread: the two
+// plain fields are read unlocked, the same trade VendorUnlocked makes for
+// get_state.
+static constexpr int kChatSourcesMinTier = 2;
+
+static bool ChatSourcesUnlocked() {
+    return g_isLoggedIn && g_currentTier >= kChatSourcesMinTier;
+}
+
+// Queue action to the UI thread and return without waiting: the vendor requests
+// run on an obs-websocket thread pool thread, which must never wait on the UI
+// thread (see the note above the section). A zero-delay singleShot with a
+// context object is a queued call, as PostChatPopupDockRefresh uses from the IPC
+// thread. The lock is checked again when the action runs, so a logout or
+// downgrade in between still wins. Once OBS is exiting nothing is queued.
+static void PostChatSourceAction(void (*action)()) {
+    if (g_obsExiting.load()) return;
+    QObject* mainWindow = (QObject*)obs_frontend_get_main_window();
+    if (!mainWindow) return;
+    QTimer::singleShot(0, mainWindow, [action]() {
+        if (ChatSourcesUnlocked()) action();
+    });
+}
+
 namespace feeds {
+
+// clear_chat_overlay. Any thread; never waits. False when locked.
+bool VendorClearChatOverlay() {
+    if (!ChatSourcesUnlocked()) return false;
+    PostChatSourceAction(&feeds::ClearChatOverlay);
+    return true;
+}
+
+// hide_chat_popup: what the Chat Dock's "Hide Chat Popup" button does. Any
+// thread; never waits. False when locked.
+bool VendorHideChatPopup() {
+    if (!ChatSourcesUnlocked()) return false;
+    PostChatSourceAction(&feeds::ClearChatPopup);
+    return true;
+}
 
 // Any thread, any time. See the note above the section.
 VendorState VendorGetState() {
@@ -12663,19 +12704,38 @@ static void OnHideChatPopupHotkey(void* /*data*/, obs_hotkey_id /*id*/,
     if (pressed) feeds::ClearChatPopup();
 }
 
+// "Feeds: Clear Chat Overlay" hotkey: empties every Chat Overlay's history, as
+// leaving a meeting does. Gated, unlike the popup hotkey above: a locked overlay
+// shows nothing, but its history would still be wiped and come back empty after
+// an upgrade or login. ClearChatOverlay only takes the overlay's own mutexes and
+// is safe from any thread, so it is called directly on whichever thread OBS runs
+// the hotkey, as the popup hotkey calls ClearChatPopup.
+static const char* kClearChatOverlayHotkeyName = "FeedsClearChatOverlay";
+static obs_hotkey_id g_clearChatOverlayHotkey  = OBS_INVALID_HOTKEY_ID;
+
+static void OnClearChatOverlayHotkey(void* /*data*/, obs_hotkey_id /*id*/,
+                                     obs_hotkey_t* /*hotkey*/, bool pressed) {
+    if (pressed && ChatSourcesUnlocked()) feeds::ClearChatOverlay();
+}
+
 // OBS Settings writes every frontend hotkey's bindings to the profile config, but
 // only loads back its own. So there is nothing to save here, just this load: at
 // startup, and on a profile switch, since bindings are per profile like every
 // other OBS hotkey. A profile with no entry clears the binding, as OBS's own do.
-static void LoadHideChatPopupHotkey() {
+static void LoadFrontendHotkey(obs_hotkey_id id, const char* name) {
     config_t* cfg = obs_frontend_get_profile_config();
     if (!cfg) return;
-    const char* json = config_get_string(cfg, "Hotkeys", kHideChatPopupHotkeyName);
+    const char* json = config_get_string(cfg, "Hotkeys", name);
     obs_data_t* data = json ? obs_data_create_from_json(json) : nullptr;
     obs_data_array_t* bindings = data ? obs_data_get_array(data, "bindings") : nullptr;
-    obs_hotkey_load(g_hideChatPopupHotkey, bindings);
+    obs_hotkey_load(id, bindings);
     obs_data_array_release(bindings);
     obs_data_release(data);
+}
+
+static void LoadFeedsHotkeys() {
+    LoadFrontendHotkey(g_hideChatPopupHotkey, kHideChatPopupHotkeyName);
+    LoadFrontendHotkey(g_clearChatOverlayHotkey, kClearChatOverlayHotkeyName);
 }
 
 // ---------------------------------------------------------------------------
@@ -12729,6 +12789,9 @@ bool obs_module_load(void) {
     g_hideChatPopupHotkey = obs_hotkey_register_frontend(
         kHideChatPopupHotkeyName, "Feeds: Hide Chat Popup",
         OnHideChatPopupHotkey, nullptr);
+    g_clearChatOverlayHotkey = obs_hotkey_register_frontend(
+        kClearChatOverlayHotkeyName, "Feeds: Clear Chat Overlay",
+        OnClearChatOverlayHotkey, nullptr);
 
     // ISO recorder: registers the single frontend-event callback that fans
     // recording start/stop/pause out to every per-person recorder.
@@ -12813,7 +12876,7 @@ bool obs_module_load(void) {
             g_sceneCollectionReloading.store(false);
             AssignSourceSlots();
             PostTierReconcile();
-            LoadHideChatPopupHotkey();
+            LoadFeedsHotkeys();
             SetupPluginMenu();
             // After SetupPluginMenu so the Feeds menu's dock toggle picks up
             // the resulting visibility, and after OBSInit's restoreState so a
@@ -12857,7 +12920,7 @@ bool obs_module_load(void) {
         // The ISO Recording toggle is remembered per profile.
         case OBS_FRONTEND_EVENT_PROFILE_CHANGED:
             RestoreIsoRecordingForProfile();
-            LoadHideChatPopupHotkey();
+            LoadFeedsHotkeys();
             break;
         // Fires before OBS starts clearing scene data on exit, which EXIT doesn't.
         case OBS_FRONTEND_EVENT_SCRIPTING_SHUTDOWN:
@@ -12893,6 +12956,7 @@ void obs_module_unload(void) {
     if (g_updateCheckThread.joinable()) g_updateCheckThread.join();
 
     obs_hotkey_unregister(g_hideChatPopupHotkey);
+    obs_hotkey_unregister(g_clearChatOverlayHotkey);
 
     // Stop the YouTube chat poller (signals exit, wakes it, joins). Worst case it
     // waits out one in-flight HTTP request (bounded by the WinHTTP timeouts).

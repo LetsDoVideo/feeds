@@ -30,6 +30,13 @@
 //   get_state                 locked: {"locked":true} and nothing else
 //                             otherwise: in_meeting, speaker (as speaker_changed),
 //                             participants (array, same fields), share_active
+//   clear_chat_overlay        {"ok":true}, or {"locked":true} when the Chat
+//                             Overlay is locked (logged out or below Streamer)
+//   hide_chat_popup           {"ok":true}, or {"locked":true} when the Chat
+//                             Popup is locked (logged out or below Streamer)
+//                             ok means the action was queued to the UI thread,
+//                             not that it has already run. Both ignore the
+//                             request data.
 //
 //   slots is a string: ascending, comma-separated, no spaces, "3,7". "" if none.
 //   A string because Streamer.bot arguments are flat, and obs_data arrays can only
@@ -38,8 +45,10 @@
 namespace feeds {
 namespace {
 
-constexpr const char* kVendorName   = "feeds";
-constexpr const char* kGetStateName = "get_state";
+constexpr const char* kVendorName           = "feeds";
+constexpr const char* kGetStateName         = "get_state";
+constexpr const char* kClearChatOverlayName = "clear_chat_overlay";
+constexpr const char* kHideChatPopupName    = "hide_chat_popup";
 
 // Null when obs-websocket is absent. Written at post_load and at frontend exit
 // and read by the emits: all on the UI thread, so no lock. The request callback
@@ -112,6 +121,40 @@ void OnGetState(obs_data_t* /*request_data*/, obs_data_t* response_data,
     }
 }
 
+// The action requests. Same thread and rules as OnGetState: action only checks
+// the tier and queues to the UI thread, so nothing here waits on anything.
+void RunActionRequest(const char* name, bool (*action)(),
+                      obs_data_t* response_data) {
+    try {
+        obs_data_set_bool(response_data, action() ? "ok" : "locked", true);
+    } catch (const std::exception& e) {
+        blog(LOG_ERROR, "[feeds] %s exception: %s", name, e.what());
+    } catch (...) {
+        blog(LOG_ERROR, "[feeds] %s unknown exception", name);
+    }
+}
+
+void OnClearChatOverlay(obs_data_t* /*request_data*/, obs_data_t* response_data,
+                        void* /*priv*/) {
+    RunActionRequest(kClearChatOverlayName, VendorClearChatOverlay, response_data);
+}
+
+void OnHideChatPopup(obs_data_t* /*request_data*/, obs_data_t* response_data,
+                     void* /*priv*/) {
+    RunActionRequest(kHideChatPopupName, VendorHideChatPopup, response_data);
+}
+
+struct VendorRequest {
+    const char*                             name;
+    obs_websocket_request_callback_function callback;
+};
+
+constexpr VendorRequest kRequests[] = {
+    {kGetStateName, OnGetState},
+    {kClearChatOverlayName, OnClearChatOverlay},
+    {kHideChatPopupName, OnHideChatPopup},
+};
+
 }  // namespace
 
 void VendorRegister() {
@@ -120,10 +163,12 @@ void VendorRegister() {
         blog(LOG_INFO, "[feeds] obs-websocket not available, vendor events are off");
         return;
     }
-    if (!obs_websocket_vendor_register_request(vendor, kGetStateName, OnGetState,
-                                               nullptr)) {
-        blog(LOG_WARNING, "[feeds] obs-websocket: could not register %s",
-             kGetStateName);
+    for (const VendorRequest& request : kRequests) {
+        if (!obs_websocket_vendor_register_request(vendor, request.name,
+                                                   request.callback, nullptr)) {
+            blog(LOG_WARNING, "[feeds] obs-websocket: could not register %s",
+                 request.name);
+        }
     }
     g_vendor = vendor;
     blog(LOG_INFO, "[feeds] obs-websocket vendor '%s' registered", kVendorName);
@@ -131,7 +176,9 @@ void VendorRegister() {
 
 void VendorShutdown() {
     if (!g_vendor) return;
-    obs_websocket_vendor_unregister_request(g_vendor, kGetStateName);
+    for (const VendorRequest& request : kRequests) {
+        obs_websocket_vendor_unregister_request(g_vendor, request.name);
+    }
     g_vendor = nullptr;
 }
 
