@@ -48,8 +48,9 @@ void RemoveZoomMessageFromOverlay(const std::string& zoomMessageId);
 void EditZoomMessageInOverlay(const std::string& zoomMessageId,
                               const std::string& content);
 
-// Drop all messages from the overlay history. Called on meeting-left
-// so stale messages don't carry into the next meeting.
+// Drop all messages from the overlay history. Manual only: called by the
+// "Feeds: Clear Chat" hotkey and the clear_chat_overlay vendor request (not at
+// meeting end). Thread-safe.
 void ClearChatOverlay();
 
 // Mark every overlay instance dirty so it re-renders on the next frame.

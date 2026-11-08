@@ -77,9 +77,16 @@ void VendorEmitParticipantMuted(const VendorPerson& person, bool muted);
 VendorState VendorGetState();
 
 // clear_chat_overlay and hide_chat_popup. Defined in plugin-main.cpp. Called on
-// an obs-websocket thread pool thread: each checks the tier and queues the action
-// to the UI thread without waiting. False, and nothing queued, when the Chat
-// Overlay / Chat Popup is locked (logged out, or below Streamer).
+// an obs-websocket thread pool thread: each checks login and tier and queues the
+// action to the UI thread without waiting.
+//
+// VendorClearChatOverlay does what the "Feeds: Clear Chat" hotkey does: clears
+// the Chat dock on any tier, and clears the Chat Overlay and hides the Chat Popup
+// only when they are unlocked (Streamer and up). False, and nothing queued, only
+// when logged out.
+//
+// VendorHideChatPopup: false, and nothing queued, when the Chat Popup is locked
+// (logged out, or below Streamer).
 bool VendorClearChatOverlay();
 bool VendorHideChatPopup();
 

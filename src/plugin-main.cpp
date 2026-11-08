@@ -2850,8 +2850,9 @@ public:
 
         if (!m_messagesStarted) {
             // First real message — drop the placeholder. From here on the
-            // dock shows real chat history until the meeting ends, when
-            // OnMeetingLeft clears it (the same history the overlay drops).
+            // dock shows real chat history, across meetings, until the user
+            // clears it ("Feeds: Clear Chat" hotkey or the clear_chat_overlay
+            // vendor request, which also clear the overlay).
             m_list->clear();
             m_messagesStarted = true;
         }
@@ -2994,19 +2995,18 @@ public:
     }
     void OnMeetingLeft() {
         UpdateChatHeaderState();   // Zoom row -> "Waiting", input disabled
-        // Hide any active popup and drop the overlay history so stale
-        // messages don't carry into the next meeting. The dock drops its own
-        // rows at the same moment, and the same set: ClearChatOverlay empties
-        // every platform (Zoom, YouTube, Twitch), so the dock clears every
-        // row, keeping the two in agreement.
-        ClearChatHistory();
+        // Hide any active popup. Chat history (dock and overlay) is NOT
+        // cleared here: a stream often carries on with YouTube or Twitch chat
+        // after a Zoom guest leaves, so clearing is manual, through the
+        // "Feeds: Clear Chat" hotkey and the clear_chat_overlay vendor request.
         feeds::ClearChatPopup();
-        feeds::ClearChatOverlay();
     }
 
     // Empty the chat list and return it to its no-history state, so the
     // placeholder logic applies again and the next message starts a fresh list.
-    // UI thread (called from OnMeetingLeft, which the IPC handler marshals).
+    // Every row goes (Zoom, YouTube, Twitch), the same set ClearChatOverlay
+    // drops. UI thread only: the hotkey and the vendor request queue it here
+    // through PostClearChat.
     void ClearChatHistory() {
         m_messagesStarted = false;
         m_list->clear();
@@ -12330,13 +12330,39 @@ static void PostChatSourceAction(void (*action)()) {
     });
 }
 
+// Clear Chat: what the "Feeds: Clear Chat" hotkey and the clear_chat_overlay
+// vendor request do. Empties the Chat dock's history on any tier, and every
+// Chat Overlay's history only while the overlay is unlocked (Streamer and up),
+// so a locked overlay never comes back empty after an upgrade or login. Also
+// hides the Chat Popup while unlocked (the same gate as the hide_chat_popup
+// request), so a message from the cleared history doesn't stay on screen. All of
+// it is queued to the UI thread without waiting, as PostChatSourceAction does: the
+// hotkey runs on OBS's hotkey thread and the request on an obs-websocket thread
+// pool thread, and the dock is a widget. Login and tier are checked again when
+// the action runs, so a logout or downgrade in between still wins. Any thread.
+// False, and nothing queued, when logged out.
+static bool PostClearChat() {
+    if (!g_isLoggedIn) return false;
+    if (g_obsExiting.load()) return true;
+    QObject* mainWindow = (QObject*)obs_frontend_get_main_window();
+    if (!mainWindow) return true;
+    QTimer::singleShot(0, mainWindow, []() {
+        if (!g_isLoggedIn) return;
+        if (g_chatDock) g_chatDock->ClearChatHistory();
+        if (ChatSourcesUnlocked()) feeds::ClearChatOverlay();
+        if (ChatSourcesUnlocked()) feeds::ClearChatPopup();
+    });
+    return true;
+}
+
 namespace feeds {
 
-// clear_chat_overlay. Any thread; never waits. False when locked.
+// clear_chat_overlay: the "Feeds: Clear Chat" hotkey's action (Chat dock on any
+// tier; Chat Overlay cleared and Chat Popup hidden when unlocked). The name
+// predates the dock clear and stays, as it is part of the vendor contract. Any
+// thread; never waits. False only when logged out.
 bool VendorClearChatOverlay() {
-    if (!ChatSourcesUnlocked()) return false;
-    PostChatSourceAction(&feeds::ClearChatOverlay);
-    return true;
+    return PostClearChat();
 }
 
 // hide_chat_popup: what the Chat Dock's "Hide Chat Popup" button does. Any
@@ -12753,18 +12779,19 @@ static void OnHideChatPopupHotkey(void* /*data*/, obs_hotkey_id /*id*/,
     if (pressed) feeds::ClearChatPopup();
 }
 
-// "Feeds: Clear Chat Overlay" hotkey: empties every Chat Overlay's history, as
-// leaving a meeting does. Gated, unlike the popup hotkey above: a locked overlay
-// shows nothing, but its history would still be wiped and come back empty after
-// an upgrade or login. ClearChatOverlay only takes the overlay's own mutexes and
-// is safe from any thread, so it is called directly on whichever thread OBS runs
-// the hotkey, as the popup hotkey calls ClearChatPopup.
+// "Feeds: Clear Chat" hotkey: empties the Chat dock's history (any tier) and
+// every Chat Overlay's history (only while the overlay is unlocked, so a locked
+// overlay's history is never wiped), and hides the Chat Popup while it is
+// unlocked. Logged out it does nothing. PostClearChat queues all of it to the UI
+// thread: OBS runs hotkeys on its hotkey thread and the dock is a widget. Chat is no longer cleared at meeting end, so this is the way
+// to start fresh. The internal name predates the dock clear and is kept so
+// existing bindings in users' profiles keep working.
 static const char* kClearChatOverlayHotkeyName = "FeedsClearChatOverlay";
 static obs_hotkey_id g_clearChatOverlayHotkey  = OBS_INVALID_HOTKEY_ID;
 
 static void OnClearChatOverlayHotkey(void* /*data*/, obs_hotkey_id /*id*/,
                                      obs_hotkey_t* /*hotkey*/, bool pressed) {
-    if (pressed && ChatSourcesUnlocked()) feeds::ClearChatOverlay();
+    if (pressed) PostClearChat();
 }
 
 // OBS Settings writes every frontend hotkey's bindings to the profile config, but
@@ -12839,7 +12866,7 @@ bool obs_module_load(void) {
         kHideChatPopupHotkeyName, "Feeds: Hide Chat Popup",
         OnHideChatPopupHotkey, nullptr);
     g_clearChatOverlayHotkey = obs_hotkey_register_frontend(
-        kClearChatOverlayHotkeyName, "Feeds: Clear Chat Overlay",
+        kClearChatOverlayHotkeyName, "Feeds: Clear Chat",
         OnClearChatOverlayHotkey, nullptr);
 
     // ISO recorder: registers the single frontend-event callback that fans

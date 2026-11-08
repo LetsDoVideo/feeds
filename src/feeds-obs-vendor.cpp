@@ -30,8 +30,12 @@
 //   get_state                 locked: {"locked":true} and nothing else
 //                             otherwise: in_meeting, speaker (as speaker_changed),
 //                             participants (array, same fields), share_active
-//   clear_chat_overlay        {"ok":true}, or {"locked":true} when the Chat
-//                             Overlay is locked (logged out or below Streamer)
+//   clear_chat_overlay        clears the Chat dock (any tier) and the Chat
+//                             Overlay, and hides the Chat Popup (both Streamer
+//                             and up only; a locked overlay or popup is left
+//                             alone), the same as the "Feeds: Clear Chat"
+//                             hotkey. {"ok":true} when logged in,
+//                             {"locked":true} only when logged out
 //   hide_chat_popup           {"ok":true}, or {"locked":true} when the Chat
 //                             Popup is locked (logged out or below Streamer)
 //                             ok means the action was queued to the UI thread,
