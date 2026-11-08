@@ -517,6 +517,11 @@ public:
         if (status == ZOOM_SDK_NAMESPACE::Video_ON && g_anchorWnd) {
             PostMessageW(g_anchorWnd, WM_FEEDS_CAMERA_ON, (WPARAM)userId, 0);
         }
+        // Video off (or muted by host): remembered so the camera-on decision
+        // rebuilds only after a real off -> on, not on a Video_ON for a feed
+        // that never stopped. Leaf lock only.
+        if (status != ZOOM_SDK_NAMESPACE::Video_ON)
+            NoteUserVideoOff(userId);
         // Camera state decides who is displayable, and the on-screen person
         // turning their camera off switches immediately, so re-derive now
         // rather than on the next 1 s tick. Any thread; coalesced.

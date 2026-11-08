@@ -125,4 +125,10 @@ void OnEngineTimer(UINT_PTR timerId);
 // delivery-gated recreate path. Invoked by EngineWndProc on WM_FEEDS_CAMERA_ON.
 void QueueCameraOnReestablish(unsigned int userId);
 
+// Defined in engine-video.cpp. Any thread (called on the SDK's video-listener
+// thread): a participant's video went off. Recorded so the camera-on decision
+// can tell a real camera off -> on from a Video_ON for a feed that never
+// stopped. Takes only a leaf mutex.
+void NoteUserVideoOff(unsigned int userId);
+
 } // namespace feeds_engine

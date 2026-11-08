@@ -21,6 +21,7 @@
 #include <atomic>
 #include <memory>
 #include <cstdio>
+#include <cstring>
 
 #include "engine-shared.h"
 #include "zoom_sdk.h"
@@ -331,11 +332,180 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// Subscription — one renderer + one shared memory writer + the delegate
-// that bridges them. One Subscription per Zoom Participant source.
+// Switch timings (make-before-break re-points and the camera-on decision).
 // ---------------------------------------------------------------------------
-class ParticipantSubscription
-    : public ZOOM_SDK_NAMESPACE::IZoomSDKRendererDelegate {
+//
+// kSwitchFirstFrameMs — how long a switch's NEW renderer may take to deliver
+// its first frame before the switch is judged failed. A healthy first frame
+// arrives in tens of milliseconds (the gate notes ~26 ms; field logs show
+// 20 ms), and a cold or HD stream waiting on a keyframe is still well under a
+// second. While the switch is pending the OLD person stays on screen, so
+// erring long costs only a late cut, never black; past 3 s the cut is visibly
+// broken and the proven recovery (a fresh renderer through the gate) is due.
+// Deliberately shorter than kLadderFirstFrameMs (7 s) so the switch's own
+// retry runs before the ladder would step the source down.
+static const ULONGLONG kSwitchFirstFrameMs = 3000;
+
+// kReleaseSettleMs — minimum spacing between destroying a renderer for a user
+// and creating another one for the same user on a switch. The gate's own
+// requeue after a refused subscribe waits one 300 ms tick for exactly this
+// reason (the SDK releases a participant's renderer asynchronously, and a
+// create that races the release is what returns WRONG_USAGE); a switch waits
+// the same tick rather than inventing a new number.
+static const ULONGLONG kReleaseSettleMs = 300;
+
+// kSelfUnsubQuietMs — after WE unSubscribe a renderer to re-point it, a
+// RawData_Off from that renderer is our own doing, not the participant's, and
+// must not blank the source. Whether the SDK fires it synchronously inside
+// unSubscribe or shortly after is not documented, so the suppression is a
+// bounded window that ends early on the renderer's next frame. A real camera
+// off after the window, or after the next frame, blanks exactly as before.
+static const ULONGLONG kSelfUnsubQuietMs = 1000;
+
+// kFrameStaleMs — a renderer that has delivered no frame for this long is not
+// receiving video. Zoom camera video runs at 10 to 30 fps and stays above
+// ~5 fps even on a poor link, so a healthy feed never goes a full second
+// without a frame. A renderer left unfed while a camera was off ages past it
+// quickly; a camera off/on short enough to stay under it is caught by the
+// video-off record instead. Used by the camera-on decision (stale -> rebuild)
+// and by a switch to decide whether there is a live picture worth keeping.
+static const ULONGLONG kFrameStaleMs = 1000;
+
+// Routing word for a source's two renderers: low 32 bits = the leg id whose
+// frames are written to the source, high 32 bits = the leg id of a pending
+// switch whose first frame may take over. 0 = none. One atomic word, so the
+// frame callback's promotion and the pump thread's abandon are a single
+// compare-exchange each, with no lock the SDK callback could wait on.
+static inline uint32_t RouteActive(uint64_t r)  { return (uint32_t)(r & 0xffffffffu); }
+static inline uint32_t RoutePending(uint64_t r) { return (uint32_t)(r >> 32); }
+static inline uint64_t MakeRoute(uint32_t active, uint32_t pending) {
+    return (uint64_t)active | ((uint64_t)pending << 32);
+}
+
+static std::atomic<uint32_t> g_nextLegId{1};
+static uint32_t NextLegId() {
+    uint32_t id = g_nextLegId.fetch_add(1, std::memory_order_relaxed);
+    if (id == 0) id = g_nextLegId.fetch_add(1, std::memory_order_relaxed);
+    return id;
+}
+
+class ParticipantSubscription;
+
+// ---------------------------------------------------------------------------
+// RendererLeg — one IZoomSDKRenderer and the delegate that receives its
+// callbacks. A source normally has one (the LIVE leg). During a
+// make-before-break switch it briefly has a second (the PENDING leg) subscribed
+// to the new user; its frames are dropped until its first frame promotes it,
+// at which point it becomes the writer and the old leg is destroyed.
+//
+// Threads:
+//   Create / Subscribe / Unsubscribe / Destroy — pump thread (or the pipe
+//     thread for the legacy paths that still run there), always under
+//     g_subsMutex. m_renderer, m_userId and m_subscribedAt are only touched
+//     there (m_renderer is also nulled by onRendererBeDestroyed, as before).
+//   Callbacks — the SDK's thread. They read the owner's routing word and the
+//     atomics below; they never take g_subsMutex.
+// ---------------------------------------------------------------------------
+class RendererLeg : public ZOOM_SDK_NAMESPACE::IZoomSDKRendererDelegate {
+public:
+    RendererLeg(ParticipantSubscription* owner, uint32_t id)
+        : m_owner(owner), m_id(id) {}
+    ~RendererLeg() { Destroy(false); }
+
+    RendererLeg(const RendererLeg&) = delete;
+    RendererLeg& operator=(const RendererLeg&) = delete;
+
+    uint32_t     Id() const      { return m_id; }
+    unsigned int UserId() const  { return m_userId; }
+    bool         HasRenderer() const { return m_renderer != nullptr; }
+
+    // createRenderer + setRawDataResolution at `rung`. Returns the
+    // createRenderer result (SDKERR_SUCCESS when the renderer exists).
+    // forSwitch = a switch's second renderer: its accepted-resolution line
+    // goes to the debug log (the switch line is the INFO record); a refusal is
+    // still a WARN.
+    ZOOM_SDK_NAMESPACE::SDKError Create(int rung, bool forSwitch = false);
+
+    // subscribe() to userId. On success starts this leg's establishment window
+    // (first-frame flag cleared, subscribe time stamped).
+    ZOOM_SDK_NAMESPACE::SDKError Subscribe(unsigned int userId);
+
+    // unSubscribe(). quiet = this is our own re-point, so a RawData_Off it
+    // provokes is suppressed (see kSelfUnsubQuietMs).
+    void Unsubscribe(bool quiet);
+
+    // unSubscribe + destroyRenderer. quiet = a leg we are retiring ourselves
+    // (switch swap or abandon): its callbacks are ignored from here on, so it
+    // can never write a blank over the leg that replaced it. quiet = false is
+    // the whole-source teardown, which behaves exactly as before.
+    void Destroy(bool quiet);
+
+    bool      GotFirstFrame() const  { return m_gotFirstFrame.load(std::memory_order_acquire); }
+    ULONGLONG FirstFrameTick() const { return m_firstFrameTick.load(std::memory_order_acquire); }
+    ULONGLONG LastFrameTick() const  { return m_lastFrameTick.load(std::memory_order_acquire); }
+    ULONGLONG SubscribedAt() const   { return m_subscribedAt; }
+
+    // Pump thread: forget this leg's subscription without an SDK call (the
+    // follow-speaker "waiting for a speaker" state).
+    void MarkUnsubscribed() { m_userId = 0; m_subscribedAt = 0; }
+
+    // IZoomSDKRendererDelegate
+    virtual void onRawDataFrameReceived(YUVRawDataI420* data) override;
+    virtual void onRawDataStatusChanged(RawDataStatus status) override;
+    virtual void onRendererBeDestroyed() override;
+
+private:
+    ParticipantSubscription* m_owner;
+    const uint32_t           m_id;
+    ZOOM_SDK_NAMESPACE::IZoomSDKRenderer* m_renderer = nullptr;
+    unsigned int             m_userId       = 0;   // pump thread
+    ULONGLONG                m_subscribedAt = 0;   // pump thread
+
+    // Requested height for the delivered-vs-requested log lines. Written in
+    // Create before any frame can arrive, read on the callback thread.
+    int                      m_requestedHeight = 0;
+
+    // Cross-thread: written on the SDK callback thread, read on the pump
+    // thread (and the reverse for the stores in Subscribe/Unsubscribe/
+    // Destroy). Lock-free so the frame callback takes no mutex.
+    std::atomic<bool>        m_gotFirstFrame{false};
+    std::atomic<ULONGLONG>   m_firstFrameTick{0};
+    std::atomic<ULONGLONG>   m_lastFrameTick{0};
+    std::atomic<ULONGLONG>   m_quietUntil{0};      // RawData_Off suppression
+    std::atomic<bool>        m_retired{false};     // set by Destroy(quiet=true)
+
+    // SDK-callback-only state; never read from outside that thread.
+    int                      m_lastSrcW       = 0;
+    int                      m_lastSrcH       = 0;
+    unsigned int             m_loggedFailures = 0;
+};
+
+// The state of one source's in-progress switch. Pump thread under g_subsMutex
+// (targetLeft is also set by the participants listener under g_subsMutex).
+enum class SwitchPhase {
+    Deferred,          // waiting on the same-userId gate / release settle
+    MakeBeforeBreak,   // pending leg subscribed, old leg still writing
+    Direct,            // single-leg re-point, waiting for its first frame
+};
+
+struct SwitchState {
+    bool         active      = false;
+    SwitchPhase  phase       = SwitchPhase::Deferred;
+    unsigned int fromUser    = 0;
+    unsigned int toUser      = 0;
+    ULONGLONG    requestTick = 0;
+    ULONGLONG    legSubTick  = 0;      // subscribe time of the leg being judged
+    const char*  directWhy   = "";     // why the direct path was taken
+    bool         targetLeft  = false;  // the target left while pending
+    bool         loggedWait  = false;  // the deferral was logged once
+};
+
+// ---------------------------------------------------------------------------
+// Subscription — one shared memory writer + scaler + isolated-audio sink, fed
+// by one live renderer leg (two during a make-before-break switch). One
+// Subscription per Zoom Participant source or ISO feed.
+// ---------------------------------------------------------------------------
+class ParticipantSubscription {
 public:
     ParticipantSubscription(const std::string& sourceUuid,
                             unsigned int userId,
@@ -343,6 +513,7 @@ public:
                             int rung)
         : m_sourceUuid(sourceUuid),
           m_userId(userId),
+          m_desiredUser(userId),
           m_followActiveSpeaker(followActiveSpeaker),
           m_rung(rung < 0 ? 0 : (rung >= kLadderRungs ? kLadderRungs - 1 : rung)) {}
 
@@ -350,10 +521,10 @@ public:
         TearDown();
     }
 
-    // Create the renderer and shared memory. If m_followActiveSpeaker is
-    // true and no speaker is yet known (m_userId == ACTIVE_SPEAKER_SENTINEL),
-    // we skip the subscribe call; caller should call Resubscribe once an
-    // active speaker is available. Returns true on success.
+    // Create the writer, the live renderer leg and the scaler, and subscribe.
+    // If m_followActiveSpeaker is true and no speaker is yet known
+    // (m_userId == ACTIVE_SPEAKER_SENTINEL), the subscribe is skipped; a later
+    // switch points it at a real user. Same outcomes as before.
     SubStart Start() {
         // Shared memory first so it's ready before any frames arrive.
         uint32_t pid = GetCurrentProcessId();
@@ -364,20 +535,18 @@ public:
         }
 
         // This source's isolated-audio ring, routed to the same user as the
-        // video (re-pointed in Resubscribe). Non-fatal if it can't open.
+        // video (moved on a switch, when the new user's video takes over).
+        // Non-fatal if it can't open.
         m_audioSink = OpenIsolatedAudioSink(m_sourceUuid, m_userId);
 
-        // Create the SDK renderer with this object as the delegate.
-        ZOOM_SDK_NAMESPACE::SDKError err =
-            ZOOM_SDK_NAMESPACE::createRenderer(&m_renderer, this);
-        if (err != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS || !m_renderer) {
-            char msg[128];
-            sprintf_s(msg, "Video: createRenderer failed: %d", (int)err);
-            LogError(msg);
+        // Create the SDK renderer (the live leg).
+        m_live = std::make_unique<RendererLeg>(this, NextLegId());
+        ZOOM_SDK_NAMESPACE::SDKError err = m_live->Create(m_rung);
+        if (err != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
+            m_live.reset();
             m_writer.Close();
             CloseIsolatedAudioSink(m_audioSink);
             m_audioSink = 0;
-            m_renderer = nullptr;
             // 11 (VIDEO_NOTREADY) / 12 (NO_PERMISSION) are the transient
             // raw-data-subsystem-not-ready codes seen at/just after the grant —
             // tell the caller to keep the request queued and retry. Any other
@@ -388,36 +557,8 @@ public:
             }
             return SubStart::Failed;
         }
-
-        // Set resolution from this subscription's ladder rung. A brand-new
-        // source is constructed at the tier's top rung, so the first attempt
-        // requests exactly what it always did (720p on Free, 1080p on paid);
-        // a lower rung is only ever reached after a failed attempt stepped it
-        // down and requeued.
-        //
-        // The return code used to be discarded, which cost us the one signal
-        // that separates "the meeting/account cannot carry this resolution"
-        // from "bandwidth dipped for this participant". A refusal here means
-        // the request was rejected outright and the SDK will deliver whatever
-        // it picked instead, so the delivered size logged on the first frame
-        // below is the only thing that tells us what we actually got. Not
-        // fatal either way — we keep the subscription and report honestly, and
-        // it is deliberately NOT a ladder trigger: the ladder steps down on
-        // absence of delivery, never on small delivery.
-        m_requestedHeight = kLadderHeight[m_rung];
-        const ZOOM_SDK_NAMESPACE::SDKError resErr =
-            m_renderer->setRawDataResolution(kLadderRes[m_rung]);
-        {
-            char msg[256];
-            sprintf_s(msg,
-                "Video: source='%s' requested %dp, setRawDataResolution "
-                "returned %d (%s)",
-                m_sourceUuid.c_str(), m_requestedHeight, (int)resErr,
-                resErr == ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS
-                    ? "accepted" : "REFUSED — SDK will pick its own");
-            if (resErr == ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) LogInfo(msg);
-            else                                              LogWarn(msg);
-        }
+        // The live leg is the writer from the start.
+        m_route.store(MakeRoute(m_live->Id(), 0), std::memory_order_release);
 
         // Spin up the scaler worker. SDK callbacks stage frames here; the
         // worker libyuv-scales to the tier ceiling and hands the result
@@ -439,8 +580,7 @@ public:
         // Subscribe to the user's video, unless we're in follow-active-
         // speaker mode and no speaker has been designated yet.
         if (!m_followActiveSpeaker || m_userId != ACTIVE_SPEAKER_SENTINEL) {
-            err = m_renderer->subscribe(m_userId,
-                                         ZOOM_SDK_NAMESPACE::RAW_DATA_TYPE_VIDEO);
+            err = m_live->Subscribe(m_userId);
             if (err != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
                 // MODE 2 — the SDK refused the subscription outright. The
                 // budget case returns SDKERR_WRONG_USAGE (2): this meeting
@@ -486,93 +626,18 @@ public:
 
     // Update the follow-mode flag without touching the renderer. Used by
     // HandleParticipantSourceSubscribe when the plugin switches an existing
-    // source's dropdown into or out of [Active Speaker]. Resubscribe()
-    // deliberately leaves the flag alone — it's also called from the
-    // RetargetFollowSources loop, where the flag must not
-    // change (the source is staying in follow mode, we're just pointing
-    // it at a new user). So the handler, not Resubscribe, owns mode flips.
+    // source's dropdown into or out of [Active Speaker]. The switch machinery
+    // deliberately leaves the flag alone — it also serves the
+    // RetargetFollowSources loop, where the flag must not change (the source is
+    // staying in follow mode, we're just pointing it at a new user). So the
+    // handler, not the switch, owns mode flips.
     void SetFollowsActiveSpeaker(bool v) { m_followActiveSpeaker = v; }
-
-    // Re-point this subscription at a different user without tearing down
-    // the renderer or shared memory. Used when the plugin changes the
-    // dropdown selection, and by the active-speaker retarget loop.
-    //
-    // Returns false ONLY when the SDK refused the subscribe — the caller then
-    // steps this source down a rung and requeues, exactly as it would for a
-    // failed initial Start(). Returns true when the subscribe succeeded or was
-    // intentionally skipped (follow-speaker with no speaker yet), neither of
-    // which is a ladder trigger.
-    bool Resubscribe(unsigned int newUserId) {
-        if (!m_renderer) return true;
-
-        // Always unsubscribe first — drops any existing subscription so
-        // the source goes black while we wait.
-        m_renderer->unSubscribe();
-        m_userId = newUserId;
-        // Audio follows the video's user. For a follow-speaker source still
-        // waiting on a speaker this is the sentinel, which matches no one.
-        SetIsolatedAudioSinkUser(m_audioSink, m_userId);
-
-        // If this is a follow-speaker source and we don't yet know who's
-        // speaking (newUserId == ACTIVE_SPEAKER_SENTINEL), skip the SDK
-        // subscribe call entirely. Passing the sentinel would just get
-        // rejected with "invalid user" — log noise. We stay unsubscribed
-        // until RetargetFollowSources calls us again with a real ID.
-        if (m_followActiveSpeaker && m_userId == ACTIVE_SPEAKER_SENTINEL) {
-            // Not subscribed by choice — stop the establishment clock so the
-            // ladder watchdog does not count this as a missing first frame.
-            m_subscribeTick = 0;
-            char msg[128];
-            sprintf_s(msg,
-                "Video: source='%s' waiting for active speaker",
-                m_sourceUuid.c_str());
-            LogToFile(msg);
-            return true;
-        }
-
-        ZOOM_SDK_NAMESPACE::SDKError err =
-            m_renderer->subscribe(m_userId,
-                                   ZOOM_SDK_NAMESPACE::RAW_DATA_TYPE_VIDEO);
-        if (err != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
-            // A refused re-point used to log at debug — which OBS drops — and
-            // leave the source black with nothing in the normal log to explain
-            // it. Now it is a WARN and a ladder trigger.
-            char msg[192];
-            sprintf_s(msg,
-                "Video: LADDER source='%s' userId=%u re-point REFUSED at %s "
-                "(code=%d%s)",
-                m_sourceUuid.c_str(), m_userId, LadderRungName(m_rung),
-                (int)err,
-                err == ZOOM_SDK_NAMESPACE::SDKERR_WRONG_USAGE
-                    ? " WRONG_USAGE — over the meeting's resolution budget"
-                    : "");
-            LogWarn(msg);
-            m_subscribeTick = 0;   // caller recreates; no watchdog on a dead sub
-            return false;
-        }
-
-        // Fresh target, fresh establishment window. m_gotFirstFrame is atomic,
-        // so clearing it here (pump thread) is safe against the SDK callback
-        // thread that sets it. m_lastSrcW/H are deliberately NOT reset — they
-        // are callback-thread-only, and the dimension-change detector spanning
-        // the re-point is what reveals a re-point that cost resolution.
-        m_gotFirstFrame.store(false, std::memory_order_release);
-        m_subscribeTick = GetTickCount64();
-
-        char msg[160];
-        sprintf_s(msg, "Video: resubscribed source='%s' to userId=%u at %s%s",
-                  m_sourceUuid.c_str(), m_userId, LadderRungName(m_rung),
-                  m_followActiveSpeaker ? " [follow-speaker]" : "");
-        LogToFile(msg);
-        return true;
-    }
 
     void TearDown() {
         // Order matters:
-        //   1. SDK teardown first — after destroyRenderer returns, the
-        //      SDK can no longer fire onRawDataFrameReceived (and
-        //      therefore can't call m_worker->StageFrame after we
-        //      destroy it).
+        //   1. SDK teardown first (both legs) — after destroyRenderer returns,
+        //      the SDK can no longer fire onRawDataFrameReceived (and
+        //      therefore can't call m_worker->StageFrame after we destroy it).
         //   2. Worker stop+join — drains any in-flight scale + write.
         //      Synchronous join means no risk of the worker touching
         //      m_writer after Close.
@@ -580,14 +645,13 @@ public:
         // The isolated-audio sink is independent of all three (its writer is
         // the SDK audio callback, serialised inside engine-audio.cpp), so it
         // just closes last.
-        if (m_renderer) {
-            try {
-                m_renderer->unSubscribe();
-                ZOOM_SDK_NAMESPACE::destroyRenderer(m_renderer);
-            } catch (...) {
-                LogToFile("Video: exception during renderer teardown (ignored)");
-            }
-            m_renderer = nullptr;
+        if (m_pending) {
+            m_pending->Destroy(true);
+            m_pending.reset();
+        }
+        if (m_live) {
+            m_live->Destroy(false);
+            m_live.reset();
         }
         if (m_worker) {
             m_worker->Stop();
@@ -598,128 +662,16 @@ public:
         m_audioSink = 0;
     }
 
-    // IZoomSDKRendererDelegate callbacks. Called by the SDK on its
-    // internal thread. v1.2.2: the callback validates the frame, copies
-    // the planes into the worker's staging slot, and signals. The worker
-    // thread libyuv-scales to the tier ceiling and writes the result to
-    // shared memory. Keeping the SDK callback cheap is what stops
-    // Broadcaster-tier multi-renderer setups from serialising past one
-    // frame's budget (research §12.4).
-    virtual void onRawDataFrameReceived(YUVRawDataI420* data) override {
-        // Delivery is confirmed: this renderer is actually receiving frames.
-        // Signal the sequencing gate ONCE, on the 0->1 transition only, so the
-        // next same-userId create proceeds promptly instead of waiting for the
-        // poll tick. exchange() makes the post fire exactly once per renderer
-        // (never per frame). PostMessageW is thread-safe from this SDK thread;
-        // the WM_TIMER poll is the fallback if a post is ever missed. This
-        // callback touches no mutex and never advances the queue itself.
-        if (!m_gotFirstFrame.exchange(true, std::memory_order_release)) {
-            if (g_anchorWnd)
-                PostMessageW(g_anchorWnd, WM_FEEDS_PROCESS_RENDERERS, 0, 0);
-        }
-
-        if (!data || !m_worker) return;
-
-        const uint8_t* y = (const uint8_t*)data->GetYBuffer();
-        const uint8_t* u = (const uint8_t*)data->GetUBuffer();
-        const uint8_t* v = (const uint8_t*)data->GetVBuffer();
-        const int      w = (int)data->GetStreamWidth();
-        const int      h = (int)data->GetStreamHeight();
-
-        // Defensive validation. Reject + log-once-per-type rather than
-        // forwarding a malformed frame and crashing the scaler.
-        if (w <= 0 || h <= 0) {
-            if (!(m_loggedFailures & validation_failures::ZERO_DIM)) {
-                char msg[256];
-                sprintf_s(msg,
-                    "Video: source='%s' received frame with zero dimension "
-                    "(%dx%d); dropping (logged once per subscription)",
-                    m_sourceUuid.c_str(), w, h);
-                LogWarn(msg);
-                m_loggedFailures |= validation_failures::ZERO_DIM;
-            }
-            return;
-        }
-        if (!y || !u || !v) {
-            if (!(m_loggedFailures & validation_failures::NULL_PLANE)) {
-                char msg[256];
-                sprintf_s(msg,
-                    "Video: source='%s' received frame with null plane "
-                    "buffer; dropping (logged once per subscription)",
-                    m_sourceUuid.c_str());
-                LogWarn(msg);
-                m_loggedFailures |= validation_failures::NULL_PLANE;
-            }
-            return;
-        }
-
-        // Delivered-resolution visibility. INFO, not DEBUG: this used to log
-        // at debug, which OBS drops from the normal log, so in every real
-        // session the one measurement that says whether a feed is genuinely
-        // 1080p was computed and thrown away. The engine's frame scaler
-        // normalises everything to the tier size before OBS sees it, so a
-        // participant delivering 720p is upscaled and looks like 1080p to
-        // every other part of the system — these two lines are the ONLY place
-        // the true delivered size is observable.
-        //
-        // Bounded by construction: one line on the first frame, then one per
-        // actual change. A steady feed logs twice per session (subscribe +
-        // first frame) and never again.
-        if (w != m_lastSrcW || h != m_lastSrcH) {
-            char msg[256];
-            if (m_lastSrcW == 0 && m_lastSrcH == 0) {
-                // First frame: state what arrived against what was asked for,
-                // so one line answers "did we get the resolution we promised".
-                sprintf_s(msg,
-                    "Video: source='%s' first frame %dx%d (requested %dp)%s",
-                    m_sourceUuid.c_str(), w, h, m_requestedHeight,
-                    (h < m_requestedHeight) ? " — BELOW REQUEST" : "");
-            } else {
-                sprintf_s(msg,
-                    "Video: frame dimensions changed for source='%s': "
-                    "%dx%d -> %dx%d (requested %dp)",
-                    m_sourceUuid.c_str(), m_lastSrcW, m_lastSrcH, w, h,
-                    m_requestedHeight);
-            }
-            LogInfo(msg);
-            m_lastSrcW = w;
-            m_lastSrcH = h;
-        }
-
-        m_worker->StageFrame(y, u, v, w, h);
-    }
-
-    virtual void onRawDataStatusChanged(RawDataStatus status) override {
-        char msg[128];
-        sprintf_s(msg, "Video: source='%s' raw data status=%d",
-                  m_sourceUuid.c_str(), (int)status);
-        LogToFile(msg);
-
-        // RawData_Off means frames have stopped flowing (camera off, user
-        // left, host removed, network disconnect). Push a blank-sentinel
-        // slot so the plugin clears its OBS source instead of freezing on
-        // the last received frame. Recovery is automatic: when frames
-        // resume the SDK fires onRawDataFrameReceived again and the plugin
-        // renders the new slot normally.
-        if (status == RawData_Off) {
-            m_writer.WriteBlankSignal();
-        }
-    }
-
-    virtual void onRendererBeDestroyed() override {
-        // SDK destroyed our renderer (probably meeting ended). Push a
-        // blank sentinel before nulling the renderer pointer — defensive
-        // cover in case the SDK doesn't fire RawData_Off first on this
-        // path. m_writer is still valid here: this callback runs while
-        // our object is alive (either before TearDown starts, or
-        // synchronously inside destroyRenderer before m_writer.Close()).
-        LogToFile("Video: SDK destroyed renderer");
-        m_writer.WriteBlankSignal();
-        m_renderer = nullptr;
-    }
-
     const std::string& SourceUuid() const { return m_sourceUuid; }
+
+    // The user whose video this source is SHOWING (the live leg's user). During
+    // a pending switch this is still the old user.
     unsigned int UserId() const { return m_userId; }
+
+    // The user this source SHOULD show: the newest request (manual pick or
+    // active-speaker target). Equal to UserId() when no switch is wanted.
+    unsigned int DesiredUserId() const { return m_desiredUser; }
+    void         SetDesiredUser(unsigned int uid) { m_desiredUser = uid; }
 
     // Push a blank-sentinel slot to the plugin without touching the SDK
     // renderer or our subscription state. Used when the bound participant
@@ -731,62 +683,442 @@ public:
         m_writer.WriteBlankSignal();
     }
 
+    // --- Called from RendererLeg callbacks (SDK thread) --------------------
+    bool IsWriterLeg(uint32_t legId) const {
+        return RouteActive(m_route.load(std::memory_order_acquire)) == legId;
+    }
+    // A pending leg's first valid frame: become the writer if this leg is
+    // still the pending one. Fails (frame dropped) if the pump thread has
+    // abandoned or replaced it.
+    bool TryPromote(uint32_t legId) {
+        uint64_t r = m_route.load(std::memory_order_acquire);
+        while (RoutePending(r) == legId) {
+            if (m_route.compare_exchange_weak(r, MakeRoute(legId, 0),
+                                              std::memory_order_acq_rel,
+                                              std::memory_order_acquire))
+                return true;
+        }
+        return false;
+    }
+    void Stage(const uint8_t* y, const uint8_t* u, const uint8_t* v,
+               int w, int h) {
+        if (m_worker) m_worker->StageFrame(y, u, v, w, h);
+    }
+    bool HasWorker() const { return m_worker != nullptr; }
+
+    // --- Switch machinery (pump thread, under g_subsMutex) ------------------
+    RendererLeg* Live()    { return m_live.get(); }
+    RendererLeg* Pending() { return m_pending.get(); }
+    SwitchState& Switch()  { return m_switch; }
+
+    // The pending leg was promoted by its first frame (the callback already
+    // made it the writer).
+    bool PendingPromoted() const {
+        return m_pending &&
+               RouteActive(m_route.load(std::memory_order_acquire)) == m_pending->Id();
+    }
+
+    // Install a freshly created pending leg as the pending route BEFORE it is
+    // subscribed, so its first frame can promote it.
+    void InstallPending(std::unique_ptr<RendererLeg> leg) {
+        m_pending = std::move(leg);
+        const uint32_t active = m_live ? m_live->Id() : 0;
+        m_route.store(MakeRoute(active, m_pending->Id()), std::memory_order_release);
+    }
+
+    // Withdraw the pending leg's claim. Returns false if it was promoted first
+    // (the caller must complete the swap instead of discarding it).
+    bool WithdrawPending() {
+        if (!m_pending) return true;
+        const uint32_t pid = m_pending->Id();
+        uint64_t r = m_route.load(std::memory_order_acquire);
+        for (;;) {
+            if (RouteActive(r) == pid) return false;          // already promoted
+            if (RoutePending(r) != pid) return true;           // not claimed
+            if (m_route.compare_exchange_weak(r, MakeRoute(RouteActive(r), 0),
+                                              std::memory_order_acq_rel,
+                                              std::memory_order_acquire))
+                return true;
+        }
+    }
+
+    // Swap: the promoted pending leg becomes the live leg. Returns the old live
+    // leg for the caller to destroy (quietly) after logging.
+    std::unique_ptr<RendererLeg> CommitPending(unsigned int newUser) {
+        std::unique_ptr<RendererLeg> old = std::move(m_live);
+        m_live   = std::move(m_pending);
+        m_userId = newUser;
+        // Isolated audio follows the video that is now on screen.
+        SetIsolatedAudioSinkUser(m_audioSink, m_userId);
+        // The new leg delivered before it was promoted: nothing to watch.
+        m_subscribeTick = 0;
+        return old;
+    }
+
+    // Discard a withdrawn pending leg (quiet destroy). Returns its user id so
+    // the caller can record the release.
+    unsigned int DiscardPending() {
+        unsigned int uid = 0;
+        if (m_pending) {
+            uid = m_pending->UserId();
+            m_pending->Destroy(true);
+            m_pending.reset();
+        }
+        return uid;
+    }
+
+    // Direct (single-leg) re-point of the live leg. Never writes a blank for
+    // our own unSubscribe. Returns the subscribe result; SDKERR_SUCCESS also
+    // for the follow-speaker sentinel, which deliberately does not subscribe.
+    ZOOM_SDK_NAMESPACE::SDKError RepointLive(unsigned int newUserId) {
+        if (!m_live || !m_live->HasRenderer()) {
+            // No renderer to re-point (the SDK destroyed it). Record the user
+            // so the switch converges; its first-frame deadline then retries
+            // through the gate with a fresh renderer.
+            m_userId = newUserId;
+            return ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS;
+        }
+        m_live->Unsubscribe(true);
+        m_userId = newUserId;
+        // Audio follows the video's user. For a follow-speaker source waiting
+        // on a speaker this is the sentinel, which matches no one.
+        SetIsolatedAudioSinkUser(m_audioSink, m_userId);
+
+        if (m_followActiveSpeaker && m_userId == ACTIVE_SPEAKER_SENTINEL) {
+            // Not subscribed by choice — stop the establishment clock so the
+            // ladder watchdog does not count this as a missing first frame.
+            m_live->MarkUnsubscribed();
+            m_subscribeTick = 0;
+            return ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS;
+        }
+
+        ZOOM_SDK_NAMESPACE::SDKError err = m_live->Subscribe(m_userId);
+        if (err != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
+            // A refused re-point is a WARN and a ladder trigger (the caller
+            // steps down and requeues).
+            char msg[192];
+            sprintf_s(msg,
+                "Video: LADDER source='%s' userId=%u re-point REFUSED at %s "
+                "(code=%d%s)",
+                m_sourceUuid.c_str(), m_userId, LadderRungName(m_rung),
+                (int)err,
+                err == ZOOM_SDK_NAMESPACE::SDKERR_WRONG_USAGE
+                    ? " WRONG_USAGE — over the meeting's resolution budget"
+                    : "");
+            LogWarn(msg);
+            m_subscribeTick = 0;   // caller recreates; no watchdog on a dead sub
+            return err;
+        }
+        // Fresh target, fresh establishment window for the MODE 3 watchdog.
+        m_subscribeTick = GetTickCount64();
+        return err;
+    }
+
+    // Live leg's delivery state for the same-userId gate: 1 delivered, 0 still
+    // establishing, -1 this source no longer has a renderer for uid.
+    int DeliveryStateFor(unsigned int uid) const {
+        if (m_pending && m_pending->UserId() == uid)
+            return m_pending->GotFirstFrame() ? 1 : 0;
+        if (m_live && m_live->UserId() == uid)
+            return m_live->GotFirstFrame() ? 1 : 0;
+        return -1;
+    }
+
+    // True while the live leg is putting a picture on screen.
+    bool LiveHasPicture(ULONGLONG now) const {
+        if (!m_live || !m_live->GotFirstFrame()) return false;
+        const ULONGLONG last = m_live->LastFrameTick();
+        return last != 0 && now >= last && now - last < kFrameStaleMs;
+    }
+
 public:
     // --- Resolution-ladder accessors (main/pump thread, under g_subsMutex) ---
     int          Rung() const { return m_rung; }
 
     // Establishment clock for the ladder's MODE 3 watchdog: GetTickCount64() at
-    // the moment subscribe() succeeded, or 0 when this subscription is not
-    // currently awaiting a first frame (never subscribed, deliberately skipped,
-    // already delivered, or already judged). Written and read only on the
-    // pump thread under g_subsMutex.
+    // the moment subscribe() succeeded on the live leg, or 0 when this
+    // subscription is not currently awaiting a first frame (never subscribed,
+    // deliberately skipped, already delivered, or already judged). Written and
+    // read only on the pump thread under g_subsMutex.
     ULONGLONG    SubscribeTick() const       { return m_subscribeTick; }
     void         ClearSubscribeTick()        { m_subscribeTick = 0; }
+
+    // The live leg has delivered since its last subscribe (MODE 3 / gate).
+    bool         LiveGotFirstFrame() const {
+        return m_live && m_live->GotFirstFrame();
+    }
 
 private:
     std::string  m_sourceUuid;
     unsigned int m_userId;
+    unsigned int m_desiredUser;
     bool         m_followActiveSpeaker = false;
 
     // Current ladder rung (index into kLadderRes/kLadderHeight). Set at
     // construction and never mutated — a step-down builds a NEW subscription at
     // the next rung through the pending-render gate rather than re-pointing this
-    // one, so the rung is immutable for the life of the object.
+    // one, so the rung is immutable for the life of the object. A switch's
+    // pending leg is created at this same rung.
     int          m_rung = 0;
     ULONGLONG    m_subscribeTick = 0;
-    ZOOM_SDK_NAMESPACE::IZoomSDKRenderer* m_renderer = nullptr;
     SharedMemoryWriter m_writer;
 
     // Token for this source's isolated-audio sink (engine-audio.h); 0 = none.
-    // Set in Start, re-pointed in Resubscribe, closed in TearDown: the same
-    // call sites (and locking) as the rest of this object's lifecycle.
+    // Set in Start, moved to the new user when a switch commits, closed in
+    // TearDown: the same call sites (and locking) as the rest of this object's
+    // lifecycle.
     uint64_t           m_audioSink = 0;
 
-    // Frame-scaler worker. Owns its own thread; SDK callback stages
-    // frames here. Lives only while the subscription is active.
+    // Frame-scaler worker. Owns its own thread; SDK callbacks stage frames
+    // here. Lives only while the subscription is active. Shared by both legs:
+    // only the writer leg stages into it.
     std::unique_ptr<FrameScalerWorker> m_worker;
 
-    // SDK-callback-only state; never read from outside that thread, so
-    // no synchronisation needed.
-    int                m_lastSrcW       = 0;  // last frame's width (0 = none yet)
-    int                m_lastSrcH       = 0;
-    unsigned int       m_loggedFailures = 0;  // bitfield from validation_failures
+    // Renderer legs. Pump thread under g_subsMutex (callbacks reach their own
+    // leg object, never these pointers).
+    std::unique_ptr<RendererLeg> m_live;
+    std::unique_ptr<RendererLeg> m_pending;
 
-    // Requested resolution height (720 / 1080), for the delivered-vs-requested
-    // log lines only — nothing reads it to make a decision. Written once in
-    // Start() before any frame can arrive, then read on the SDK callback
-    // thread, so it needs no synchronisation.
-    int                m_requestedHeight = 0;
+    // Which leg writes (see RouteActive/RoutePending). Written by the pump
+    // thread (Start, InstallPending, WithdrawPending) and by the pending leg's
+    // frame callback (TryPromote); read by every frame callback.
+    std::atomic<uint64_t> m_route{0};
 
-public:
-    // Delivery-established signal for the per-userId sequencing gate: set true
-    // on the FIRST frame the SDK routes to this renderer. Written (release) on
-    // the SDK callback thread, read (acquire) by ProcessPendingRenderers on the
-    // main thread — a lock-free cross-thread flag so the frame callback takes no
-    // mutex. Lifetime-safe: TearDown unSubscribe()s + destroyRenderer()s before
-    // the object destructs, so no callback races the read/free.
-    std::atomic<bool> m_gotFirstFrame{false};
+    SwitchState  m_switch;
 };
+
+// ---------------------------------------------------------------------------
+// RendererLeg out-of-line members (need the full ParticipantSubscription).
+// ---------------------------------------------------------------------------
+ZOOM_SDK_NAMESPACE::SDKError RendererLeg::Create(int rung, bool forSwitch) {
+    ZOOM_SDK_NAMESPACE::SDKError err =
+        ZOOM_SDK_NAMESPACE::createRenderer(&m_renderer, this);
+    if (err != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS || !m_renderer) {
+        char msg[128];
+        sprintf_s(msg, "Video: createRenderer failed: %d", (int)err);
+        LogError(msg);
+        m_renderer = nullptr;
+        return err != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS
+                   ? err : ZOOM_SDK_NAMESPACE::SDKERR_UNKNOWN;
+    }
+
+    // Set resolution from the subscription's ladder rung. A brand-new
+    // source is constructed at the tier's top rung, so the first attempt
+    // requests exactly what it always did (720p on Free, 1080p on paid);
+    // a lower rung is only ever reached after a failed attempt stepped it
+    // down and requeued.
+    //
+    // The return code used to be discarded, which cost us the one signal
+    // that separates "the meeting/account cannot carry this resolution"
+    // from "bandwidth dipped for this participant". A refusal here means
+    // the request was rejected outright and the SDK will deliver whatever
+    // it picked instead, so the delivered size logged on the first frame
+    // is the only thing that tells us what we actually got. Not fatal
+    // either way — we keep the subscription and report honestly, and it is
+    // deliberately NOT a ladder trigger: the ladder steps down on absence
+    // of delivery, never on small delivery.
+    m_requestedHeight = kLadderHeight[rung];
+    const ZOOM_SDK_NAMESPACE::SDKError resErr =
+        m_renderer->setRawDataResolution(kLadderRes[rung]);
+    {
+        char msg[256];
+        sprintf_s(msg,
+            "Video: source='%s' requested %dp, setRawDataResolution "
+            "returned %d (%s)",
+            m_owner->SourceUuid().c_str(), m_requestedHeight, (int)resErr,
+            resErr == ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS
+                ? "accepted" : "REFUSED — SDK will pick its own");
+        if (resErr != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) LogWarn(msg);
+        else if (forSwitch)                               LogToFile(msg);
+        else                                              LogInfo(msg);
+    }
+    return ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS;
+}
+
+ZOOM_SDK_NAMESPACE::SDKError RendererLeg::Subscribe(unsigned int userId) {
+    if (!m_renderer) return ZOOM_SDK_NAMESPACE::SDKERR_UNINITIALIZE;
+    // Fresh establishment window. Cleared BEFORE subscribe so the first frame
+    // of the new stream is never mistaken for one of the old.
+    m_gotFirstFrame.store(false, std::memory_order_release);
+    m_firstFrameTick.store(0, std::memory_order_release);
+    m_lastFrameTick.store(0, std::memory_order_release);
+    ZOOM_SDK_NAMESPACE::SDKError err =
+        m_renderer->subscribe(userId, ZOOM_SDK_NAMESPACE::RAW_DATA_TYPE_VIDEO);
+    if (err == ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
+        m_userId       = userId;
+        m_subscribedAt = GetTickCount64();
+    } else {
+        m_userId       = 0;
+        m_subscribedAt = 0;
+    }
+    return err;
+}
+
+void RendererLeg::Unsubscribe(bool quiet) {
+    if (!m_renderer) return;
+    if (quiet)
+        m_quietUntil.store(GetTickCount64() + kSelfUnsubQuietMs,
+                           std::memory_order_release);
+    m_renderer->unSubscribe();
+    m_userId       = 0;
+    m_subscribedAt = 0;
+}
+
+void RendererLeg::Destroy(bool quiet) {
+    if (quiet) m_retired.store(true, std::memory_order_release);
+    if (m_renderer) {
+        try {
+            m_renderer->unSubscribe();
+            ZOOM_SDK_NAMESPACE::destroyRenderer(m_renderer);
+        } catch (...) {
+            LogToFile("Video: exception during renderer teardown (ignored)");
+        }
+        m_renderer = nullptr;
+    }
+}
+
+// Called by the SDK on its internal thread. The callback validates the frame,
+// copies the planes into the worker's staging slot, and signals. The worker
+// thread libyuv-scales to the tier ceiling and writes the result to shared
+// memory. Keeping the SDK callback cheap is what stops Broadcaster-tier
+// multi-renderer setups from serialising past one frame's budget.
+void RendererLeg::onRawDataFrameReceived(YUVRawDataI420* data) {
+    // A leg we retired ourselves: its picture has been replaced.
+    if (m_retired.load(std::memory_order_acquire)) return;
+
+    const ULONGLONG now = GetTickCount64();
+    m_lastFrameTick.store(now, std::memory_order_release);
+    // Our own unSubscribe's quiet window ends at the next real frame.
+    m_quietUntil.store(0, std::memory_order_relaxed);
+
+    // Delivery is confirmed: this renderer is actually receiving frames.
+    // Signal the pump thread ONCE, on the 0->1 transition only, so the
+    // sequencing gate (and a pending switch) proceeds promptly instead of
+    // waiting for the poll tick. exchange() makes the post fire exactly once
+    // per subscribe (never per frame). PostMessageW is thread-safe from this
+    // SDK thread; the WM_TIMER poll is the fallback if a post is ever missed.
+    if (!m_gotFirstFrame.exchange(true, std::memory_order_acq_rel)) {
+        m_firstFrameTick.store(now, std::memory_order_release);
+        if (g_anchorWnd)
+            PostMessageW(g_anchorWnd, WM_FEEDS_PROCESS_RENDERERS, 0, 0);
+    }
+
+    if (!data || !m_owner->HasWorker()) return;
+
+    const uint8_t* y = (const uint8_t*)data->GetYBuffer();
+    const uint8_t* u = (const uint8_t*)data->GetUBuffer();
+    const uint8_t* v = (const uint8_t*)data->GetVBuffer();
+    const int      w = (int)data->GetStreamWidth();
+    const int      h = (int)data->GetStreamHeight();
+
+    // Defensive validation. Reject + log-once-per-type rather than
+    // forwarding a malformed frame and crashing the scaler.
+    if (w <= 0 || h <= 0) {
+        if (!(m_loggedFailures & validation_failures::ZERO_DIM)) {
+            char msg[256];
+            sprintf_s(msg,
+                "Video: source='%s' received frame with zero dimension "
+                "(%dx%d); dropping (logged once per renderer)",
+                m_owner->SourceUuid().c_str(), w, h);
+            LogWarn(msg);
+            m_loggedFailures |= validation_failures::ZERO_DIM;
+        }
+        return;
+    }
+    if (!y || !u || !v) {
+        if (!(m_loggedFailures & validation_failures::NULL_PLANE)) {
+            char msg[256];
+            sprintf_s(msg,
+                "Video: source='%s' received frame with null plane "
+                "buffer; dropping (logged once per renderer)",
+                m_owner->SourceUuid().c_str());
+            LogWarn(msg);
+            m_loggedFailures |= validation_failures::NULL_PLANE;
+        }
+        return;
+    }
+
+    // Make-before-break: a pending leg's frames are dropped until its first
+    // VALID frame, which promotes it to the writer in one compare-exchange.
+    // From that frame on, the old leg's frames are the ones dropped. The pump
+    // thread completes the swap (destroys the old renderer, moves audio) on
+    // the post above.
+    if (!m_owner->IsWriterLeg(m_id)) {
+        if (!m_owner->TryPromote(m_id)) return;
+    }
+
+    // Delivered-resolution visibility. INFO, not DEBUG: the engine's frame
+    // scaler normalises everything to the tier size before OBS sees it, so a
+    // participant delivering 720p is upscaled and looks like 1080p to every
+    // other part of the system — these two lines are the ONLY place the true
+    // delivered size is observable.
+    //
+    // Bounded by construction: one line on a renderer's first written frame,
+    // then one per actual change.
+    if (w != m_lastSrcW || h != m_lastSrcH) {
+        char msg[256];
+        if (m_lastSrcW == 0 && m_lastSrcH == 0) {
+            sprintf_s(msg,
+                "Video: source='%s' first frame %dx%d (requested %dp)%s",
+                m_owner->SourceUuid().c_str(), w, h, m_requestedHeight,
+                (h < m_requestedHeight) ? " — BELOW REQUEST" : "");
+        } else {
+            sprintf_s(msg,
+                "Video: frame dimensions changed for source='%s': "
+                "%dx%d -> %dx%d (requested %dp)",
+                m_owner->SourceUuid().c_str(), m_lastSrcW, m_lastSrcH, w, h,
+                m_requestedHeight);
+        }
+        LogInfo(msg);
+        m_lastSrcW = w;
+        m_lastSrcH = h;
+    }
+
+    m_owner->Stage(y, u, v, w, h);
+}
+
+void RendererLeg::onRawDataStatusChanged(RawDataStatus status) {
+    char msg[256];
+    sprintf_s(msg, "Video: source='%s' raw data status=%d",
+              m_owner->SourceUuid().c_str(), (int)status);
+    LogToFile(msg);
+
+    // RawData_Off means frames have stopped flowing (camera off, user
+    // left, host removed, network disconnect). Push a blank-sentinel
+    // slot so the plugin clears its OBS source instead of freezing on
+    // the last received frame. Recovery is automatic: when frames
+    // resume the SDK fires onRawDataFrameReceived again and the plugin
+    // renders the new slot normally.
+    //
+    // Only the WRITER leg may blank the source, and not inside the quiet
+    // window of our own re-point: a switch we started must never blank.
+    if (status != RawData_Off) return;
+    if (m_retired.load(std::memory_order_acquire)) return;
+    if (!m_owner->IsWriterLeg(m_id)) return;
+    const ULONGLONG quiet = m_quietUntil.load(std::memory_order_acquire);
+    if (quiet != 0 && GetTickCount64() < quiet) {
+        sprintf_s(msg,
+            "Video: source='%s' raw data off from our own re-point — not blanking",
+            m_owner->SourceUuid().c_str());
+        LogToFile(msg);
+        return;
+    }
+    m_owner->BlankSource();
+}
+
+void RendererLeg::onRendererBeDestroyed() {
+    // SDK destroyed our renderer (probably meeting ended). Push a blank
+    // sentinel before nulling the renderer pointer — defensive cover in case
+    // the SDK doesn't fire RawData_Off first on this path. The owner's writer
+    // is still valid here: this callback runs while the subscription is alive
+    // (either before TearDown starts, or synchronously inside destroyRenderer
+    // before the writer closes). A leg we retired ourselves, or a pending leg
+    // that never took over, does not blank.
+    LogToFile("Video: SDK destroyed renderer");
+    if (!m_retired.load(std::memory_order_acquire) && m_owner->IsWriterLeg(m_id))
+        m_owner->BlankSource();
+    m_renderer = nullptr;
+}
 
 // ---------------------------------------------------------------------------
 // Registry of active subscriptions. Keyed by source UUID.
@@ -823,7 +1155,7 @@ static std::mutex g_subsMutex;
 // same-user renderers; a burst feeds only one — and blind ~300ms pacing was
 // shown insufficient, leaving createRenderer=success with zero frames). So we do
 // NOT create same-userId renderer N+1 until renderer N confirms delivery by
-// actually receiving its first frame (m_gotFirstFrame), or a generous timeout
+// actually receiving its first frame (RendererLeg::GotFirstFrame), or a generous timeout
 // (kEstablishTimeoutMs) elapses — replicating the manual reselect, which
 // establishes one renderer in confirmed isolation. The gate is keyed on userId
 // (g_inflightByUser): different-userId entries never wait on each other and are
@@ -888,6 +1220,19 @@ static const UINT_PTR         kCameraOnDebounceTimerId = 2;
 static const UINT             kCameraOnDebounceMs      = 600;
 static std::set<unsigned int> g_cameraOnPending;   // userIds awaiting re-establish
 
+// When the engine last saw each user's video go OFF (Video_OFF or muted by
+// host). Written by NoteUserVideoOff on the SDK's video-listener thread, read
+// by the camera-on decision on the pump thread. Its own leaf mutex: nothing
+// else is ever taken while it is held, so it adds no lock-order edge beyond
+// g_subsMutex -> g_videoOffMutex.
+static std::mutex                           g_videoOffMutex;
+static std::map<unsigned int, ULONGLONG>    g_videoOffTickByUser;
+
+// When a switch last destroyed a renderer for each user (pump thread, under
+// g_subsMutex). Read by the switch and by the gate so a new renderer for that
+// user waits kReleaseSettleMs (see there).
+static std::map<unsigned int, ULONGLONG>    g_releaseTickByUser;
+
 void TearDownAllVideoSubscriptions() {
     std::lock_guard<std::mutex> lock(g_subsMutex);
     if (!g_subs.empty()) {
@@ -903,6 +1248,11 @@ void TearDownAllVideoSubscriptions() {
     g_rawRenderReady = false;
     g_pendingRenders.clear();
     g_inflightByUser.clear();     // no renderers in flight; next create is immediate
+    g_releaseTickByUser.clear();
+    {
+        std::lock_guard<std::mutex> offLock(g_videoOffMutex);
+        g_videoOffTickByUser.clear();
+    }
 }
 
 // Blank any subscriptions currently bound to the given user ID. Called
@@ -917,12 +1267,23 @@ void TearDownAllVideoSubscriptions() {
 void BlankSubscriptionsForUser(unsigned int userId) {
     std::lock_guard<std::mutex> lock(g_subsMutex);
     int blanked = 0;
+    bool switchTargetLeft = false;
     for (auto& kv : g_subs) {
         if (kv.second && kv.second->UserId() == userId) {
             kv.second->BlankSource();
             ++blanked;
         }
+        // A switch in progress TOWARD the departed user can never deliver.
+        // Flag it; the pump thread abandons it and lands the source in the
+        // same state as before (bound to that user, blanked).
+        if (kv.second && kv.second->Switch().active &&
+            kv.second->Switch().toUser == userId) {
+            kv.second->Switch().targetLeft = true;
+            switchTargetLeft = true;
+        }
     }
+    if (switchTargetLeft && g_anchorWnd)
+        PostMessageW(g_anchorWnd, WM_FEEDS_PROCESS_RENDERERS, 0, 0);
     if (blanked > 0) {
         char msg[128];
         sprintf_s(msg, "Video: blanked %d subscription(s) for departed user %u",
@@ -1023,6 +1384,404 @@ static void LadderStepDownLocked(const std::string& sourceId,
     EnqueuePendingRenderLocked(sourceId, uid, sub->FollowsActiveSpeaker(), next);
 }
 
+// ---------------------------------------------------------------------------
+// Switching an existing source to another user (make-before-break).
+//
+// Every re-point of an existing source — a manual dropdown change and an
+// [Active Speaker] retarget — sets the source's DESIRED user and lets the pump
+// thread reconcile it here. ISO feeds never re-point this way (their repoint
+// is a fresh renderer through the gate).
+//
+//   MAKE-BEFORE-BREAK (normal path). The live renderer keeps writing the old
+//   person while a second renderer (the pending leg) is created at the same
+//   rung and subscribed to the new user. Its frames are dropped until its first
+//   valid frame, which makes it the writer in the frame callback itself (one
+//   compare-exchange on the routing word); the pump thread then destroys the
+//   old renderer and moves isolated audio. The source is never blanked by a
+//   switch, and there is no plugin reopen in between.
+//
+//   FALLBACK (direct re-point of the single live renderer — the old
+//   behaviour, minus the self-inflicted blank). Taken when there is no live
+//   picture worth keeping (the old leg has no recent frame), when the target's
+//   camera is reported off (then the source blanks, as a camera-off person
+//   always has), for the follow-speaker "no one to show" sentinel, when the
+//   second renderer cannot be created or its subscribe is refused (for example
+//   WRONG_USAGE over the meeting's resolution budget), and when the target
+//   leaves mid-switch.
+//
+//   FAILURE. If the new renderer (either path) has not delivered within
+//   kSwitchFirstFrameMs, the pending leg is destroyed with the old person still
+//   on screen and the source is retried ONCE through the existing fresh-
+//   renderer gate (EnqueuePendingRenderLocked). That gate entry is the retry;
+//   a gate-built renderer is covered by the MODE 3 watchdog from there.
+//
+// Constraints kept: a second renderer for user U is created only when no other
+// renderer for U is still establishing (g_inflightByUser, the same gate the
+// queue uses), and not within kReleaseSettleMs of a switch destroying one for U.
+// A new desired user while a switch is pending replaces it. A source with a gate
+// entry queued is left to the gate (the entry's user is kept in step).
+//
+// All of this runs on the pump thread under g_subsMutex, except that
+// HandleParticipantSourceSubscribe (pipe thread, also under g_subsMutex) only
+// writes the desired user and posts WM_FEEDS_PROCESS_RENDERERS.
+// ---------------------------------------------------------------------------
+
+enum class VideoState { On, Off, Unknown };
+
+// SDK getter; pump thread. Unknown = no user record (left, or a roster that
+// has not caught up with a fresh join).
+static VideoState UserVideoState(unsigned int uid) {
+    if (ZOOM_SDK_NAMESPACE::IMeetingService* ms = GetMeetingService()) {
+        if (auto* pc = ms->GetMeetingParticipantsController()) {
+            if (auto* ui = pc->GetUserByUserID(uid))
+                return ui->IsVideoOn() ? VideoState::On : VideoState::Off;
+        }
+    }
+    return VideoState::Unknown;
+}
+
+static void NoteReleaseLocked(unsigned int uid, ULONGLONG now) {
+    if (uid > ACTIVE_SPEAKER_SENTINEL) g_releaseTickByUser[uid] = now;
+}
+
+static bool ReleaseSettlingLocked(unsigned int uid, ULONGLONG now) {
+    auto rel = g_releaseTickByUser.find(uid);
+    if (rel == g_releaseTickByUser.end()) return false;
+    if (now >= rel->second && now - rel->second < kReleaseSettleMs) return true;
+    g_releaseTickByUser.erase(rel);
+    return false;
+}
+
+// Is a gate entry queued for this source? If so, keep a specific-participant
+// entry's user in step with the newest request (follow entries are re-resolved
+// at drain anyway), so the gate never rebuilds the source on a stale pick.
+static bool SyncQueuedEntryLocked(const std::string& sourceId,
+                                  unsigned int desired, bool follow) {
+    for (auto& p : g_pendingRenders) {
+        if (p.sourceId != sourceId) continue;
+        p.followActiveSpeaker = follow;
+        if (!follow) p.userId = desired;
+        return true;
+    }
+    return false;
+}
+
+static ULONGLONG MsSince(ULONGLONG from, ULONGLONG to) {
+    return (from != 0 && to >= from) ? to - from : 0;
+}
+
+static void CompleteSwapLocked(const std::string& id,
+                               ParticipantSubscription* sub, ULONGLONG now) {
+    SwitchState& sw = sub->Switch();
+    const ULONGLONG first = sub->Pending() ? sub->Pending()->FirstFrameTick() : 0;
+    std::unique_ptr<RendererLeg> old = sub->CommitPending(sw.toUser);
+    unsigned int oldUid = 0;
+    if (old) {
+        oldUid = old->UserId();
+        old->Destroy(true);    // quiet: it can no longer blank the source
+        old.reset();
+        NoteReleaseLocked(oldUid, now);
+    }
+    char msg[512];
+    sprintf_s(msg,
+        "Video: switch source='%s' from=%u to=%u path=make-before-break "
+        "first_frame_ms=%llu old_renderer=released",
+        id.c_str(), sw.fromUser, sw.toUser,
+        (unsigned long long)MsSince(sw.requestTick, first ? first : now));
+    LogInfo(msg);
+    sw.active = false;
+}
+
+// Single-renderer re-point of the live leg (the fallback). Never blanks for our
+// own unSubscribe; blanks only when the person now shown has no video.
+static void DirectSwitchLocked(const std::string& id,
+                               ParticipantSubscription* sub, ULONGLONG now,
+                               const char* why) {
+    SwitchState& sw = sub->Switch();
+    sw.phase     = SwitchPhase::Direct;
+    sw.directWhy = why;
+
+    const ZOOM_SDK_NAMESPACE::SDKError err = sub->RepointLive(sw.toUser);
+
+    if (sw.toUser == ACTIVE_SPEAKER_SENTINEL) {
+        // [Active Speaker] with no one displayable: nothing to show.
+        sub->BlankSource();
+        char msg[512];
+        sprintf_s(msg,
+            "Video: switch source='%s' from=%u to=none path=fallback(%s) "
+            "— waiting for an active speaker, source blank",
+            id.c_str(), sw.fromUser, why);
+        LogInfo(msg);
+        sw.active = false;
+        return;
+    }
+    if (err != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
+        // Refused re-point: the ladder owns it from here (requeue at a lower
+        // rung through the gate), exactly as before.
+        sw.active = false;
+        LadderStepDownLocked(id, sub, "repoint_refused");
+        return;
+    }
+    // The target has no video (camera off, or gone): showing them means
+    // showing nothing — the same blank a camera-off person has always had.
+    if (std::strcmp(why, "target_video_off") == 0 ||
+        std::strcmp(why, "target_left") == 0)
+        sub->BlankSource();
+
+    sw.legSubTick = now;
+    char msg[512];
+    sprintf_s(msg,
+        "Video: switch source='%s' from=%u to=%u taking path=fallback(%s)",
+        id.c_str(), sw.fromUser, sw.toUser, why);
+    LogToFile(msg);
+}
+
+static void BeginSwitchLocked(const std::string& id,
+                              ParticipantSubscription* sub, ULONGLONG now) {
+    SwitchState& sw = sub->Switch();
+    sw             = SwitchState();
+    sw.active      = true;
+    sw.fromUser    = sub->UserId();
+    sw.toUser      = sub->DesiredUserId();
+    sw.requestTick = now;
+    sw.phase       = SwitchPhase::Deferred;
+
+    const char* direct = nullptr;
+    if (sw.toUser == ACTIVE_SPEAKER_SENTINEL)              direct = "no_speaker";
+    else if (UserVideoState(sw.toUser) == VideoState::Off) direct = "target_video_off";
+    else if (!sub->LiveHasPicture(now))                    direct = "no_live_picture";
+    if (direct) DirectSwitchLocked(id, sub, now, direct);
+}
+
+// Advance an active switch by one step. Pump thread, g_subsMutex held. Never
+// mutates g_subs (a retry only appends to g_pendingRenders).
+static void AdvanceSwitchLocked(const std::string& id,
+                                ParticipantSubscription* sub, ULONGLONG now) {
+    SwitchState& sw = sub->Switch();
+    if (!sw.active) return;
+    const unsigned int to = sw.toUser;
+
+    switch (sw.phase) {
+    case SwitchPhase::Deferred: {
+        if (sw.targetLeft) { DirectSwitchLocked(id, sub, now, "target_left"); return; }
+
+        const char* waitWhy = nullptr;
+        if (!g_rawRenderReady) {
+            waitWhy = "raw_render_not_ready";
+        } else {
+            // Same-userId sequencing gate: never create a renderer for `to`
+            // while another renderer for `to` is still establishing.
+            auto inf = g_inflightByUser.find(to);
+            if (inf != g_inflightByUser.end()) {
+                int state = -1;
+                auto sit = g_subs.find(inf->second.sourceId);
+                if (sit != g_subs.end() && sit->second)
+                    state = sit->second->DeliveryStateFor(to);
+                if (state == 0 && now - inf->second.createTick < kEstablishTimeoutMs)
+                    waitWhy = "same_user_establishing";
+                else
+                    g_inflightByUser.erase(inf);
+            }
+            if (!waitWhy && ReleaseSettlingLocked(to, now))
+                waitWhy = "release_settling";
+        }
+        if (waitWhy) {
+            if (now - sw.requestTick >= kSwitchFirstFrameMs) {
+                char msg[512];
+                sprintf_s(msg,
+                    "Video: switch source='%s' from=%u to=%u could not start a "
+                    "second renderer in %llums (%s) — re-pointing directly",
+                    id.c_str(), sw.fromUser, to,
+                    (unsigned long long)kSwitchFirstFrameMs, waitWhy);
+                LogWarn(msg);
+                DirectSwitchLocked(id, sub, now, "deferral_timeout");
+            } else if (!sw.loggedWait) {
+                sw.loggedWait = true;
+                char msg[512];
+                sprintf_s(msg,
+                    "Video: switch source='%s' to=%u waiting (%s)",
+                    id.c_str(), to, waitWhy);
+                LogToFile(msg);
+            }
+            return;
+        }
+
+        // Second renderer for the new user, at this source's rung.
+        auto leg = std::make_unique<RendererLeg>(sub, NextLegId());
+        ZOOM_SDK_NAMESPACE::SDKError err = leg->Create(sub->Rung(), true);
+        if (err != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
+            leg.reset();
+            char msg[512];
+            sprintf_s(msg,
+                "Video: switch source='%s' to=%u second renderer not created "
+                "(code=%d) — falling back to a direct re-point",
+                id.c_str(), to, (int)err);
+            LogInfo(msg);
+            DirectSwitchLocked(id, sub, now, "create_refused");
+            return;
+        }
+        // Claim the pending route BEFORE subscribing, so the first frame can
+        // promote this leg the instant it arrives.
+        sub->InstallPending(std::move(leg));
+        err = sub->Pending()->Subscribe(to);
+        if (err != ZOOM_SDK_NAMESPACE::SDKERR_SUCCESS) {
+            // Never subscribed, so it cannot have been promoted.
+            sub->WithdrawPending();
+            sub->DiscardPending();
+            const bool budget = (err == ZOOM_SDK_NAMESPACE::SDKERR_WRONG_USAGE);
+            char msg[512];
+            sprintf_s(msg,
+                "Video: switch source='%s' to=%u second renderer subscribe "
+                "REFUSED at %s (code=%d%s) — falling back to a direct re-point",
+                id.c_str(), to, LadderRungName(sub->Rung()), (int)err,
+                budget ? " WRONG_USAGE, over the meeting's resolution budget" : "");
+            LogInfo(msg);
+            DirectSwitchLocked(id, sub, now,
+                               budget ? "budget_wrong_usage" : "subscribe_refused");
+            return;
+        }
+        // Same-userId siblings now wait for this renderer's first frame.
+        g_inflightByUser[to] = { id, now };
+        sw.phase      = SwitchPhase::MakeBeforeBreak;
+        sw.legSubTick = now;
+        char msg[512];
+        sprintf_s(msg,
+            "Video: switch source='%s' from=%u to=%u second renderer subscribed "
+            "at %s; old renderer stays live until its first frame",
+            id.c_str(), sw.fromUser, to, LadderRungName(sub->Rung()));
+        LogToFile(msg);
+        return;
+    }
+
+    case SwitchPhase::MakeBeforeBreak: {
+        if (sub->PendingPromoted()) { CompleteSwapLocked(id, sub, now); return; }
+        const bool timedOut = (now - sw.legSubTick >= kSwitchFirstFrameMs);
+        if (!sw.targetLeft && !timedOut) return;
+
+        // Withdraw the pending leg. If its first frame won the race it is
+        // already the writer: finish the swap instead.
+        if (!sub->WithdrawPending()) { CompleteSwapLocked(id, sub, now); return; }
+        NoteReleaseLocked(sub->DiscardPending(), now);
+
+        if (sw.targetLeft) {
+            char msg[512];
+            sprintf_s(msg,
+                "Video: switch source='%s' from=%u to=%u abandoned: target left "
+                "the meeting",
+                id.c_str(), sw.fromUser, to);
+            LogInfo(msg);
+            DirectSwitchLocked(id, sub, now, "target_left");
+            return;
+        }
+        if (UserVideoState(to) != VideoState::On) {
+            char msg[512];
+            sprintf_s(msg,
+                "Video: switch FAILED source='%s' from=%u to=%u "
+                "path=make-before-break: no first frame in %llums and the "
+                "target's camera is off — showing them as camera-off",
+                id.c_str(), sw.fromUser, to,
+                (unsigned long long)kSwitchFirstFrameMs);
+            LogWarn(msg);
+            DirectSwitchLocked(id, sub, now, "target_video_off");
+            return;
+        }
+        char msg[512];
+        sprintf_s(msg,
+            "Video: switch FAILED source='%s' from=%u to=%u "
+            "path=make-before-break: no first frame in %llums; second renderer "
+            "destroyed, userId=%u stays on screen, retrying once with a fresh "
+            "renderer",
+            id.c_str(), sw.fromUser, to,
+            (unsigned long long)kSwitchFirstFrameMs, sw.fromUser);
+        LogWarn(msg);
+        sw.active = false;
+        EnqueuePendingRenderLocked(id, to, sub->FollowsActiveSpeaker(), sub->Rung());
+        return;
+    }
+
+    case SwitchPhase::Direct: {
+        if (sub->LiveGotFirstFrame()) {
+            const ULONGLONG first = sub->Live()->FirstFrameTick();
+            char msg[512];
+            sprintf_s(msg,
+                "Video: switch source='%s' from=%u to=%u path=fallback(%s) "
+                "first_frame_ms=%llu old_renderer=none (single renderer "
+                "re-pointed)",
+                id.c_str(), sw.fromUser, to, sw.directWhy,
+                (unsigned long long)MsSince(sw.requestTick, first ? first : now));
+            LogInfo(msg);
+            sw.active = false;
+            return;
+        }
+        if (now - sw.legSubTick < kSwitchFirstFrameMs) return;
+
+        sw.active = false;
+        sub->ClearSubscribeTick();   // judged here; MODE 3 must not double-act
+        if (UserVideoState(to) != VideoState::On) {
+            // Camera off or gone: nothing to deliver. The camera-on path owns
+            // recovery; make sure the source shows them as camera-off.
+            sub->BlankSource();
+            char msg[512];
+            sprintf_s(msg,
+                "Video: switch source='%s' from=%u to=%u path=fallback(%s): no "
+                "frame in %llums, target camera off or gone — camera-on path "
+                "owns recovery",
+                id.c_str(), sw.fromUser, to, sw.directWhy,
+                (unsigned long long)kSwitchFirstFrameMs);
+            LogInfo(msg);
+            return;
+        }
+        char msg[512];
+        sprintf_s(msg,
+            "Video: switch FAILED source='%s' from=%u to=%u path=fallback(%s): "
+            "no first frame in %llums; retrying once with a fresh renderer",
+            id.c_str(), sw.fromUser, to, sw.directWhy,
+            (unsigned long long)kSwitchFirstFrameMs);
+        LogWarn(msg);
+        EnqueuePendingRenderLocked(id, to, sub->FollowsActiveSpeaker(), sub->Rung());
+        return;
+    }
+    }
+}
+
+// Bring one source's switch state in line with its desired user. Pump thread,
+// g_subsMutex held. Cheap no-op in the steady state.
+static void ReconcileSwitchLocked(const std::string& id,
+                                  ParticipantSubscription* sub, ULONGLONG now) {
+    SwitchState& sw = sub->Switch();
+    const unsigned int desired = sub->DesiredUserId();
+
+    if (sw.active && desired != sw.toUser) {
+        // A newer request replaces the pending one.
+        char msg[512];
+        sprintf_s(msg,
+            "Video: switch REPLACED source='%s' from=%u to=%u after %llums "
+            "by to=%u",
+            id.c_str(), sw.fromUser, sw.toUser,
+            (unsigned long long)MsSince(sw.requestTick, now), desired);
+        LogInfo(msg);
+        if (sub->Pending()) {
+            if (!sub->WithdrawPending()) {
+                CompleteSwapLocked(id, sub, now);   // it won the race; keep it
+            } else {
+                NoteReleaseLocked(sub->DiscardPending(), now);
+            }
+        }
+        // A Direct switch already re-pointed the live leg to sw.toUser; the
+        // next switch simply starts from there.
+        sw.active = false;
+    }
+
+    if (!sw.active && desired != sub->UserId()) {
+        // A gate entry already queued for this source will rebuild it with the
+        // desired user; do not build a second renderer it would throw away.
+        if (SyncQueuedEntryLocked(id, desired, sub->FollowsActiveSpeaker()))
+            return;
+        BeginSwitchLocked(id, sub, now);
+    }
+    if (sw.active) AdvanceSwitchLocked(id, sub, now);
+}
+
 // participant_source_subscribe — plugin requests video for a source.
 //   {"type":"participant_source_subscribe",
 //    "source_id":"<uuid>",
@@ -1032,9 +1791,11 @@ static void LadderStepDownLocked(const std::string& sourceId,
 // whoever is currently the active speaker — subscribe to the current
 // speaker now (if known) and re-point on speaker changes.
 //
-// If a subscription for this source already exists, we reuse the renderer
-// and just re-point it at the new user. Cheaper than tear-down + recreate,
-// and avoids a brief black-frame gap when the user changes the dropdown.
+// If a subscription for this source already exists, this is a switch: the
+// desired user is recorded here and the pump thread performs it make-before-
+// break (see "Switching an existing source" above), so the old person stays on
+// screen until the new person's first frame. No SDK call runs on this (pipe)
+// thread for a switch.
 void HandleParticipantSourceSubscribe(const std::string& json) {
     std::string sourceId = JsonExtractString(json, "source_id");
     uint32_t    userId   = JsonExtractUint(json, "participant_id");
@@ -1057,7 +1818,7 @@ void HandleParticipantSourceSubscribe(const std::string& json) {
 
     // For follow-active-speaker subscriptions, subscribe to the target
     // engine-speaker.cpp resolved. It is the sentinel when no one is
-    // displayable yet, and Start()/Resubscribe() then skip the SDK subscribe
+    // displayable yet, and Start() / the switch then skip the SDK subscribe
     // until RetargetFollowSources re-points us. A specific-participant
     // subscription uses its own userId and never reads active-speaker state.
     unsigned int actualUserId = followActiveSpeaker
@@ -1066,24 +1827,47 @@ void HandleParticipantSourceSubscribe(const std::string& json) {
 
     auto it = g_subs.find(sourceId);
     if (it != g_subs.end()) {
-        // Carry the follow-mode flag through. Resubscribe() re-points the
-        // user but deliberately leaves m_followActiveSpeaker alone (it's
-        // also called from RetargetFollowSources' loop,
-        // where the flag must not change). So if the plugin's dropdown
-        // was switched into [Active Speaker] on an existing subscription,
-        // this is where the follow flag flips on; switching to a specific
-        // user flips it off. Without this line the source would stay
-        // pointed at its initial user forever (the retarget loop checks
-        // FollowsActiveSpeaker() and skips subs whose flag is stale).
+        // Carry the follow-mode flag through. The switch machinery re-points
+        // the user but deliberately leaves m_followActiveSpeaker alone (it
+        // also serves RetargetFollowSources' loop, where the flag must not
+        // change). So if the plugin's dropdown was switched into
+        // [Active Speaker] on an existing subscription, this is where the
+        // follow flag flips on; switching to a specific user flips it off.
+        // Without this line the source would stay pointed at its initial user
+        // forever (the retarget loop checks FollowsActiveSpeaker() and skips
+        // subs whose flag is stale).
         it->second->SetFollowsActiveSpeaker(followActiveSpeaker);
 
-        // Existing subscription — just switch the user. A refused re-point is
-        // a ladder trigger: step down and requeue rather than leaving a live
-        // renderer pointed at a user it will never receive frames for.
-        if (!it->second->Resubscribe(actualUserId)) {
-            LadderStepDownLocked(sourceId, it->second.get(), "repoint_refused");
-            return;
+        // Existing subscription — record the switch; the pump thread performs
+        // it (ReconcileSwitchLocked from ProcessPendingRenderers). A queued
+        // gate entry for this source is kept in step so it cannot rebuild the
+        // source on the previous pick.
+        ParticipantSubscription* sub = it->second.get();
+        sub->SetDesiredUser(actualUserId);
+        const bool queued =
+            SyncQueuedEntryLocked(sourceId, actualUserId, followActiveSpeaker);
+
+        // Re-picking [Active Speaker] on a source that already shows the
+        // target used to re-point its renderer in place, which doubled as the
+        // operator's "kick a stuck source" gesture. Keep that recovery, but
+        // only where it is needed: a source that is not receiving frames gets
+        // a fresh renderer through the gate; a healthy one is left alone (no
+        // flash).
+        const ULONGLONG now = GetTickCount64();
+        if (!queued && followActiveSpeaker &&
+            actualUserId != ACTIVE_SPEAKER_SENTINEL &&
+            actualUserId == sub->UserId() && !sub->Switch().active &&
+            !sub->LiveHasPicture(now)) {
+            char msg[256];
+            sprintf_s(msg,
+                "Video: [Active Speaker] re-pick on source='%s' (userId=%u) "
+                "that is not receiving frames — rebuilding with a fresh renderer",
+                sourceId.c_str(), actualUserId);
+            LogInfo(msg);
+            EnqueuePendingRenderLocked(sourceId, actualUserId, true, sub->Rung());
         }
+        if (g_anchorWnd)
+            PostMessageW(g_anchorWnd, WM_FEEDS_PROCESS_RENDERERS, 0, 0);
 
         uint32_t pid = GetCurrentProcessId();
         char resp[512];
@@ -1196,14 +1980,17 @@ void ProcessPendingRenderers() {
             const ULONGLONG elapsed = now - inf->second.createTick;
             bool confirmed = false, timedOut = false;
             auto sit = g_subs.find(inf->second.sourceId);
-            if (sit != g_subs.end() && sit->second) {
-                if (sit->second->m_gotFirstFrame.load(std::memory_order_acquire))
-                    confirmed = true;
-                else if (elapsed >= kEstablishTimeoutMs)
-                    timedOut = true;
+            // The in-flight renderer may be a source's live leg or a switch's
+            // pending leg; DeliveryStateFor checks whichever is on uid.
+            const int state = (sit != g_subs.end() && sit->second)
+                                  ? sit->second->DeliveryStateFor(uid) : -1;
+            if (state == 1) {
+                confirmed = true;
+            } else if (state == 0) {
+                if (elapsed >= kEstablishTimeoutMs) timedOut = true;
             } else {
-                // The in-flight renderer is gone (replaced/unsubscribed) — this
-                // userId is no longer establishing; free it.
+                // The in-flight renderer is gone (replaced/unsubscribed/switched
+                // away) — this userId is no longer establishing; free it.
                 confirmed = true;
             }
 
@@ -1220,6 +2007,11 @@ void ProcessPendingRenderers() {
                 continue;
             }
         }
+
+        // A switch just destroyed a renderer for this user (a failed switch's
+        // retry lands here moments after its pending leg was discarded): give
+        // the SDK's asynchronous release one tick before creating another.
+        if (ReleaseSettlingLocked(uid, now)) { ++i; continue; }
 
         // uid is free — produce a FRESH renderer: destroy any existing
         // subscription for this source first (a rejoin's kept renderer is stale),
@@ -1315,6 +2107,13 @@ void ProcessPendingRenderers() {
         }
     }
 
+    // Switches: start, advance, complete, fail or replace each source's switch
+    // toward its desired user. Runs after the gate loop (which may have just
+    // rebuilt a source) and never mutates g_subs itself.
+    for (auto& kv : g_subs) {
+        if (kv.second) ReconcileSwitchLocked(kv.first, kv.second.get(), now);
+    }
+
     // -----------------------------------------------------------------------
     // MODE 3 watchdog — subscribed, camera ON, but no first frame ever arrived.
     //
@@ -1344,10 +2143,13 @@ void ProcessPendingRenderers() {
         for (auto& kv : g_subs) {
             ParticipantSubscription* s = kv.second.get();
             if (!s) continue;
+            // A switch in progress has its own (shorter) first-frame deadline
+            // and retry; it clears the tick when it judges.
+            if (s->Switch().active) continue;
 
             const ULONGLONG tick = s->SubscribeTick();
             if (tick == 0) continue;                    // not awaiting a first frame
-            if (s->m_gotFirstFrame.load(std::memory_order_acquire)) {
+            if (s->LiveGotFirstFrame()) {
                 s->ClearSubscribeTick();                // delivered — stop watching
                 continue;
             }
@@ -1391,9 +2193,16 @@ void ProcessPendingRenderers() {
     // first frame also posts WM_FEEDS_PROCESS_RENDERERS directly, so the common
     // case doesn't wait for a tick.) Owned here so it's only touched on the
     // main thread.
+    //
+    // Switches are watched from this tick too, so a switch in progress (or a
+    // desired user not yet acted on) keeps it armed: a re-point that never
+    // delivers is always judged, whichever path it took. Before this, a
+    // re-point stamped the MODE 3 clock without arming the timer.
     bool ladderWatchPending = false;
     for (const auto& kv : g_subs) {
-        if (kv.second && kv.second->SubscribeTick() != 0) {
+        if (!kv.second) continue;
+        if (kv.second->SubscribeTick() != 0 || kv.second->Switch().active ||
+            kv.second->DesiredUserId() != kv.second->UserId()) {
             ladderWatchPending = true;
             break;
         }
@@ -1411,31 +2220,89 @@ void ProcessPendingRenderers() {
     }
 }
 
-// Re-establish every source currently bound to userId through the SAME
-// delivery-gated recreate path a rejoin uses: enqueue each into the gate, which
-// does g_subs.erase + source_texture_released (Fix 2) + a fresh, first-frame-
-// confirmed Start. Caller MUST hold g_subsMutex (mirrors EnqueuePendingRenderLocked).
-// Scoped strictly to this participant's sources — not others, not all sources —
-// with each source's follow-active-speaker flag preserved. When a camera turns
-// on, this recovers renderers left created-but-unfed while it was off.
-static void ReestablishSourcesForUserLocked(unsigned int userId) {
-    for (auto& kv : g_subs) {
-        if (kv.second && kv.second->UserId() == userId) {
-            // Preserve the source's CURRENT rung rather than resetting to the
-            // tier top. A camera toggle is not new information about the
-            // meeting's resolution budget, so re-asking for a rung that already
-            // failed would just fail again — and on a camera that flickers it
-            // would ladder down, spring back up, and fail once per toggle. A
-            // source only climbs back to full resolution on a deliberate fresh
-            // start (recreate / rejoin / manual reselect).
-            EnqueuePendingRenderLocked(kv.first, userId,
-                                       kv.second->FollowsActiveSpeaker(),
-                                       kv.second->Rung());
-        }
+// Camera-on decision for one user, when the debounce fires. Re-establishes a
+// source showing userId through the SAME delivery-gated recreate path a rejoin
+// uses (enqueue into the gate: g_subs.erase + source_texture_released + a
+// fresh, first-frame-confirmed Start) ONLY when that source actually needs it:
+//
+//   video_off_seen  the engine saw this user's video go OFF after the source's
+//                   last frame (or, with no frame yet, after its subscribe):
+//                   a real camera off -> on, the case this path exists for,
+//                   which can leave a renderer created-but-unfed.
+//   no_frame        the source has had no frame for kFrameStaleMs (or none
+//                   since a subscribe that long ago): it is not receiving.
+//
+// A Video_ON for a user whose source is receiving frames normally is ignored:
+// Zoom also reports Video_ON for a participant whose camera never went off
+// (seen for an HD participant shortly after we subscribe to them), and
+// rebuilding a healthy source then is a visible flicker for nothing. A source
+// with a switch in progress is left to the switch.
+//
+// Caller MUST hold g_subsMutex. Logs one INFO line per user per debounce when
+// any source shows them.
+static void DecideCameraOnLocked(unsigned int userId, ULONGLONG now) {
+    ULONGLONG offTick = 0;
+    {
+        std::lock_guard<std::mutex> offLock(g_videoOffMutex);
+        auto it = g_videoOffTickByUser.find(userId);
+        if (it != g_videoOffTickByUser.end()) offTick = it->second;
     }
+
+    int matched = 0, rebuiltOff = 0, rebuiltStale = 0;
+    int skippedLive = 0, skippedSwitch = 0;
+    ULONGLONG newestAge = ~0ull;
+    for (auto& kv : g_subs) {
+        ParticipantSubscription* s = kv.second.get();
+        if (!s || s->UserId() != userId) continue;
+        ++matched;
+        if (s->Switch().active) { ++skippedSwitch; continue; }
+
+        RendererLeg* live = s->Live();
+        ULONGLONG ref = 0;
+        if (live) ref = live->LastFrameTick() ? live->LastFrameTick()
+                                              : live->SubscribedAt();
+        const bool offSince = (offTick != 0 && offTick >= ref);
+        const bool stale    = (ref == 0 || now < ref || now - ref >= kFrameStaleMs);
+        if (!offSince && !stale) {
+            ++skippedLive;
+            const ULONGLONG age = now - ref;
+            if (age < newestAge) newestAge = age;
+            continue;
+        }
+        if (offSince) ++rebuiltOff; else ++rebuiltStale;
+        // Preserve the source's CURRENT rung rather than resetting to the
+        // tier top. A camera toggle is not new information about the
+        // meeting's resolution budget, so re-asking for a rung that already
+        // failed would just fail again — and on a camera that flickers it
+        // would ladder down, spring back up, and fail once per toggle. A
+        // source only climbs back to full resolution on a deliberate fresh
+        // start (recreate / rejoin / manual reselect).
+        EnqueuePendingRenderLocked(kv.first, userId, s->FollowsActiveSpeaker(),
+                                   s->Rung());
+    }
+
+    char msg[320];
+    if (matched == 0) {
+        sprintf_s(msg, "Video: camera-on userId=%u: no source shows them", userId);
+        LogToFile(msg);
+        return;
+    }
+    char ageStr[32] = "n/a";
+    if (newestAge != ~0ull)
+        sprintf_s(ageStr, "%llums", (unsigned long long)newestAge);
+    sprintf_s(msg,
+        "Video: camera-on userId=%u: %s — rebuilt=%d (video_off_seen=%d "
+        "no_frame_%llums=%d) skipped_receiving=%d (last frame %s ago) "
+        "skipped_switching=%d",
+        userId,
+        (rebuiltOff + rebuiltStale) > 0 ? "REBUILDING" : "ignored, source(s) receiving frames",
+        rebuiltOff + rebuiltStale, rebuiltOff,
+        (unsigned long long)kFrameStaleMs, rebuiltStale,
+        skippedLive, ageStr, skippedSwitch);
+    LogInfo(msg);
 }
 
-// Debounce fired (main thread): re-establish all pending userIds, then clear.
+// Debounce fired (main thread): decide for every pending userId, then clear.
 // KillTimer at the top makes the (periodic) debounce timer one-shot per settle.
 static void ProcessCameraOnDebounce() {
     if (g_anchorWnd) KillTimer(g_anchorWnd, kCameraOnDebounceTimerId);
@@ -1446,8 +2313,18 @@ static void ProcessCameraOnDebounce() {
     if (users.empty()) return;
 
     std::lock_guard<std::mutex> lock(g_subsMutex);
+    const ULONGLONG now = GetTickCount64();
     for (unsigned int uid : users)
-        ReestablishSourcesForUserLocked(uid);
+        DecideCameraOnLocked(uid, now);
+}
+
+// SDK video-listener thread: a participant's video went off (Video_OFF or
+// muted by host). Recorded for the camera-on decision. Leaf lock only; no
+// g_subsMutex, no SDK call.
+void NoteUserVideoOff(unsigned int userId) {
+    if (userId == 0) return;
+    std::lock_guard<std::mutex> offLock(g_videoOffMutex);
+    g_videoOffTickByUser[userId] = GetTickCount64();
 }
 
 // Main-thread entry from WM_FEEDS_CAMERA_ON (posted by the video listener on a
@@ -1487,7 +2364,7 @@ void NotifyRawRenderReady() {
 // evaluation (see engine-speaker.h). Deciding WHO to show — the Feeds-user and
 // camera-off filters — happens there; this only applies the result.
 //
-// Level-triggered: re-points every follow-speaker source whose current user
+// Level-triggered: re-points every follow-speaker source whose desired user
 // differs from the resolved target, rather than acting only when the target
 // changes, so a follow source left on a stale user by any path converges on
 // the next evaluation. A source already on the target is not touched, so a
@@ -1505,23 +2382,36 @@ FollowRetargetResult RetargetFollowSources() {
     const unsigned int target = GetResolvedActiveSpeakerTarget();
     result.target = target;
 
-    // A refused re-point is a ladder trigger, and it is handled by REQUEUEING
-    // (LadderStepDownLocked touches g_pendingRenders, never g_subs) — an inline
-    // destroy/recreate here would mutate the very container this loop is walking.
+    // Each follow source's desired user becomes the target and its switch is
+    // reconciled inline (make-before-break; see "Switching an existing
+    // source"). A refused re-point is a ladder trigger, and it is handled by
+    // REQUEUEING (LadderStepDownLocked touches g_pendingRenders, never g_subs)
+    // — an inline destroy/recreate here would mutate the very container this
+    // loop is walking.
+    const ULONGLONG now = GetTickCount64();
+    bool switching = false;
     for (auto& kv : g_subs) {
         ParticipantSubscription* s = kv.second.get();
         if (!s || !s->FollowsActiveSpeaker()) continue;
         ++result.follow;
 
-        if (s->UserId() != target) {
+        if (s->DesiredUserId() != target) {
             ++result.repointed;
-            if (!s->Resubscribe(target))
-                LadderStepDownLocked(kv.first, s, "repoint_refused");
+            s->SetDesiredUser(target);
         }
+        ReconcileSwitchLocked(kv.first, s, now);
+        if (s->Switch().active) switching = true;
 
         if (!result.bound.empty()) result.bound += ",";
         result.bound += kv.first + "=" + std::to_string(s->UserId());
+        if (s->Switch().active)
+            result.bound += "->" + std::to_string(s->Switch().toUser);
     }
+
+    // A switch in progress is judged from the renderer tick: make sure it is
+    // armed even if nothing else is queued.
+    if (switching && g_anchorWnd)
+        PostMessageW(g_anchorWnd, WM_FEEDS_PROCESS_RENDERERS, 0, 0);
 
     if (result.repointed > 0) {
         char msg[160];

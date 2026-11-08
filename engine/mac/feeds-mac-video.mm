@@ -33,8 +33,10 @@
 //
 // The SDK's frame callback thread touches exactly one thing: a FrameSink, held
 // by the renderer's delegate through a shared_ptr, whose shared-memory writer
-// carries its own mutex. It never reads the registry, so it can never be
-// holding a lock that the main thread needs.
+// carries its own mutex. (A participant renderer also has its own per-renderer
+// FrameSink, and shares a lock-free routing word with the source's output sink
+// for make-before-break switching; no lock beyond the writer's.) It never reads
+// the registry, so it can never be holding a lock that the main thread needs.
 //
 // That split is not tidiness, it is the fix for a real deadlock. destroyRender
 // invokes onRendererBeDestroyed SYNCHRONOUSLY on the calling thread, and it can
@@ -433,6 +435,32 @@ struct FrameSink {
     // only, like the fields above, and grown once rather than per frame.
     std::vector<uint8_t> evenPack;
 
+    // ── Participant renderer legs (make-before-break switching) ─────────────
+    // A participant source's OUTPUT sink (writer + scaler) can be fed by two
+    // renderers for a moment during a switch: the live one and a pending one
+    // subscribed to the new user. Each renderer then has its own small
+    // FrameSink holding only its per-renderer state (the fields above plus
+    // these), and the output sink's `route` says whose frames are written.
+    // Screenshare does not use any of this: its delegate passes no leg, and
+    // its one sink is both output and per-renderer state, exactly as before.
+    //
+    // route (output sink only): low 32 bits = the leg id whose frames are
+    // written, high 32 bits = a pending leg id whose first frame may take
+    // over. Written by the main queue and by a pending leg's frame callback
+    // (one compare-exchange each); read by every frame callback. Lock-free on
+    // purpose: the frame thread must never wait on anything the main queue
+    // holds across destroyRender.
+    std::atomic<uint64_t> route{0};
+
+    // Per-leg (leg sinks only). legId is set before the renderer exists and
+    // never changes. The atomics are written on the frame-callback thread and
+    // read on the main queue (quietUntilMs and retired the other way round).
+    uint32_t              legId = 0;
+    std::atomic<uint64_t> firstFrameMs{0};
+    std::atomic<uint64_t> lastFrameMs{0};
+    std::atomic<uint64_t> quietUntilMs{0};   // our own unSubscribe: no blank
+    std::atomic<bool>     retired{false};    // we retired this renderer
+
     // The scaler worker, and the reason this member is LAST.
     //
     // Members destruct in reverse declaration order, so declaring the worker
@@ -454,10 +482,60 @@ enum : unsigned int {
 // timeout. Defined below; declared here because the frame path calls it.
 void NotifyFirstFrame();
 
-void SinkOnFrame(const std::shared_ptr<FrameSink>& sink,
+// Switch timings — the same values and reasons as engine-video.cpp (see the
+// notes on kSwitchFirstFrameMs, kReleaseSettleMs, kSelfUnsubQuietMs and
+// kFrameStaleMs there).
+const uint64_t kSwitchFirstFrameMs = 3000;
+const uint64_t kReleaseSettleMs    = 300;
+const uint64_t kSelfUnsubQuietMs   = 1000;
+const uint64_t kFrameStaleMs       = 1000;
+const uint64_t kCameraOnDebounceMs = 600;
+
+inline uint32_t RouteActive(uint64_t r)  { return (uint32_t)(r & 0xffffffffu); }
+inline uint32_t RoutePending(uint64_t r) { return (uint32_t)(r >> 32); }
+inline uint64_t MakeRoute(uint32_t active, uint32_t pending)
+{
+    return (uint64_t)active | ((uint64_t)pending << 32);
+}
+
+uint32_t g_nextLegId = 1;   // main queue only
+uint32_t NextLegId()
+{
+    uint32_t id = g_nextLegId++;
+    if (id == 0) id = g_nextLegId++;
+    return id;
+}
+
+// A pending leg's first valid frame: become the writer if it is still the
+// pending leg. Frame-callback thread.
+bool TryPromote(FrameSink* out, uint32_t legId)
+{
+    uint64_t r = out->route.load(std::memory_order_acquire);
+    while (RoutePending(r) == legId) {
+        if (out->route.compare_exchange_weak(r, MakeRoute(legId, 0),
+                                             std::memory_order_acq_rel,
+                                             std::memory_order_acquire))
+            return true;
+    }
+    return false;
+}
+
+// `out` is the sink frames are written through; `st` holds this renderer's own
+// state. For screenshare they are the same object (no routing). For a
+// participant leg, frames are written only while this leg is the route's
+// active leg, and a pending leg's first valid frame promotes it.
+void SinkOnFrame(const std::shared_ptr<FrameSink>& out, FrameSink* st,
                  ZoomSDKYUVRawDataI420* data)
 {
-    if (!sink || !data) return;
+    if (!out || !st || !data) return;
+    FrameSink* sink = st;
+    const bool isLeg = (st != out.get());
+    if (isLeg) {
+        if (st->retired.load(std::memory_order_acquire)) return;
+        st->lastFrameMs.store(NowMs(), std::memory_order_release);
+        // Our own unSubscribe's quiet window ends at the next real frame.
+        st->quietUntilMs.store(0, std::memory_order_relaxed);
+    }
 
     const int w = (int)[data getStreamWidth];
     const int h = (int)[data getStreamHeight];
@@ -483,6 +561,15 @@ void SinkOnFrame(const std::shared_ptr<FrameSink>& sink,
         return;
     }
 
+    // Make-before-break: a pending leg's frames are dropped until its first
+    // VALID frame promotes it to the writer; from then on the old leg's frames
+    // are the ones dropped. The main queue finishes the swap (destroys the old
+    // renderer) on the NotifyFirstFrame hop below.
+    if (isLeg &&
+        RouteActive(out->route.load(std::memory_order_acquire)) != st->legId &&
+        !TryPromote(out.get(), st->legId))
+        return;
+
     // The one undocumented unknown in the feasibility plan was which thread the
     // SDK delivers frames on, because everything else it does arrives on the
     // main run loop. Answer it in the log, once per subscription, rather than
@@ -490,6 +577,7 @@ void SinkOnFrame(const std::shared_ptr<FrameSink>& sink,
     // from whatever this thread is, and it is (the writer carries its own
     // mutex), but nobody should have to re-derive that.
     if (!sink->gotFirstFrame.exchange(true, std::memory_order_acq_rel)) {
+        if (isLeg) sink->firstFrameMs.store(NowMs(), std::memory_order_release);
         char tname[64] = {0};
         pthread_getname_np(pthread_self(), tname, sizeof(tname));
         LogInfo("Video: source '" + sink->label + "' FIRST FRAME " +
@@ -520,7 +608,7 @@ void SinkOnFrame(const std::shared_ptr<FrameSink>& sink,
     // and past that point the SDK cannot call us at all. It is checked rather
     // than assumed because a renderer that failed to build tears its sink down
     // without ever having had one.
-    if (!sink->scaler) return;
+    if (!out->scaler) return;
 
     // The scaler reads its source tightly packed at EVEN dimensions. Camera
     // video is always even, so the SDK's own buffers go straight through. A
@@ -536,7 +624,7 @@ void SinkOnFrame(const std::shared_ptr<FrameSink>& sink,
         // Even width: the planes are already tight at `we`. An odd HEIGHT needs
         // no repack either — it only means the last row goes unread, and u/v
         // are the SDK's own plane pointers, so dropping it cannot shift them.
-        sink->scaler->StageFrame(y, u, v, we, he);
+        out->scaler->StageFrame(y, u, v, we, he);
         return;
     }
 
@@ -556,7 +644,7 @@ void SinkOnFrame(const std::shared_ptr<FrameSink>& sink,
         memcpy(pu + (size_t)r * dstCStride, u + (size_t)r * srcCStride, dstCStride);
         memcpy(pv + (size_t)r * dstCStride, v + (size_t)r * srcCStride, dstCStride);
     }
-    sink->scaler->StageFrame(py, pu, pv, we, he);
+    out->scaler->StageFrame(py, pu, pv, we, he);
 }
 
 }  // namespace
@@ -564,16 +652,23 @@ void SinkOnFrame(const std::shared_ptr<FrameSink>& sink,
 // ---------------------------------------------------------------------------
 // The renderer delegate.
 //
-// One instance per renderer, holding only a shared_ptr to its sink. It
+// One instance per renderer, holding only shared_ptrs to its sinks. It
 // deliberately knows nothing about the subscription registry, so nothing it can
 // be called on can contend with the main thread's teardown path.
+//
+// `_sink` is where frames are written. `_leg`, for a participant renderer, is
+// that renderer's own state (see the leg notes on FrameSink); it is null for
+// screenshare, whose one sink plays both parts exactly as before.
 // ---------------------------------------------------------------------------
 @interface FeedsRendererDelegate : NSObject <ZoomSDKRendererDelegate>
 - (instancetype)initWithSink:(std::shared_ptr<FrameSink>)sink;
+- (instancetype)initWithSink:(std::shared_ptr<FrameSink>)sink
+                         leg:(std::shared_ptr<FrameSink>)leg;
 @end
 
 @implementation FeedsRendererDelegate {
     std::shared_ptr<FrameSink> _sink;
+    std::shared_ptr<FrameSink> _leg;
 }
 
 - (instancetype)initWithSink:(std::shared_ptr<FrameSink>)sink
@@ -582,15 +677,50 @@ void SinkOnFrame(const std::shared_ptr<FrameSink>& sink,
     return self;
 }
 
+- (instancetype)initWithSink:(std::shared_ptr<FrameSink>)sink
+                         leg:(std::shared_ptr<FrameSink>)leg
+{
+    if ((self = [super init])) {
+        _sink = std::move(sink);
+        _leg  = std::move(leg);
+    }
+    return self;
+}
+
+// The per-renderer state: the leg for a participant, the sink for screenshare.
+- (FrameSink*)legState
+{
+    return _leg ? _leg.get() : _sink.get();
+}
+
+// May this renderer blank the source? Screenshare: always (unchanged). A
+// participant leg: only while it is the writer, never after we retired it, and
+// not inside the quiet window of our own re-point.
+- (bool)mayBlank
+{
+    if (!_sink) return false;
+    if (!_leg) return true;
+    if (_leg->retired.load(std::memory_order_acquire)) return false;
+    if (RouteActive(_sink->route.load(std::memory_order_acquire)) != _leg->legId)
+        return false;
+    const uint64_t quiet = _leg->quietUntilMs.load(std::memory_order_acquire);
+    if (quiet != 0 && NowMs() < quiet) {
+        LogInfo("Video: source '" + _leg->label + "' raw data OFF from our own "
+                "re-point — not blanking");
+        return false;
+    }
+    return true;
+}
+
 - (void)onRawDataReceived:(ZoomSDKYUVRawDataI420*)data
 {
-    SinkOnFrame(_sink, data);
+    SinkOnFrame(_sink, [self legState], data);
 }
 
 - (void)onSubscribedUserDataOn
 {
     if (_sink)
-        LogInfo("Video: source '" + _sink->label + "' raw data ON");
+        LogInfo("Video: source '" + [self legState]->label + "' raw data ON");
 }
 
 - (void)onSubscribedUserDataOff
@@ -598,8 +728,8 @@ void SinkOnFrame(const std::shared_ptr<FrameSink>& sink,
     // Frames have stopped (camera off, network drop, the sharer paused). Push
     // the blank sentinel so the plugin clears its OBS source instead of
     // freezing on the last frame; recovery is automatic when frames resume.
-    if (!_sink) return;
-    LogInfo("Video: source '" + _sink->label + "' raw data OFF — blanking");
+    if (![self mayBlank]) return;
+    LogInfo("Video: source '" + [self legState]->label + "' raw data OFF — blanking");
     _sink->writer.WriteBlankSignal();
 }
 
@@ -614,7 +744,11 @@ void SinkOnFrame(const std::shared_ptr<FrameSink>& sink,
     // exists to make unnecessary.
     if (!_sink) return;
     LogInfo("Video: the SDK destroyed the renderer for source '" +
-            _sink->label + "'");
+            [self legState]->label + "'");
+    if (_leg && (_leg->retired.load(std::memory_order_acquire) ||
+                 RouteActive(_sink->route.load(std::memory_order_acquire)) !=
+                     _leg->legId))
+        return;   // not the renderer on screen: nothing to clear
     _sink->writer.WriteBlankSignal();
 }
 
@@ -625,16 +759,45 @@ namespace {
 // ---------------------------------------------------------------------------
 // Subscription registry — MAIN QUEUE ONLY, and therefore unlocked.
 // ---------------------------------------------------------------------------
+// A switch in progress (make-before-break; see "Switching an existing source"
+// below). Same phases and meaning as engine-video.cpp's SwitchState.
+enum class SwitchPhase { Deferred, MakeBeforeBreak, Direct };
+
+struct MacSwitch {
+    bool         active      = false;
+    SwitchPhase  phase       = SwitchPhase::Deferred;
+    unsigned int fromUser    = 0;
+    unsigned int toUser      = 0;
+    uint64_t     requestMs   = 0;
+    uint64_t     legSubMs    = 0;     // subscribe time of the leg being judged
+    const char*  directWhy   = "";
+    bool         targetLeft  = false;
+    bool         loggedWait  = false;
+};
+
 struct MacSubscription {
     std::string  sourceUuid;
-    unsigned int userId              = 0;
+    unsigned int userId              = 0;   // whose video is ON SCREEN
+    unsigned int desiredUser         = 0;   // whose video SHOULD be (newest request)
     bool         followActiveSpeaker = false;
     int          rung                = 0;
     uint64_t     subscribeTick       = 0;   // 0 = not awaiting a first frame
 
+    // The live leg. `sink` is the output (writer + scaler); `liveLeg` is this
+    // renderer's own state (first frame, frame times, quiet window).
     ZoomSDKRenderer*           renderer = nil;
     FeedsRendererDelegate*     delegate = nil;   // strong: the SDK's is `assign`
     std::shared_ptr<FrameSink> sink;
+    std::shared_ptr<FrameSink> liveLeg;
+    uint64_t                   liveSubscribedMs = 0;
+
+    // The pending leg of a make-before-break switch (null renderer = none).
+    ZoomSDKRenderer*           pendingRenderer = nil;
+    FeedsRendererDelegate*     pendingDelegate = nil;
+    std::shared_ptr<FrameSink> pendingLeg;
+    unsigned int               pendingUser     = 0;
+
+    MacSwitch                  sw;
 };
 
 std::map<std::string, std::unique_ptr<MacSubscription>> g_subs;
@@ -717,6 +880,15 @@ const uint64_t kSpeakerHeartbeatMs  = 5000;   // re-announce cadence
 dispatch_source_t g_tickTimer = nil;
 uint64_t          g_lastHeartbeatMs = 0;
 
+// ── Camera-on decision and switch bookkeeping (main queue) ──────────────────
+// When the engine last saw each user's video go off; userIds whose Video_ON is
+// waiting out the debounce; the debounce's newest-wins sequence number; and
+// when a switch last destroyed a renderer for each user.
+std::map<unsigned int, uint64_t> g_videoOffMsByUser;
+std::vector<unsigned int>        g_cameraOnPending;
+uint64_t                         g_cameraOnSeq = 0;
+std::map<unsigned int, uint64_t> g_releaseMsByUser;
+
 // ── Active speaker ──────────────────────────────────────────────────────────
 // The stored value is the INPUT (what the SDK last reported), never a decision.
 // The on-screen target is DERIVED fresh on every evaluation, so a speaker who
@@ -751,6 +923,7 @@ unsigned int               g_shareSourceId   = 0;
 unsigned int               g_sharerUserId    = 0;
 
 void ProcessPendingRenderers();
+void ProcessSwitches();
 void EvaluateActiveSpeaker(bool heartbeat);
 
 // ---------------------------------------------------------------------------
@@ -792,12 +965,33 @@ void TearDownRenderer(ZoomSDKRenderer* __strong* renderer,
     }
 }
 
+// Retire ONE renderer of a participant source (a switch's old leg after the
+// swap, or a pending leg being withdrawn) without touching the source's writer
+// or scaler, which the other leg keeps using. Same order as TearDownRenderer
+// steps 1 and 2, with the leg marked retired first so a frame callback already
+// in flight drops its frame instead of writing it, and can never blank.
+void TearDownLeg(ZoomSDKRenderer* __strong* renderer,
+                 FeedsRendererDelegate* __strong* delegate,
+                 const std::shared_ptr<FrameSink>& leg)
+{
+    if (leg) leg->retired.store(true, std::memory_order_release);
+    if (renderer && *renderer) {
+        [*renderer setDelegate:nil];
+        [*renderer unSubscribe];
+        ZoomSDKRawDataController* rdc = RawDataController();
+        if (rdc) [rdc destroyRender:*renderer];
+        *renderer = nil;
+    }
+    if (delegate) *delegate = nil;
+}
+
 void TearDownSubscription(const std::string& sourceId)
 {
     auto it = g_subs.find(sourceId);
     if (it == g_subs.end()) return;
 
     MacSubscription* sub = it->second.get();
+    TearDownLeg(&sub->pendingRenderer, &sub->pendingDelegate, sub->pendingLeg);
     TearDownRenderer(&sub->renderer, &sub->delegate, sub->sink);
 
     // Whatever this source was establishing, it no longer is.
@@ -888,11 +1082,19 @@ SubStart StartSubscription(const std::string& sourceId, unsigned int userId,
     auto sub = std::make_unique<MacSubscription>();
     sub->sourceUuid          = sourceId;
     sub->userId              = userId;
+    sub->desiredUser         = userId;
     sub->followActiveSpeaker = follow;
     sub->rung                = rung;
     sub->sink                = std::make_shared<FrameSink>();
     sub->sink->label           = sourceId;
     sub->sink->requestedHeight = kLadderHeight[rung];
+    // The live renderer's own state, and the route that makes it the writer.
+    sub->liveLeg                  = std::make_shared<FrameSink>();
+    sub->liveLeg->label           = sourceId;
+    sub->liveLeg->requestedHeight = kLadderHeight[rung];
+    sub->liveLeg->legId           = NextLegId();
+    sub->sink->route.store(MakeRoute(sub->liveLeg->legId, 0),
+                           std::memory_order_release);
 
     // The region first, so it is ready before any frame can arrive.
     const std::string regionName =
@@ -943,7 +1145,7 @@ SubStart StartSubscription(const std::string& sourceId, unsigned int userId,
     }
 
     FeedsRendererDelegate* delegate =
-        [[FeedsRendererDelegate alloc] initWithSink:sub->sink];
+        [[FeedsRendererDelegate alloc] initWithSink:sub->sink leg:sub->liveLeg];
     renderer.delegate = delegate;
     sub->renderer     = renderer;
     sub->delegate     = delegate;
@@ -978,7 +1180,8 @@ SubStart StartSubscription(const std::string& sourceId, unsigned int userId,
             TearDownRenderer(&sub->renderer, &sub->delegate, sub->sink);
             return SubStart::StepDown;
         }
-        sub->subscribeTick = NowMs();
+        sub->subscribeTick    = NowMs();
+        sub->liveSubscribedMs = sub->subscribeTick;
         LogInfo("Video: subscribed source='" + sourceId + "' to userId=" +
                 std::to_string(userId) + " at " + LadderRungName(rung) +
                 (follow ? " [follow-speaker]" : ""));
@@ -990,25 +1193,40 @@ SubStart StartSubscription(const std::string& sourceId, unsigned int userId,
     return SubStart::Started;
 }
 
-// Re-point a live subscription at a different user without rebuilding the
-// renderer or the region. Returns false when the SDK refused the re-point, in
-// which case the caller steps the source down a rung and requeues.
-bool Resubscribe(MacSubscription* sub, unsigned int newUserId)
+// Direct (single-renderer) re-point of the live leg at a different user without
+// rebuilding the renderer or the region — the switch fallback. Our own
+// unSubscribe never blanks the source (its RawData_Off lands in the leg's quiet
+// window). Returns the subscribe result; Success also for the follow-speaker
+// sentinel, which deliberately does not subscribe (the caller blanks: there is
+// no one to show).
+ZoomSDKError RepointLive(MacSubscription* sub, unsigned int newUserId)
 {
-    if (!sub || !sub->renderer) return true;
+    if (!sub) return ZoomSDKError_Success;
+    if (!sub->renderer || !sub->liveLeg) {
+        // No renderer to re-point. Record the user so the switch converges;
+        // its first-frame deadline then retries through the gate.
+        sub->userId = newUserId;
+        return ZoomSDKError_Success;
+    }
 
+    sub->liveLeg->quietUntilMs.store(NowMs() + kSelfUnsubQuietMs,
+                                     std::memory_order_release);
     [sub->renderer unSubscribe];
-    sub->userId = newUserId;
+    sub->userId           = newUserId;
+    sub->liveSubscribedMs = 0;
 
     if (sub->followActiveSpeaker && newUserId == kActiveSpeakerSentinel) {
         // Unsubscribed by choice: stop the establishment clock so the watchdog
         // does not read this as a missing first frame.
         sub->subscribeTick = 0;
-        sub->sink->writer.WriteBlankSignal();
-        LogInfo("Video: source='" + sub->sourceUuid +
-                "' waiting for an active speaker");
-        return true;
+        return ZoomSDKError_Success;
     }
+
+    // Fresh target, fresh establishment window — cleared BEFORE subscribe so
+    // the new stream's first frame is never mistaken for the old one's.
+    sub->liveLeg->gotFirstFrame.store(false, std::memory_order_release);
+    sub->liveLeg->firstFrameMs.store(0, std::memory_order_release);
+    sub->liveLeg->lastFrameMs.store(0, std::memory_order_release);
 
     const ZoomSDKError err =
         [sub->renderer subscribe:newUserId rawDataType:ZoomSDKRawDataType_Video];
@@ -1018,16 +1236,12 @@ bool Resubscribe(MacSubscription* sub, unsigned int newUserId)
                 LadderRungName(sub->rung) + " (code " +
                 std::to_string((int)err) + ")");
         sub->subscribeTick = 0;
-        return false;
+        return err;
     }
 
-    // Fresh target, fresh establishment window.
-    sub->sink->gotFirstFrame.store(false, std::memory_order_release);
-    sub->subscribeTick = NowMs();
-    LogInfo("Video: resubscribed source='" + sub->sourceUuid + "' to userId=" +
-            std::to_string(newUserId) + " at " + LadderRungName(sub->rung) +
-            (sub->followActiveSpeaker ? " [follow-speaker]" : ""));
-    return true;
+    sub->subscribeTick    = NowMs();
+    sub->liveSubscribedMs = sub->subscribeTick;
+    return err;
 }
 
 // Step one source down the ladder and requeue it, or retire it at the bottom.
@@ -1051,6 +1265,492 @@ void LadderStepDown(const std::string& sourceId, unsigned int userId,
 }
 
 // ---------------------------------------------------------------------------
+// Switching an existing source to another user (make-before-break).
+//
+// Same design as engine-video.cpp (see its "Switching an existing source"
+// note): every re-point of an existing source — a manual dropdown change and
+// an [Active Speaker] retarget — sets the source's desired user and is
+// reconciled here. The live renderer keeps writing the old person while a
+// second renderer, created at the same rung, subscribes to the new one; its
+// first valid frame makes it the writer (one compare-exchange in the frame
+// callback) and the main queue then retires the old renderer. Fallback is the
+// direct single-renderer re-point (no self-inflicted blank). A switch that
+// has not delivered in kSwitchFirstFrameMs keeps the old person on screen and
+// retries once through the gate.
+//
+// macOS difference: everything here runs on the main queue, where the
+// registry already lives, so there is no lock; the frame thread only ever
+// touches the sinks' atomics.
+// ---------------------------------------------------------------------------
+
+enum class VideoState { On, Off, Unknown };
+
+VideoState UserVideoState(unsigned int userId)
+{
+    ZoomSDKMeetingActionController* action = ActionController();
+    if (!action) return VideoState::Unknown;
+    ZoomSDKUserInfo* info = [action getUserByUserID:userId];
+    if (!info) return VideoState::Unknown;
+    return [info isVideoOn] ? VideoState::On : VideoState::Off;
+}
+
+void NoteRelease(unsigned int uid, uint64_t now)
+{
+    if (uid > kActiveSpeakerSentinel) g_releaseMsByUser[uid] = now;
+}
+
+bool ReleaseSettling(unsigned int uid, uint64_t now)
+{
+    auto rel = g_releaseMsByUser.find(uid);
+    if (rel == g_releaseMsByUser.end()) return false;
+    if (now >= rel->second && now - rel->second < kReleaseSettleMs) return true;
+    g_releaseMsByUser.erase(rel);
+    return false;
+}
+
+// Is a gate entry queued for this source? Keep a specific-participant entry's
+// user in step with the newest request (follow entries re-resolve at drain).
+bool SyncQueuedEntry(const std::string& sourceId, unsigned int desired,
+                     bool follow)
+{
+    for (auto& p : g_pending) {
+        if (p.sourceId != sourceId) continue;
+        p.follow = follow;
+        if (!follow) p.userId = desired;
+        return true;
+    }
+    return false;
+}
+
+uint64_t MsSince(uint64_t from, uint64_t to)
+{
+    return (from != 0 && to >= from) ? to - from : 0;
+}
+
+bool LiveGotFirstFrame(const MacSubscription* s)
+{
+    return s->liveLeg && s->liveLeg->gotFirstFrame.load(std::memory_order_acquire);
+}
+
+// True while the live leg is putting a picture on screen.
+bool LiveHasPicture(const MacSubscription* s, uint64_t now)
+{
+    if (!s->renderer || !LiveGotFirstFrame(s)) return false;
+    const uint64_t last = s->liveLeg->lastFrameMs.load(std::memory_order_acquire);
+    return last != 0 && now >= last && now - last < kFrameStaleMs;
+}
+
+// Delivery state of this source's renderer for uid, for the same-user gate:
+// 1 delivered, 0 still establishing, -1 no renderer for uid here.
+int DeliveryStateFor(const MacSubscription* s, unsigned int uid)
+{
+    if (s->pendingRenderer && s->pendingUser == uid && s->pendingLeg)
+        return s->pendingLeg->gotFirstFrame.load(std::memory_order_acquire) ? 1 : 0;
+    if (s->renderer && s->userId == uid && s->liveLeg)
+        return LiveGotFirstFrame(s) ? 1 : 0;
+    return -1;
+}
+
+bool PendingPromoted(const MacSubscription* s)
+{
+    return s->pendingRenderer && s->pendingLeg && s->sink &&
+           RouteActive(s->sink->route.load(std::memory_order_acquire)) ==
+               s->pendingLeg->legId;
+}
+
+// Withdraw the pending leg's claim. False if its first frame already promoted
+// it (the caller completes the swap instead).
+bool WithdrawPending(MacSubscription* s)
+{
+    if (!s->pendingLeg || !s->sink) return true;
+    const uint32_t pid = s->pendingLeg->legId;
+    uint64_t r = s->sink->route.load(std::memory_order_acquire);
+    for (;;) {
+        if (RouteActive(r) == pid) return false;
+        if (RoutePending(r) != pid) return true;
+        if (s->sink->route.compare_exchange_weak(r, MakeRoute(RouteActive(r), 0),
+                                                 std::memory_order_acq_rel,
+                                                 std::memory_order_acquire))
+            return true;
+    }
+}
+
+// Retire a withdrawn pending leg. Returns its user for the release record.
+unsigned int DiscardPending(MacSubscription* s)
+{
+    const unsigned int uid = s->pendingUser;
+    TearDownLeg(&s->pendingRenderer, &s->pendingDelegate, s->pendingLeg);
+    s->pendingLeg.reset();
+    s->pendingUser = 0;
+    return uid;
+}
+
+void CompleteSwap(const std::string& id, MacSubscription* s, uint64_t now)
+{
+    MacSwitch& sw = s->sw;
+    const uint64_t first =
+        s->pendingLeg ? s->pendingLeg->firstFrameMs.load(std::memory_order_acquire) : 0;
+
+    // Retire the old live renderer; the promoted one takes its place.
+    const unsigned int oldUid = s->userId;
+    TearDownLeg(&s->renderer, &s->delegate, s->liveLeg);
+    NoteRelease(oldUid, now);
+
+    s->renderer         = s->pendingRenderer;
+    s->delegate         = s->pendingDelegate;
+    s->liveLeg          = s->pendingLeg;
+    s->userId           = s->pendingUser;
+    s->liveSubscribedMs = sw.legSubMs;
+    s->subscribeTick    = 0;   // delivered before it was promoted
+    s->pendingRenderer  = nil;
+    s->pendingDelegate  = nil;
+    s->pendingLeg.reset();
+    s->pendingUser      = 0;
+
+    LogInfo("Video: switch source='" + id + "' from=" +
+            std::to_string(sw.fromUser) + " to=" + std::to_string(sw.toUser) +
+            " path=make-before-break first_frame_ms=" +
+            std::to_string(MsSince(sw.requestMs, first ? first : now)) +
+            " old_renderer=released");
+    sw.active = false;
+}
+
+void DirectSwitch(const std::string& id, MacSubscription* s, uint64_t now,
+                  const char* why)
+{
+    MacSwitch& sw = s->sw;
+    sw.phase     = SwitchPhase::Direct;
+    sw.directWhy = why;
+
+    const ZoomSDKError err = RepointLive(s, sw.toUser);
+
+    if (sw.toUser == kActiveSpeakerSentinel) {
+        // [Active Speaker] with no one displayable: nothing to show.
+        if (s->sink) s->sink->writer.WriteBlankSignal();
+        LogInfo("Video: switch source='" + id + "' from=" +
+                std::to_string(sw.fromUser) + " to=none path=fallback(" + why +
+                ") — waiting for an active speaker, source blank");
+        sw.active = false;
+        return;
+    }
+    if (err != ZoomSDKError_Success) {
+        // Refused re-point: the ladder owns it (requeue at a lower rung through
+        // the gate, which rebuilds the source).
+        sw.active = false;
+        LadderStepDown(id, sw.toUser, s->followActiveSpeaker, s->rung,
+                       "repoint_refused");
+        return;
+    }
+    // The target has no video: showing them means showing nothing.
+    if ((std::strcmp(why, "target_video_off") == 0 ||
+         std::strcmp(why, "target_left") == 0) && s->sink)
+        s->sink->writer.WriteBlankSignal();
+    sw.legSubMs = now;
+}
+
+void BeginSwitch(const std::string& id, MacSubscription* s, uint64_t now)
+{
+    MacSwitch& sw = s->sw;
+    sw           = MacSwitch();
+    sw.active    = true;
+    sw.fromUser  = s->userId;
+    sw.toUser    = s->desiredUser;
+    sw.requestMs = now;
+    sw.phase     = SwitchPhase::Deferred;
+
+    const char* direct = nullptr;
+    if (sw.toUser == kActiveSpeakerSentinel)               direct = "no_speaker";
+    else if (UserVideoState(sw.toUser) == VideoState::Off) direct = "target_video_off";
+    else if (!LiveHasPicture(s, now))                      direct = "no_live_picture";
+    if (direct) DirectSwitch(id, s, now, direct);
+}
+
+void AdvanceSwitch(const std::string& id, MacSubscription* s, uint64_t now)
+{
+    MacSwitch& sw = s->sw;
+    if (!sw.active) return;
+    const unsigned int to = sw.toUser;
+
+    switch (sw.phase) {
+    case SwitchPhase::Deferred: {
+        if (sw.targetLeft) { DirectSwitch(id, s, now, "target_left"); return; }
+
+        const char* waitWhy = nullptr;
+        if (!g_rawStreamActive || !g_rawRenderReady) {
+            waitWhy = "raw_render_not_ready";
+        } else {
+            auto inf = g_inflightByUser.find(to);
+            if (inf != g_inflightByUser.end()) {
+                int state = -1;
+                auto sit = g_subs.find(inf->second.sourceId);
+                if (sit != g_subs.end() && sit->second)
+                    state = DeliveryStateFor(sit->second.get(), to);
+                if (state == 0 && now - inf->second.createMs < kEstablishTimeoutMs)
+                    waitWhy = "same_user_establishing";
+                else
+                    g_inflightByUser.erase(inf);
+            }
+            if (!waitWhy && ReleaseSettling(to, now)) waitWhy = "release_settling";
+        }
+        if (waitWhy) {
+            if (now - sw.requestMs >= kSwitchFirstFrameMs) {
+                LogWarn("Video: switch source='" + id + "' from=" +
+                        std::to_string(sw.fromUser) + " to=" +
+                        std::to_string(to) + " could not start a second "
+                        "renderer in " + std::to_string(kSwitchFirstFrameMs) +
+                        "ms (" + waitWhy + ") — re-pointing directly");
+                DirectSwitch(id, s, now, "deferral_timeout");
+            }
+            return;
+        }
+
+        ZoomSDKRawDataController* rdc = RawDataController();
+        ZoomSDKRenderer* renderer = nil;
+        const ZoomSDKError createErr =
+            rdc ? [rdc createRender:&renderer] : ZoomSDKError_Failed;
+        if (createErr != ZoomSDKError_Success || !renderer) {
+            LogInfo("Video: switch source='" + id + "' to=" + std::to_string(to) +
+                    " second renderer not created (code " +
+                    std::to_string((int)createErr) +
+                    ") — falling back to a direct re-point");
+            DirectSwitch(id, s, now, "create_refused");
+            return;
+        }
+
+        auto leg = std::make_shared<FrameSink>();
+        leg->label           = id;
+        leg->requestedHeight = kLadderHeight[s->rung];
+        leg->legId           = NextLegId();
+        FeedsRendererDelegate* delegate =
+            [[FeedsRendererDelegate alloc] initWithSink:s->sink leg:leg];
+        renderer.delegate = delegate;
+
+        const ZoomSDKError resErr = [renderer setResolution:kLadderRes[s->rung]];
+        if (resErr != ZoomSDKError_Success) {
+            TearDownLeg(&renderer, &delegate, leg);
+            LogInfo("Video: switch source='" + id + "' to=" + std::to_string(to) +
+                    " second renderer setResolution(" + LadderRungName(s->rung) +
+                    ") refused (code " + std::to_string((int)resErr) +
+                    ") — falling back to a direct re-point");
+            DirectSwitch(id, s, now, "create_refused");
+            return;
+        }
+
+        // Claim the pending route BEFORE subscribing, so the first frame can
+        // promote this leg the instant it arrives.
+        s->pendingRenderer = renderer;
+        s->pendingDelegate = delegate;
+        s->pendingLeg      = leg;
+        s->pendingUser     = to;
+        const uint32_t activeId = s->liveLeg ? s->liveLeg->legId : 0;
+        s->sink->route.store(MakeRoute(activeId, leg->legId),
+                             std::memory_order_release);
+
+        const ZoomSDKError subErr =
+            [renderer subscribe:to rawDataType:ZoomSDKRawDataType_Video];
+        if (subErr != ZoomSDKError_Success) {
+            WithdrawPending(s);   // never subscribed, so never promoted
+            DiscardPending(s);
+            LogInfo("Video: switch source='" + id + "' to=" + std::to_string(to) +
+                    " second renderer subscribe REFUSED at " +
+                    LadderRungName(s->rung) + " (code " +
+                    std::to_string((int)subErr) + ", over the meeting's "
+                    "resolution budget or not subscribable) — falling back to a "
+                    "direct re-point");
+            DirectSwitch(id, s, now, "subscribe_refused");
+            return;
+        }
+        g_inflightByUser[to] = { id, now };
+        sw.phase    = SwitchPhase::MakeBeforeBreak;
+        sw.legSubMs = now;
+        return;
+    }
+
+    case SwitchPhase::MakeBeforeBreak: {
+        if (PendingPromoted(s)) { CompleteSwap(id, s, now); return; }
+        const bool timedOut = (now - sw.legSubMs >= kSwitchFirstFrameMs);
+        if (!sw.targetLeft && !timedOut) return;
+
+        if (!WithdrawPending(s)) { CompleteSwap(id, s, now); return; }
+        NoteRelease(DiscardPending(s), now);
+
+        if (sw.targetLeft) {
+            LogInfo("Video: switch source='" + id + "' from=" +
+                    std::to_string(sw.fromUser) + " to=" + std::to_string(to) +
+                    " abandoned: target left the meeting");
+            DirectSwitch(id, s, now, "target_left");
+            return;
+        }
+        if (UserVideoState(to) != VideoState::On) {
+            LogWarn("Video: switch FAILED source='" + id + "' from=" +
+                    std::to_string(sw.fromUser) + " to=" + std::to_string(to) +
+                    " path=make-before-break: no first frame in " +
+                    std::to_string(kSwitchFirstFrameMs) + "ms and the target's "
+                    "camera is off — showing them as camera-off");
+            DirectSwitch(id, s, now, "target_video_off");
+            return;
+        }
+        LogWarn("Video: switch FAILED source='" + id + "' from=" +
+                std::to_string(sw.fromUser) + " to=" + std::to_string(to) +
+                " path=make-before-break: no first frame in " +
+                std::to_string(kSwitchFirstFrameMs) + "ms; second renderer "
+                "destroyed, userId=" + std::to_string(sw.fromUser) +
+                " stays on screen, retrying once with a fresh renderer");
+        sw.active = false;
+        EnqueuePendingRender(id, to, s->followActiveSpeaker, s->rung);
+        return;
+    }
+
+    case SwitchPhase::Direct: {
+        if (LiveGotFirstFrame(s)) {
+            const uint64_t first =
+                s->liveLeg->firstFrameMs.load(std::memory_order_acquire);
+            LogInfo("Video: switch source='" + id + "' from=" +
+                    std::to_string(sw.fromUser) + " to=" + std::to_string(to) +
+                    " path=fallback(" + sw.directWhy + ") first_frame_ms=" +
+                    std::to_string(MsSince(sw.requestMs, first ? first : now)) +
+                    " old_renderer=none (single renderer re-pointed)");
+            sw.active = false;
+            return;
+        }
+        if (now - sw.legSubMs < kSwitchFirstFrameMs) return;
+
+        sw.active        = false;
+        s->subscribeTick = 0;   // judged here; the watchdog must not double-act
+        if (UserVideoState(to) != VideoState::On) {
+            if (s->sink) s->sink->writer.WriteBlankSignal();
+            LogInfo("Video: switch source='" + id + "' from=" +
+                    std::to_string(sw.fromUser) + " to=" + std::to_string(to) +
+                    " path=fallback(" + sw.directWhy + "): no frame in " +
+                    std::to_string(kSwitchFirstFrameMs) + "ms, target camera "
+                    "off or gone — camera-on path owns recovery");
+            return;
+        }
+        LogWarn("Video: switch FAILED source='" + id + "' from=" +
+                std::to_string(sw.fromUser) + " to=" + std::to_string(to) +
+                " path=fallback(" + sw.directWhy + "): no first frame in " +
+                std::to_string(kSwitchFirstFrameMs) + "ms; retrying once with a "
+                "fresh renderer");
+        EnqueuePendingRender(id, to, s->followActiveSpeaker, s->rung);
+        return;
+    }
+    }
+}
+
+// Bring one source's switch in line with its desired user. Cheap no-op in the
+// steady state. Never mutates g_subs (a retry only appends to g_pending).
+void ReconcileSwitch(const std::string& id, MacSubscription* s, uint64_t now)
+{
+    MacSwitch& sw = s->sw;
+    const unsigned int desired = s->desiredUser;
+
+    if (sw.active && desired != sw.toUser) {
+        LogInfo("Video: switch REPLACED source='" + id + "' from=" +
+                std::to_string(sw.fromUser) + " to=" + std::to_string(sw.toUser) +
+                " after " + std::to_string(MsSince(sw.requestMs, now)) +
+                "ms by to=" + std::to_string(desired));
+        if (s->pendingRenderer) {
+            if (!WithdrawPending(s)) CompleteSwap(id, s, now);
+            else                     NoteRelease(DiscardPending(s), now);
+        }
+        sw.active = false;
+    }
+
+    if (!sw.active && desired != s->userId) {
+        if (SyncQueuedEntry(id, desired, s->followActiveSpeaker)) return;
+        BeginSwitch(id, s, now);
+    }
+    if (sw.active) AdvanceSwitch(id, s, now);
+}
+
+void ProcessSwitches()
+{
+    const uint64_t now = NowMs();
+    for (auto& kv : g_subs)
+        if (kv.second) ReconcileSwitch(kv.first, kv.second.get(), now);
+}
+
+// ---------------------------------------------------------------------------
+// Camera-on decision — the same rule as engine-video.cpp's
+// DecideCameraOnLocked. A Video_ON rebuilds a source showing that user only if
+// the engine saw their video go off after the source's last frame
+// (video_off_seen), or the source has had no frame for kFrameStaleMs
+// (no_frame). A source receiving frames normally is left alone; a source with
+// a switch in progress is left to the switch. One INFO line per user per
+// debounce.
+// ---------------------------------------------------------------------------
+void DecideCameraOn(unsigned int userId, uint64_t now)
+{
+    uint64_t offMs = 0;
+    auto off = g_videoOffMsByUser.find(userId);
+    if (off != g_videoOffMsByUser.end()) offMs = off->second;
+
+    int matched = 0, rebuiltOff = 0, rebuiltStale = 0;
+    int skippedLive = 0, skippedSwitch = 0;
+    uint64_t newestAge = UINT64_MAX;
+    for (auto& kv : g_subs) {
+        MacSubscription* s = kv.second.get();
+        if (!s || s->userId != userId) continue;
+        ++matched;
+        if (s->sw.active) { ++skippedSwitch; continue; }
+
+        uint64_t ref = 0;
+        if (s->liveLeg) {
+            ref = s->liveLeg->lastFrameMs.load(std::memory_order_acquire);
+            if (ref == 0) ref = s->liveSubscribedMs;
+        }
+        const bool offSince = (offMs != 0 && offMs >= ref);
+        const bool stale    = (ref == 0 || now < ref || now - ref >= kFrameStaleMs);
+        if (!offSince && !stale) {
+            ++skippedLive;
+            if (now - ref < newestAge) newestAge = now - ref;
+            continue;
+        }
+        if (offSince) ++rebuiltOff; else ++rebuiltStale;
+        EnqueuePendingRender(kv.first, userId, s->followActiveSpeaker, s->rung);
+    }
+    if (matched == 0) return;
+
+    const int rebuilt = rebuiltOff + rebuiltStale;
+    LogInfo("Video: camera-on userId=" + std::to_string(userId) + ": " +
+            (rebuilt > 0 ? "REBUILDING" : "ignored, source(s) receiving frames") +
+            " — rebuilt=" + std::to_string(rebuilt) + " (video_off_seen=" +
+            std::to_string(rebuiltOff) + " no_frame_" +
+            std::to_string(kFrameStaleMs) + "ms=" + std::to_string(rebuiltStale) +
+            ") skipped_receiving=" + std::to_string(skippedLive) +
+            " (last frame " +
+            (newestAge == UINT64_MAX ? std::string("n/a")
+                                     : std::to_string(newestAge) + "ms") +
+            " ago) skipped_switching=" + std::to_string(skippedSwitch));
+}
+
+void ProcessCameraOnDebounce()
+{
+    std::vector<unsigned int> users;
+    users.swap(g_cameraOnPending);
+    if (users.empty()) return;
+    const uint64_t now = NowMs();
+    for (unsigned int uid : users) DecideCameraOn(uid, now);
+    ProcessPendingRenderers();
+}
+
+// Trailing-edge debounce, as on Windows: every Video_ON re-arms it, and only
+// the newest arming fires.
+void QueueCameraOn(unsigned int userId)
+{
+    bool have = false;
+    for (unsigned int u : g_cameraOnPending) if (u == userId) have = true;
+    if (!have) g_cameraOnPending.push_back(userId);
+    const uint64_t seq = ++g_cameraOnSeq;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)(kCameraOnDebounceMs * NSEC_PER_MSEC)),
+                   dispatch_get_main_queue(), ^{
+        if (seq != g_cameraOnSeq) return;
+        ProcessCameraOnDebounce();
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Active speaker
 // ---------------------------------------------------------------------------
 
@@ -1070,28 +1770,25 @@ void RetargetFollowSources(unsigned int target, int& outFollow, int& outMoved,
     outMoved  = 0;
     outBound.clear();
 
-    // Collect step-downs and apply them after the loop: LadderStepDown queues
-    // work that can rebuild a subscription, and mutating the map underneath
-    // this walk would invalidate it.
-    std::vector<std::tuple<std::string, unsigned int, int>> stepDowns;
-
+    // Each follow source's desired user becomes the target and its switch is
+    // reconciled inline (make-before-break). A refused re-point steps down
+    // through LadderStepDown, which only queues (g_pending), so walking g_subs
+    // here stays safe.
+    const uint64_t now = NowMs();
     for (auto& kv : g_subs) {
         MacSubscription* s = kv.second.get();
         if (!s || !s->followActiveSpeaker) continue;
         ++outFollow;
 
-        if (s->userId != target) {
+        if (s->desiredUser != target) {
             ++outMoved;
-            if (!Resubscribe(s, target))
-                stepDowns.emplace_back(kv.first, target, s->rung);
+            s->desiredUser = target;
         }
+        ReconcileSwitch(kv.first, s, now);
+
         if (!outBound.empty()) outBound += ",";
         outBound += kv.first + "=" + std::to_string(s->userId);
-    }
-
-    for (const auto& sd : stepDowns) {
-        LadderStepDown(std::get<0>(sd), std::get<1>(sd), true, std::get<2>(sd),
-                       "repoint_refused");
+        if (s->sw.active) outBound += "->" + std::to_string(s->sw.toUser);
     }
 }
 
@@ -1224,11 +1921,13 @@ void ProcessPendingRenderers()
         if (inf != g_inflightByUser.end()) {
             bool free = false;
             auto sit = g_subs.find(inf->second.sourceId);
-            if (sit == g_subs.end() || !sit->second) {
+            // The in-flight renderer may be a source's live renderer or a
+            // switch's pending one; DeliveryStateFor checks whichever is on uid.
+            const int state = (sit == g_subs.end() || !sit->second)
+                                  ? -1 : DeliveryStateFor(sit->second.get(), uid);
+            if (state == -1) {
                 free = true;                       // that renderer is gone
-            } else if (sit->second->sink &&
-                       sit->second->sink->gotFirstFrame.load(
-                           std::memory_order_acquire)) {
+            } else if (state == 1) {
                 free = true;                       // delivery confirmed
             } else if (now - inf->second.createMs >= kEstablishTimeoutMs) {
                 free = true;                       // generous timeout elapsed
@@ -1236,6 +1935,11 @@ void ProcessPendingRenderers()
             if (!free) { ++i; continue; }          // sibling waits, stays queued
             g_inflightByUser.erase(inf);
         }
+
+        // A switch just destroyed a renderer for this user (a failed switch's
+        // retry lands here moments later): give the SDK's asynchronous release
+        // one tick before creating another.
+        if (ReleaseSettling(uid, now)) { ++i; continue; }
 
         // A drained request always produces a FRESH renderer: a kept one is
         // stale across a participant's rejoin. Destroy any existing
@@ -1314,7 +2018,10 @@ void SweepUndeliveredSubscriptions()
     for (auto& kv : g_subs) {
         MacSubscription* s = kv.second.get();
         if (!s || s->subscribeTick == 0) continue;
-        if (s->sink && s->sink->gotFirstFrame.load(std::memory_order_acquire)) {
+        // A switch in progress has its own (shorter) first-frame deadline and
+        // retry, and clears the tick when it judges.
+        if (s->sw.active) continue;
+        if (LiveGotFirstFrame(s)) {
             s->subscribeTick = 0;               // delivered; stop watching
             continue;
         }
@@ -1347,6 +2054,7 @@ void SweepUndeliveredSubscriptions()
 void Tick()
 {
     ProcessPendingRenderers();
+    ProcessSwitches();
     SweepUndeliveredSubscriptions();
 
     const uint64_t now = NowMs();
@@ -1382,8 +2090,12 @@ void NotifyFirstFrame()
     // Called on the SDK's frame-callback thread: hop, never touch the registry
     // from here. The 300 ms tick is the fallback if a hop is ever dropped, so
     // this is an optimisation for how QUICKLY a waiting sibling proceeds, not
-    // the only path by which it does.
-    dispatch_async(dispatch_get_main_queue(), ^{ ProcessPendingRenderers(); });
+    // the only path by which it does. It also completes a promoted switch
+    // (retires the old renderer) without waiting for the tick.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        ProcessPendingRenderers();
+        ProcessSwitches();
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1656,19 +2368,32 @@ void VideoHandleSubscribe(const std::string& json, bool recreate)
 
         auto it = g_subs.find(sourceId);
         if (!recreate && it != g_subs.end() && it->second) {
-            // Cheap in-place re-point, the manual-dropdown case. Carry the
-            // follow flag through: Resubscribe deliberately leaves it alone,
-            // because the retarget loop also calls it and must not flip it.
+            // A switch of an existing source, the manual-dropdown case: record
+            // the desired user and reconcile it (make-before-break). Carry the
+            // follow flag through: the switch deliberately leaves it alone,
+            // because the retarget loop also drives it and must not flip it.
             MacSubscription* sub = it->second.get();
             sub->followActiveSpeaker = follow;
-            if (!Resubscribe(sub, actualUserId)) {
-                const int  rung = sub->rung;
-                TearDownSubscription(sourceId);
-                Send("{\"type\":\"source_texture_released\",\"source_id\":\"" +
-                     feeds::JsonEscape(sourceId) + "\"}");
-                LadderStepDown(sourceId, actualUserId, follow, rung,
-                               "repoint_refused");
-                return;
+            sub->desiredUser         = actualUserId;
+            const bool queued = SyncQueuedEntry(sourceId, actualUserId, follow);
+
+            // Re-picking [Active Speaker] on a source that already shows the
+            // target used to re-point it in place, which doubled as the
+            // operator's "kick a stuck source" gesture. Keep that recovery
+            // only where it is needed: a source not receiving frames gets a
+            // fresh renderer through the gate; a healthy one is left alone.
+            const uint64_t now = NowMs();
+            if (!queued && follow && actualUserId != kActiveSpeakerSentinel &&
+                actualUserId == sub->userId && !sub->sw.active &&
+                !LiveHasPicture(sub, now)) {
+                LogInfo("Video: [Active Speaker] re-pick on source='" +
+                        sourceId + "' (userId=" + std::to_string(actualUserId) +
+                        ") that is not receiving frames — rebuilding with a "
+                        "fresh renderer");
+                EnqueuePendingRender(sourceId, actualUserId, true, sub->rung);
+                ProcessPendingRenderers();
+            } else {
+                ReconcileSwitch(sourceId, sub, now);
             }
             SendTextureReady(sourceId);
             return;
@@ -1740,6 +2465,10 @@ void VideoMeetingEnded()
 
         g_pending.clear();
         g_inflightByUser.clear();
+        g_releaseMsByUser.clear();
+        g_videoOffMsByUser.clear();
+        g_cameraOnPending.clear();
+        ++g_cameraOnSeq;      // drop any camera-on debounce still pending
         g_rawSpeakerId      = 0;
         g_resolvedSpeakerId = 0;
         g_onScreenLeftId    = 0;
@@ -1769,20 +2498,15 @@ void VideoOnUserVideoStatusChanged(unsigned int userId, bool videoOn)
     OnMain(^{
         // A camera coming back on is the recovery path for a source the
         // watchdog stopped watching, and for one that was subscribed while the
-        // camera was off. Re-establish it with a fresh renderer through the
-        // gate rather than hoping the existing subscription wakes up.
-        if (videoOn) {
-            for (auto& kv : g_subs) {
-                MacSubscription* s = kv.second.get();
-                if (!s || s->userId != userId) continue;
-                if (s->sink &&
-                    s->sink->gotFirstFrame.load(std::memory_order_acquire))
-                    continue;                       // already delivering
-                EnqueuePendingRender(kv.first, userId, s->followActiveSpeaker,
-                                     s->rung);
-            }
-            ProcessPendingRenderers();
-        }
+        // camera was off. After a 600 ms trailing-edge debounce (as on
+        // Windows), DecideCameraOn re-establishes only the sources that need
+        // it — video seen off since their last frame, or no frame for
+        // kFrameStaleMs — and leaves a source receiving frames alone. This
+        // used to act immediately on every Video_ON for any source whose
+        // first frame had not yet arrived, which includes a source that was
+        // re-pointed at that user a moment earlier.
+        if (videoOn) QueueCameraOn(userId);
+        else         g_videoOffMsByUser[userId] = NowMs();
         // The speaker filter reads camera state, so a change on either edge can
         // change who is displayable.
         EvaluateActiveSpeaker(false);
@@ -1797,9 +2521,18 @@ void VideoOnUserLeft(unsigned int userId)
         // freeze on their last frame. Blank it but keep the subscription: the
         // binding is preserved, so a same-id rejoin resumes on its own.
         int blanked = 0;
+        bool switchTargetLeft = false;
         for (auto& kv : g_subs) {
             MacSubscription* s = kv.second.get();
-            if (!s || s->userId != userId || !s->sink) continue;
+            if (!s) continue;
+            // A switch in progress TOWARD the departed user can never deliver:
+            // flag it, and ProcessSwitches below lands the source in the same
+            // state as before (bound to that user, blanked).
+            if (s->sw.active && s->sw.toUser == userId) {
+                s->sw.targetLeft = true;
+                switchTargetLeft = true;
+            }
+            if (s->userId != userId || !s->sink) continue;
             s->sink->writer.WriteBlankSignal();
             ++blanked;
         }
@@ -1807,6 +2540,7 @@ void VideoOnUserLeft(unsigned int userId)
             LogInfo("Video: blanked " + std::to_string(blanked) +
                     " source(s) bound to departed user " +
                     std::to_string(userId));
+        if (switchTargetLeft) ProcessSwitches();
 
         if (g_rawSpeakerId == userId) g_rawSpeakerId = 0;
         // The on-screen person leaving switches immediately; with no one to
