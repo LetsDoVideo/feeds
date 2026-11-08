@@ -48,7 +48,7 @@ Download the latest **Feeds.zip** from the [Releases](https://github.com/LetsDoV
 
 1. In OBS, click **+** in the Sources panel and add a **Feeds Participant** source
 2. In the source Properties window, click **Not logged in to Zoom. Click to Login.** A browser window opens for you to sign in to your Zoom account, then return to OBS
-3. Once logged in, click **Logged in. Click to Connect to Zoom Meeting.**
+3. Once logged in, click the **Start or Join a Zoom Meeting** button
 4. Enter your Zoom meeting number or link when prompted
 5. Enter the meeting password if required
 6. The host will see a **"Request to livestream"** popup in Zoom. Have them click **Allow**

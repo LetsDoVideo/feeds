@@ -258,6 +258,26 @@ enum class RawPrivilegeState {
 };
 RawPrivilegeState g_rawPrivilegeState = RawPrivilegeState::NotRequested;
 
+// Short permission line for a Participant dock row, read from the same
+// g_rawPrivilegeState the properties window's PrivilegeStatusText uses, with
+// the same mapping (NotRequested reads as Pending: the brief gap between
+// meeting_joined and the engine's pending/granted message). Empty when Granted,
+// so the caller falls back to its own text. Only meaningful in a meeting.
+static const char* DockPrivilegeStatusText(RawPrivilegeState state) {
+    switch (state) {
+        case RawPrivilegeState::Granted:
+            return "";
+        case RawPrivilegeState::Denied:
+            return "Host denied permission. Leave and rejoin.";
+        case RawPrivilegeState::TimedOut:
+            return "Still waiting for permission. Check with the host.";
+        case RawPrivilegeState::Pending:
+        case RawPrivilegeState::NotRequested:
+        default:
+            return "Waiting for host permission (check Zoom for a popup)";
+    }
+}
+
 // Single network-requirements page that BOTH network-failure messages point
 // at (login_timeout and tier_unreachable), so a blocked user — or the IT desk
 // they forward the message to — lands in one place that lists every host Feeds
@@ -1623,7 +1643,7 @@ void OnConnectClick() {
             QString::fromUtf8("Feeds - Login Required"),
             QString::fromUtf8(
                 "You need to log in to Zoom first.\n\n"
-                "Please log in and then try Connect to Zoom Meeting again."));
+                "Please log in and then try Start or Join a Zoom Meeting again."));
         OnLoginClick();
         return;
     }
@@ -1671,7 +1691,7 @@ void OnConnectClick() {
     int choice = 0;
     {
         QDialog dlg(mainWindow);
-        dlg.setWindowTitle("Connect to Zoom Meeting");
+        dlg.setWindowTitle("Start or Join a Zoom Meeting");
 
         // Tile palette. Blue marks the two host-your-own-room actions; grey
         // marks the rest. Hover lightens the fill, press darkens it — same
@@ -2504,7 +2524,7 @@ public:
         // logged in to Zoom.") would restate what the button's own presence
         // already says.
         const bool loggedIn = (state == kLoggedIn);
-        m_button = new QPushButton(loggedIn ? "Click to Connect to Zoom Meeting"
+        m_button = new QPushButton(loggedIn ? "Click to Start or Join a Zoom Meeting"
                                             : "Click to Login to Zoom",
                                    this);
         StylePrimaryCtaButton(m_button);
@@ -2830,10 +2850,8 @@ public:
 
         if (!m_messagesStarted) {
             // First real message — drop the placeholder. From here on the
-            // dock shows only real chat history for the rest of the OBS
-            // session. We don't re-add the placeholder after a meeting
-            // ends; preserving history across meetings is the Phase 1
-            // behavior per spec.
+            // dock shows real chat history until the meeting ends, when
+            // OnMeetingLeft clears it (the same history the overlay drops).
             m_list->clear();
             m_messagesStarted = true;
         }
@@ -2977,9 +2995,23 @@ public:
     void OnMeetingLeft() {
         UpdateChatHeaderState();   // Zoom row -> "Waiting", input disabled
         // Hide any active popup and drop the overlay history so stale
-        // messages don't carry into the next meeting.
+        // messages don't carry into the next meeting. The dock drops its own
+        // rows at the same moment, and the same set: ClearChatOverlay empties
+        // every platform (Zoom, YouTube, Twitch), so the dock clears every
+        // row, keeping the two in agreement.
+        ClearChatHistory();
         feeds::ClearChatPopup();
         feeds::ClearChatOverlay();
+    }
+
+    // Empty the chat list and return it to its no-history state, so the
+    // placeholder logic applies again and the next message starts a fresh list.
+    // UI thread (called from OnMeetingLeft, which the IPC handler marshals).
+    void ClearChatHistory() {
+        m_messagesStarted = false;
+        m_list->clear();
+        HideNewMessagesPill();
+        SetPlaceholder(CurrentPlaceholderText());
     }
 
     // Called from the IPC handlers when login state changes: refreshes the
@@ -4093,7 +4125,17 @@ public:
 
         const bool   loggedIn    = g_isLoggedIn;
         const bool   inMeeting   = g_isInMeeting;
-        const bool   granted     = (g_rawPrivilegeState == RawPrivilegeState::Granted);
+        // Read once so the live gate and every row's permission line agree.
+        const RawPrivilegeState privState = g_rawPrivilegeState;
+        const bool   granted     = (privState == RawPrivilegeState::Granted);
+        // A non-live row's line: in a meeting without permission it names the
+        // permission state (same source and mapping as the properties window);
+        // otherwise, including granted-but-alone, it stays "Waiting for
+        // participants…". Every raw_livestream_* transition runs
+        // RefreshAllSourceProperties, which posts this rebuild.
+        const QString waitingText = (inMeeting && !granted)
+            ? QString::fromUtf8(DockPrivilegeStatusText(privState))
+            : QString::fromUtf8("Waiting for participants…");
         // Others present: roster entries excluding self (myId). Same count the
         // properties dialog uses to decide between a live dropdown and the
         // "Waiting for participants..." state. Computed from the released roster
@@ -4173,7 +4215,8 @@ public:
         // than the box appearing/disappearing.
         for (const auto& r : rows) {
             if (loggedIn && r.disabled) continue;
-            m_root->addWidget(MakeSourceBox(r, live, myId, roster, pidCount, livePidCount));
+            m_root->addWidget(MakeSourceBox(r, live, waitingText, myId, roster,
+                                            pidCount, livePidCount));
         }
 
         if (atOrOverCap) {
@@ -5199,7 +5242,8 @@ private:
         return label;
     }
 
-    QWidget* MakeSourceBox(const Row& r, bool live, unsigned int myId,
+    QWidget* MakeSourceBox(const Row& r, bool live, const QString& waitingText,
+                           unsigned int myId,
                            const std::map<unsigned int, std::string>& roster,
                            const std::map<long long, int>& pidCount,
                            const std::map<long long, int>& livePidCount) {
@@ -5283,8 +5327,13 @@ private:
             // of the combo. The dot/mute/warn are painted once (static — the dock
             // is not in an active meeting state, so nothing updates them in place;
             // the non-live->live transition rebuilds). Occupies the combo's slot so
-            // the box height stays stable across the flip.
-            QLabel* status = new QLabel("Waiting for participants…");
+            // the box height stays stable across the flip. The text is the
+            // caller's: "Waiting for participants…", or the permission state
+            // while in a meeting without it. Word-wrapped: the permission
+            // lines are wider than the dock's minimum width, and an unwrapped
+            // label would force the dock wider instead of breaking the line.
+            QLabel* status = new QLabel(waitingText);
+            status->setWordWrap(true);
             status->setStyleSheet("QLabel { color: #7a7d80; }");
             boxL->addWidget(status);
             return box;
@@ -5903,7 +5952,7 @@ static void SetMenuItemBold(QAction* action, bool bold) {
 // Emphasise the one Feeds menu item that is the user's next step, so the menu
 // answers "what do I do now?" at a glance:
 //   not logged in           -> Login to Zoom (nothing else works first)
-//   logged in, no meeting   -> Connect to Zoom Meeting
+//   logged in, no meeting   -> Start or Join a Zoom Meeting
 //   otherwise               -> neither, i.e. in a meeting (both steps done),
 //                              or an auth round-trip is in flight, where the
 //                              item reads "Cancel login" and cancelling is
@@ -7907,7 +7956,7 @@ void SetupPluginMenu() {
     feedsMenu->setToolTipsVisible(true);
 
     g_loginLogoutAction  = feedsMenu->addAction("Login to Zoom");
-    g_connectAction      = feedsMenu->addAction("Connect to Zoom Meeting");
+    g_connectAction      = feedsMenu->addAction("Start or Join a Zoom Meeting");
     feedsMenu->addSeparator();
     g_isoRecordingAction = feedsMenu->addAction("ISO Recording");
     g_isoRecordingAction->setCheckable(true);
@@ -9271,7 +9320,7 @@ static obs_properties_t* zp_properties(void* data) {
                 });
         } else {
             obs_properties_add_button(props, "connect_btn",
-                "Logged in. Click to Connect to Zoom Meeting.",
+                "Click to Start or Join a Zoom Meeting",
                 [](obs_properties_t*, obs_property_t*, void*) -> bool {
                     OnConnectClick();
                     return true;
@@ -9805,7 +9854,7 @@ static obs_properties_t* zs_properties(void* data) {
                 });
         } else {
             obs_properties_add_button(props, "connect_btn",
-                "Logged in. Click to Connect to Zoom Meeting.",
+                "Click to Start or Join a Zoom Meeting",
                 [](obs_properties_t*, obs_property_t*, void*) -> bool {
                     OnConnectClick();
                     return true;
