@@ -6,7 +6,8 @@
 
 // Public interface for the feeds_lower_third OBS source — a per-participant
 // nameplate (avatar + name + editable title) drawn as a card over that
-// participant's video.
+// participant's video, or, in name tag mode, just the name in a small box at
+// the participant's bottom-left corner.
 //
 // It is a SEPARATE source that sits above the participant source in the scene,
 // not something composited into the participant's frames. That is the whole
@@ -68,6 +69,12 @@ void UpdateLowerThirdContent(const std::string& participantUuid,
 // ReconcileChatPopupSources / ReconcileChatOverlaySources.
 void ReconcileLowerThirdSources();
 
+// Name tag mode: the scene-item scale that sizes the tag to a participant whose
+// on-canvas box is participantHeight tall. The tag is drawn as if its
+// participant filled the canvas, so this is participantHeight / canvas height.
+// Used by plugin-main's PlaceLowerThirdItem.
+float LowerThirdNameTagScale(float participantHeight);
+
 // Implemented by plugin-main, called by the lower third's own properties panel
 // when the user edits the title there. The lower third writes the new value
 // through to the participant's settings itself (that is the source of truth);
@@ -81,5 +88,11 @@ void NotifyLowerThirdTitleChanged(const std::string& participantUuid);
 // the UI thread; tier-locked it does nothing, with no upgrade prompt. Declared
 // here for the same reason.
 void RequestLowerThirdShown(const std::string& participantUuid, bool shown);
+
+// Implemented by plugin-main, called by lt_update when the lower third's name
+// tag mode setting changes. lt_update has already taken it off screen; this
+// clears its stored shown flag through the dock's Hide path, queued onto the UI
+// thread, and refreshes the dock row for the new mode. Any thread.
+void NotifyLowerThirdModeChanged(const std::string& participantUuid);
 
 }  // namespace feeds

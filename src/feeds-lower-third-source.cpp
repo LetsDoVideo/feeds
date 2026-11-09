@@ -22,16 +22,16 @@
 // The slide differs from the popup on purpose: the lower third comes in from
 // the LEFT (the traditional lower-third entrance) rather than up from below,
 // which also keeps it visually distinct from a chat popup on the same stream.
-// Same ease-out cubic and same 0.5s duration.
+// Same ease-out cubic and same 0.5s duration. The card stays full size for as
+// long as it is shown.
 //
-// Intro then compact: every Show starts with the full card, and after
-// kLowerThirdIntroMs (if still heading on screen) the card shrinks over
-// kLowerThirdShrinkMs to a compact name tag in the bottom-left corner of its
-// own box. The shrink is drawn INSIDE the source (the image keeps its full
-// size and the plate repaints smaller each frame), so the scene items placed
-// on Show are never touched again: every scene, transition and Studio Mode
-// view of the source shows the same plate at the same moment. Per source
-// opt-out: the "compact_after_intro" setting (default on).
+// Name tag mode (the "name_tag_mode" setting, default off): the same source
+// draws only the participant's name in a small translucent black box, the way
+// Zoom labels a gallery tile. No avatar, no title, no slide: it fades in and
+// out. Its sizes are fractions of the participant's height (kNameTag*), and
+// plugin-main's PlaceLowerThirdItem anchors it to the participant's
+// bottom-left corner with the same one-shot placement the card uses. A mode
+// change hides the source at once; the user shows it again in the new mode.
 
 #include "feeds-lower-third-source.h"
 #include "feeds-card-render.h"
@@ -52,6 +52,7 @@
 #include <QUrl>
 
 #include <algorithm>
+#include <cmath>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -88,11 +89,12 @@ static constexpr int LOWER_THIRD_MIN_TIER = 1;
 static constexpr const char* kLtParticipantUuidKey = "participant_uuid";
 static constexpr const char* kLtShownKey           = "shown";
 static constexpr const char* kLtTitleKey           = "title";
-//   compact_after_intro — shrink to the compact name tag after the intro.
-//                      Default true, which also applies to lower thirds in
-//                      collections saved before the setting existed (libobs
-//                      falls back to the default for a missing key).
-static constexpr const char* kLtCompactKey         = "compact_after_intro";
+//   name_tag_mode    — draw the name-only tag instead of the full card.
+//                      Default false. Mirrored in plugin-main.cpp
+//                      (kLtNameTagModeKey), which reads it for placement and
+//                      for the dock row. A "compact_after_intro" value saved by
+//                      older versions is no longer read and is ignored.
+static constexpr const char* kLtNameTagKey         = "name_tag_mode";
 
 // The participant-side key holding the one true title string. Mirrored in
 // plugin-main.cpp (kLowerThirdTitleKey) — both sides read and write this
@@ -142,46 +144,56 @@ static constexpr int L_NAME_FONT          = 30;
 static constexpr int L_TITLE_FONT         = 24;
 static constexpr int L_TITLE_TOP_GAP      = 8;    // below the pill
 
-// Intro, then the shrink to the compact name tag. Both timed from the source's
-// own video tick, like the slide.
-static constexpr float kLowerThirdIntroMs  = 8000.0f;   // full card after Show
-static constexpr float kLowerThirdShrinkMs = 400.0f;    // full -> compact
+// ---------------------------------------------------------------------------
+// Name tag mode look. Tune here. Every size is a fraction of the participant
+// source's on-canvas HEIGHT at show time (the padding and font are fractions
+// of the box height, the width cap a fraction of the participant's width).
+//
+// How "relative to the participant" works with one texture serving N scene
+// items: the tag is drawn as if the participant filled the whole canvas (the
+// reference size is the canvas base width x height), and PlaceLowerThirdItem
+// scales each scene item by participant height / canvas height
+// (LowerThirdNameTagScale). The width cap therefore lands at exactly 60% of a
+// participant whose aspect ratio matches the canvas (the normal 16:9 case);
+// on a participant cropped to another aspect it is 60% of the canvas-aspect
+// width at that height.
+//
+// The texture is a fixed size for a given canvas: room for the widest
+// allowed box plus the left and bottom margins. The box inside it fits the
+// name, so the source never changes size while shown. Its bottom-left corner
+// sits on the participant's bottom-left corner, which puts the box the
+// margin away from both edges.
+// ---------------------------------------------------------------------------
+static constexpr float kNameTagBoxHeightFraction    = 0.07f;   // of participant height
+static constexpr float kNameTagCornerRadiusFraction = 0.01f;   // of participant height
+static constexpr float kNameTagMarginFraction       = 0.005f;  // of participant height, left and bottom
+static constexpr float kNameTagMaxWidthFraction     = 0.60f;   // of participant width
+static constexpr float kNameTagPaddingFraction      = 0.30f;   // of box height, each side
+static constexpr float kNameTagFontFraction         = 0.50f;   // text pixel size, of box height
+static constexpr float kNameTagBoxOpacity           = 0.65f;   // black box alpha
+static constexpr float kNameTagFadeSeconds          = 0.20f;   // fade in and fade out
 
-// Compact name tag, same scale-1.0 reference as the L_ literals (full card 768
-// wide on a 1080p canvas). The same plate, about half size: everything vertical
-// is ~0.53x (card 120 -> 64, avatar 96 -> 50, name 30 -> 17, title 24 -> 14) so
-// avatar, name and title keep their proportions to each other, and the padding
-// is tightened a little more than that so the tag reads as a tag, not a shrunk
-// card. Its width is FIXED (C_CARD_WIDTH, about a third of the full card's
-// 748px plate), never fitted to its content: a long title must not stretch the
-// tag back across the guest's face. Name and title elide inside it, exactly as
-// they do on the full card.
-//
-// Readability floor: one texture serves every scene item, and each item is
-// scaled by its participant's box (PlaceLowerThirdItem: 92% of the box width
-// over the 768px card). The smallest common layout, a 2x2 grid at 1080p
-// (960px boxes, item scale ~1.15), gives a ~20px name and ~16px title, about
-// the smallest that stays legible on a 1080p stream. A full-screen
-// participant (scale ~2.3) gets a ~39px name, still half the full card.
-//
-// Width 250 leaves 172px of text (250 - 7 - 50 - 9 - 12): room for a typical
-// name in its pill and a title of about 25 characters before either elides.
-static constexpr int C_CARD_WIDTH         = 250;
-static constexpr int C_CARD_HEIGHT        = 64;
-static constexpr int C_CARD_CORNER_RADIUS = 3;
-static constexpr int C_SHADOW_OFFSET      = 3;
-static constexpr int C_AVATAR_INSET       = 7;
-static constexpr int C_AVATAR_SIZE        = 50;
-static constexpr int C_AVATAR_BORDER      = 2;
-static constexpr int C_TEXT_GAP           = 9;
-static constexpr int C_TEXT_RIGHT_PAD     = 12;
-static constexpr int C_PILL_TOP           = 7;
-static constexpr int C_PILL_H_PAD         = 6;
-static constexpr int C_PILL_V_PAD         = 3;
-static constexpr int C_PILL_CORNER_RADIUS = 4;
-static constexpr int C_NAME_FONT          = 17;
-static constexpr int C_TITLE_FONT         = 14;
-static constexpr int C_TITLE_TOP_GAP      = 3;
+// The canvas size the name tag is drawn against (see above). Falls back to
+// 1080p like GetCardWidth.
+static void GetNameTagReference(float& outW, float& outH) {
+    struct obs_video_info ovi;
+    if (obs_get_video_info(&ovi) && ovi.base_width > 0 && ovi.base_height > 0) {
+        outW = (float)ovi.base_width;
+        outH = (float)ovi.base_height;
+        return;
+    }
+    outW = 1920.0f;
+    outH = 1080.0f;
+}
+
+// The name tag texture's fixed footprint for the current canvas.
+static void ComputeNameTagSize(uint32_t& outWidth, uint32_t& outHeight) {
+    float refW = 0.0f, refH = 0.0f;
+    GetNameTagReference(refW, refH);
+    const float margin = refH * kNameTagMarginFraction;
+    outWidth  = (uint32_t)std::ceil(margin + refW * kNameTagMaxWidthFraction);
+    outHeight = (uint32_t)std::ceil(refH * kNameTagBoxHeightFraction + margin);
+}
 
 // 40% of the active OBS canvas width, queried per content change so the card
 // is the same proportion of the screen at any canvas resolution. Falls back to
@@ -260,13 +272,12 @@ struct FeedsLowerThirdData {
     float         anim_from    = 1.0f;
     float         anim_to      = 1.0f;
 
-    // Intro then compact (see the file header). shrink_u is linear progress,
-    // 0 = full card, 1 = compact tag, moved toward shrink_target by the video
-    // tick; the render eases it. All reset to full once the card is Hidden.
-    bool          compact_enabled = true;
-    float         intro_elapsed   = 0.0f;   // seconds since this Show began
-    float         shrink_u        = 0.0f;
-    float         shrink_target   = 0.0f;
+    // Name tag mode (see the file header). Changes only through lt_update,
+    // which also snaps the source to Hidden, so it never changes mid-animation.
+    bool          name_tag     = false;
+    // Opacity the name tag texture was last painted at. The fade repaints the
+    // small tag at each new opacity; -1 forces the first paint.
+    float         painted_opacity = -1.0f;
 
     // Show/Hide hotkeys, one pair per source so each lists under its own name.
     obs_hotkey_pair_id hotkey_pair = OBS_INVALID_HOTKEY_PAIR_ID;
@@ -285,53 +296,38 @@ std::mutex                          g_ltStateMutex;
 // Paint the card into d->rendered_image. name/title/avatar are passed in as a
 // snapshot so the caller can take them under the state mutex and release it
 // before the slow paint.
-//
-// k is the eased shrink: 0 = the full card, 1 = the compact name tag, and
-// anything between is the shrink in flight. Every metric interpolates between
-// its L_ and C_ literal; at k = 0 each one is exactly the L_ value, so a card
-// that never shrinks (compact off, or still in its intro) paints exactly what
-// it always has. The image itself is always the full card's size: the plate
-// shrinks toward the bottom-left corner of it.
 // ---------------------------------------------------------------------------
 static void RenderLowerThirdToImage(FeedsLowerThirdData* d,
                                     const QString& name,
                                     const QString& title,
-                                    const QImage&  avatar,
-                                    float          k) {
+                                    const QImage&  avatar) {
     const int   cardWidth = (int)GetCardWidth();
     const float scale     = (float)cardWidth / kReferenceCardWidth;
-
-    // Interpolated pixel size of one layout literal.
-    auto px = [scale, k](int full, int compact) {
-        return (int)(((float)full + (float)(compact - full) * k) * scale);
-    };
 
     const int CARD_LEFT_MARGIN   = (int)(L_CARD_LEFT_MARGIN   * scale);
     const int CARD_RIGHT_MARGIN  = (int)(L_CARD_RIGHT_MARGIN  * scale);
     const int CARD_TOP_OFFSET    = (int)(L_CARD_TOP_OFFSET    * scale);
     const int BOTTOM_MARGIN      = (int)(L_BOTTOM_MARGIN      * scale);
-    const int FULL_CARD_HEIGHT   = (int)(L_CARD_HEIGHT        * scale);
-    const int CARD_HEIGHT        = px(L_CARD_HEIGHT,        C_CARD_HEIGHT);
-    const int CARD_CORNER_RADIUS = px(L_CARD_CORNER_RADIUS, C_CARD_CORNER_RADIUS);
-    const int SHADOW_OFFSET      = px(L_SHADOW_OFFSET,      C_SHADOW_OFFSET);
-    const int AVATAR_INSET       = px(L_AVATAR_INSET,       C_AVATAR_INSET);
-    const int AVATAR_SIZE        = px(L_AVATAR_SIZE,        C_AVATAR_SIZE);
-    const int AVATAR_BORDER      = std::max(1, px(L_AVATAR_BORDER, C_AVATAR_BORDER));
-    const int TEXT_GAP           = px(L_TEXT_GAP,           C_TEXT_GAP);
-    const int TEXT_RIGHT_PAD     = px(L_TEXT_RIGHT_PAD,     C_TEXT_RIGHT_PAD);
-    const int PILL_TOP           = px(L_PILL_TOP,           C_PILL_TOP);
-    const int PILL_H_PAD         = px(L_PILL_H_PAD,         C_PILL_H_PAD);
-    const int PILL_V_PAD         = px(L_PILL_V_PAD,         C_PILL_V_PAD);
-    const int PILL_CORNER_RADIUS = px(L_PILL_CORNER_RADIUS, C_PILL_CORNER_RADIUS);
-    const int NAME_FONT          = std::max(1, px(L_NAME_FONT,  C_NAME_FONT));
-    const int TITLE_FONT         = std::max(1, px(L_TITLE_FONT, C_TITLE_FONT));
-    const int TITLE_TOP_GAP      = px(L_TITLE_TOP_GAP,      C_TITLE_TOP_GAP);
+    const int CARD_HEIGHT        = (int)(L_CARD_HEIGHT        * scale);
+    const int CARD_CORNER_RADIUS = (int)(L_CARD_CORNER_RADIUS * scale);
+    const int SHADOW_OFFSET      = (int)(L_SHADOW_OFFSET      * scale);
+    const int AVATAR_INSET       = (int)(L_AVATAR_INSET       * scale);
+    const int AVATAR_SIZE        = (int)(L_AVATAR_SIZE        * scale);
+    const int AVATAR_BORDER      = std::max(1, (int)(L_AVATAR_BORDER * scale));
+    const int TEXT_GAP           = (int)(L_TEXT_GAP           * scale);
+    const int TEXT_RIGHT_PAD     = (int)(L_TEXT_RIGHT_PAD     * scale);
+    const int PILL_TOP           = (int)(L_PILL_TOP           * scale);
+    const int PILL_H_PAD         = (int)(L_PILL_H_PAD         * scale);
+    const int PILL_V_PAD         = (int)(L_PILL_V_PAD         * scale);
+    const int PILL_CORNER_RADIUS = (int)(L_PILL_CORNER_RADIUS * scale);
+    const int NAME_FONT          = std::max(1, (int)(L_NAME_FONT  * scale));
+    const int TITLE_FONT         = std::max(1, (int)(L_TITLE_FONT * scale));
+    const int TITLE_TOP_GAP      = (int)(L_TITLE_TOP_GAP      * scale);
 
     // Fixed height — see the layout note above. Written before the QImage is
     // sized so OBS's next get_width/get_height query sees the current canvas.
-    // Always the FULL card's footprint, whatever k is.
     d->width  = (uint32_t)cardWidth;
-    d->height = (uint32_t)(CARD_TOP_OFFSET + FULL_CARD_HEIGHT + BOTTOM_MARGIN);
+    d->height = (uint32_t)(CARD_TOP_OFFSET + CARD_HEIGHT + BOTTOM_MARGIN);
 
     if (d->rendered_image.size() != QSize((int)d->width, (int)d->height) ||
         d->rendered_image.format() != QImage::Format_RGBA8888) {
@@ -344,18 +340,10 @@ static void RenderLowerThirdToImage(FeedsLowerThirdData* d,
     p.setRenderHint(QPainter::Antialiasing, true);
     p.setRenderHint(QPainter::SmoothPixmapTransform, true);
 
-    // The plate. Its left edge and its bottom stay where the full card's are,
-    // so the shrink closes in on the bottom-left corner of the box. The width
-    // runs from the full card's to the compact tag's fixed width; the text
-    // below elides against whatever width the plate has at this k.
-    const int fullCardW = cardWidth - CARD_LEFT_MARGIN - CARD_RIGHT_MARGIN;
-    const int compactW  = (int)(C_CARD_WIDTH * scale);
-    const int cardW =
-        (int)((float)fullCardW + (float)(compactW - fullCardW) * k);
     const QRect cardRect(
         CARD_LEFT_MARGIN,
-        CARD_TOP_OFFSET + FULL_CARD_HEIGHT - CARD_HEIGHT,
-        cardW,
+        CARD_TOP_OFFSET,
+        cardWidth - CARD_LEFT_MARGIN - CARD_RIGHT_MARGIN,
         CARD_HEIGHT);
 
     feeds::card::DrawCardBody(p, cardRect, CARD_CORNER_RADIUS, SHADOW_OFFSET);
@@ -424,51 +412,114 @@ static void RenderLowerThirdToImage(FeedsLowerThirdData* d,
     p.end();
 }
 
+// Paint the name tag into d->rendered_image at `opacity` (the fade). The image
+// is the fixed ComputeNameTagSize footprint; the box inside it fits the name,
+// left-aligned, its bottom one margin above the image's bottom edge. An empty
+// name (an Active-Speaker tag with nobody speaking, or content not pushed
+// yet) draws nothing rather than an empty box.
+static void RenderNameTagToImage(FeedsLowerThirdData* d, const QString& name,
+                                 float opacity) {
+    float refW = 0.0f, refH = 0.0f;
+    GetNameTagReference(refW, refH);
+    ComputeNameTagSize(d->width, d->height);
+
+    if (d->rendered_image.size() != QSize((int)d->width, (int)d->height) ||
+        d->rendered_image.format() != QImage::Format_RGBA8888) {
+        d->rendered_image = QImage((int)d->width, (int)d->height,
+                                   QImage::Format_RGBA8888);
+    }
+    d->rendered_image.fill(Qt::transparent);
+    if (name.isEmpty() || opacity <= 0.0f) return;
+
+    const float margin  = refH * kNameTagMarginFraction;
+    const float boxH    = refH * kNameTagBoxHeightFraction;
+    const float pad     = boxH * kNameTagPaddingFraction;
+    const float radius  = refH * kNameTagCornerRadiusFraction;
+    const float maxBoxW = refW * kNameTagMaxWidthFraction;
+
+    QFont font;   // the application's sans-serif UI font
+    font.setBold(false);
+    font.setPixelSize(std::max(1, (int)std::lround(boxH * kNameTagFontFraction)));
+    const QFontMetricsF fm(font);
+
+    // Fit the box to the name, capped; past the cap the name elides with an
+    // ellipsis so the box never exceeds it.
+    const float maxTextW = std::max(0.0f, maxBoxW - 2.0f * pad);
+    const QString text =
+        fm.elidedText(name, Qt::ElideRight, (qreal)maxTextW);
+    const float boxW =
+        std::min(maxBoxW, (float)fm.horizontalAdvance(text) + 2.0f * pad);
+
+    const QRectF boxRect(margin, (float)d->height - margin - boxH, boxW, boxH);
+
+    QPainter p(&d->rendered_image);
+    p.setRenderHint(QPainter::Antialiasing, true);
+    p.setRenderHint(QPainter::TextAntialiasing, true);
+    p.setOpacity(opacity);
+
+    p.setPen(Qt::NoPen);
+    p.setBrush(QColor(0, 0, 0, (int)std::lround(255.0f * kNameTagBoxOpacity)));
+    p.drawRoundedRect(boxRect, radius, radius);
+
+    p.setFont(font);
+    p.setPen(Qt::white);
+    p.drawText(boxRect.adjusted(pad, 0.0, -pad, 0.0),
+               Qt::AlignLeft | Qt::AlignVCenter, text);
+    p.end();
+}
+
 // Repaint + re-upload. Called from video_render on the graphics thread, so the
 // graphics context is already active — no obs_enter_graphics needed.
 static void RegenerateTexture(FeedsLowerThirdData* d,
+                              bool           nameTag,
                               const QString& name,
                               const QString& title,
                               const QImage&  avatar,
-                              float          shrink) {
-    RenderLowerThirdToImage(d, name, title, avatar, shrink);
+                              float          opacity) {
+    if (nameTag) {
+        RenderNameTagToImage(d, name, opacity);
+        d->painted_opacity = opacity;
+    } else {
+        RenderLowerThirdToImage(d, name, title, avatar);
+    }
     feeds::card::UploadImageToTexture(d->rendered_image, d->width, d->height,
                                       d->texture);
     d->texture_dirty = false;
 }
 
-// Current X-offset fraction: 0 = card in place, 1 = card translated fully off
-// the left edge of its box. Caller must hold g_ltStateMutex.
+// Current hidden fraction: 0 = fully in place, 1 = fully hidden. For the card
+// it is the X offset (translated fully off the left edge of its box) on the
+// ease-out slide; for the name tag it is 1 - opacity, on a linear fade.
+// Caller must hold g_ltStateMutex.
+static float AnimDurationSeconds(const FeedsLowerThirdData* d) {
+    return d->name_tag ? kNameTagFadeSeconds : feeds::card::kSlideDurationSeconds;
+}
+
 static float ComputeFraction_locked(const FeedsLowerThirdData* d) {
     switch (d->anim) {
         case LtAnimState::Hidden: return 1.0f;
         case LtAnimState::Shown:  return 0.0f;
         case LtAnimState::AnimatingIn:
         case LtAnimState::AnimatingOut: {
-            float t = d->anim_elapsed / feeds::card::kSlideDurationSeconds;
+            float t = d->anim_elapsed / AnimDurationSeconds(d);
             if (t < 0.0f) t = 0.0f;
             if (t > 1.0f) t = 1.0f;
-            const float e = feeds::card::EaseOutCubic(t);
+            const float e = d->name_tag ? t : feeds::card::EaseOutCubic(t);
             return d->anim_from + (d->anim_to - d->anim_from) * e;
         }
     }
     return 0.0f;
 }
 
-// Begin a slide toward `show`, starting from wherever the card currently sits
-// so a rapid show/hide/show reverses smoothly instead of jumping. Caller must
-// hold g_ltStateMutex.
+// Begin a slide (or fade) toward `show`, starting from wherever the card
+// currently sits so a rapid show/hide/show reverses smoothly instead of
+// jumping. Caller must hold g_ltStateMutex.
 static void StartSlide_locked(FeedsLowerThirdData* d, bool show) {
     const float cur = ComputeFraction_locked(d);
     d->anim         = show ? LtAnimState::AnimatingIn : LtAnimState::AnimatingOut;
     d->anim_elapsed = 0.0f;
     d->anim_from    = cur;
     d->anim_to      = show ? 0.0f : 1.0f;
-    // Every Show is a new intro, whichever path started it (dock, a binding
-    // returning, a settings update). From fully hidden the plate is already
-    // back to full; reversing a slide-out that had shrunk grows it back to full
-    // over the shrink duration instead of jumping (see lt_video_tick).
-    if (show) d->intro_elapsed = 0.0f;
 }
 
 // Reconcile the animation with the two inputs that decide whether the card
@@ -539,12 +590,12 @@ static void lt_get_defaults(obs_data_t* settings) {
     obs_data_set_default_string(settings, kLtParticipantUuidKey, "");
     obs_data_set_default_string(settings, kLtTitleKey, "");
     obs_data_set_default_bool(settings, kLtShownKey, false);
-    obs_data_set_default_bool(settings, kLtCompactKey, true);
+    obs_data_set_default_bool(settings, kLtNameTagKey, false);
 }
 
 // Show/Hide hotkeys. Show or Hide is a Feeds action because the eye icon can't
-// replay the intro, so these go through the dock's path rather than scene-item
-// visibility. Pair contract: return whether the press did anything. With one key
+// play the slide or fade or re-place the source over its participant, so these
+// go through the dock's path rather than scene-item visibility. Pair contract: return whether the press did anything. With one key
 // bound to both, the first callback declines when the card is already in that
 // state and the other one runs, which makes a single key a toggle. Reads the same
 // settings flag the dock's button reads, so the two can't disagree.
@@ -595,15 +646,16 @@ static void* lt_create(obs_data_t* settings, obs_source_t* source) {
 
     // Report correct dimensions immediately: the placement code reads
     // obs_source_get_width/height to compute the scene-item scale, and it runs
-    // right after the source is added. The card's size depends only on the
-    // canvas, so it is known before any content arrives.
-    ComputeCardSize(d->width, d->height);
+    // right after the source is added. Both modes' sizes depend only on the
+    // canvas, so they are known before any content arrives.
+    if (settings) d->name_tag = obs_data_get_bool(settings, kLtNameTagKey);
+    if (d->name_tag) ComputeNameTagSize(d->width, d->height);
+    else             ComputeCardSize(d->width, d->height);
 
     if (settings) {
         const char* pu = obs_data_get_string(settings, kLtParticipantUuidKey);
         if (pu) d->participant_uuid = pu;
         d->shown = obs_data_get_bool(settings, kLtShownKey);
-        d->compact_enabled = obs_data_get_bool(settings, kLtCompactKey);
         // Restored HIDDEN regardless of the stored `shown` flag. A saved scene
         // collection is loaded long before any meeting exists, so no source can
         // be bound yet, and a nameplate with no bound participant must display
@@ -696,7 +748,7 @@ static void lt_update(void* data, obs_data_t* settings) {
 
     const char* pu    = obs_data_get_string(settings, kLtParticipantUuidKey);
     const bool  shown = obs_data_get_bool(settings, kLtShownKey);
-    const bool  compact = obs_data_get_bool(settings, kLtCompactKey);
+    const bool  nameTag = obs_data_get_bool(settings, kLtNameTagKey);
     const char* mirror = obs_data_get_string(settings, kLtTitleKey);
 
     // Resolve the title BEFORE taking the state lock (ResolveDisplayTitle
@@ -713,29 +765,54 @@ static void lt_update(void* data, obs_data_t* settings) {
     // included, re-apply the stored title instead of clobbering it.
     const QString title = ResolveDisplayTitle(pu ? pu : "", mirror);
 
-    std::lock_guard<std::mutex> lock(g_ltStateMutex);
+    bool        modeChanged = false;
+    std::string participantUuid;
+    {
+        std::lock_guard<std::mutex> lock(g_ltStateMutex);
 
-    if (pu && d->participant_uuid != pu) {
-        d->participant_uuid = pu;
-        d->texture_dirty    = true;
+        if (pu && d->participant_uuid != pu) {
+            d->participant_uuid = pu;
+            d->texture_dirty    = true;
+        }
+
+        if (d->title != title) {
+            d->title         = title;
+            d->texture_dirty = true;
+        }
+
+        // Mode change: switch at once and snap to Hidden, with no fade or
+        // slide in the old look. Its size changes with the mode, and the
+        // next Show re-places the scene items for the new size, so it must
+        // not stay on screen at the old placement. The stored `shown` flag is
+        // cleared through plugin-main below (the dock's Hide path), so the
+        // source stays hidden until the user shows it again.
+        if (nameTag != d->name_tag) {
+            d->name_tag        = nameTag;
+            d->anim            = LtAnimState::Hidden;
+            d->anim_elapsed    = 0.0f;
+            d->anim_from       = 1.0f;
+            d->anim_to         = 1.0f;
+            d->painted_opacity = -1.0f;
+            d->texture_dirty   = true;
+            if (nameTag) ComputeNameTagSize(d->width, d->height);
+            else         ComputeCardSize(d->width, d->height);
+            modeChanged     = true;
+            participantUuid = d->participant_uuid;
+        }
+
+        // Record the user's choice, then let the shared gate decide — `shown`
+        // alone no longer determines visibility, the binding has to agree.
+        // Unconditional rather than guarded on a change: the gate is
+        // idempotent, and routing both inputs through one place is what keeps
+        // show/hide and bind/unbind from fighting over the animation. After a
+        // mode change it stays down whatever the stored flag says.
+        d->shown = modeChanged ? false : shown;
+        ApplyEffectiveVisibility_locked(d);
     }
 
-    if (d->title != title) {
-        d->title         = title;
-        d->texture_dirty = true;
-    }
-
-    // Record the user's choice, then let the shared gate decide — `shown` alone
-    // no longer determines visibility, the binding has to agree. Unconditional
-    // rather than guarded on a change: the gate is idempotent, and routing both
-    // inputs through one place is what keeps show/hide and bind/unbind from
-    // fighting over the animation.
-    d->shown = shown;
-    ApplyEffectiveVisibility_locked(d);
-
-    // Picked up by the next video tick: on while past the intro shrinks the
-    // card, off while shrunk grows it back, both animated.
-    d->compact_enabled = compact;
+    // Outside the lock: plugin-main clears the stored shown flag (if set) and
+    // refreshes the dock row's button and title field for the new mode.
+    if (modeChanged) feeds::NotifyLowerThirdModeChanged(participantUuid);
 }
 
 // libobs calls this once the ENTIRE scene collection has been created —
@@ -827,9 +904,13 @@ static obs_properties_t* lt_get_properties(void* data) {
             return false;   // value persists; no property layout change
         }, data);
 
-    // Per-source escape hatch for the intro-then-compact behaviour. Bound to
-    // this source's own settings, so OBS applies it through lt_update.
-    obs_properties_add_bool(props, kLtCompactKey, "Shrink to compact after intro");
+    // Name tag mode. Bound to this source's own settings, so OBS applies it
+    // through lt_update, which hides the source on a change and has
+    // plugin-main update the dock row. No modified callback on purpose: OBS
+    // runs those when the panel opens too, and lt_update already sees every
+    // change, including the panel's Cancel restoring the old value.
+    obs_properties_add_bool(props, kLtNameTagKey,
+                            "Name tag mode (name only, like Zoom)");
 
     if (!d || d->participant_uuid.empty()) {
         obs_properties_add_text(props, "orphan_msg",
@@ -849,47 +930,6 @@ static obs_properties_t* lt_get_properties(void* data) {
     return props;
 }
 
-// Intro timer and shrink, after the slide has been stepped. Caller must hold
-// g_ltStateMutex.
-//   - Heading on screen: the intro counts; once it has run (and compact is on)
-//     the target is the compact tag, otherwise the full card. Turning compact
-//     off while shrunk therefore grows the card back, animated.
-//   - Heading off screen: the target freezes where the plate is, so a Hide
-//     during the shrink slides the plate out at its current size.
-//   - Hidden: everything resets to full, ready for the next Show's intro.
-// No Qt timer anywhere: all of it lives in this per-frame tick, so a Hide can
-// never leave a timer behind to fire later.
-static void StepIntroAndShrink_locked(FeedsLowerThirdData* d, float seconds) {
-    if (d->anim == LtAnimState::Hidden) {
-        if (d->shrink_u != 0.0f) d->texture_dirty = true;
-        d->intro_elapsed = 0.0f;
-        d->shrink_u      = 0.0f;
-        d->shrink_target = 0.0f;
-        return;
-    }
-
-    const bool heading =
-        (d->anim == LtAnimState::Shown || d->anim == LtAnimState::AnimatingIn);
-    if (heading) {
-        bool introDone = d->intro_elapsed * 1000.0f >= kLowerThirdIntroMs;
-        if (!introDone) {
-            d->intro_elapsed += seconds;
-            introDone = d->intro_elapsed * 1000.0f >= kLowerThirdIntroMs;
-        }
-        d->shrink_target = (d->compact_enabled && introDone) ? 1.0f : 0.0f;
-    } else {
-        d->shrink_target = d->shrink_u;
-    }
-
-    if (d->shrink_u == d->shrink_target) return;
-    const float step = seconds * 1000.0f / kLowerThirdShrinkMs;
-    if (d->shrink_u < d->shrink_target)
-        d->shrink_u = std::min(d->shrink_target, d->shrink_u + step);
-    else
-        d->shrink_u = std::max(d->shrink_target, d->shrink_u - step);
-    d->texture_dirty = true;   // the plate repaints at its new size
-}
-
 // Advance this instance's own animation. Unlike the popup — whose single
 // global clock forces a "am I the first instance" gate — every lower third
 // animates independently, so each one just steps its own counter.
@@ -901,7 +941,7 @@ static void lt_video_tick(void* data, float seconds) {
     if (d->anim == LtAnimState::AnimatingIn ||
         d->anim == LtAnimState::AnimatingOut) {
         d->anim_elapsed += seconds;
-        if (d->anim_elapsed >= feeds::card::kSlideDurationSeconds) {
+        if (d->anim_elapsed >= AnimDurationSeconds(d)) {
             d->anim = (d->anim == LtAnimState::AnimatingIn) ? LtAnimState::Shown
                                                             : LtAnimState::Hidden;
             d->anim_elapsed = 0.0f;
@@ -909,7 +949,6 @@ static void lt_video_tick(void* data, float seconds) {
             d->anim_to      = d->anim_from;
         }
     }
-    StepIntroAndShrink_locked(d, seconds);
 }
 
 static void lt_video_render(void* data, gs_effect_t* /*effect*/) {
@@ -925,11 +964,11 @@ static void lt_video_render(void* data, gs_effect_t* /*effect*/) {
     // the same lock — a push landing after we release sets it again and the
     // next frame catches up.
     bool    dirty;
+    bool    nameTag;
     QString name;
     QString title;
     QImage  avatar;
     float   fraction;
-    float   shrink;
     {
         std::lock_guard<std::mutex> lock(g_ltStateMutex);
 
@@ -946,25 +985,30 @@ static void lt_video_render(void* data, gs_effect_t* /*effect*/) {
         if (d->anim == LtAnimState::Hidden) return;
 
         dirty    = d->texture_dirty;
+        nameTag  = d->name_tag;
         name     = d->name;
         title    = d->title;
         avatar   = d->avatar;
         if (dirty) d->texture_dirty = false;
         fraction = ComputeFraction_locked(d);
-        // Eased like the slide. Exactly 0 while the card is full.
-        shrink   = d->shrink_u > 0.0f ? feeds::card::EaseOutCubic(d->shrink_u)
-                                      : 0.0f;
     }
 
+    // The name tag fades instead of sliding: the opacity is baked into its
+    // small texture, repainted whenever it moves (a handful of frames per
+    // fade, nothing while it sits shown).
+    const float opacity = nameTag ? (1.0f - fraction) : 1.0f;
+    if (nameTag && opacity != d->painted_opacity) dirty = true;
+
     if (dirty || !d->texture) {
-        RegenerateTexture(d, name, title, avatar, shrink);
+        RegenerateTexture(d, nameTag, name, title, avatar, opacity);
     }
     if (!d->texture) return;
 
-    // Slide in from the LEFT: fraction 1 translates the card one full box
-    // width to the left (entirely outside the clip box), fraction 0 leaves it
-    // in place. The popup's equivalent is a positive Y offset.
-    const float xOffset = -fraction * (float)d->width;
+    // Card: slide in from the LEFT. Fraction 1 translates the card one full
+    // box width to the left (entirely outside the clip box), fraction 0 leaves
+    // it in place. The popup's equivalent is a positive Y offset. The name tag
+    // never moves.
+    const float xOffset = nameTag ? 0.0f : -fraction * (float)d->width;
 
     feeds::card::DrawClippedSlide(d->texrender, d->texture,
                                   d->width, d->height, xOffset, 0.0f);
@@ -1032,6 +1076,12 @@ void UpdateLowerThirdContent(const std::string& participantUuid,
             d->texture_dirty = true;
         }
     }
+}
+
+float LowerThirdNameTagScale(float participantHeight) {
+    float refW = 0.0f, refH = 0.0f;
+    GetNameTagReference(refW, refH);
+    return participantHeight / refH;
 }
 
 void ReconcileLowerThirdSources() {

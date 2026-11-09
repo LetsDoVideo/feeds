@@ -456,13 +456,15 @@ static void ShowIncludedScenesMenu(const std::string& uuid);
 // resolvers). The dock's per-row lower-third controls call these:
 //   GetLowerThirdUuidFor  — the participant's forward pointer, validated
 //                           ("" = never created, or since deleted)
-//   IsLowerThirdShown     — the lower third's persisted shown flag
+//   IsLowerThirdShown     — the lower third's persisted shown flag (and,
+//                           optionally, its name tag mode setting)
 //   CreateLowerThirdFor   — create the source + a scene-item in every scene
 //                           the participant is in, place them, show it
 //   SetLowerThirdShownFor — show (re-placing one-shot) or hide
 //   SetLowerThirdTitleFor — write the canonical title + fan the change out
 static std::string GetLowerThirdUuidFor(const std::string& participantUuid);
-static bool        IsLowerThirdShown(const std::string& ltUuid);
+static bool        IsLowerThirdShown(const std::string& ltUuid,
+                                     bool* outNameTag = nullptr);
 static void        CreateLowerThirdFor(const std::string& participantUuid);
 static void        SetLowerThirdShownFor(const std::string& participantUuid,
                                          bool shown);
@@ -533,6 +535,12 @@ static constexpr const char* kLowerThirdUuidKey  = "feeds_lower_third_uuid";
 // gap stays constant.
 static constexpr float kLowerThirdWidthFraction = 0.92f;
 static constexpr float kLowerThirdBottomInset   = 0.06f;
+
+// The lower third's own "name tag mode" setting (on the LOWER THIRD source,
+// not the participant). Mirrored in feeds-lower-third-source.cpp
+// (kLtNameTagKey), which owns it; read here for placement and the dock row.
+// The name tag's look constants live in that file.
+static constexpr const char* kLtNameTagModeKey = "name_tag_mode";
 
 // Tier gate for the lower third: Basic and up. Deliberately lower than the
 // chat popup/overlay (Streamer, >= 2) — the lower third is Basic's marquee
@@ -4120,7 +4128,7 @@ public:
         // row's button falls back to "Create Lower Third".
         for (auto& r : rows) {
             r.ltUuid  = GetLowerThirdUuidFor(r.uuid);
-            r.ltShown = IsLowerThirdShown(r.ltUuid);
+            r.ltShown = IsLowerThirdShown(r.ltUuid, &r.ltNameTag);
         }
 
         const bool   loggedIn    = g_isLoggedIn;
@@ -4654,6 +4662,7 @@ private:
         // --- Lower third ---
         std::string ltUuid;            // "" = none created yet (or since deleted)
         bool        ltShown = false;   // the lower third's persisted shown flag
+        bool        ltNameTag = false; // its name tag mode setting
         std::string ltTitle;           // the canonical title (participant settings)
     };
 
@@ -5490,7 +5499,11 @@ private:
         // always displays the real title. Commits on editingFinished (Enter or
         // focus-out), never on every keystroke, so a mid-typing dock refresh
         // can't write a partial value.
-        if (exists) {
+        //
+        // Not in name tag mode: the tag shows no title, so the field goes and
+        // the button takes its share of the row instead.
+        const bool nameTag = exists && r.ltNameTag;
+        if (exists && !nameTag) {
             const QString full = QString::fromStdString(r.ltTitle);
             QLineEdit* title = new QLineEdit(full);
             title->setPlaceholderText(QString::fromUtf8("Lower third title…"));
@@ -5545,17 +5558,20 @@ private:
         // (that is the whole point of the long Create label), and gives way to
         // an ellipsis only when the dock is dragged narrower than the row —
         // which beats forcing a horizontal scrollbar on the whole dock.
+        //
+        // Name tag mode only relabels Show/Hide; the click runs the same path.
         ElidingPushButton* btn = new ElidingPushButton(
             !exists     ? "Create Lower Third"
+            : nameTag   ? (r.ltShown ? "Hide Name Tag" : "Show Name Tag")
             : r.ltShown ? "Hide"
                         : "Show");
         btn->setToolTip(
             !exists     ? "Create a nameplate for this participant"
+            : nameTag   ? (r.ltShown
+                               ? "Hide the name tag (the source is kept)"
+                               : "Show the name tag over this participant")
             : r.ltShown ? "Hide the nameplate (the source is kept)"
-                        // <qt> makes Qt treat it as rich text, which wraps.
-                        : "<qt>Shows a full lower third, then shrinks to a "
-                          "compact name tag. To keep it full size, turn this "
-                          "off in the lower third's Properties.</qt>");
+                        : "Show the lower third over this participant");
         StyleLowerThirdButton(btn, locked, m_cdLowerThird.count(uuid) != 0);
         m_ltButtons[uuid] = btn;
 
@@ -5588,7 +5604,8 @@ private:
                 }
                 SetLowerThirdShownFor(uuid, !shown);
             });
-        rowL->addWidget(btn);
+        // In name tag mode the button takes the title field's stretch.
+        rowL->addWidget(btn, nameTag ? 1 : 0);
 
         return row;
     }
@@ -11732,10 +11749,28 @@ static void StackLowerThirdAboveParticipant(obs_sceneitem_t* ltItem,
     if (ltPos != target) obs_sceneitem_set_order_position(ltItem, target);
 }
 
+// The lower third's name tag mode setting, read off the source's settings.
+static bool LowerThirdSourceIsNameTag(obs_source_t* lt) {
+    if (!lt) return false;
+    bool nameTag = false;
+    if (obs_data_t* s = obs_source_get_settings(lt)) {
+        nameTag = obs_data_get_bool(s, kLtNameTagModeKey);
+        obs_data_release(s);
+    }
+    return nameTag;
+}
+
 // Position one nameplate scene-item over one participant scene-item, and stack
 // it directly above. One-shot: this reads the participant's transform as it is
 // right now. It is NOT live-follow — moving the participant afterwards leaves
 // the nameplate where it was until the next Show re-places it.
+//
+// Both modes share all of that (the same caller, the same measurement, the same
+// degenerate-box rule and stacking); only the anchor and the scale differ:
+//   card:     bottom-centre, scaled to 92% of the participant's width.
+//   name tag: bottom-left corner on the participant's bottom-left corner,
+//             scaled by the participant's height (the tag carries its own
+//             margin; see the kNameTag* constants in the source file).
 static void PlaceLowerThirdItem(obs_sceneitem_t* ltItem,
                                 obs_sceneitem_t* participantItem,
                                 obs_source_t* ltSource) {
@@ -11768,6 +11803,22 @@ static void PlaceLowerThirdItem(obs_sceneitem_t* ltItem,
         // (correct — its participant hasn't moved either), and a brand-new one
         // keeps OBS's default until the next Show re-places it once video is
         // flowing, which is the contract this path always documented.
+        StackLowerThirdAboveParticipant(ltItem, participantItem);
+        return;
+    }
+
+    if (LowerThirdSourceIsNameTag(ltSource)) {
+        const float s = feeds::LowerThirdNameTagScale(rh);
+        vec2 scale;
+        scale.x = s;
+        scale.y = s;
+        vec2 pos;
+        pos.x = rx;
+        pos.y = ry + rh;
+        obs_sceneitem_set_bounds_type(ltItem, OBS_BOUNDS_NONE);
+        obs_sceneitem_set_alignment(ltItem, OBS_ALIGN_BOTTOM | OBS_ALIGN_LEFT);
+        obs_sceneitem_set_scale(ltItem, &scale);
+        obs_sceneitem_set_pos(ltItem, &pos);
         StackLowerThirdAboveParticipant(ltItem, participantItem);
         return;
     }
@@ -11914,7 +11965,8 @@ static std::string GetLowerThirdUuidFor(const std::string& participantUuid) {
 // with N scene-items, survives save/load, and preserves the slide-out that
 // flipping an item's eye icon can't give. The scene items stay visible either
 // way, exactly like a chat popup sitting in a scene with nothing to show.
-static bool IsLowerThirdShown(const std::string& ltUuid) {
+static bool IsLowerThirdShown(const std::string& ltUuid, bool* outNameTag) {
+    if (outNameTag) *outNameTag = false;
     if (ltUuid.empty()) return false;
     obs_source_t* lt = obs_get_source_by_uuid(ltUuid.c_str());
     if (!lt) return false;
@@ -11922,6 +11974,7 @@ static bool IsLowerThirdShown(const std::string& ltUuid) {
     bool shown = false;
     if (obs_data_t* s = obs_source_get_settings(lt)) {
         shown = obs_data_get_bool(s, "shown");
+        if (outNameTag) *outNameTag = obs_data_get_bool(s, kLtNameTagModeKey);
         obs_data_release(s);
     }
     obs_source_release(lt);
@@ -12591,6 +12644,26 @@ void RequestLowerThirdShown(const std::string& participantUuid, bool shown) {
     QTimer::singleShot(0, mainWindow, [participantUuid, shown]() {
         if (PassLowerThirdTierGate())
             SetLowerThirdShownFor(participantUuid, shown);
+    });
+}
+
+// The lower third's name tag mode changed (lt_update, on the graphics thread).
+// The source has already snapped off screen; this makes the stored state agree.
+// A source that was shown goes through the dock's own Hide path, so the stored
+// shown flag clears and the button reads Show; the next Show re-places it for
+// the new mode's size. Not tier-gated: hiding is always allowed, and the dock
+// row has to follow the mode either way. SetLowerThirdShownFor and the plain
+// branch both post the dock refresh that relabels the row.
+void NotifyLowerThirdModeChanged(const std::string& participantUuid) {
+    if (g_obsExiting.load()) return;
+    QObject* mainWindow = static_cast<QObject*>(obs_frontend_get_main_window());
+    if (!mainWindow) return;
+    QTimer::singleShot(0, mainWindow, [participantUuid]() {
+        const std::string ltUuid = GetLowerThirdUuidFor(participantUuid);
+        if (!ltUuid.empty() && IsLowerThirdShown(ltUuid))
+            SetLowerThirdShownFor(participantUuid, false);
+        else
+            PostParticipantDockRefresh();
     });
 }
 
