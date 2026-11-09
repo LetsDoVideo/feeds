@@ -67,8 +67,11 @@ OAuth flow completed and user info has been fetched. Plugin should cache these f
 {"type": "login_succeeded",
  "display_name": "David Maldow",
  "pmi": "1234567890",
- "tier": 0}
+ "tier": 0,
+ "had_trial": false}
 ```
+
+`had_trial` is the entitlement backend's flag for an account that has had a free trial or a paid plan. The plugin uses it to decide whether to offer the free trial. Older engines omit it, and a missing value reads as false. It always follows `tier`.
 
 #### `sdk_authenticated` (E→P)
 SDK authentication succeeded. Plugin flips UI state to logged-in. Always arrives **after** `login_succeeded` so the cache is populated before the Connect menu becomes enabled.

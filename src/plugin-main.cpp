@@ -169,6 +169,7 @@ static void LogProxyResolutionOnce(const feeds_http::ProxyResolution& px,
 // existing unqualified call sites resolve unchanged.
 using feeds::ExtractJsonString;
 using feeds::ExtractJsonNumber;
+using feeds::ExtractJsonBool;
 using feeds::ExtractJsonStringEscaped;
 using feeds::JsonEscape;
 using feeds::JsonExtractArrayBody;
@@ -289,6 +290,11 @@ static std::string g_userDisplayName;
 static std::string g_userPMI;
 // Non-static for the same reason as g_isLoggedIn above.
 int                g_currentTier = 0;
+// The backend's had_trial for this account (sent with the tier in
+// login_succeeded): true once the account has had a free trial or a paid Zoom
+// plan. Gates the Controls Dock's free trial line. Same lifetime and thread
+// (UI) as g_currentTier, cleared everywhere it is.
+static bool        g_hadTrial    = false;
 static uint32_t    g_enginePid   = 0;   // Populated from engine_ready
 
 static unsigned long long g_currentMeetingNumber = 0;
@@ -4398,7 +4404,10 @@ private:
         return header;
     }
 
-    // Tier-conditional footer. Logged-in Free or Basic: the free-trial offer.
+    // Tier-conditional footer. Logged-in Free account that has never had a
+    // trial (g_hadTrial false): the free-trial offer. A trial puts the account
+    // on a paid tier, which hides it, and had_trial keeps it hidden after the
+    // trial ends. Basic and up never see it.
     // Streamer+: "Your Streamer Bundle is ready" until it has been clicked
     // once (here or from the Feeds menu). Logged out, the tier reads 0
     // whatever the account is, so it stays hidden until login says otherwise.
@@ -4407,11 +4416,12 @@ private:
     void UpdateTrialFooter() {
         if (!m_trialFooter) return;
         QString text;
-        if (g_isLoggedIn && g_currentTier < 2) {
+        if (g_isLoggedIn && g_currentTier == 0 && !g_hadTrial) {
             text = QString::fromUtf8(
-                "Want to try Streamer features free? Request a 2-week trial at "
-                "<a href=\"https://letsdovideo.com/feeds-freetrial\">"
-                "letsdovideo.com/feeds-freetrial</a>");
+                "Get more feeds, lower thirds and chat tools. Try any paid plan "
+                "free for 2 weeks. "
+                "<a href=\"https://marketplace.zoom.us/apps/9ZWYWHNdRCSuI-9pFTuPJw\">"
+                "Start free trial</a>");
         } else if (g_currentTier >= 2 && !HasSeenStreamerBundle()) {
             text = QString("Your Streamer Bundle is ready. "
                            "<a href=\"%1\">Get it here.</a>")
@@ -10170,6 +10180,9 @@ static void RegisterEngineHandlers() {
         std::string displayName = ExtractJsonString(json, "display_name");
         std::string pmi         = ExtractJsonString(json, "pmi");
         int         tier        = (int)ExtractJsonNumber(json, "tier");
+        // Absent (an older engine) reads as false, so the trial line keeps
+        // showing for a Free account exactly as before.
+        const bool  hadTrial    = ExtractJsonBool(json, "had_trial");
         // NOTE: g_loginAttemptCompleted is intentionally NOT armed here.
         // It is set together with g_isLoggedIn in the sdk_authenticated
         // handler so the popup gate (g_loginAttemptCompleted && !g_isLoggedIn)
@@ -10186,10 +10199,11 @@ static void RegisterEngineHandlers() {
         // belong on the main thread, and it reads g_currentTier, so the
         // assignments have to precede it in this same step.
         QTimer::singleShot(0, (QObject*)obs_frontend_get_main_window(),
-            [displayName, pmi, tier]() {
+            [displayName, pmi, tier, hadTrial]() {
                 g_userDisplayName = displayName;
                 g_userPMI         = pmi;
                 g_currentTier     = tier;
+                g_hadTrial        = hadTrial;
                 ReconcileSourcesToTier();
             });
     });
@@ -10385,6 +10399,7 @@ static void RegisterEngineHandlers() {
             g_userDisplayName.clear();
             g_userPMI.clear();
             g_currentTier = 0;
+            g_hadTrial    = false;
             {
                 std::lock_guard<std::mutex> lock(g_participantsMutex);
                 g_cachedParticipants.clear();
@@ -10447,6 +10462,7 @@ static void RegisterEngineHandlers() {
             g_userDisplayName.clear();
             g_userPMI.clear();
             g_currentTier = 0;
+            g_hadTrial    = false;
             {
                 std::lock_guard<std::mutex> lock(g_participantsMutex);
                 g_cachedParticipants.clear();

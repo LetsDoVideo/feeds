@@ -28,6 +28,7 @@ const std::string& GetUserDisplayName();
 const std::string& GetUserPMI();
 const std::string& GetUserEmail();
 int                GetCurrentTier();
+bool               GetHadTrial();
 void               ClearStoredCredentials();
 unsigned           GetSessionExpiredNoticeCount();
 
@@ -272,6 +273,7 @@ static void AnnounceLoginSucceeded() {
     const std::string& name = GetUserDisplayName();
     const std::string& pmi  = GetUserPMI();
     int tier = GetCurrentTier();
+    const bool hadTrial = GetHadTrial();
 
     // Escape the display name defensively. We don't expect quotes or
     // backslashes, but non-ASCII names are common and we want to be safe.
@@ -288,8 +290,9 @@ static void AnnounceLoginSucceeded() {
         "{\"type\":\"login_succeeded\","
         "\"display_name\":\"%s\","
         "\"pmi\":\"%s\","
-        "\"tier\":%d}",
-        escName.c_str(), pmi.c_str(), tier);
+        "\"tier\":%d,"
+        "\"had_trial\":%s}",   // after "tier", which stays the first tier key
+        escName.c_str(), pmi.c_str(), tier, hadTrial ? "true" : "false");
     SendToPlugin(resp);
 
     // Then the UI-state flip. Order matters: login_succeeded first (so the

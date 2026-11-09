@@ -5,7 +5,8 @@
 // plugin are identical, so the plugin's existing login UI needs no macOS
 // special case:
 //
-//   login_succeeded {display_name, pmi, tier}   a usable session exists
+//   login_succeeded {display_name, pmi, tier,    a usable session exists
+//                    had_trial}
 //   sdk_authenticated                            "ready to connect"
 //   login_failed    {error}                      no_stored_token /
 //                                                session_restore_unreachable /

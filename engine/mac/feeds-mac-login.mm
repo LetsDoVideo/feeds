@@ -46,6 +46,9 @@ const char* const kSessionItem      = "Feeds_Session";
 // preferences now, which keeps the property that actually mattered (a second
 // macOS user cannot inherit the first user's entitlement) at no prompt cost.
 const char* const kCachedTierPref   = "cached_tier";
+// The /tier response's had_trial (0 or 1), cached and removed with the tier.
+// Missing (never cached, or cached before had_trial existed) reads as false.
+const char* const kCachedHadTrialPref = "cached_had_trial";
 
 // Superseded by kSessionItem. Read once to migrate an existing login, then
 // deleted; a user who already signed in keeps their session across the change
@@ -64,6 +67,7 @@ std::string g_refreshToken;
 std::string g_displayName;
 std::string g_pmi;
 int         g_currentTier    = 0;
+bool        g_hadTrial       = false;   // /tier had_trial; same lifetime as the tier
 bool        g_tierUnresolved = false;
 
 std::mutex g_loginMutex;
@@ -263,9 +267,15 @@ bool LoadStoredRefreshToken(std::string& refresh)
 // macOS user on this machine can never inherit the first user's entitlement.
 // What changed is where it lives: per-user preferences rather than the
 // Keychain, because it is not a secret and a Keychain item costs prompts.
-void SaveCachedTier(int tier)
+void SaveCachedTier(int tier, bool hadTrial)
 {
     PrefsSetInt(kCachedTierPref, tier);
+    PrefsSetInt(kCachedHadTrialPref, hadTrial ? 1 : 0);
+}
+
+bool LoadCachedHadTrial()
+{
+    return PrefsGetInt(kCachedHadTrialPref, 0) == 1;
 }
 
 // -1 means "never cached": the brand-new user who has not once reached the
@@ -483,6 +493,8 @@ void FetchAndApplyEntitlement()
     {
         std::lock_guard<std::mutex> lock(g_stateMutex);
         g_currentTier    = (cached >= 0) ? cached : 0;
+        // had_trial follows the same rule: a failure keeps the last known value.
+        g_hadTrial       = (cached >= 0) ? LoadCachedHadTrial() : false;
         g_tierUnresolved = false;
     }
 
@@ -519,12 +531,17 @@ void FetchAndApplyEntitlement()
     const int tier = atoi(tierText.c_str());
     if (tier < 0 || tier > 3) { giveUp("tier out of range"); return; }
 
+    // A JSON boolean next to "tier"; absent or unreadable is false.
+    const bool hadTrial = feeds::ExtractJsonBool(r.body, "had_trial");
+
     {
         std::lock_guard<std::mutex> lock(g_stateMutex);
         g_currentTier = tier;
+        g_hadTrial    = hadTrial;
     }
-    SaveCachedTier(tier);
-    LogInfo("API: entitlement tier " + std::to_string(tier));
+    SaveCachedTier(tier, hadTrial);
+    LogInfo("API: entitlement tier " + std::to_string(tier) +
+            " had_trial=" + (hadTrial ? "1" : "0"));
 }
 
 // Announce a restored or completed login. Order matters: login_succeeded
@@ -564,18 +581,22 @@ void AnnounceLoginSucceeded()
 
     std::string name, pmi;
     int tier = 0;
+    bool hadTrial = false;
     bool tierUnresolved = false;
     {
         std::lock_guard<std::mutex> lock(g_stateMutex);
         name           = g_displayName;
         pmi            = g_pmi;
         tier           = g_currentTier;
+        hadTrial       = g_hadTrial;
         tierUnresolved = g_tierUnresolved;
     }
 
+    // had_trial after "tier", which stays the first tier key, as on Windows.
     EngineSend("{\"type\":\"login_succeeded\",\"display_name\":\"" +
                feeds::JsonEscape(name) + "\",\"pmi\":\"" + pmi +
-               "\",\"tier\":" + std::to_string(tier) + "}");
+               "\",\"tier\":" + std::to_string(tier) +
+               ",\"had_trial\":" + (hadTrial ? "true" : "false") + "}");
     EngineSend("{\"type\":\"sdk_authenticated\"}");
 
     // Last, deliberately: the plugin puts a modal up for this, and a modal
@@ -785,6 +806,7 @@ void ClearStoredCredentials()
         g_displayName.clear();
         g_pmi.clear();
         g_currentTier = 0;
+        g_hadTrial    = false;
     }
     {
         // Forget the memo too, or a login straight after a logout would restore
@@ -804,6 +826,7 @@ void ClearStoredCredentials()
     // until their own tier query lands. It is a preference now, not a Keychain
     // item, so removing it costs no prompt.
     PrefsRemove(kCachedTierPref);
+    PrefsRemove(kCachedHadTrialPref);
 }
 
 std::string FetchZak()

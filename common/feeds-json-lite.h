@@ -44,6 +44,20 @@ inline long long ExtractJsonNumber(const std::string& json, const std::string& k
     try { return std::stoll(numStr); } catch (...) { return 0; }
 }
 
+// A JSON boolean: true only when the key is present and its value is the
+// literal true. Absent, false, null or anything unreadable is false, so a
+// sender that predates the field reads as false.
+inline bool ExtractJsonBool(const std::string& json, const std::string& key) {
+    std::string search = "\"" + key + "\"";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return false;
+    pos = json.find_first_not_of(" \t\r\n", pos + search.size());
+    if (pos == std::string::npos || json[pos] != ':') return false;
+    pos = json.find_first_not_of(" \t\r\n", pos + 1);
+    if (pos == std::string::npos) return false;
+    return json.compare(pos, 4, "true") == 0;
+}
+
 // JSON string escaper for outgoing IPC. Mirrors the engine's JsonEscape
 // — they need to agree on what counts as an escape so both sides can
 // round-trip user-entered chat content (quotes, backslashes, newlines).

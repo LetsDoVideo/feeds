@@ -38,6 +38,9 @@ static std::string g_userDisplayName;
 static std::string g_userPMI;
 static std::string g_userEmail;
 static int         g_currentTier = 0;   // 0 = Free until proven otherwise
+// The /tier response's had_trial: the account has had a free trial or a paid
+// Zoom plan. Resolved with the tier, cached with it, cleared with it.
+static bool        g_hadTrial    = false;
 
 // True only when the tier fetch failed AND there was no cached tier to fall
 // back on — i.e. the one case where the user involuntarily lands on Free. Read
@@ -52,6 +55,7 @@ const std::string& GetUserDisplayName() { return g_userDisplayName; }
 const std::string& GetUserPMI()         { return g_userPMI; }
 const std::string& GetUserEmail()       { return g_userEmail; }
 int                GetCurrentTier()     { return g_currentTier; }
+bool               GetHadTrial()        { return g_hadTrial; }
 bool               WasTierUnresolved()  { return g_tierUnresolved; }
 
 void SetAccessToken(const std::string& t)  { g_accessToken  = t; }
@@ -64,6 +68,7 @@ void ClearUserInfo() {
     g_userPMI.clear();
     g_userEmail.clear();
     g_currentTier = 0;
+    g_hadTrial    = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -131,6 +136,20 @@ static std::string JsonExtractNumber(const std::string& json,
                                                       : end - pos);
 }
 
+// A JSON boolean: true only when the key is present and its value is the
+// literal true; anything else is false. Mirrors feeds::ExtractJsonBool in
+// common/feeds-json-lite.h, like the helpers above mirror theirs.
+static bool JsonExtractBool(const std::string& json, const std::string& key) {
+    std::string search = "\"" + key + "\"";
+    size_t pos = json.find(search);
+    if (pos == std::string::npos) return false;
+    pos = json.find_first_not_of(" \t\r\n", pos + search.size());
+    if (pos == std::string::npos || json[pos] != ':') return false;
+    pos = json.find_first_not_of(" \t\r\n", pos + 1);
+    if (pos == std::string::npos) return false;
+    return json.compare(pos, 4, "true") == 0;
+}
+
 // ---------------------------------------------------------------------------
 // Credential Manager helpers — save new tokens after a refresh
 // ---------------------------------------------------------------------------
@@ -189,10 +208,15 @@ static void LoadRefreshTokenFromCredentialManager() {
 // Written ONLY on a clean 200 + parse. Read once at the top of the fetch, so
 // every failure path keeps the cached value without each one having to know
 // the cache exists.
+//
+// had_trial rides in the same credential as "<tier>,<0|1>", so it shares the
+// tier's lifecycle with no second item to delete. A value written before
+// had_trial existed is just "<tier>": LoadCachedTier reads either form (atoi
+// stops at the comma), and LoadCachedHadTrial reads the old form as false.
 // ---------------------------------------------------------------------------
-static void SaveCachedTier(int tier) {
+static void SaveCachedTier(int tier, bool hadTrial) {
     char buf[16];
-    sprintf_s(buf, "%d", tier);
+    sprintf_s(buf, "%d,%d", tier, hadTrial ? 1 : 0);
     std::string blob(buf);
 
     CREDENTIALA cred = {};
@@ -217,6 +241,17 @@ static int LoadCachedTier() {
     if (v.empty()) return -1;
     int tier = atoi(v.c_str());
     return (tier >= 0 && tier <= 3) ? tier : -1;
+}
+
+// The cached had_trial; false when nothing is cached or the cache predates it.
+static bool LoadCachedHadTrial() {
+    PCREDENTIALA pCred = nullptr;
+    if (!CredReadA("Feeds_CachedTier", CRED_TYPE_GENERIC, 0, &pCred))
+        return false;
+    std::string v((char*)pCred->CredentialBlob, pCred->CredentialBlobSize);
+    CredFree(pCred);
+    const size_t comma = v.find(',');
+    return comma != std::string::npos && v.compare(comma + 1, 1, "1") == 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -801,6 +836,8 @@ void FetchAndApplyEntitlement() {
     // clean 200 + parse changes it (and re-caches it).
     const int cachedTier = LoadCachedTier();
     g_currentTier    = (cachedTier >= 0) ? cachedTier : 0;
+    // had_trial follows the same rule: a failure keeps the last known value.
+    g_hadTrial       = (cachedTier >= 0) ? LoadCachedHadTrial() : false;
     g_tierUnresolved = false;
 
     // One place that decides what a failure means, so the six early-returns
@@ -906,11 +943,13 @@ void FetchAndApplyEntitlement() {
     // caches a 0: a backend that answers "tier 0" is a real downgrade (expired
     // or cancelled subscription) and must stick, unlike an unanswered query.
     g_currentTier = atoi(tierStr.c_str());
-    SaveCachedTier(g_currentTier);
+    // A JSON boolean next to "tier"; absent or unreadable is false.
+    g_hadTrial    = JsonExtractBool(response, "had_trial");
+    SaveCachedTier(g_currentTier, g_hadTrial);
 
     char msg[128];
-    sprintf_s(msg, "API: entitlement applied, tier=%d (from backend)",
-              g_currentTier);
+    sprintf_s(msg, "API: entitlement applied, tier=%d had_trial=%d (from backend)",
+              g_currentTier, g_hadTrial ? 1 : 0);
     LogInfo(msg);
 }
 
